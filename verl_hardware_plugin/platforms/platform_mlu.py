@@ -126,10 +126,13 @@ class PlatformMLU(PlatformBase):
     # ------------------------------------------------------------------
 
     def ray_resource_name(self) -> str:
-        return "MLU"
+        # For MLU devices, we use GPU as resource name
+        return "GPU"
 
     def ray_resource_options(self, num_gpus: float) -> dict[str, Any]:
-        return {"resources": {"MLU": num_gpus}}
+        # For MLU devices, we use num_gpus because Ray clusters are typically
+        # configured with GPU resources even when using MLU hardware
+        return {"num_gpus": num_gpus}
 
     def ray_noset_envvars(self) -> list[str]:
         return ["RAY_EXPERIMENTAL_NOSET_MLU_VISIBLE_DEVICES"]
