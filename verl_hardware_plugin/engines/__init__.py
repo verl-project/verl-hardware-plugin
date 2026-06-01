@@ -58,6 +58,13 @@ def register_all_engines():
     except Exception as e:
         logger.debug("MLU Megatron engines not registered: %s", e)
 
+    try:
+        from verl_hardware_plugin.engines import cncl_checkpoint_engine  # noqa: F401
+
+        logger.info("Registered engines: cncl_checkpoint_engine")
+    except Exception as e:
+        logger.debug("CNCL Checkpoint engine not registered: %s", e)
+
     # MetaX engines
     try:
         from verl_hardware_plugin.engines import fsdp_metax  # noqa: F401
