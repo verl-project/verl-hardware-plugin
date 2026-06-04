@@ -5,6 +5,23 @@
 
 Supports Cambricon MLU (Machine Learning Unit) devices via torch_mlu
 and CNCL (Cambricon NCCL) communication backend.
+
+Key design decisions for Cambricon MLU:
+- device_name: "mlu" (Cambricon's torch extension uses torch.mlu.*)
+- vendor_name: "cambricon" (used for engine lookup key)
+- communication_backend: "cncl" (Cambricon's collective communication library)
+- ray_resource_name: "MLU" (custom Ray resource — requires Ray workers to
+  advertise this resource via --resources='{"MLU": N}')
+- visible_devices_envvar: "MLU_VISIBLE_DEVICES" (Cambricon driver control)
+- is_ipc_supported: False (not yet supported by Cambricon runtime)
+
+Prerequisites:
+- torch_mlu must be installed (provides torch.mlu.* API)
+- Cambricon driver and runtime must be installed on the host
+
+Example usage:
+    export VERL_PLATFORM=cambricon
+    python -m verl.trainer.main --config config.yaml
 """
 
 import logging
@@ -23,7 +40,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 def _ensure_torch_mlu() -> bool:
-    """Try to import torch_mlu so that torch.mlu becomes available."""
+    """Try to import torch_mlu so that torch.mlu becomes available.
+
+    Cambricon's torch extension follows the same pattern as other vendor
+    extensions (torch_npu for Huawei, intel_extension_for_pytorch for Intel):
+    importing the package registers the device backend with PyTorch.
+
+    Returns:
+        True if torch.mlu is usable after the import attempt.
+    """
     if hasattr(torch, "mlu"):
         return True
     try:
@@ -36,7 +61,18 @@ def _ensure_torch_mlu() -> bool:
 
 @PlatformRegistry.register(platform="cambricon")
 class PlatformMLU(PlatformBase):
-    """Platform backend for Cambricon MLU."""
+    """Platform backend for Cambricon MLU.
+
+    Registration key: "cambricon"
+    Engines for this platform should register with: device="mlu", vendor="cambricon"
+
+    Note on Ray resource:
+        Unlike NVIDIA/Intel which use the built-in "GPU" resource, MLU uses a
+        custom "MLU" resource. Ray workers must be started with:
+            ray start --resources='{"MLU": 8}'
+        This gives verl full control over device assignment without interfering
+        with CUDA GPU scheduling.
+    """
 
     # ------------------------------------------------------------------
     # Core device management
@@ -56,7 +92,12 @@ class PlatformMLU(PlatformBase):
             raise RuntimeError("torch_mlu is not installed or torch.mlu is not available")
         return torch.mlu
 
-    def is_available(self, use_smi_check: bool = False) -> bool:
+    def is_available(self) -> bool:
+        if not _ensure_torch_mlu():
+            return False
+        return torch.mlu.is_available()
+
+    def is_platform_available(self, use_smi_check: bool = False) -> bool:
         if not _ensure_torch_mlu():
             return False
         return torch.mlu.is_available()
@@ -116,9 +157,13 @@ class PlatformMLU(PlatformBase):
     # ------------------------------------------------------------------
 
     def communication_backend_name(self) -> str:
+        # CNCL = Cambricon NCCL — Cambricon's collective communication library
+        # Compatible with torch.distributed process group initialization
         return "cncl"
 
     def visible_devices_envvar(self) -> str:
+        # Cambricon driver uses MLU_VISIBLE_DEVICES to control device visibility
+        # (analogous to CUDA_VISIBLE_DEVICES)
         return "MLU_VISIBLE_DEVICES"
 
     # ------------------------------------------------------------------
@@ -126,12 +171,16 @@ class PlatformMLU(PlatformBase):
     # ------------------------------------------------------------------
 
     def ray_resource_name(self) -> str:
+        # Custom resource name — Ray workers must advertise "MLU" resources.
+        # This avoids conflicting with CUDA "GPU" resources on heterogeneous clusters.
         return "MLU"
 
     def ray_resource_options(self, num_gpus: float) -> dict[str, Any]:
+        # Custom resources use the "resources" dict (not the shorthand "num_gpus" key)
         return {"resources": {"MLU": num_gpus}}
 
     def ray_noset_envvars(self) -> list[str]:
+        # Prevent Ray from auto-setting MLU_VISIBLE_DEVICES — verl manages this
         return ["RAY_EXPERIMENTAL_NOSET_MLU_VISIBLE_DEVICES"]
 
     # ------------------------------------------------------------------

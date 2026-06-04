@@ -1,11 +1,29 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""MetaX (沐曦) platform implementation.
+"""MetaX platform implementation.
 
 MetaX GPUs are CUDA-compatible, so torch.cuda.is_available() returns True
 even on MetaX hardware. To distinguish MetaX from NVIDIA during auto-detection,
 an optional SMI command check (mx-smi) can be enabled.
+
+Key design decisions for MetaX:
+- device_name: "cuda" (MetaX is CUDA-compatible, uses torch.cuda.*)
+- vendor_name: "metax" (distinguishes from "nvidia" in engine lookup)
+- communication_backend: "nccl" (standard NCCL works on MetaX)
+- is_platform_available: uses mx-smi to distinguish from NVIDIA hardware
+- ray_resource_name: "GPU" (standard GPU scheduling)
+
+Since MetaX and NVIDIA share the "cuda" device type, the engine registry uses
+the (device="cuda", vendor="metax") key to select MetaX-specific engines.
+Without vendor distinction, MetaX would fall back to NVIDIA's engines.
+
+Example usage:
+    export VERL_PLATFORM=metax
+    python -m verl.trainer.main --config config.yaml
+
+    # Or let auto-detection handle it (requires mx-smi in PATH)
+    python -m verl.trainer.main --config config.yaml
 """
 
 import logging
@@ -25,7 +43,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 @PlatformRegistry.register(platform="metax")
 class PlatformMetaX(PlatformBase):
-    """Platform backend for MetaX (沐曦) GPUs.
+    """Platform backend for MetaX GPUs.
 
     MetaX GPUs expose a CUDA-compatible interface, so this platform uses
     torch.cuda underneath. The is_available() method supports an optional
@@ -48,7 +66,24 @@ class PlatformMetaX(PlatformBase):
     def device_module(self) -> ModuleType:
         return torch.cuda
 
-    def is_available(self, use_smi_check: bool = False) -> bool:
+    def is_available(self) -> bool:
+        return torch.cuda.is_available()
+
+    def is_platform_available(self, use_smi_check: bool = False) -> bool:
+        """Determine if the current machine has MetaX hardware.
+
+        Since MetaX is CUDA-compatible, torch.cuda.is_available() returns True
+        on both MetaX and NVIDIA machines. The only reliable way to distinguish
+        them is the mx-smi command (MetaX's equivalent of nvidia-smi).
+
+        Detection logic:
+        1. If torch.cuda is not available at all → False
+        2. If use_smi_check=True → check if mx-smi exists and exits 0
+        3. If use_smi_check=False → True (assume CUDA = MetaX)
+
+        The use_smi_check=True path is used during first-time auto-detection.
+        In subsequent calls (runtime checks), use_smi_check=False is typical.
+        """
         if not torch.cuda.is_available():
             return False
         if use_smi_check:

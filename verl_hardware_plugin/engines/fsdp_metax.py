@@ -1,7 +1,7 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""FSDP engine for MetaX (沐曦) devices.
+"""FSDP engine for MetaX devices.
 
 MetaX GPUs are CUDA-compatible, so the base FSDP engine works directly.
 """
