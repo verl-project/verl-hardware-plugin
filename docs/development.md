@@ -2,6 +2,9 @@
 
 This document explains how to add support for a new hardware accelerator to verl via the plugin system, with detailed examples and inline commentary.
 
+> [!NOTE]
+> 目前 verl-core 中的 platform/engine 插件机制仍在持续验证中。如果您在适配过程中发现仅通过在本仓库中增加 platform 和 engine 无法满足需求（例如 `PlatformBase` 缺少必要接口、Engine 基类行为与硬件不兼容等），欢迎在 [verl](https://github.com/verl-project/verl) 仓库提出 Issue，并给出需要完善的建议，我们会快速响应。
+
 > **verl core PR**: The platform and engine registry mechanism is implemented in
 > [verl#6086](https://github.com/verl-project/verl/pull/6086). Refer to that PR
 > for the base class interfaces (`PlatformBase`, `EngineRegistry`) and the
@@ -398,6 +401,31 @@ class PlatformMyDevice(PlatformBase):
         pass
 
     # ==================================================================
+    # vLLM integration
+    # ==================================================================
+
+    def get_device_uuid(self, device_id: int) -> str:
+        """Return a unique identifier string for the given device.
+
+        Used by verl's vLLM integration to map Ray resources to physical
+        devices. The default implementation in PlatformBase constructs a
+        UUID from ray_resource_name() + visible device index (via the
+        visible_devices_envvar()).
+
+        Most platforms do NOT need to override this — the base class logic
+        handles it. Override only if your hardware has a different UUID scheme.
+
+        Default behavior (inherited from PlatformBase):
+            1. If visible_devices_envvar() is set:
+               return ray_resource_name() + visible_devices[device_id]
+            2. Otherwise:
+               return f"{ray_resource_name()}-{device_id}"
+        """
+        # Usually no need to override — base class implementation is sufficient.
+        # Only override if your device UUID scheme differs from the default.
+        return super().get_device_uuid(device_id)
+
+    # ==================================================================
     # Model patches
     # ==================================================================
 
@@ -763,6 +791,7 @@ class PlatformMetaX(PlatformBase):
 | | `ray_resource_options(num_gpus)` | No (has default) | Ray actor resource dict |
 | **IPC** | `is_ipc_supported()` | Yes | Whether IPC tensor sharing is supported |
 | **Rollout** | `rollout_env_vars()` | No | Env vars for rollout engine launch |
+| **vLLM** | `get_device_uuid(device_id)` | No (has default) | Unique device identifier for vLLM resource mapping |
 | **Model Patches** | `apply_model_patches(model_type)` | No | Apply platform-specific model monkey patches |
 | **Profiling** | `nvtx_range(msg)` | Yes | Context manager for profiler ranges |
 | | `profiler_start()` | Yes | Start device profiler |
@@ -855,7 +884,6 @@ verl-hardware-plugin/
 │   └── test_plugin_registration.py
 └── docs/
     ├── development.md                     # This file
-    ├── adaptation_guide.md                # 中文适配指南
     └── user_guide.md                      # End-user documentation
 ```
 
@@ -880,4 +908,3 @@ The following files in this repository serve as examples:
 - **Engine base class**: `verl/workers/engine/base.py`
 - **Platform README**: `verl/plugin/platform/README.md`
 - **User Guide**: [docs/user_guide.md](user_guide.md)
-- **适配指南 (中文)**: [docs/adaptation_guide.md](adaptation_guide.md)

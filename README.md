@@ -121,7 +121,6 @@ Each hardware platform provides a standalone user guide (following the structure
 ### Developer Guides
 
 - **[Development Guide](docs/development.md)** — How to add a new hardware platform and engine (start here for adaptation)
-- **[Adaptation Guide](docs/adaptation_guide.md)** — Multi-chip adaptation guide for hardware vendors (Chinese)
 
 ## Development
 
