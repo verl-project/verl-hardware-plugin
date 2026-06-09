@@ -17,7 +17,7 @@ from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithValueHead
 from verl_hardware_plugin.utils import FLEnvManager, may_enable_flag_gems
 
 logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device="cuda", vendor="flagos")
