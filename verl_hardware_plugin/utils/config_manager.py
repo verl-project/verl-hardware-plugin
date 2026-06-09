@@ -16,7 +16,6 @@ Environment Variables:
 
 import logging
 import os
-import sys
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -123,12 +122,6 @@ def may_enable_flag_gems(phase: str = "training") -> None:
     """
     if not FLEnvManager.is_flaggems_enabled():
         logger.debug("FlagGems is not enabled (TRAINING_FL_FLAGGEMS_ENABLE not set)")
-        return
-
-    # collocate processes should have the same FlagGems state, so we check if it's already imported
-    # to avoid redundant enable calls
-    if "flag_gems" in sys.modules:
-        logger.debug("FlagGems is already imported, skipping enable")
         return
 
     try:
