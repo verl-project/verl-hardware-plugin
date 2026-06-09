@@ -16,19 +16,19 @@ The platforms and engines in this repository are **reference implementations** �
 
 > **Note**: The implementations below are **examples only**. Full production support and maintenance require collaboration with the respective hardware vendors. These serve as templates for vendors to adapt and maintain their own integrations.
 
-| Platform | Device | Communication | Status |
-|----------|--------|---------------|--------|
-| FlagOS | xxx | FlagCX | ✅ Example (requires vendor support) |
-| Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Example (requires vendor support) |
-| Cambricon MLU | MLU370 / MLU590 | CNCL | ✅ Example (requires vendor support) |
-| MetaX | MetaX GPUs (CUDA-compatible) | NCCL | ✅ Example (requires vendor support) |
-| Huawei NPU | Ascend 910B | HCCL | Built-in (verl core) |
+| Platform | Device | Communication | Status | Doc |
+|----------|--------|---------------|--------|-----|
+| FlagOS | NVIDIA GPU (verified) | FlagCX / NCCL | ✅ Supported | [User Guide](docs/user_guide_flagos/README.md) |
+| Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Example (requires vendor support) | TBD |
+| Cambricon MLU | MLU370 / MLU590 | CNCL | ✅ Example (requires vendor support) | TBD |
+| MetaX | MetaX GPUs (CUDA-compatible) | NCCL | ✅ Example (requires vendor support) | TBD |
+| Huawei NPU | Ascend 910B | HCCL | Built-in (verl core) | [Ascend Tutorial](https://github.com/verl-project/verl/tree/main/docs/ascend_tutorial) |
 
 
 ## Installation
 
 ```bash
-pip install -e .
+pip install --no-build-isolation -e .
 ```
 
 ## Usage
@@ -36,41 +36,7 @@ pip install -e .
 After `pip install`, the plugin is automatically discovered by verl through the
 `verl.plugins` entry_points group. No additional configuration needed.
 
-### Platform Selection
-
-The platform is auto-detected based on hardware availability. During auto-detection, SMI commands (e.g. `nvidia-smi`, `mx-smi`) are used to distinguish CUDA-compatible hardware. To force a specific platform:
-
-```bash
-export VERL_PLATFORM=intel     # Force Intel XPU
-export VERL_PLATFORM=cambricon # Force Cambricon MLU
-export VERL_PLATFORM=metax     # Force MetaX
-export VERL_PLATFORM=flagos    # Force FlagOS
-```
-
-### FlagOS Configuration
-
-```bash
-# Enable FlagGems operator library
-export USE_FLAGGEMS=true
-
-# Enable FlagCX communication library
-export USE_FLAGCX=1
-
-# Optional: operator whitelist/blacklist
-export TRAINING_FL_FLAGOS_WHITELIST=rmsnorm,layernorm,softmax
-# OR
-export TRAINING_FL_FLAGOS_BLACKLIST=flash_attention
-```
-
-### MetaX Configuration
-
-MetaX GPUs are CUDA-compatible, so they work with `torch.cuda` directly. The plugin uses `mx-smi` to distinguish MetaX hardware from NVIDIA during auto-detection.
-
-```bash
-export VERL_PLATFORM=metax  # or let auto-detection handle it
-
-python -m verl.trainer.main --config your_config.yaml
-```
+For platform-specific usage and configuration, please refer to each platform's documentation in the [Supported Hardware](#supported-hardware-reference-implementations) table above.
 
 ## Architecture
 

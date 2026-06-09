@@ -1,10 +1,10 @@
 # FlagOS User Guide
 
-Last updated: 06/04/2026.
+Last updated: 06/09/2026.
 
 ## Introduction
 
-This document describes how to use verl for reinforcement learning training on the FlagOS unified heterogeneous platform.
+This document describes how to use verl for reinforcement learning training with FlagOS multi-chip engine. FlagOS is designed as a unified heterogeneous engine that supports multiple hardware backends through a single interface — it does not register as a separate platform but as an engine vendor (`flagos`) on top of existing device platforms (e.g., `cuda`).
 
 ## Directory Structure
 
@@ -12,31 +12,42 @@ This document describes how to use verl for reinforcement learning training on t
 user_guide_flagos/
 ├── README.md              # This file
 ├── install_guidance.md    # Installation guide
-├── quick_start.md         # Quick start
+├── quick_start.md         # Quick start (NVIDIA example)
+├── env_reference.md       # Environment variables reference
 └── faq.md                 # FAQ and troubleshooting
 ```
 
 ## Getting Started
 
-- [Installation Guide](./install_guidance.md)
-- [Quick Start](./quick_start.md)
-- [FAQ](./faq.md)
+- [Installation Guide](./install_guidance.md) — Docker setup, component installation
+- [Quick Start](./quick_start.md) — Run your first GRPO training job (NVIDIA example)
+- [Environment Variables Reference](./env_reference.md) — Operator dispatch and backend control
+- [FAQ](./faq.md) — Troubleshooting common issues
 
 ## Platform Summary
 
 | Item | Description |
 |------|-------------|
-| Device type | `cuda` (CUDA-compatible) |
+| Type | Engine (not a standalone platform) |
 | Vendor identifier | `flagos` |
-| Communication backend | `flagcx` (or fallback to `nccl`) |
-| Device visibility env var | `CUDA_VISIBLE_DEVICES` |
+| Design | Multi-chip unified engine |
+| Communication backend | `flagcx` (or fallback to device-native, e.g. `nccl`) |
 | Ray resource name | `GPU` |
 | IPC support | Yes |
+
+### Tested Hardware
+
+| Device | Status |
+|--------|--------|
+| NVIDIA GPU | Verified |
+| Ascend NPU | In progress |
+| MetaX | In progress |
+| Iluvatar | In progress |
 
 ## Environment Variables
 
 ```bash
-export VERL_PLATFORM=flagos
+export VERL_ENGINE_VENDOR='flagos'
 export USE_FLAGGEMS=true    # Enable FlagGems operator library
 export USE_FLAGCX=1         # Enable FlagCX communication library
 
@@ -44,3 +55,5 @@ export USE_FLAGCX=1         # Enable FlagCX communication library
 export TRAINING_FL_FLAGOS_WHITELIST=rmsnorm,layernorm,softmax
 # export TRAINING_FL_FLAGOS_BLACKLIST=flash_attention
 ```
+
+See [Environment Variables Reference](./env_reference.md) for the full list.

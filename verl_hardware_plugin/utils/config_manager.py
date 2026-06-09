@@ -6,7 +6,7 @@
 Manages FlagGems and FlagCX environment variables for training and rollout phases.
 
 Environment Variables:
-    USE_FLAGGEMS: Enable FlagGems globally (true/false/1/0)
+    TRAINING_FL_FLAGGEMS_ENABLE: Enable FlagGems for training (true/false/1/0)
     USE_FLAGCX: Enable FlagCX communication (1/0)
     TRAINING_FL_FLAGOS_WHITELIST: FlagGems operator whitelist for training
     TRAINING_FL_FLAGOS_BLACKLIST: FlagGems operator blacklist for training
@@ -16,10 +16,11 @@ Environment Variables:
 
 import logging
 import os
+import sys
 from typing import Optional
 
 logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 class FLEnvManager:
@@ -32,7 +33,10 @@ class FLEnvManager:
         "TE_FL_DENY_VENDORS",
         "TE_FL_PER_OP",
         "TE_FL_PREFER_VENDOR",
+        "TE_FL_PLUGIN_MODULES",
+        "TE_FL_SKIP_CUDA",
         "TEFL_LOG_LEVEL",
+        "TRAINING_FL_FLAGGEMS_ENABLE",
         "TRAINING_FL_FLAGOS_WHITELIST",
         "TRAINING_FL_FLAGOS_BLACKLIST",
     ]
@@ -48,14 +52,13 @@ class FLEnvManager:
     ]
 
     COMMON_ENV_KEYS = [
-        "USE_FLAGGEMS",
         "USE_FLAGCX",
         "FLAGCX_PATH",
     ]
 
     @classmethod
     def is_flaggems_enabled(cls) -> bool:
-        return os.getenv("USE_FLAGGEMS", "").lower() in ("1", "true")
+        return os.getenv("TRAINING_FL_FLAGGEMS_ENABLE", "").lower() in ("1", "true")
 
     @classmethod
     def is_flagcx_enabled(cls) -> bool:
@@ -119,7 +122,13 @@ def may_enable_flag_gems(phase: str = "training") -> None:
         phase: Either "training" or "rollout", controls which whitelist/blacklist to use.
     """
     if not FLEnvManager.is_flaggems_enabled():
-        logger.debug("FlagGems is not enabled (USE_FLAGGEMS not set)")
+        logger.debug("FlagGems is not enabled (TRAINING_FL_FLAGGEMS_ENABLE not set)")
+        return
+
+    # collocate processes should have the same FlagGems state, so we check if it's already imported
+    # to avoid redundant enable calls
+    if "flag_gems" in sys.modules:
+        logger.debug("FlagGems is already imported, skipping enable")
         return
 
     try:
@@ -151,5 +160,6 @@ def may_enable_flag_gems(phase: str = "training") -> None:
 
     except ImportError:
         logger.warning(
-            "FlagGems is not available but USE_FLAGGEMS is set. Please install FlagGems: pip install flag-gems"
+            "FlagGems is not available but TRAINING_FL_FLAGGEMS_ENABLE is set. "
+            "Please install FlagGems: pip install flag-gems"
         )
