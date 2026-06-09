@@ -112,7 +112,7 @@ class PlatformMLU(PlatformBase):
         return ["RAY_EXPERIMENTAL_NOSET_MLU_VISIBLE_DEVICES"]
 
     def is_ipc_supported(self) -> bool:
-        return False
+        return True
 
     @contextmanager
     def nvtx_range(self, msg: str):
