@@ -188,7 +188,7 @@ class PlatformMLU(PlatformBase):
     # ------------------------------------------------------------------
 
     def is_ipc_supported(self) -> bool:
-        return False
+        return True
 
     # ------------------------------------------------------------------
     # Profiling helpers
