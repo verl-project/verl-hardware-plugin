@@ -69,7 +69,7 @@ FlagCX is the unified communication library for FlagOS, supporting multiple hard
 cd /workspace
 git clone https://github.com/flagos-ai/FlagCX.git
 cd FlagCX
-git checkout -b v0.9.0
+git checkout v0.9.0
 git submodule update --init --recursive
 
 # Build (set the flag for your platform: USE_NVIDIA, USE_ASCEND, etc.)
