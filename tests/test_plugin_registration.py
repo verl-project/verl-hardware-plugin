@@ -50,6 +50,14 @@ class TestPlatformRegistration:
         cls = PlatformRegistry.get("metax")
         assert cls is PlatformMetaX
 
+    def test_iluvatar_registered(self):
+        from verl.plugin.platform.platform_manager import PlatformRegistry
+        from verl_hardware_plugin.platforms.platform_cuda_iluvatar import PlatformIluvatar  # noqa: F401
+
+        assert "iluvatar" in PlatformRegistry.registered_names()
+        cls = PlatformRegistry.get("iluvatar")
+        assert cls is PlatformIluvatar
+
     def test_xpu_detection_with_env(self):
         from verl.plugin.platform.platform_manager import _detect_platform_name
         from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU  # noqa: F401
@@ -73,6 +81,14 @@ class TestPlatformRegistration:
         with _fresh_registries():
             with mock.patch.dict(os.environ, {"VERL_PLATFORM": "metax"}):
                 assert _detect_platform_name() == "metax"
+
+    def test_iluvatar_detection_with_env(self):
+        from verl.plugin.platform.platform_manager import _detect_platform_name
+        from verl_hardware_plugin.platforms.platform_cuda_iluvatar import PlatformIluvatar  # noqa: F401
+
+        with _fresh_registries():
+            with mock.patch.dict(os.environ, {"VERL_PLATFORM": "iluvatar"}):
+                assert _detect_platform_name() == "iluvatar"
 
 
 class TestEngineRegistration:
@@ -119,6 +135,16 @@ class TestEngineRegistration:
         assert EngineRegistry._engines["language_model"]["fsdp"][("cuda", "metax")] is FSDPMetaXEngineWithLMHead
         assert EngineRegistry._engines["value_model"]["fsdp"][("cuda", "metax")] is FSDPMetaXEngineWithValueHead
 
+    def test_fsdp_iluvatar_engines_registered(self):
+        from verl.workers.engine.base import EngineRegistry
+        from verl_hardware_plugin.engines.fsdp_iluvatar import (
+            FSDPIluvatarEngineWithLMHead,
+            FSDPIluvatarEngineWithValueHead,
+        )
+
+        assert EngineRegistry._engines["language_model"]["fsdp"][("cuda", "iluvatar")] is FSDPIluvatarEngineWithLMHead
+        assert EngineRegistry._engines["value_model"]["fsdp"][("cuda", "iluvatar")] is FSDPIluvatarEngineWithValueHead
+
     def test_megatron_flagos_engine_registered(self):
         from verl.workers.engine.base import EngineRegistry
         from verl_hardware_plugin.engines.megatron_flagos import MegatronFlagOSEngineWithLMHead
@@ -146,6 +172,12 @@ class TestEngineRegistration:
         from verl_hardware_plugin.engines.megatron_metax import MegatronMetaXEngineWithLMHead
 
         assert EngineRegistry._engines["language_model"]["megatron"][("cuda", "metax")] is MegatronMetaXEngineWithLMHead
+
+    def test_megatron_iluvatar_engine_registered(self):
+        from verl.workers.engine.base import EngineRegistry
+        from verl_hardware_plugin.engines.megatron_iluvatar import MegatronIluvatarEngineWithLMHead
+
+        assert EngineRegistry._engines["language_model"]["megatron"][("cuda", "iluvatar")] is MegatronIluvatarEngineWithLMHead
 
 
 class TestFLEnvManager:
