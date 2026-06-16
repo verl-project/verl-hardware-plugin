@@ -46,10 +46,9 @@ verl_hardware_plugin/
       excludes: ["/.git/"]
       env_vars:
         TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
-        CUDA_DEVICE_MAX_CONNECTIONS: "1"
         RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO: "0"
         VERL_USE_EXTERNAL_MODULES: "verl_hardware_plugin"
       ```
-    2. You can run the scripts in [verl examples](https://verl.readthedocs.io/en/latest/start/install.html).
+    2. You can run the scripts in [verl examples](https://github.com/verl-project/verl/tree/main/examples).
 
 
