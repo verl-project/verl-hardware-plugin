@@ -19,6 +19,19 @@ verl_hardware_plugin/
 └── platforms
   └── platform_mlu.py              # basic platform settings
 ```
+And docs to start.
+
+```
+user_guide_flagos/
+├── README.md              # This file
+├── install_guidance.md    # Installation guide
+└── quick_start.md         # Quick start
+```
+
+## Getting Started
+
+- [Installation Guide](./install_guidance.md) — Docker setup, component installation
+- [Quick Start](./quick_start.md) — Run your first GRPO training job
 
 ## Platform Summary
 
@@ -30,25 +43,4 @@ verl_hardware_plugin/
 | Device visibility env var | `MLU_VISIBLE_DEVICES` |
 | Ray resource name | `GPU` |
 | IPC support | Yes |
-
-## Getting Started
-- Please use Cambricon release docker images to run verl and make sure you are in pytorch_infer env.
-- Install verl & verl_hardware_plugin
-- Start ray cluster:
-  -   ```bash
-      ray start --head --dashboard-host=0.0.0.0
-      ```
-- Run verl scripts
-  - We recommend using Ray to lanuch the task to make sure all env vars are set correctly.
-    1. Add necessary environment variables in runtime_env.yaml
-    ```bash 
-      working_dir: ./
-      excludes: ["/.git/"]
-      env_vars:
-        TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
-        RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO: "0"
-        VERL_USE_EXTERNAL_MODULES: "verl_hardware_plugin"
-      ```
-    2. You can run the scripts in [verl examples](https://github.com/verl-project/verl/tree/main/examples).
-
 
