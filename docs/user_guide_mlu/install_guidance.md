@@ -16,18 +16,17 @@ Start a container (example):
 ```bash
 docker_image=cambricon_release_image
 docker_name=verl_test
-sudo docker run -itd \
+docker run -itd \
     --name ${docker_name} \
     --privileged \
     --network=host \
     --ipc=host \
     --pid=host \
-    --cap-add=ALL \
     --shm-size 512G \
-    --ulimit memlock=-1 \
+    --device /dev/cambricon_ctl \
     -v /dev/:/dev/ \
     -v /usr/src/:/usr/src/ \
-    -v /lib/modules/:/lib/modules/ \
+    -w /workspace \
     ${docker_image} \
     /bin/bash
 
