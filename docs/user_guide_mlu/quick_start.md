@@ -1,8 +1,8 @@
-# Iluvatar Quick Start
+# Cambricon Quick Start
 
 Last updated: 06/16/2026.
 
-This guide walks you through running a GRPO training job with verl on the Iluvatar platform. Make sure you have completed the [Installation Guide](./install_guidance.md) first.
+This guide walks you through running a GRPO training job with verl on the Cambricon platform. Make sure you have completed the [Installation Guide](./install_guidance.md) first.
 
 ## Environment Setup
 1. Please use Cambricon release docker images to run verl and make sure you are in pytorch_infer env.
