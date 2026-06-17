@@ -65,4 +65,4 @@ git clone https://github.com/verl-project/verl-hardware-plugin.git
 cd verl-hardware-plugin
 pip install -e .
 ```
-Other dependency like vllm, ray are already installed in cambricon iamges Now you can run a verl script.
+Other dependency like Vllm, Ray are already installed in cambricon images. Now you can run a verl script.
