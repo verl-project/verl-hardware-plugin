@@ -26,6 +26,24 @@ env_vars:
 ```
 Run scripts in [verl examples](https://github.com/verl-project/verl/tree/main/examples)
 
+If you see some print containing mlu related info, and step-level progress output, this means the training is successfully running. 
+```bash
+INFO - mlu -> vllm_mlu:register_mlu_platform
+INFO All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO Platform plugin mlu is activated
+......
+......
+INFO platform_manager.py: Auto-detected platform: cambricon
+INFO platform_manager.py: verl platform initialised: mlu
+
+......
+......
+
+step:1 - actor/entropy:xxxxxx - perf/mfu/actor_infer:xxxxxx - actor/pg_clipfrac:xxxxxx - actor/ppo_kl:xxxxxx ...... perf/throughput:xxxxxx
+
+```
+
+
 
 ## Next Steps
 
