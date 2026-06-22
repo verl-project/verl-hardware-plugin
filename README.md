@@ -20,7 +20,7 @@ The platforms and engines in this repository are **reference implementations** �
 |----------|--------|---------------|--------|-----|
 | FlagOS | NVIDIA GPU (verified) | FlagCX / NCCL | ✅ Supported | [User Guide](docs/user_guide_flagos/README.md) |
 | Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Example (requires vendor support) | TBD |
-| Cambricon MLU | MLU370 / MLU590 | CNCL | ✅ Example (requires vendor support) | TBD |
+| Cambricon MLU | MLU370 / MLU590 | CNCL | ✅ Supported | [User Guide](docs/user_guide_mlu/README.md) |
 | MetaX | MetaX GPUs (CUDA-compatible) | NCCL | ✅ Example (requires vendor support) | TBD |
 | Huawei NPU | Ascend 910B | HCCL | Built-in (verl core) | [Ascend Tutorial](https://github.com/verl-project/verl/tree/main/docs/ascend_tutorial) |
 

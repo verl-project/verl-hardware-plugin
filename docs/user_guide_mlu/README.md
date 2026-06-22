@@ -1,6 +1,6 @@
 # Cambricon MLU User Guide
 
-Last updated: 06/04/2026.
+Last updated: 06/16/2026.
 
 ## Introduction
 
@@ -8,19 +8,30 @@ This document describes how to use verl for reinforcement learning training on C
 
 ## Directory Structure
 
+Here we list all MLU related files for reference, we will continue to add new features. 
+
 ```
-user_guide_mlu/
+verl_hardware_plugin/
+├── engines
+  ├── cncl_checkpoint_engine.py    # support checkpoint engine
+  ├── fsdp_mlu.py                  # fsdp related model support
+  ├── megatron_mlu.py              # megatron related model support
+└── platforms
+  └── platform_mlu.py              # basic platform settings
+```
+And docs to start.
+
+```
+user_guide_flagos/
 ├── README.md              # This file
 ├── install_guidance.md    # Installation guide
-├── quick_start.md         # Quick start
-└── faq.md                 # FAQ and troubleshooting
+└── quick_start.md         # Quick start
 ```
 
 ## Getting Started
 
-- [Installation Guide](./install_guidance.md)
-- [Quick Start](./quick_start.md)
-- [FAQ](./faq.md)
+- [Installation Guide](./install_guidance.md) — Docker setup, component installation
+- [Quick Start](./quick_start.md) — Run your first GRPO training job
 
 ## Platform Summary
 
@@ -30,20 +41,6 @@ user_guide_mlu/
 | Vendor identifier | `cambricon` |
 | Communication backend | `cncl` |
 | Device visibility env var | `MLU_VISIBLE_DEVICES` |
-| Ray resource name | `MLU` (custom) |
-| IPC support | No |
+| Ray resource name | `GPU` |
+| IPC support | Yes |
 
-## Environment Variables
-
-```bash
-export VERL_PLATFORM=cambricon
-export MLU_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-```
-
-## Ray Cluster Configuration
-
-Note: MLU uses a custom Ray resource. You must declare it when starting Ray workers:
-
-```bash
-ray start --head --resources='{"MLU": 8}'
-```

@@ -171,13 +171,13 @@ class PlatformMLU(PlatformBase):
     # ------------------------------------------------------------------
 
     def ray_resource_name(self) -> str:
-        # Custom resource name — Ray workers must advertise "MLU" resources.
-        # This avoids conflicting with CUDA "GPU" resources on heterogeneous clusters.
-        return "MLU"
+        # For MLU devices, we use GPU as resource name
+        return "GPU"
 
     def ray_resource_options(self, num_gpus: float) -> dict[str, Any]:
-        # Custom resources use the "resources" dict (not the shorthand "num_gpus" key)
-        return {"resources": {"MLU": num_gpus}}
+        # For MLU devices, we use num_gpus because Ray clusters are typically
+        # configured with GPU resources even when using MLU hardware
+        return {"num_gpus": num_gpus}
 
     def ray_noset_envvars(self) -> list[str]:
         # Prevent Ray from auto-setting MLU_VISIBLE_DEVICES — verl manages this
@@ -188,7 +188,7 @@ class PlatformMLU(PlatformBase):
     # ------------------------------------------------------------------
 
     def is_ipc_supported(self) -> bool:
-        return False
+        return True
 
     # ------------------------------------------------------------------
     # Profiling helpers
