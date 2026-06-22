@@ -62,3 +62,12 @@ def register_all_platforms():
         logger.info("Registered platform: metax (cuda)")
     except Exception as e:
         logger.debug("MetaX platform not registered: %s", e)
+
+    # Enflame GCU — requires torch_gcu
+    try:
+        from verl_hardware_plugin.platforms import platform_enflame  # noqa: F401
+
+        logger.info("Registered platform: enflame (gcu)")
+    except Exception as e:
+        logger.debug("ENFLAME platform not registered: %s", e)
+

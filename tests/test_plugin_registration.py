@@ -66,6 +66,56 @@ class TestPlatformRegistration:
             with mock.patch.dict(os.environ, {"VERL_PLATFORM": "cambricon"}):
                 assert _detect_platform_name() == "cambricon"
 
+    def test_enflame_registered(self):
+        from verl.plugin.platform.platform_manager import PlatformRegistry
+        from verl_hardware_plugin.platforms.platform_enflame import PlatformENFLAME  # noqa: F401
+
+        assert "enflame" in PlatformRegistry.registered_names()
+        cls = PlatformRegistry.get("enflame")
+        assert cls is PlatformENFLAME
+
+    def test_enflame_detection_with_env(self):
+        from verl.plugin.platform.platform_manager import _detect_platform_name
+        from verl_hardware_plugin.platforms.platform_enflame import PlatformENFLAME  # noqa: F401
+
+        with _fresh_registries():
+            with mock.patch.dict(os.environ, {"VERL_PLATFORM": "enflame"}):
+                assert _detect_platform_name() == "enflame"
+
+    def test_enflame_device_and_vendor_names(self):
+        from verl_hardware_plugin.platforms.platform_enflame import PlatformENFLAME
+
+        platform = PlatformENFLAME()
+        assert platform.device_name == "gcu"
+        assert platform.vendor_name == "enflame"
+
+    def test_enflame_gcu_ipc_collect_shim(self):
+        from types import ModuleType
+        from unittest import mock
+
+        import verl_hardware_plugin.platforms.platform_enflame as platform_enflame
+
+        fake_gcu = ModuleType("gcu")
+        old_patched = platform_enflame._gcu_runtime_patched
+        try:
+            platform_enflame._gcu_runtime_patched = False
+            with mock.patch.object(platform_enflame, "_ensure_torch_gcu", return_value=True):
+                with mock.patch.object(platform_enflame.torch, "gcu", fake_gcu, create=True):
+                    module = platform_enflame._get_gcu_module()
+                    assert module is fake_gcu
+                    assert callable(module.ipc_collect)
+                    module.ipc_collect()
+        finally:
+            platform_enflame._gcu_runtime_patched = old_patched
+
+    def test_enflame_communication_backend(self):
+        from verl_hardware_plugin.platforms.platform_enflame import PlatformENFLAME
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            assert PlatformENFLAME().communication_backend_name() == "eccl"
+        with mock.patch.dict(os.environ, {"USE_FLAGCX": "1"}, clear=False):
+            assert PlatformENFLAME().communication_backend_name() == "flagcx"
+
     def test_metax_detection_with_env(self):
         from verl.plugin.platform.platform_manager import _detect_platform_name
         from verl_hardware_plugin.platforms.platform_cuda_metax import PlatformMetaX  # noqa: F401
@@ -146,6 +196,26 @@ class TestEngineRegistration:
         from verl_hardware_plugin.engines.megatron_metax import MegatronMetaXEngineWithLMHead
 
         assert EngineRegistry._engines["language_model"]["megatron"][("cuda", "metax")] is MegatronMetaXEngineWithLMHead
+
+
+    def test_fsdp_enflame_engines_registered(self):
+        from verl.workers.engine.base import EngineRegistry
+        from verl_hardware_plugin.engines.fsdp_enflame import (
+            FSDPEnflameEngineWithLMHead,
+            FSDPEnflameEngineWithValueHead,
+        )
+
+        assert EngineRegistry._engines["language_model"]["fsdp"][("gcu", "enflame")] is FSDPEnflameEngineWithLMHead
+        assert EngineRegistry._engines["value_model"]["fsdp"][("gcu", "enflame")] is FSDPEnflameEngineWithValueHead
+
+    def test_megatron_enflame_engine_registered(self):
+        from verl.workers.engine.base import EngineRegistry
+        from verl_hardware_plugin.engines.megatron_enflame import MegatronEnflameEngineWithLMHead
+
+        assert (
+            EngineRegistry._engines["language_model"]["megatron"][("gcu", "enflame")]
+            is MegatronEnflameEngineWithLMHead
+        )
 
 
 class TestFLEnvManager:

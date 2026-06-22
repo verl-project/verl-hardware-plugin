@@ -22,6 +22,7 @@ The platforms and engines in this repository are **reference implementations** �
 | Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Example (requires vendor support) | TBD |
 | Cambricon MLU | MLU370 / MLU590 | CNCL | ✅ Example (requires vendor support) | TBD |
 | MetaX | MetaX GPUs (CUDA-compatible) | NCCL | ✅ Example (requires vendor support) | TBD |
+| Enflame GCU | GCU | ECCL / FlagCX | ✅ Example (requires vendor support) | [User Guide](docs/user_guide_enflame/README.md) |
 | Huawei NPU | Ascend 910B | HCCL | Built-in (verl core) | [Ascend Tutorial](https://github.com/verl-project/verl/tree/main/docs/ascend_tutorial) |
 
 
@@ -47,11 +48,13 @@ verl-FL (main framework)
             ├── PlatformRegistry.register("intel")    → PlatformXPU
             ├── PlatformRegistry.register("cambricon")→ PlatformMLU
             ├── PlatformRegistry.register("metax")    → PlatformMetaX
+            ├── PlatformRegistry.register("enflame")  → PlatformENFLAME
             ├── PlatformRegistry.register("flagos")   → PlatformFlagOS
             │
             ├── EngineRegistry.register(device="xpu", vendor="intel")
             ├── EngineRegistry.register(device="mlu", vendor="cambricon")
             ├── EngineRegistry.register(device="cuda", vendor="metax")
+            ├── EngineRegistry.register(device="enflame", vendor="enflame")
             └── EngineRegistry.register(device="cuda", vendor="flagos")
 ```
 
@@ -83,6 +86,7 @@ Each hardware platform provides a standalone user guide (following the structure
 - **[Cambricon MLU](docs/user_guide_mlu/README.md)** — Cambricon MLU370 / MLU590 user guide
 - **[MetaX GPU](docs/user_guide_metax/README.md)** — MetaX GPU user guide
 - **[FlagOS](docs/user_guide_flagos/README.md)** — FlagOS unified heterogeneous platform user guide
+- **[Enflame GCU](docs/user_guide_enflame/README.md)** — Enflame GCU user guide
 
 ### Developer Guides
 

@@ -689,6 +689,7 @@ Existing reference implementations:
 - `docs/user_guide_mlu/` — Cambricon MLU
 - `docs/user_guide_metax/` — MetaX
 - `docs/user_guide_flagos/` — FlagOS
+- `docs/user_guide_enflame/` — Enflame GCU
 
 > **Tip**: Refer to `verl/docs/ascend_tutorial` (Huawei NPU) for documentation quality and coverage expectations. That tutorial covers installation, quick start, advanced features, performance tuning, precision analysis, and FAQ.
 
@@ -898,6 +899,7 @@ The following files in this repository serve as examples:
 | Intel XPU | `platforms/platform_xpu.py` | `engines/fsdp_xpu.py`, `engines/megatron_xpu.py` |
 | Cambricon MLU | `platforms/platform_mlu.py` | `engines/fsdp_mlu.py`, `engines/megatron_mlu.py` |
 | MetaX | `platforms/platform_cuda_metax.py` | `engines/fsdp_metax.py`, `engines/megatron_metax.py` |
+| Enflame GCU | `platforms/platform_enflame.py` | `engines/fsdp_enflame.py`, `engines/megatron_enflame.py` |
 
 ---
 
