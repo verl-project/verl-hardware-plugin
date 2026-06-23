@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 BAAI. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
-"""Check that files with Bytedance copyright also include BAAI copyright.
+"""Check that files have a recognized copyright header.
 
-This plugin repo is maintained by BAAI. Files that originate from verl (Bytedance)
-and are modified here must carry both copyright notices. New files should use
-the BAAI header only.
+This plugin repo is jointly maintained by Bytedance and BAAI. Acceptable
+copyright combinations:
+- BAAI only
+- Bytedance only
+- Both BAAI and Bytedance
 """
 
 import subprocess
@@ -21,6 +23,9 @@ BYTEDANCE_MARKERS = [
 ]
 
 BAAI_MARKER = "Copyright (c) 2026 BAAI. All rights reserved."
+
+# A file is valid if it has at least one recognized copyright header.
+# Both Bytedance and BAAI copyrights are acceptable independently or together.
 
 
 def _git_tracked_py_files() -> set[Path]:
@@ -63,15 +68,18 @@ def main():
         has_bytedance = any(marker in content for marker in BYTEDANCE_MARKERS)
         has_baai = BAAI_MARKER in content
 
-        if has_bytedance and not has_baai:
+        # File must have at least one recognized copyright header
+        if not has_bytedance and not has_baai:
             failures.append(str(path))
 
     if failures:
-        print(f"Found {len(failures)} file(s) with Bytedance copyright but missing BAAI copyright:")
+        print(f"Found {len(failures)} file(s) missing a recognized copyright header:")
         for f in failures:
             print(f"  {f}")
         print()
-        print(f"Please add: # {BAAI_MARKER}")
+        print("Please add one of:")
+        print(f"  # {BAAI_MARKER}")
+        print("  # Copyright 2024 Bytedance Ltd. and/or its affiliates")
         sys.exit(1)
 
 
