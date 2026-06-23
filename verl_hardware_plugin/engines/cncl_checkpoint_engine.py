@@ -26,7 +26,6 @@ from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegist
 from verl.utils.distributed import stateless_init_process_group
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 
-
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -56,7 +55,7 @@ class BroadcastOperation:
         rank: int,
         process_group: StatelessProcessGroup | str,
         bucket: torch.Tensor,
-        metadata: dict[str, TensorMeta],
+        metadata: dict[str, TensorMeta] | None,
         socket: zmq.Socket,
         topic: str,
     ) -> None:
@@ -81,7 +80,7 @@ class BroadcastOperation:
         # broadcast tensor via CNCL
         self.pycncl.broadcast(self.bucket, src=0)
 
-    async def wait_for_complete(self) -> dict[str, TensorMeta]:
+    async def wait_for_complete(self) -> dict[str, TensorMeta] | None:
         """Wait for the broadcast operation to complete.
 
         Returns:
@@ -125,7 +124,7 @@ class CNCLCheckpointEngine(CheckpointEngine):
             self._start_zmq_server()
             self.dist_port, _ = get_free_port(self.ip)
 
-    def prepare(self) -> MasterMetadata:
+    def prepare(self) -> MasterMetadata | None:
         self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="mlu")
         self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="mlu")
 
@@ -325,6 +324,7 @@ class CNCLCheckpointEngine(CheckpointEngine):
             topic=self.topic,
         )
         metadata = await broadcast_op.wait_for_complete()
+        assert metadata is not None
         total_bytes += self.bucket_size
         total_params += len(metadata["bucket_meta"])
 
@@ -350,6 +350,7 @@ class CNCLCheckpointEngine(CheckpointEngine):
 
             # 3. wait for next bucket broadcast finish
             metadata = await broadcast_op.wait_for_complete()
+            assert metadata is not None
             total_bytes += self.bucket_size
             total_params += len(metadata["bucket_meta"])
 

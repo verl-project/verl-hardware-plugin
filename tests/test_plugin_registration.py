@@ -285,9 +285,9 @@ class TestMayEnableFlagGems:
                 sys.modules.pop("flag_gems", None)
                 with mock.patch(
                     "builtins.__import__",
-                    side_effect=lambda name, *a, **kw: fake_module
-                    if name == "flag_gems"
-                    else __import__(name, *a, **kw),
+                    side_effect=lambda name, *a, **kw: (
+                        fake_module if name == "flag_gems" else __import__(name, *a, **kw)
+                    ),
                 ):
                     may_enable_flag_gems(phase="training")
                     fake_module.enable.assert_called_once()
@@ -309,9 +309,9 @@ class TestMayEnableFlagGems:
                 sys.modules.pop("flag_gems", None)
                 with mock.patch(
                     "builtins.__import__",
-                    side_effect=lambda name, *a, **kw: fake_module
-                    if name == "flag_gems"
-                    else __import__(name, *a, **kw),
+                    side_effect=lambda name, *a, **kw: (
+                        fake_module if name == "flag_gems" else __import__(name, *a, **kw)
+                    ),
                 ):
                     with pytest.raises(ValueError, match="Cannot set both whitelist and blacklist"):
                         may_enable_flag_gems(phase="training")
