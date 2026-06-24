@@ -1,6 +1,6 @@
 # Iluvatar Installation Guide
 
-Last updated: 06/16/2026.
+Last updated: 06/24/2026.
 
 ## Prerequisites
 
@@ -63,7 +63,7 @@ verl-hardware-plugin provides the Iluvatar hardware platform integration for ver
 cd /root
 
 # Install verl (ver > v0.8.0, #6086)
-pip install -v -e "git+https://github.com/verl-project/verl.git@main#egg=verl" --no-build-isolation
+pip install -v -e "git+https://github.com/verl-project/verl.git@ed89419c23653730e95c43954c00e6c24277e1c8#egg=verl" --no-build-isolation
 
 # Install verl-hardware-plugin
 git clone https://github.com/verl-project/verl-hardware-plugin.git
@@ -77,7 +77,6 @@ After installation, verify the components are properly installed:
 
 ```bash
 python3 -c "import vllm; print('vLLM OK')"
-python3 -c "import ray; ray.init(address='auto'); res=ray.cluster_resources(); print('Ray OK' if 'GPU' in res and res['GPU']>0 else 'Failed'); ray.shutdown()"
 python3 -c "import transformer_engine; print('TransformerEngine OK')"
 python3 -c "import megatron.core; print('Megatron-LM OK')"
 python3 -c "import verl; print('verl OK')"

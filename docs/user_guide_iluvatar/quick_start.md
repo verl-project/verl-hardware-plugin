@@ -119,6 +119,10 @@ TRAINER=(
     trainer.total_epochs=${total_epochs}
 )
 
+RAY=(
+    +ray_kwargs.ray_init.num_gpus=${NGPUS_PER_NODE}
+)
+
 HYDRA_FULL_ERROR=1
 ########################### launch ###########################
 python3 -m verl.trainer.main_ppo \
@@ -128,6 +132,7 @@ python3 -m verl.trainer.main_ppo \
     "${ROLLOUT[@]}" \
     "${REF[@]}" \
     "${TRAINER[@]}" \
+    "${RAY[@]}" \
     "$@" \
     2>&1 | tee -a "verl_demo.log"
 ```

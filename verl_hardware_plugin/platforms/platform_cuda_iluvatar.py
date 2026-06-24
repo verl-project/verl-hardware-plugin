@@ -77,18 +77,19 @@ class PlatformIluvatar(PlatformBase):
         them is the ixsmi command (Iluvatar's equivalent of nvidia-smi).
 
         Detection logic:
-        1. If torch.cuda is not available at all → False
+        1. If not hasattr(torch, "cuda") → False
         2. If use_smi_check=True → check if ixsmi exists and exits 0
         3. If use_smi_check=False → True (assume CUDA = Iluvatar)
+        4. return torch.cuda.is_available()
 
         The use_smi_check=True path is used during first-time auto-detection.
         In subsequent calls (runtime checks), use_smi_check=False is typical.
         """
-        if not torch.cuda.is_available():
+        if not hasattr(torch, "cuda"):
             return False
         if use_smi_check:
             return self.check_smi_command("ixsmi")
-        return True
+        return torch.cuda.is_available()
 
     def current_device(self) -> int:
         return torch.cuda.current_device()
