@@ -177,7 +177,10 @@ class TestEngineRegistration:
         from verl.workers.engine.base import EngineRegistry
         from verl_hardware_plugin.engines.megatron_iluvatar import MegatronIluvatarEngineWithLMHead
 
-        assert EngineRegistry._engines["language_model"]["megatron"][("cuda", "iluvatar")] is MegatronIluvatarEngineWithLMHead
+        assert (
+            EngineRegistry._engines["language_model"]["megatron"][("cuda", "iluvatar")]
+            is MegatronIluvatarEngineWithLMHead
+        )
 
 
 class TestFLEnvManager:
