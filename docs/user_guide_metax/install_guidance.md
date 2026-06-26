@@ -6,12 +6,13 @@
 
 ## 1. Pull the Base Image
 
-Please download docker images from (https://developer.metax-tech.com/) or contact Metax engineers to get the docker images.
+Visit the MetaX Docker Hub page  (e.g., https://developer.metax-tech.com/softnova/docker?chip_name=%E6%9B%A6%E4%BA%91C500%E7%B3%BB%E5%88%97&package_name=verl:0.7.1-maca.ai3.5.3.3-torch2.8-py310-ubuntu22.04-amd64)
+Copy the docker pull command and run it in your terminal.
 
-Start a container (MetaX example):
+Start a container (e.g., verl:0.7.1-maca.ai3.5.3.3-torch2.8-py310-ubuntu22.04-amd64):
 
 ```bash
-docker_image=<metaX-base-image>
+docker_image=verl:0.7.1-maca.ai3.5.3.3-torch2.8-py310-ubuntu22.04-amd64
 docker_name=verl_test
 sudo docker run -itd \
     --name ${docker_name} \
@@ -57,9 +58,9 @@ verl-hardware-plugin provides the MetaX hardware platform integration for verl. 
 
 ```bash
 cd /workspace
-git clone https://github.com/verl-project/verl
-cd verl
-pip install --no-build-isolation -v -e .
+git clone https://github.com/verl-project/verl verl_main
+cd verl_main
+pip install --no-build-isolation --no-dependencies -v -e .
 
 # Install verl-hardware-plugin
 git clone https://github.com/verl-project/verl-hardware-plugin.git

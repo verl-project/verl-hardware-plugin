@@ -28,7 +28,7 @@ user_guide_metax/
 |------|-------------|
 | Device type | `cuda` (CUDA-compatible) |
 | Vendor identifier | `metax` |
-| Communication backend | `nccl` |
+| Communication backend | `mccl` |
 | Device visibility env var | `CUDA_VISIBLE_DEVICES` |
 | Ray resource name | `GPU` |
 | IPC support | Yes |

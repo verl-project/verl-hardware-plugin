@@ -28,7 +28,7 @@ You can bypass auto-detection by setting `VERL_PLATFORM=metax` explicitly.
 
 ### Q: What communication backend does MetaX use?
 
-MetaX uses standard **NCCL** for distributed communication. No special communication library is required.
+MetaX uses  **MCCL** for distributed communication. 
 
 ### Q: Does MetaX support FSDP and Megatron training?
 
