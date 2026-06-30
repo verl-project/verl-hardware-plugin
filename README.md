@@ -23,6 +23,7 @@ The platforms and engines in this repository are **reference implementations** �
 | Cambricon MLU | MLU370 / MLU590 | CNCL | ✅ Supported | [User Guide](docs/user_guide_mlu/README.md) |
 | MetaX | MetaX GPUs (CUDA-compatible) | MCCL | ✅ Supported | [User Guide](docs/user_guide_metax/README.md) |
 | Huawei NPU | Ascend 910B | HCCL | Built-in (verl core) | [Ascend Tutorial](https://github.com/verl-project/verl/tree/main/docs/ascend_tutorial) |
+| Iluvatar | BI-V150 (CUDA-compatible) | IXCCL | ✅ Supported | [User Guide](docs/user_guide_iluvatar/README.md) |
 
 
 ## Installation
