@@ -5,7 +5,8 @@
       "Read",
       "Write",
       "Edit",
-      "Skill(update-config)"
+      "Skill(update-config)",
+      "WebFetch(domain:swanlab.cn)"
     ]
   }
 }

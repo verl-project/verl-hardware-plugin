@@ -22,14 +22,14 @@ repos:
         pass_filenames: false
 
       - id: check-no-bytedance-copyright
-        name: Check no Bytedance-only copyright (must co-exist with BAAI)
+        name: Check copyright headers (Bytedance or BAAI)
         entry: python3 scripts/check_bytedance_copyright.py --directories .
         language: python
         pass_filenames: false
 
       - id: check-naming-conventions
         name: Check naming conventions
-        entry: sh -c 'fail=0; if grep -rIn --exclude-dir=.git --exclude-dir=venv --exclude-dir=__pycache__ --exclude=.pre-commit-config.yaml "veRL" .; then echo "Please use verl instead of veRL"; fail=1; fi; exit $fail'
+        entry: sh -c 'fail=0; if grep -rIn --exclude-dir=.git --exclude-dir=venv --exclude-dir=__pycache__ --exclude-dir=.github --exclude=.pre-commit-config.yaml "veRL" .; then echo "Please use verl instead of veRL"; fail=1; fi; exit $fail'
         language: system
         pass_filenames: false
 

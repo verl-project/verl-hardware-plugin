@@ -18,7 +18,7 @@ The platforms and engines in this repository are **reference implementations** �
 
 | Platform | Device | Communication | Status | Doc |
 |----------|--------|---------------|--------|-----|
-| FlagOS | NVIDIA GPU (verified) | FlagCX / NCCL | ✅ Supported | [User Guide](docs/user_guide_flagos/README.md) |
+| FlagOS | NVIDIA GPU (verified) | FlagCX / NCCL | ✅ Supported | [User Guide](docs/user_guide_flagos/nvidia/README.md) |
 | Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Example (requires vendor support) | TBD |
 | Cambricon MLU | MLU370 / MLU590 | CNCL | ✅ Example (requires vendor support) | TBD |
 | MetaX | MetaX GPUs (CUDA-compatible) | NCCL | ✅ Example (requires vendor support) | TBD |
@@ -85,7 +85,7 @@ Each hardware platform provides a standalone user guide (following the structure
 - **[Intel XPU](docs/user_guide_xpu/README.md)** — Intel Data Center GPU Max / Arc user guide
 - **[Cambricon MLU](docs/user_guide_mlu/README.md)** — Cambricon MLU370 / MLU590 user guide
 - **[MetaX GPU](docs/user_guide_metax/README.md)** — MetaX GPU user guide
-- **[FlagOS](docs/user_guide_flagos/README.md)** — FlagOS unified heterogeneous platform user guide
+- **[FlagOS](docs/user_guide_flagos/README.md)** — FlagOS unified heterogeneous engine user guide ([NVIDIA](docs/user_guide_flagos/nvidia/README.md))
 - **[Enflame GCU](docs/user_guide_enflame/README.md)** — Enflame GCU user guide
 
 ### Developer Guides
