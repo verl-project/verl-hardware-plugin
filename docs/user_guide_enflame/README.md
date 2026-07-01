@@ -1,7 +1,5 @@
 # Enflame GCU User Guide
 
-Last updated: 06/24/2026.
-
 ## Introduction
 
 This document describes how to use verl for reinforcement learning training on Enflame GCU accelerators. Training uses the `torch_gcu` PyTorch extension (`torch.gcu` API), ECCL (or FlagCX) for distributed communication, and the `verl_hardware_plugin` platform/engine integration.
