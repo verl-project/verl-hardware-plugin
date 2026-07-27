@@ -120,3 +120,17 @@ def register_all_engines():
         logger.info("Registered engines: megatron_enflame")
     except Exception as e:
         logger.debug("Enflame Megatron engines not registered: %s", e)
+    # Iluvatar engines (CUDA-compatible with vendor-specific optimizations)
+    try:
+        from verl_hardware_plugin.engines import fsdp_iluvatar  # noqa: F401
+
+        logger.info("Registered engines: fsdp_iluvatar")
+    except Exception as e:
+        logger.debug("Iluvatar FSDP engines not registered: %s", e)
+
+    try:
+        from verl_hardware_plugin.engines import megatron_iluvatar  # noqa: F401
+
+        logger.info("Registered engines: megatron_iluvatar")
+    except Exception as e:
+        logger.debug("Iluvatar Megatron engines not registered: %s", e)

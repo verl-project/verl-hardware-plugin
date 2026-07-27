@@ -5,8 +5,9 @@ Multi-chip hardware platform and engine plugin **reference implementations** for
 This package provides platform abstraction and training engine extensions for non-CUDA accelerators. It serves as a **template and example** for hardware vendors to adapt verl to their own devices through the unified plugin interface.
 
 ## About
+This repository is jointly developed by the ByteDance verl team and the [FlagOS](https://github.com/flagos-ai#flagos-a-unified-open-source-ai-system-software-stack) community. FlagOS community is an organiztion jointly launched by the Beijing Academy of Artificial Intelligence (BAAI), together with a broad coalition of research institutes, chipmakers, system vendors, and algorithm and software providers from both China and abroad.
 
-This repository is jointly developed by the ByteDance verl team and the [FlagOS](https://github.com/flagos-ai#flagos-a-unified-open-source-ai-system-software-stack) team at Beijing Academy of Artificial Intelligence (BAAI).
+FlagOS is a fully open-sourced AI system software stack for heterogeneous AI chips, allowing AI models to be developed once and seamlessly ported to a wide range of AI hardwares with minimum effort.
 
 ## Purpose
 
@@ -24,6 +25,7 @@ The platforms and engines in this repository are **reference implementations** �
 | MetaX | MetaX GPUs (CUDA-compatible) | MCCL | ✅ Supported | [User Guide](docs/user_guide_metax/README.md) |
 | Enflame GCU | GCU | ECCL / FlagCX | ✅ Example (requires vendor support) | [User Guide](docs/user_guide_enflame/README.md) |
 | Huawei NPU | Ascend 910B | HCCL | Built-in (verl core) | [Ascend Tutorial](https://github.com/verl-project/verl/tree/main/docs/ascend_tutorial) |
+| Iluvatar | BI-V150 (CUDA-compatible) | IXCCL | ✅ Supported | [User Guide](docs/user_guide_iluvatar/README.md) |
 
 
 ## Installation

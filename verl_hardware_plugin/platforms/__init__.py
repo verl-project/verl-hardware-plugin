@@ -71,3 +71,10 @@ def register_all_platforms():
     except Exception as e:
         logger.debug("ENFLAME platform not registered: %s", e)
 
+    # Iluvatar — CUDA-compatible, no extra extension needed
+    try:
+        from verl_hardware_plugin.platforms import platform_cuda_iluvatar  # noqa: F401
+
+        logger.info("Registered platform: iluvatar (cuda)")
+    except Exception as e:
+        logger.debug("Iluvatar platform not registered: %s", e)
