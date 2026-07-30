@@ -2,6 +2,11 @@
 
 This guide covers prerequisites, software installation, and environment verification for running verl on Enflame GCU.
 
+## Prerequisites
+
+- Docker environment
+- Network access to pull images and download models
+
 ## 1. Pull the Base Image
 
 Please contact Cambricon engineer to get the cambricon_release docker images.
