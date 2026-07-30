@@ -9,7 +9,7 @@ This guide covers prerequisites, software installation, and environment verifica
 
 ## 1. Pull the Base Image
 
-Please contact Cambricon engineer to get the cambricon_release docker images.
+Please contact enflame engineer to get the release docker images.
 
 Start a container (example):
 
@@ -22,10 +22,8 @@ docker run -itd \
     --network=host \
     --ipc=host \
     --pid=host \
-    --shm-size 512G \
-    --device /dev/cambricon_ctl \
-    -v /home:/home
-    -v /sys:/sys
+    -v /home:/home \
+    -v /sys:/sys   \
     ${docker_image} \
     /bin/bash
 
