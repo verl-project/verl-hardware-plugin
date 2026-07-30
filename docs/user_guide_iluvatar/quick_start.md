@@ -107,7 +107,7 @@ REF=(
 
 TRAINER=(
     trainer.balance_batch=True
-    trainer.logger='["console","swanlab"]'
+    trainer.logger='["console"]'
     trainer.project_name=${PROJECT_NAME}
     trainer.experiment_name=${EXPERIMENT_NAME}
     trainer.n_gpus_per_node=${n_trainer_devices}

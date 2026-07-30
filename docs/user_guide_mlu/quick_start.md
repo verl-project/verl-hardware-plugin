@@ -22,7 +22,6 @@ excludes: ["/.git/"]
 env_vars:
   TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
   RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO: "0"
-  VERL_USE_EXTERNAL_MODULES: "verl_hardware_plugin"
 ```
 Run scripts in [verl examples](https://github.com/verl-project/verl/tree/main/examples)
 

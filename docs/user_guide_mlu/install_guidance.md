@@ -31,6 +31,9 @@ docker run -itd \
     /bin/bash
 
 docker exec -it verl_test bash
+# install extra package
+pip install "numpy<2"
+pip install TransferQueue
 ```
 
 ## 2. Prepare Data and Models

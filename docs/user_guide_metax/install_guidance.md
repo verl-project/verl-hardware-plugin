@@ -9,10 +9,10 @@
 Visit the MetaX Docker Hub page  (e.g., https://developer.metax-tech.com/softnova/docker?chip_name=%E6%9B%A6%E4%BA%91C500%E7%B3%BB%E5%88%97&package_name=verl:0.7.1-maca.ai3.5.3.3-torch2.8-py310-ubuntu22.04-amd64)
 Copy the docker pull command and run it in your terminal.
 
-Start a container (e.g., verl:0.7.1-maca.ai3.5.3.3-torch2.8-py310-ubuntu22.04-amd64):
+Start a container (e.g., verl:0.7.1-maca.ai3.5.3.3-torch2.8-py312-ubuntu22.04-amd64):
 
 ```bash
-docker_image=verl:0.7.1-maca.ai3.5.3.3-torch2.8-py310-ubuntu22.04-amd64
+docker_image=verl:0.7.1-maca.ai3.5.3.3-torch2.8-py312-ubuntu22.04-amd64
 docker_name=verl_test
 sudo docker run -itd \
     --name ${docker_name} \
@@ -32,6 +32,9 @@ sudo docker run -itd \
     /bin/bash
 
 docker exec -it verl_test bash
+# install extra package
+pip install "numpy<2"
+pip install TransferQueue
 ```
 
 > **Note:** `/dev/mxcd` is the MetaX compute device and `/dev/dri` provides GPU rendering access — both are required for MetaX GPU workloads. Ensure `mx-smi` is available inside the container for hardware auto-detection. Add `-v` mounts for your data and model directories as needed (e.g., `-v /data/share/:/data/share/`).
@@ -41,8 +44,8 @@ docker exec -it verl_test bash
 ```bash
 cd /workspace
 
-# Download model (example: Qwen3-8B)
-modelscope download --model Qwen/Qwen3-8B --local_dir ./Qwen3-8B
+# Download model (example: Qwen3-0.6B)
+modelscope download --model Qwen/Qwen3-0.6B --local_dir ./Qwen3-0.6B
 
 # Download dataset (example: GSM8K)
 mkdir gsm8k && cd gsm8k
