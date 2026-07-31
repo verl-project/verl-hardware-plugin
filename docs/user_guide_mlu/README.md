@@ -22,16 +22,18 @@ verl_hardware_plugin/
 And docs to start.
 
 ```
-user_guide_flagos/
+user_guide_mlu/
 ├── README.md              # This file
 ├── install_guidance.md    # Installation guide
-└── quick_start.md         # Quick start
+├── quick_start.md         # Quick start
+└── profiling.md           # Profiling guide
 ```
 
 ## Getting Started
 
 - [Installation Guide](./install_guidance.md) — Docker setup, component installation
 - [Quick Start](./quick_start.md) — Run your first GRPO training job
+- [Profiling Guide](./profiling.md) — Use community torch profile on MLU
 
 ## Platform Summary
 
