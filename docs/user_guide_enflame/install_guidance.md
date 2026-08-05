@@ -55,6 +55,7 @@ verl-hardware-plugin provides the Cambricon hardware platform integration for ve
 git clone https://github.com/verl-project/verl
 cd verl
 pip install -e .
+pip install TransferQueue-0.1.8 --break
 
 # Install verl-hardware-plugin
 git clone https://github.com/verl-project/verl-hardware-plugin.git
