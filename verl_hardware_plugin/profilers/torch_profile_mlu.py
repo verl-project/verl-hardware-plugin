@@ -43,8 +43,8 @@ def _patch_tool_config():
                 f"Profiler contents only supports mlu, cuda, cpu, memory, shapes, stack, but gets {content}"
             )
 
-        start = self.profile_token_start
-        stop = self.profile_token_end
+        start = getattr(self, "profile_token_start", None)
+        stop = getattr(self, "profile_token_end", None)
         for name, value in (("profile_token_start", start), ("profile_token_end", stop)):
             if value is not None:
                 assert isinstance(value, int), f"{name} must be int or None, got {type(value)}"
@@ -66,20 +66,26 @@ def _patch_get_torch_profiler():
 
     _original_get_torch_profiler = tp.get_torch_profiler
 
-    def _mlu_get_torch_profiler(contents, save_path, role=None, save_file_prefix=None, rank=0):
-        if role:
-            save_path = os.path.join(save_path, role)
-        os.makedirs(save_path, exist_ok=True)
+    def _mlu_get_torch_profiler(contents, save_path, role=None, save_file_prefix=None, rank=0, schedule=None):
+        save_dir = os.path.join(save_path, role) if role else save_path
+        os.makedirs(save_dir, exist_ok=True)
 
-        ts = datetime.now(tz=timezone.utc).astimezone().strftime("%Y%m%d%H%M%S%f")[:-3]
-        fname = f"prof_rank-{rank}_{os.getpid()}_{ts}.json.gz"
-        if save_file_prefix:
-            fname = f"{save_file_prefix}_{fname}"
-        save_path = os.path.join(save_path, fname)
+        if hasattr(tp, "build_trace_basename"):
+            base_file_name = tp.build_trace_basename(rank=rank, role=role, save_file_prefix=save_file_prefix)
+        else:
+            ts = datetime.now(tz=timezone.utc).astimezone().strftime("%Y%m%d%H%M%S%f")[:-3]
+            fname = f"prof_rank-{rank}_{os.getpid()}_{ts}"
+            base_file_name = f"{save_file_prefix}_{fname}" if save_file_prefix else fname
+
+        handler_state = {"count": 0}
 
         def _trace_handler(prof):
-            print(f"[Profiler] Saving trace to {save_path}")
-            prof.export_chrome_trace(save_path)
+            idx = handler_state["count"]
+            handler_state["count"] += 1
+            suffix = "" if idx == 0 else f"_cycle{idx}"
+            out_path = os.path.join(save_dir, f"{base_file_name}{suffix}.json.gz")
+            print(f"[Profiler] Saving trace to {out_path}")
+            prof.export_chrome_trace(out_path)
 
         _contents = set(contents) if contents else set()
         activities = []
@@ -94,13 +100,17 @@ def _patch_get_torch_profiler():
         elif "cuda" in _contents:
             activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-        return torch.profiler.profile(
+        profile_kwargs = dict(
             activities=activities,
             with_stack="stack" in _contents,
             record_shapes="shapes" in _contents,
             profile_memory="memory" in _contents,
             on_trace_ready=_trace_handler,
         )
+        if schedule:
+            profile_kwargs["schedule"] = torch.profiler.schedule(**schedule)
+
+        return torch.profiler.profile(**profile_kwargs)
 
     tp.get_torch_profiler = _mlu_get_torch_profiler
     logger.info("[verl_hardware_plugin] Patched get_torch_profiler: +MLU activity")
