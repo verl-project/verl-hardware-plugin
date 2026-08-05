@@ -2,6 +2,10 @@
 
 ## Common Questions
 
+### Q: On which Enflame chips does verl need to provide support?
+
+   verl needs to provide support on Enflame fourth-generation and above chips.
+
 ### Q: What is the difference between `enflame` and `gcu`?
 
 | Name | Where used | Value |
