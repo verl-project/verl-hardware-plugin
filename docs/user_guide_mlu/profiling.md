@@ -33,7 +33,7 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.profiler.all_ranks=False \
   actor_rollout_ref.actor.profiler.ranks=[0] \
   actor_rollout_ref.actor.profiler.tool_config.torch.contents=[mlu,cpu,memory,shapes,stack] \
-  actor_rollout_ref.actor.profiler.tool_config.torch.discrete=False
+  actor_rollout_ref.actor.profiler.tool_config.torch.discrete=True
 ```
 
 Common `contents` values:
