@@ -1,3 +1,6 @@
+# Copyright (c) 2026 BAAI. All rights reserved.
+# Licensed under the Apache License, Version 2.0.
+
 """Profiler integrations via monkey-patching verl's profiler utilities."""
 
 import logging
