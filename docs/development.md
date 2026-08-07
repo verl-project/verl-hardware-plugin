@@ -1060,3 +1060,4 @@ When submitting a PR for a new hardware platform, you must provide:
 - **Platform base class**: `verl/plugin/platform/platform_base.py`
 - **Engine base class**: `verl/workers/engine/base.py`
 - **Platform README**: `verl/plugin/platform/README.md`
+- **User Guide**: [docs/user_guide.md](user_guide.md)
