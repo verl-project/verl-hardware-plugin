@@ -232,7 +232,6 @@ class TestEngineRegistration:
             is MegatronIluvatarEngineWithLMHead
         )
 
-
     def test_fsdp_enflame_engines_registered(self):
         from verl.workers.engine.base import EngineRegistry
         from verl_hardware_plugin.engines.fsdp_enflame import (
@@ -248,8 +247,7 @@ class TestEngineRegistration:
         from verl_hardware_plugin.engines.megatron_enflame import MegatronEnflameEngineWithLMHead
 
         assert (
-            EngineRegistry._engines["language_model"]["megatron"][("gcu", "enflame")]
-            is MegatronEnflameEngineWithLMHead
+            EngineRegistry._engines["language_model"]["megatron"][("gcu", "enflame")] is MegatronEnflameEngineWithLMHead
         )
 
 
