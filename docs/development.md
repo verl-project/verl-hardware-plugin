@@ -528,7 +528,7 @@ If your hardware needs custom training behavior (e.g. different reduction ops, s
 
 Extends the base FSDP engine with hardware-specific initialization:
 - Custom reduction operations for the vendor's communication library
-- Memory op timization flags specific to the hardware
+- Memory optimization flags specific to the hardware
 - Device-specific workarounds for known issues
 """
 
