@@ -546,10 +546,10 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 @EngineRegistry.register(
-    model_type="language_model", # "language_model" or "value_model"
-    backend=["fsdp", "fsdp2"], # which backends this engine supports
+    model_type="language_model",  # "language_model" or "value_model"
+    backend=["fsdp", "fsdp2"],  # which backends this engine supports
     device="my_device",  # must match platform.device_name
-    vendor="my_vendor", # must match platform.vendor_name
+    vendor="my_vendor",  # must match platform.vendor_name
 )
 class FSDPMyVendorEngineWithLMHead(FSDPEngineWithLMHead):
     """FSDP Engine for MyVendor with custom communication backend.
@@ -614,12 +614,12 @@ class FSDPMyVendorEngineWithValueHead(FSDPEngineWithValueHead):
 Then register in `verl_hardware_plugin/engines/__init__.py`:
 
 ```python
- # MyVendor engines
- try:
-     from verl_hardware_plugin.engines import fsdp_my_vendor  # noqa: F401
-     logger.info("Registered engines: fsdp_my_vendor")
- except Exception as e:
-     logger.debug("MyVendor FSDP engines not registered: %s", e)
+# MyVendor engines
+try:
+    from verl_hardware_plugin.engines import fsdp_my_vendor  # noqa: F401
+    logger.info("Registered engines: fsdp_my_vendor")
+except Exception as e:
+    logger.debug("MyVendor FSDP engines not registered: %s", e)
 ```
 
 ### Step 4: Test Registration
