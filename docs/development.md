@@ -617,6 +617,7 @@ Then register in `verl_hardware_plugin/engines/__init__.py`:
 # MyVendor engines
 try:
     from verl_hardware_plugin.engines import fsdp_my_vendor  # noqa: F401
+
     logger.info("Registered engines: fsdp_my_vendor")
 except Exception as e:
     logger.debug("MyVendor FSDP engines not registered: %s", e)
