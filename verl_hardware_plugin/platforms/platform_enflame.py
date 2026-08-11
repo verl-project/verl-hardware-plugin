@@ -64,7 +64,7 @@ def _patch_gcu_runtime(gcu: ModuleType) -> None:
 
     # torch_gcu stubs cuda.ipc_collect but not gcu.ipc_collect; verl cleanup calls it.
     if not hasattr(gcu, "ipc_collect"):
-        gcu.ipc_collect = lambda: None
+        gcu.ipc_collect = lambda: None  # type: ignore[attr-defined]
 
     stream_cls = getattr(gcu, "Stream", None)
     if stream_cls is not None and not hasattr(stream_cls, "cuda_stream"):
