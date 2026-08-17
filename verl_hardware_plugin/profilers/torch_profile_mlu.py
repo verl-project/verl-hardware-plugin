@@ -83,7 +83,7 @@ def _patch_get_torch_profiler():
             handler_state["count"] += 1
             suffix = "" if idx == 0 else f"_cycle{idx}"
             out_path = os.path.join(save_dir, f"{base_file_name}{suffix}.json.gz")
-            print(f"[Profiler] Saving trace to {out_path}")
+            logger.info("[Profiler] Saving trace to %s", out_path)
             prof.export_chrome_trace(out_path)
 
         _contents = set(contents) if contents else set()
