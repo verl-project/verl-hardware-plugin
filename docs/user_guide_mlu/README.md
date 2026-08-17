@@ -4,7 +4,7 @@ Last updated: 06/16/2026.
 
 ## Introduction
 
-This document describes how to use verl for reinforcement learning training on Cambricon MLU (MLU370 / MLU590).
+This document describes how to use verl for reinforcement learning training on Cambricon MLU.
 
 ## Directory Structure
 

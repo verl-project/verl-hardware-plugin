@@ -85,11 +85,11 @@ def register_all_engines():
         logger.debug("MLU Megatron engines not registered: %s", e)
 
     try:
-        from verl_hardware_plugin.engines import cncl_checkpoint_engine  # noqa: F401
+        from verl_hardware_plugin.engines import cncl_checkpoint_engine, cnixl_checkpoint_engine  # noqa: F401
 
-        logger.info("Registered engines: cncl_checkpoint_engine")
+        logger.info("Registered engines: cncl_checkpoint_engine, cnixl_checkpoint_engine")
     except Exception as e:
-        logger.debug("CNCL Checkpoint engine not registered: %s", e)
+        logger.debug("CNCL or CNXIL Checkpoint engine not registered: %s", e)
 
     # MetaX engines (CUDA-compatible with vendor-specific optimizations)
     try:
@@ -106,6 +106,20 @@ def register_all_engines():
     except Exception as e:
         logger.debug("MetaX Megatron engines not registered: %s", e)
 
+    # Enflame engines (ECCL communication)
+    try:
+        from verl_hardware_plugin.engines import fsdp_enflame  # noqa: F401
+
+        logger.info("Registered engines: fsdp_enflame")
+    except Exception as e:
+        logger.debug("Enflame FSDP engines not registered: %s", e)
+
+    try:
+        from verl_hardware_plugin.engines import megatron_enflame  # noqa: F401
+
+        logger.info("Registered engines: megatron_enflame")
+    except Exception as e:
+        logger.debug("Enflame Megatron engines not registered: %s", e)
     # Iluvatar engines (CUDA-compatible with vendor-specific optimizations)
     try:
         from verl_hardware_plugin.engines import fsdp_iluvatar  # noqa: F401

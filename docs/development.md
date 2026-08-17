@@ -95,6 +95,7 @@ def _ensure_torch_my_device() -> bool:
         return True
     try:
         import my_vendor_torch_extension  # noqa: F401
+
         return hasattr(torch, "my_device")
     except ImportError:
         return False
@@ -151,10 +152,7 @@ class PlatformMyDevice(PlatformBase):
         Must return the actual module object (e.g. torch.cuda, torch.xpu).
         """
         if not _ensure_torch_my_device():
-            raise RuntimeError(
-                "torch.my_device is not available. "
-                "Install my-vendor-torch-extension."
-            )
+            raise RuntimeError("torch.my_device is not available. Install my-vendor-torch-extension.")
         return torch.my_device
 
     def is_available(self) -> bool:
@@ -509,6 +507,7 @@ def register_all_platforms():
     # MyVendor
     try:
         from verl_hardware_plugin.platforms import platform_my_vendor  # noqa: F401
+
         logger.info("Registered platform: my_vendor")
     except Exception as e:
         logger.debug("MyVendor platform not registered: %s", e)
@@ -547,10 +546,10 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 @EngineRegistry.register(
-    model_type="language_model",          # "language_model" or "value_model"
-    backend=["fsdp", "fsdp2"],            # which backends this engine supports
-    device="my_device",                   # must match platform.device_name
-    vendor="my_vendor",                   # must match platform.vendor_name
+    model_type="language_model",  # "language_model" or "value_model"
+    backend=["fsdp", "fsdp2"],  # which backends this engine supports
+    device="my_device",  # must match platform.device_name
+    vendor="my_vendor",  # must match platform.vendor_name
 )
 class FSDPMyVendorEngineWithLMHead(FSDPEngineWithLMHead):
     """FSDP Engine for MyVendor with custom communication backend.
@@ -615,12 +614,13 @@ class FSDPMyVendorEngineWithValueHead(FSDPEngineWithValueHead):
 Then register in `verl_hardware_plugin/engines/__init__.py`:
 
 ```python
-    # MyVendor engines
-    try:
-        from verl_hardware_plugin.engines import fsdp_my_vendor  # noqa: F401
-        logger.info("Registered engines: fsdp_my_vendor")
-    except Exception as e:
-        logger.debug("MyVendor FSDP engines not registered: %s", e)
+# MyVendor engines
+try:
+    from verl_hardware_plugin.engines import fsdp_my_vendor  # noqa: F401
+
+    logger.info("Registered engines: fsdp_my_vendor")
+except Exception as e:
+    logger.debug("MyVendor FSDP engines not registered: %s", e)
 ```
 
 ### Step 4: Test Registration
@@ -689,6 +689,7 @@ Existing reference implementations:
 - `docs/user_guide_mlu/` — Cambricon MLU
 - `docs/user_guide_metax/` — MetaX
 - `docs/user_guide_flagos/` — FlagOS
+- `docs/user_guide_enflame/` — Enflame GCU
 
 > **Tip**: Refer to `verl/docs/ascend_tutorial` (Huawei NPU) for documentation quality and coverage expectations. That tutorial covers installation, quick start, advanced features, performance tuning, precision analysis, and FAQ.
 
@@ -709,9 +710,9 @@ Here's how the Intel XPU platform is actually implemented in this repository, an
 # 6. visible_devices_envvar = "ZE_AFFINITY_MASK" — Intel Level Zero environment variable
 # 7. _ensure_torch_xpu() — must import intel_extension_for_pytorch before torch.xpu works
 
+
 @PlatformRegistry.register(platform="intel")
-class PlatformXPU(PlatformBase):
-    ...
+class PlatformXPU(PlatformBase): ...
 ```
 
 And the corresponding engine:
@@ -723,6 +724,7 @@ And the corresponding engine:
 # 2. Only overrides initialize() — minimal intrusion pattern
 # 3. Forces sum reduction — xccl doesn't support ReduceOp.AVG,
 #    so gradient averaging is done as sum/world_size instead
+
 
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device="xpu", vendor="intel")
 class FSDPXPUEngineWithLMHead(FSDPEngineWithLMHead):
@@ -748,6 +750,7 @@ MetaX is a special case — it uses `torch.cuda` but is not NVIDIA hardware:
 #    we use the mx-smi tool to detect MetaX hardware specifically.
 # 4. communication_backend = "nccl" — MetaX supports standard NCCL
 # 5. ray_resource_name = "GPU" — standard CUDA GPU resource
+
 
 @PlatformRegistry.register(platform="metax")
 class PlatformMetaX(PlatformBase):
@@ -898,6 +901,7 @@ The following files in this repository serve as examples:
 | Intel XPU | `platforms/platform_xpu.py` | `engines/fsdp_xpu.py`, `engines/megatron_xpu.py` |
 | Cambricon MLU | `platforms/platform_mlu.py` | `engines/fsdp_mlu.py`, `engines/megatron_mlu.py` |
 | MetaX | `platforms/platform_cuda_metax.py` | `engines/fsdp_metax.py`, `engines/megatron_metax.py` |
+| Enflame GCU | `platforms/platform_enflame.py` | `engines/fsdp_enflame.py`, `engines/megatron_enflame.py` |
 
 ---
 

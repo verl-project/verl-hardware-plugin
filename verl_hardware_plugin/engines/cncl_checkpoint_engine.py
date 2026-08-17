@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# mypy: disable-error-code="attr-defined"
 import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import AsyncGenerator, Generator
+from typing import AsyncGenerator, Generator, Optional
 
 import ray
 import torch
@@ -56,7 +58,7 @@ class BroadcastOperation:
         process_group: StatelessProcessGroup | str,
         bucket: torch.Tensor,
         metadata: dict[str, TensorMeta] | None,
-        socket: zmq.Socket,
+        socket: zmq.Socket,  # type: ignore[name-defined]
         topic: str,
     ) -> None:
         self.rank = rank
@@ -80,7 +82,7 @@ class BroadcastOperation:
         # broadcast tensor via CNCL
         self.pycncl.broadcast(self.bucket, src=0)
 
-    async def wait_for_complete(self) -> dict[str, TensorMeta] | None:
+    async def wait_for_complete(self):
         """Wait for the broadcast operation to complete.
 
         Returns:
@@ -124,7 +126,7 @@ class CNCLCheckpointEngine(CheckpointEngine):
             self._start_zmq_server()
             self.dist_port, _ = get_free_port(self.ip)
 
-    def prepare(self) -> MasterMetadata | None:
+    def prepare(self) -> Optional[MasterMetadata]:
         self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="mlu")
         self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="mlu")
 
@@ -148,18 +150,18 @@ class CNCLCheckpointEngine(CheckpointEngine):
         torch.mlu.empty_cache()
 
     @classmethod
-    def build_topology(cls, trainer_world_size: int, rollout_world_size: int, metadata: list[dict]):
-        trainer_kwargs = {
-            "rank": [0] + [-1] * (trainer_world_size - 1),
-            "world_size": [rollout_world_size + 1] * trainer_world_size,
-            "master_metadata": [metadata[0]] * trainer_world_size,
+    def build_topology(cls, actor_wg_world_size: int, rollout_world_size: int, metadata: list[dict]):
+        actor_wg_kwargs = {
+            "rank": [0] + [-1] * (actor_wg_world_size - 1),
+            "world_size": [rollout_world_size + 1] * actor_wg_world_size,
+            "master_metadata": [metadata[0]] * actor_wg_world_size,
         }
         rollout_kwargs = {
             "rank": list(range(1, rollout_world_size + 1)),
             "world_size": [rollout_world_size + 1] * rollout_world_size,
             "master_metadata": [metadata[0]] * rollout_world_size,
         }
-        return trainer_kwargs, rollout_kwargs
+        return actor_wg_kwargs, rollout_kwargs
 
     def _start_zmq_server(self):
         self.ip = ray.util.get_node_ip_address().strip("[]")
@@ -195,7 +197,7 @@ class CNCLCheckpointEngine(CheckpointEngine):
             rank (int): The rank of the current process.
             world_size (int): The total number of processes.
         """
-        # For trainer workers other than rank 0, their rank should be -1.
+        # For actor workers other than rank 0, their rank should be -1.
         if rank < 0:
             self.rank = rank
             self.world_size = world_size
@@ -235,7 +237,7 @@ class CNCLCheckpointEngine(CheckpointEngine):
         """
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
 
-        # For trainer rank other than 0, consume weights without sending.
+        # For actor rank other than 0, consume weights without sending.
         if self.rank < 0:
             for name, weight in weights:
                 pass
@@ -324,7 +326,6 @@ class CNCLCheckpointEngine(CheckpointEngine):
             topic=self.topic,
         )
         metadata = await broadcast_op.wait_for_complete()
-        assert metadata is not None
         total_bytes += self.bucket_size
         total_params += len(metadata["bucket_meta"])
 
@@ -350,7 +351,6 @@ class CNCLCheckpointEngine(CheckpointEngine):
 
             # 3. wait for next bucket broadcast finish
             metadata = await broadcast_op.wait_for_complete()
-            assert metadata is not None
             total_bytes += self.bucket_size
             total_params += len(metadata["bucket_meta"])
 
