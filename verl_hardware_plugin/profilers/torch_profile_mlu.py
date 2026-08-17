@@ -21,8 +21,7 @@ _original_post_init = None
 
 
 def _patch_tool_config():
-    """Add 'mlu' to allowed contents in TorchProfilerToolConfig.
-    """
+    """Add 'mlu' to allowed contents in TorchProfilerToolConfig."""
     from verl.utils.profiler.config import TorchProfilerToolConfig
 
     global _original_post_init
