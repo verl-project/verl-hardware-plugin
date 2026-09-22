@@ -38,6 +38,8 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+.compat-work/
+.upstream/
 nosetests.xml
 coverage.xml
 *,cover

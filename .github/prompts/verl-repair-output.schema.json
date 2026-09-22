@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "patch": {
+      "type": "string",
+      "description": "A plain Git unified diff, or an empty string when no safe repair is possible."
+    },
+    "summary": {
+      "type": "string",
+      "description": "A concise explanation of the proposed repair or why no repair is safe."
+    }
+  },
+  "required": ["patch", "summary"],
+  "additionalProperties": false
+}

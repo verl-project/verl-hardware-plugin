@@ -1055,6 +1055,36 @@ When submitting a PR for a new hardware platform, you must provide:
 
 ---
 
+## Automatic verl Release Compatibility
+
+`.github/workflows/verl-release-compat.yml` checks the latest stable semantic-version tag in
+`verl-project/verl` every day. The last validated tag is stored in
+`compat/verl-release.json`, together with the immutable commit resolved from that tag.
+
+When a new tag appears, the workflow checks every statically imported verl API and runs
+the CPU unit test suite against that exact tag. If the checks pass, it opens a draft PR
+that advances the validated tag. If they fail and the repository has an `OPENAI_API_KEY`
+secret in a protected `verl-compat-repair` GitHub Environment, the workflow uses the
+[Codex GitHub Action](https://learn.chatgpt.com/docs/github-action) to propose a minimal
+repair as a structured diff. Codex has read-only access and is the last step in the only
+job that can access the secret. A separate secret-free runner enforces a Python-only path
+allowlist, applies the diff, and reruns the complete compatibility gate before publishing
+anything. An unsuccessful repair creates or updates a tag-specific issue instead of
+publishing an unverified patch.
+
+Repository administrators must enable **Actions → General → Workflow permissions →
+Allow GitHub Actions to create and approve pull requests**. The workflow never
+auto-merges its PRs; CODEOWNERS review and hardware validation still apply.
+
+Restrict the `verl-compat-repair` Environment to the protected `main` branch. This
+keeps the repair credential out of release installation, validation, and publishing
+jobs; only the isolated Codex repair job can access it.
+
+The workflow runs daily at 02:17 UTC and can also be started manually from the `main`
+branch in the Actions tab.
+
+---
+
 ## Related Resources
 
 - **verl core PR**: [verl#6086 — Platform & Engine Registry](https://github.com/verl-project/verl/pull/6086)
