@@ -1063,22 +1063,20 @@ When submitting a PR for a new hardware platform, you must provide:
 
 When a new tag appears, the workflow checks every statically imported verl API and runs
 the CPU unit test suite against that exact tag. If the checks pass, it opens a draft PR
-that advances the validated tag. If they fail and the repository has an `OPENAI_API_KEY`
-secret in a protected `verl-compat-repair` GitHub Environment, the workflow uses the
-[Codex GitHub Action](https://learn.chatgpt.com/docs/github-action) to propose a minimal
-repair as a structured diff. Codex has read-only access and is the last step in the only
-job that can access the secret. A separate secret-free runner enforces a Python-only path
-allowlist, applies the diff, and reruns the complete compatibility gate before publishing
-anything. An unsuccessful repair creates or updates a tag-specific issue instead of
-publishing an unverified patch.
+that advances the validated tag. If installation or compatibility checks fail, it creates
+or updates a tag-specific issue with a link to the diagnostic artifact. The marker is not
+advanced until the exact upstream commit passes the compatibility gate.
+
+The monitor runs entirely on GitHub-hosted runners and uses only the built-in
+`GITHUB_TOKEN`; it needs no external automation service, API key, or GitHub Environment.
+Upstream code is installed and tested only in a read-only job. The separate publication
+job has write permission, but it never checks out or executes upstream code and stages
+only `compat/verl-release.json`.
 
 Repository administrators must enable **Actions → General → Workflow permissions →
-Allow GitHub Actions to create and approve pull requests**. The workflow never
-auto-merges its PRs; CODEOWNERS review and hardware validation still apply.
-
-Restrict the `verl-compat-repair` Environment to the protected `main` branch. This
-keeps the repair credential out of release installation, validation, and publishing
-jobs; only the isolated Codex repair job can access it.
+Allow GitHub Actions to create and approve pull requests**. If that setting is disabled,
+the workflow reports the publication failure in an issue. It never auto-merges its PRs;
+CODEOWNERS review and hardware validation still apply.
 
 The workflow runs daily at 02:17 UTC and can also be started manually from the `main`
 branch in the Actions tab.
