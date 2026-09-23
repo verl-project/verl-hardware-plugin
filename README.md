@@ -9,6 +9,10 @@ This repository is jointly developed by the ByteDance verl team and the [FlagOS]
 
 FlagOS is a fully open-sourced AI system software stack for heterogeneous AI chips, allowing AI models to be developed once and seamlessly ported to a wide range of AI hardwares with minimum effort.
 
+## Community
+
+Join the [Feishu discussion group](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=049p82e5-ec84-4a76-90f6-10ae302a9793) to discuss hardware plugin development and usage.
+
 ## Purpose
 
 The platforms and engines in this repository are **reference implementations** — they demonstrate how vendors can integrate their hardware with verl's plugin system. Hardware vendors can use these as templates to build their own plugins.
@@ -20,15 +24,15 @@ The platforms and engines in this repository are **reference implementations** �
 | Platform | Device | Communication | Status | Doc |
 |----------|--------|---------------|--------|-----|
 | FlagOS | NVIDIA GPU (verified) | FlagCX / NCCL | ✅ Supported | [User Guide](docs/user_guide_flagos/nvidia/README.md) |
-| Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Example (requires vendor support) | TBD |
+| Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Example (requires vendor support) | [User Guide](docs/user_guide_xpu/README.md) |
 | Cambricon MLU | MLU | CNCL | ✅ Supported | [User Guide](docs/user_guide_mlu/README.md) |
-| MetaX | MetaX GPUs (CUDA-compatible) | MCCL | ✅ Supported | [User Guide](docs/user_guide_metax/README.md) |
+| MetaX | MetaX GPUs (CUDA-compatible) | NCCL API / MCCL | ✅ Supported | [User Guide](docs/user_guide_metax/README.md) |
 | Enflame GCU | GCU | ECCL / FlagCX | ✅ Example (requires vendor support) | [User Guide](docs/user_guide_enflame/README.md) |
 | Huawei NPU | Ascend 910B | HCCL | Built-in (verl core) | [Ascend Tutorial](https://github.com/verl-project/verl/tree/main/docs/ascend_tutorial) |
-| Iluvatar | BI-V150 (CUDA-compatible) | IXCCL | ✅ Supported | [User Guide](docs/user_guide_iluvatar/README.md) |
-| Moore Threads | MUSA (CUDA-compatible) | MCCL | ✅ Supported | [User Guide](docs/user_guide_musa/README.md) |
+| Iluvatar | BI-V150 (CUDA-compatible) | NCCL | ✅ Supported | [User Guide](docs/user_guide_iluvatar/README.md) |
+| Moore Threads | MUSA | MCCL | ✅ Supported | [User Guide](docs/user_guide_musa/README.md) |
 | Google TPU | v6e | tpu_dist | Platform only (engine pending) | [User Guide](docs/user_guide_tpu/README.md) |
-| Biren | SUPA (CUDA-compatible) | BCCL | Platform only (engine pending) | [User Guide](docs/user_guide_biren/README.md) |
+| Biren | SUPA (CUDA-compatible) | BCCL | ✅ Example (requires vendor support) | [User Guide](docs/user_guide_biren/README.md) |
 
 
 ## Installation
@@ -47,23 +51,29 @@ For platform-specific usage and configuration, please refer to each platform's d
 ## Architecture
 
 ```
-verl-FL (main framework)
+verl (main framework)
     └── entry_points: verl.plugins → verl_hardware_plugin
             │
             ├── PlatformRegistry.register("intel")    → PlatformXPU
             ├── PlatformRegistry.register("cambricon")→ PlatformMLU
             ├── PlatformRegistry.register("metax")    → PlatformMetaX
             ├── PlatformRegistry.register("enflame")  → PlatformENFLAME
-            ├── PlatformRegistry.register("flagos")   → PlatformFlagOS
-            ├── PlatformRegistry.register("biren")    → PlatformSUPA
+            ├── PlatformRegistry.register("iluvatar") → PlatformIluvatar
+            ├── PlatformRegistry.register("musa")     → PlatformMUSA
+            ├── PlatformRegistry.register("tpu")      → PlatformTPU
+            ├── PlatformRegistry.register("biren")    → PlatformSupa
             │
+            ├── EngineRegistry.register(device="cuda", vendor="flagos")
             ├── EngineRegistry.register(device="xpu", vendor="intel")
             ├── EngineRegistry.register(device="mlu", vendor="cambricon")
             ├── EngineRegistry.register(device="cuda", vendor="metax")
-            ├── EngineRegistry.register(device="enflame", vendor="enflame")
-            └── EngineRegistry.register(device="cuda", vendor="flagos")
+            ├── EngineRegistry.register(device="gcu", vendor="enflame")
+            ├── EngineRegistry.register(device="cuda", vendor="iluvatar")
+            ├── EngineRegistry.register(device="musa", vendor="moore_threads")
             └── EngineRegistry.register(device="supa", vendor="biren")
 ```
+
+FlagOS registers engines on the CUDA platform rather than a separate platform. TPU currently registers a platform but no training engine in this plugin.
 
 The plugin uses verl's decorator-based registration:
 - `@PlatformRegistry.register(platform="vendor_name")` for platform classes
@@ -94,7 +104,9 @@ Each hardware platform provides a standalone user guide (following the structure
 - **[MetaX GPU](docs/user_guide_metax/README.md)** — MetaX GPU user guide
 - **[FlagOS](docs/user_guide_flagos/README.md)** — FlagOS unified heterogeneous engine user guide ([NVIDIA](docs/user_guide_flagos/nvidia/README.md))
 - **[Enflame GCU](docs/user_guide_enflame/README.md)** — Enflame GCU user guide
+- **[Iluvatar GPU](docs/user_guide_iluvatar/README.md)** — Iluvatar GPU user guide
 - **[Moore Threads GPU](docs/user_guide_musa/README.md)** — Moore Threads GPU user guide
+- **[Google TPU](docs/user_guide_tpu/README.md)** — Google TPU platform guide
 - **[Biren SUPA](docs/user_guide_biren/README.md)** — Biren SUPA accelerator user guide
 
 ### Developer Guides
