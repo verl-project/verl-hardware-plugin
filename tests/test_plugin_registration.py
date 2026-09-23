@@ -56,10 +56,22 @@ def _stub_training_engine_runtimes():
     megatron_transformer.MegatronEngineWithLMHead = _StubEngine
     megatron_transformer.MegatronEngineWithValueHead = _StubEngine
 
+    torchtitan_transformer = ModuleType("verl.workers.engine.torchtitan.transformer_impl")
+    torchtitan_transformer.TorchTitanEngine = _StubEngine
+    torchtitan_transformer.TorchTitanEngineWithLMHead = _StubEngine
+
+    torchtitan_utils = ModuleType("verl.workers.engine.torchtitan.utils")
+    torchtitan_utils.NoOpDataLoader = mock.MagicMock()
+    torchtitan_utils.derive_torchtitan_name_and_flavor = mock.MagicMock()
+    torchtitan_utils.enable_fsdp_gradient_division = mock.MagicMock()
+    torchtitan_utils.get_attention_masks = mock.MagicMock()
+
     engine_modules = {
         "verl.workers.engine.fsdp": fsdp,
         "verl.workers.engine.fsdp.transformer_impl": fsdp_transformer,
         "verl.workers.engine.megatron.transformer_impl": megatron_transformer,
+        "verl.workers.engine.torchtitan.transformer_impl": torchtitan_transformer,
+        "verl.workers.engine.torchtitan.utils": torchtitan_utils,
     }
     with (
         mock.patch.dict(os.environ, {"VERL_USE_EXTERNAL_PLUGINS": "none"}),
@@ -523,6 +535,22 @@ class TestEngineRegistration:
 
         assert (
             EngineRegistry._engines["language_model"]["megatron"][("gcu", "enflame")] is MegatronEnflameEngineWithLMHead
+        )
+
+    def test_torchtitan_tpu_engine_registered(self):
+        # detach_tree landed in verl core after the 0.9.0 release. The TPU engine imports it, so on
+        # an older verl this test would fail with an ImportError that says nothing about the TPU
+        # plugin. Skip with the real reason instead; every other engine here is version-agnostic.
+        import verl.workers.engine.utils as engine_utils
+
+        if not hasattr(engine_utils, "detach_tree"):
+            pytest.skip("verl.workers.engine.utils.detach_tree is required by the TPU engine (verl > 0.9.0)")
+
+        from verl.workers.engine.base import EngineRegistry
+        from verl_hardware_plugin.engines.torchtitan_tpu import TorchTitanTPUEngineWithLMHead
+
+        assert (
+            EngineRegistry._engines["language_model"]["torchtitan"][("tpu", "google")] is TorchTitanTPUEngineWithLMHead
         )
 
 

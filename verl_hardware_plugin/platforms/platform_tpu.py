@@ -62,15 +62,72 @@ TPU_HBM_BYTES_MAP = {
 # Fallback HBM capacity when the chip generation cannot be determined.
 HBM_BYTES_TPU_DEFAULT = HBM_BYTES_TPU_V6E
 
-# TPU default 3D mesh topology mappings by pod type or total chips
-TPU_TOPOLOGY_MAP = {
-    "v6e-32": "4,8,1",
-    "v6e-8": "2,4,1",
-    "v6e-4": "2,2,1",
-    32: "4,8,1",
-    8: "2,4,1",
+# TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice.
+# Mirrors DEFAULT_TPU_TOPOLOGY_MAP in verl's rollout-side TPU utils so the trainer mesh and
+# the rollout mesh agree on the physical layout of a given slice size.
+DEFAULT_TPU_TOPOLOGY_MAP = {
+    1: "1,1,1",
+    2: "1,2,1",
     4: "2,2,1",
+    8: "2,4,1",
+    16: "4,4,1",
+    32: "4,8,1",
+    64: "8,8,1",
+    128: "8,16,1",
+    256: "16,16,1",
 }
+
+# Pod types are consulted first: a pod type names the physical slice exactly, whereas the chip
+# count is only the number of chips this job was given and can be a subset of the slice.
+TPU_POD_TYPE_TOPOLOGY_MAP = {
+    "v6e-4": "2,2,1",
+    "v6e-8": "2,4,1",
+    "v6e-16": "4,4,1",
+    "v6e-32": "4,8,1",
+}
+
+# Slices at or below this many chips live on a single host, so the chips are addressed within
+# the host bounds rather than across them.
+TPU_SINGLE_HOST_MAX_CHIPS = 4
+
+
+def resolve_tpu_topology_bounds(
+    total_chips: int,
+    num_nodes: int,
+    pod_type: str = "",
+) -> tuple[str, str, str, str]:
+    """Resolve ``(topology, host_bounds, chips_per_host_bounds, chips_per_host)`` for a TPU slice.
+
+    Resolution order for the topology is: the ``TORCH_TPU_TOPOLOGY`` escape hatch, then the pod
+    type reported by Ray, then the chip count.
+
+    Raises:
+        ValueError: if the topology cannot be determined. Guessing here is worse than failing:
+            a wrong mesh does not error, it silently trains on part of the slice.
+    """
+    topology = (
+        os.environ.get("TORCH_TPU_TOPOLOGY")
+        or TPU_POD_TYPE_TOPOLOGY_MAP.get(pod_type.lower())
+        or DEFAULT_TPU_TOPOLOGY_MAP.get(total_chips)
+    )
+    if not topology:
+        raise ValueError(
+            f"Cannot determine the TPU topology for total_chips={total_chips} "
+            f"(pod_type={pod_type!r}). Set TORCH_TPU_TOPOLOGY='x,y,z' to override. "
+            f"Known chip counts: {sorted(DEFAULT_TPU_TOPOLOGY_MAP)}."
+        )
+
+    inferred_chips_per_host = max(1, total_chips // max(1, num_nodes))
+    chips_per_host = str(os.environ.get("VERL_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
+
+    if total_chips <= TPU_SINGLE_HOST_MAX_CHIPS:
+        host_bounds = "1,1,1"
+        chips_per_host_bounds = topology if num_nodes == 1 else "1,1,1"
+    else:
+        host_bounds = topology
+        chips_per_host_bounds = "1,1,1"
+
+    return topology, host_bounds, chips_per_host_bounds, chips_per_host
 
 
 def get_tpu_chip_hbm_bytes() -> int:
@@ -223,12 +280,50 @@ class TPUDeviceModuleProxy:
             except Exception as e:
                 logger.warning(f"torch.tpu.synchronize() failed: {e}")
 
+    def manual_seed_all(self, seed: int) -> None:
+        # torch_tpu does not always expose manual_seed_all; the global torch seed is the
+        # right fallback because a TPU process owns exactly one chip.
+        fn = getattr(self._original_module, "manual_seed_all", None)
+        if fn is not None:
+            fn(seed)
+        else:
+            torch.manual_seed(seed)
+
     def empty_cache(self) -> None:
         if hasattr(self._original_module, "_clear_cache"):
             try:
                 self._original_module._clear_cache()
             except Exception as e:
                 logger.warning(f"Failed to clear TPU cache: {e}")
+
+
+def patch_ray_worker() -> None:
+    """Ray ``worker_process_setup_hook`` for GKE TPU pods.
+
+    Runs once in every Ray worker process before any task. It does two things:
+
+    1. Pins ``VERL_PLATFORM=tpu`` so a worker that did not inherit the driver's environment still
+       resolves the TPU platform.
+    2. Makes Raylet's accelerator-id lookup non-fatal. Each GKE pod is given only its own slice of
+       the host's TPU chips, so a host-level index lookup can run off the end of the visible list
+       and raise ``IndexError``. Returning an empty list is correct here: verl assigns chips itself
+       via ``TPU_VISIBLE_CHIPS``.
+    """
+    os.environ["VERL_PLATFORM"] = "tpu"
+
+    try:
+        original_func = ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource
+
+        def patched_func(self, resource_name, resource_regex):
+            try:
+                return original_func(self, resource_name, resource_regex)
+            except IndexError as e:
+                logger.debug("Intercepted Ray accelerator lookup IndexError for resource %r: %s", resource_name, e)
+                return []
+
+        ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource = patched_func
+    except Exception as e:
+        logger.warning(f"Failed to apply Ray worker accelerator patch: {e}")
 
 
 @PlatformRegistry.register(platform="tpu")
@@ -363,6 +458,67 @@ class PlatformTPU(PlatformBase):
         # A TPU chip belongs to one process and cannot be shared between colocated WorkerGroups.
         return False
 
+    def get_ray_init_kwargs(self) -> dict[str, Any]:
+        """Install the GKE TPU worker setup hook and pin the platform inside Ray workers."""
+        return {
+            "runtime_env": {
+                "worker_process_setup_hook": patch_ray_worker,
+                "env_vars": {"VERL_PLATFORM": "tpu"},
+            }
+        }
+
+    def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
+        """Pin a resource pool to a TPU slice on multi-slice clusters.
+
+        Called unconditionally from ``verl.single_controller.ray.base.RayResourcePool.__init__``
+        whenever ``device_name == "tpu"``; ``PlatformBase`` does not declare it, so the TPU
+        platform has to provide it.
+
+        A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per slice. Without
+        an affinity label a pool can straddle two slices, which the TPU mesh cannot span, so pin
+        it to the first slice.
+        """
+        if accelerator_type is not None:
+            return accelerator_type
+
+        try:
+            if ray.is_initialized():
+                tpu_slices = set()
+                for node in ray.nodes():
+                    if node.get("Alive"):
+                        for res in node.get("Resources", {}):
+                            if res.startswith("tpu-group-"):
+                                tpu_slices.add(res)
+                slices = sorted(tpu_slices)
+                if slices:
+                    return slices[0]
+        except Exception as e:
+            logger.debug("Could not auto-assign a TPU slice for %r: %s", name_prefix, e)
+
+        return accelerator_type
+
+    def configure_placement_group_bundle(
+        self,
+        bundle: dict,
+        use_gpu: bool,
+        device_name: str,
+        name_prefix: str,
+        accelerator_type: Optional[str] = None,
+    ) -> None:
+        """Shape a placement-group bundle for GKE TPU.
+
+        Called unconditionally from ``verl.single_controller.ray.base.RayResourcePool``
+        whenever ``device_name == "tpu"``; ``PlatformBase`` does not declare it, so the TPU
+        platform has to provide it.
+
+        The slice affinity is requested as a fractional amount so it acts as a label rather
+        than a real reservation.
+        """
+        if use_gpu:
+            bundle[device_name] = 1
+        if accelerator_type is not None:
+            bundle[accelerator_type] = 1e-4
+
     def get_tpu_env_vars(
         self,
         rank: int,
@@ -423,18 +579,22 @@ class PlatformTPU(PlatformBase):
             "TPU_VISIBLE_CHIPS": str(local_rank),
         }
 
-        # Apply TPU topology and host bounds based on TPU pod type or world size
+        # Derive the mesh from the pod type Ray reports, falling back to the chip count.
         tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
         tpu_type = tpu_nodes[0].get("Labels", {}).get("ray.io/tpu-pod-type", "") if tpu_nodes else ""
 
-        topo = TPU_TOPOLOGY_MAP.get(tpu_type, TPU_TOPOLOGY_MAP.get(world_size, "1,1,1"))
+        topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(
+            total_chips=world_size,
+            num_nodes=len(unique_hostnames),
+            pod_type=tpu_type,
+        )
 
         env_vars.update(
             {
-                "TORCH_TPU_TOPOLOGY": topo,
-                "TPU_HOST_BOUNDS": topo,
-                "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
-                "CHIPS_PER_HOST": "4",
+                "TORCH_TPU_TOPOLOGY": topology,
+                "TPU_HOST_BOUNDS": host_bounds,
+                "TPU_CHIPS_PER_HOST_BOUNDS": chips_per_host_bounds,
+                "CHIPS_PER_HOST": chips_per_host,
             }
         )
 

@@ -1,8 +1,9 @@
 # Google TPU Quick Start
 
-> **There is no TPU training quick start yet.** TPU support is at the platform layer only. A GRPO
-> or PPO run cannot be launched on TPU from stock verl today — see the status note in the
-> [User Guide](./README.md). This page covers what you can verify now.
+> **TPU support is under active development and testing.** The TPU platform and the
+> TorchTitan TPU training engine are registered and can be verified on any host, but the
+> end-to-end training recipes are not published yet — see the status note in the
+> [User Guide](./README.md). This page covers what you can verify today.
 
 ## 1. Select the Platform
 
@@ -59,15 +60,11 @@ Expected output: `{'resources': {'TPU': 4}}`
 Your Ray cluster must advertise a `TPU` resource for scheduling to succeed. On KubeRay this comes
 from the TPU node pool's resource annotations.
 
-## 4. Run the Plugin Test Suite
+## 4. Verify TorchTitan TPU Engine Registration
 
 ```bash
 pytest tests/test_plugin_registration.py -k tpu -v
+pytest tests/test_tpu_engine.py -v
 ```
 
-Expected: all TPU cases pass. These run on any host, with or without a TPU attached.
-
-## Next Steps
-
-The core-side hook call sites are still unmerged in verl. The TPU training engine will land in a
-follow-up PR to this plugin.
+Expected: all TPU registration and engine utility cases pass on any host, with or without a TPU attached.

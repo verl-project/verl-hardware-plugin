@@ -4,15 +4,17 @@
 
 This document describes Google TPU support in `verl-hardware-plugin`.
 
-The plugin registers the TPU platform: device metadata, Ray resource configuration, and the
-worker environment. It does not provide a TPU training engine, and the extension hooks the
-platform implements (`supports_colocated_worker_groups`, `get_worker_env_vars`,
-`ray_local_rank_override`) have no call sites in verl core yet.
+The plugin registers both the TPU platform (`PlatformTPU`: device metadata, Ray resource
+configuration, and the PJRT worker environment) and the TorchTitan TPU training engine
+(`TorchTitanTPUEngineWithLMHead` under `verl_hardware_plugin/engines/torchtitan_tpu.py`).
 
 ## Directory Structure
 
 ```text
 verl_hardware_plugin/
+├── engines
+│   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SPMD)
+│   └── tpu_utils.py                  # Sequence bucketing and TorchTitan TPU config/input helpers
 └── platforms
     └── platform_tpu.py               # TPU platform settings
 ```

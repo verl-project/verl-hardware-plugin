@@ -164,3 +164,11 @@ def register_all_engines():
         logger.info("Registered engines: megatron_supa")
     except Exception as e:
         logger.debug("SUPA Megatron engines not registered: %s", e)
+
+    # Google TPU engines (TorchTitan FSDP2 / SPMD)
+    try:
+        from verl_hardware_plugin.engines import torchtitan_tpu  # noqa: F401
+
+        logger.info("Registered engines: torchtitan_tpu")
+    except Exception as e:
+        logger.debug("TPU TorchTitan engines not registered: %s", e)
