@@ -140,6 +140,91 @@ class TestPlatformRegistration:
             with mock.patch.dict(os.environ, {"VERL_PLATFORM": "intel"}):
                 assert _detect_platform_name() == "intel"
 
+    def test_xpu_device_and_vendor_names(self):
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        platform = PlatformXPU()
+        assert platform.device_name == "xpu"
+        assert platform.vendor_name == "intel"
+        assert platform.communication_backend_name() == "xccl"
+        assert platform.visible_devices_envvar() == "ZE_AFFINITY_MASK"
+
+    def test_xpu_ray_resource_options(self):
+        """XPU reuses Ray's built-in GPU resource, unlike TPU's custom "TPU" resource.
+
+        ray_resource_options() must return the num_gpus key Ray's built-in
+        GPU scheduling expects, not a custom resources dict.
+        """
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        platform = PlatformXPU()
+        assert platform.ray_resource_name() == "GPU"
+        assert platform.ray_resource_options(4) == {"num_gpus": 4}
+        assert platform.ray_resource_options(0) == {"num_gpus": 0}
+
+    def test_xpu_derives_from_platform_base(self):
+        """PlatformXPU must not acquire another vendor's platform behaviour by inheritance."""
+        from verl.plugin.platform.platform_base import PlatformBase
+        from verl.plugin.platform.platform_cuda import PlatformCUDA
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        assert issubclass(PlatformXPU, PlatformBase)
+        assert not issubclass(PlatformXPU, PlatformCUDA)
+        assert PlatformXPU.__abstractmethods__ == frozenset()
+
+    def test_xpu_no_cuda_collective_or_rollout_env(self):
+        """Neither a CUDA collective module nor extra rollout env vars apply to XPU."""
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        platform = PlatformXPU()
+        assert platform.get_collective_module() is None
+        assert platform.rollout_env_vars() == {}
+
+    def test_xpu_memory_and_capability_methods(self):
+        """set_allocator_settings() is a no-op; XPU has no CUDA compute-capability model."""
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        platform = PlatformXPU()
+        assert platform.set_allocator_settings("expandable_segments:True") is None
+        assert platform.get_device_capability() == (None, None)
+
+    def test_xpu_ray_noset_envvars(self):
+        """XPU only manages ZE_AFFINITY_MASK -- it has no CUDA_VISIBLE_DEVICES aliasing to
+        worry about, unlike TPU which deliberately keeps a CUDA entry too."""
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        assert PlatformXPU().ray_noset_envvars() == ["RAY_EXPERIMENTAL_NOSET_ZE_AFFINITY_MASK"]
+
+    def test_xpu_ipc_unsupported(self):
+        """Intel XPU has no CUDA-style IPC handle, so verl must fall back to the
+        serialized tensor transfer path instead of routing through CUDA IPC."""
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        assert PlatformXPU().is_ipc_supported() is False
+
+    def test_xpu_cudart_returns_none(self):
+        """There is no CUDA runtime on an XPU host; PlatformBase documents None as the answer."""
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        assert PlatformXPU().cudart() is None
+
+    def test_xpu_profiler_is_noop(self):
+        """XPU profiling is handled externally via Intel VTune/Advisor, not verl's profiler hooks."""
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        platform = PlatformXPU()
+        assert platform.profiler_start() is None
+        assert platform.profiler_stop() is None
+
+    def test_xpu_nvtx_range_yields(self):
+        """nvtx_range must yield immediately; XPU has no NVTX equivalent."""
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        entered = False
+        with PlatformXPU().nvtx_range("xpu-test"):
+            entered = True
+        assert entered
+
     def test_mlu_detection_with_env(self):
         from verl.plugin.platform.platform_manager import _detect_platform_name
         from verl_hardware_plugin.platforms.platform_mlu import PlatformMLU  # noqa: F401
