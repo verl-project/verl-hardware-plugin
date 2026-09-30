@@ -197,6 +197,20 @@ class PlatformXPU(PlatformBase):
         return False
 
     # ------------------------------------------------------------------
+    # Attention kernels
+    # ------------------------------------------------------------------
+
+    def attention_utils_module(self) -> Optional[str]:
+        # No dedicated flash-attn-equivalent package for XPU yet. Reuse NPU's
+        # pure-PyTorch index_first_axis/pad_input/rearrange/unpad_input
+        # (a direct copy of flash-attn's own bert_padding.py) rather than
+        # attention_utils.py's generic _fallback_* implementations: this is
+        # the same code path validated end-to-end (GRPO/PPO/SFT) on real
+        # Intel Arc Pro B-series hardware before this hook existed, whereas
+        # the generic fallback has no such hardware validation yet.
+        return "verl.utils.npu_flash_attn_utils"
+
+    # ------------------------------------------------------------------
     # Profiling helpers
     # ------------------------------------------------------------------
 
@@ -214,6 +228,29 @@ class PlatformXPU(PlatformBase):
     def profiler_stop(self) -> None:
         # No-op: see profiler_start
         pass
+
+    def profiler_markers(self):
+        # Intel VTune (ITT) tracing markers, used as the tracing-marker
+        # backend when no `nvtx` package is installed. See
+        # verl/utils/profiler/__init__.py for how verl core discovers this.
+        from verl_hardware_plugin.profilers import itt_profile_xpu
+
+        return (
+            itt_profile_xpu.mark_start_range,
+            itt_profile_xpu.mark_end_range,
+            itt_profile_xpu.mark_annotate,
+            itt_profile_xpu.marked_timer,
+        )
+
+    def dist_profiler_cls(self, tool: str):
+        # Selected when a training config sets `profiler.tool: vtune`. See
+        # verl/utils/profiler/profile.py:DistProfiler for how verl core
+        # discovers this.
+        if tool != "vtune":
+            return None
+        from verl_hardware_plugin.profilers.itt_profile_xpu import VtuneProfiler
+
+        return VtuneProfiler
 
     # ------------------------------------------------------------------
     # Model patches

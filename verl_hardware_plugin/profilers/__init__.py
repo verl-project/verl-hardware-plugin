@@ -1,7 +1,14 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Profiler integrations via monkey-patching verl's profiler utilities."""
+"""Profiler integrations via monkey-patching verl's profiler utilities.
+
+Intel XPU's profiler integration (itt_profile_xpu.py) is the exception: it
+uses the newer PlatformXPU.profiler_markers()/dist_profiler_cls() hooks
+instead of monkey-patching, so it needs no registration call here — verl
+core looks those up lazily through get_platform() rather than having them
+applied at import time.
+"""
 
 import logging
 import os

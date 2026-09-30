@@ -717,5 +717,50 @@ class TestMayEnableFlagGems:
                         may_enable_flag_gems(phase="training")
 
 
+class TestVtuneProfilerToolConfig:
+    """VtuneProfiler must accept the tool_config verl core actually hands it.
+
+    verl core has no ``tool_config.vtune`` schema entry, so ``tool_config.get("vtune")``
+    resolves to None and DistProfiler then substitutes the *whole* tool_config mapping
+    (verl/utils/profiler/profile.py: ``if tool_config is None: tool_config = config.tool_config``).
+    That mapping is truthy but carries no ``discrete``, so reading it as a plain attribute
+    raises AttributeError for every ``profiler.tool=vtune`` run. ``discrete`` is a no-op on
+    XPU anyway (PlatformXPU.profiler_start/profiler_stop are no-ops), so False is correct.
+    """
+
+    @staticmethod
+    def _vtune_cls():
+        module = pytest.importorskip("verl_hardware_plugin.profilers.itt_profile_xpu")
+        return module.VtuneProfiler
+
+    @pytest.mark.parametrize("enable", [True, False])
+    @pytest.mark.parametrize(
+        "tool_config",
+        [
+            None,
+            {},
+            # What core passes when no `vtune` block exists: the full tool_config mapping.
+            {"nsys": {"discrete": False}, "npu": {}, "torch": {}},
+        ],
+        ids=["none", "empty", "whole-tool_config-mapping"],
+    )
+    def test_discrete_defaults_false_without_vtune_block(self, tool_config, enable):
+        from verl.utils.profiler.config import ProfilerConfig
+
+        profiler = self._vtune_cls()(rank=0, config=ProfilerConfig(ranks=[0], enable=enable), tool_config=tool_config)
+        assert profiler.discrete is False
+
+    def test_explicit_discrete_is_honoured(self):
+        """An explicit `+tool_config.vtune.*` override is still read, even though XPU ignores it."""
+        from verl.utils.profiler.config import NsightToolConfig, ProfilerConfig
+
+        profiler = self._vtune_cls()(
+            rank=0,
+            config=ProfilerConfig(ranks=[0], enable=True),
+            tool_config=NsightToolConfig(discrete=True),
+        )
+        assert profiler.discrete is True
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
