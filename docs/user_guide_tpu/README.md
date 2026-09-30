@@ -61,4 +61,5 @@ Ray node labels or environment variables, the platform falls back to the v6e HBM
 
 ## Related Documentation
 
+- [vLLM rollout on TPU](./rollout.md)
 - [verl plugin system](../development.md)

@@ -26,6 +26,14 @@ from verl.plugin.platform.platform_manager import PlatformRegistry
 
 logger = logging.getLogger(__name__)
 
+_ROLLOUT_POOL_KEYWORDS = ("rollout", "reward", "teacher")
+
+
+def _is_rollout_pool(name_prefix: Optional[str]) -> bool:
+    """Whether a resource pool hosts vLLM servers (rollout, reward or teacher models)."""
+    name = (name_prefix or "").lower()
+    return any(k in name for k in _ROLLOUT_POOL_KEYWORDS)
+
 
 def _ensure_torch_tpu() -> bool:
     """Try to import torch_tpu, which registers the ``tpu_dist`` distributed backend.
@@ -475,8 +483,10 @@ class PlatformTPU(PlatformBase):
         platform has to provide it.
 
         A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per slice. Without
-        an affinity label a pool can straddle two slices, which the TPU mesh cannot span, so pin
-        it to the first slice.
+        an affinity label a pool can straddle two slices, which the TPU mesh cannot span. The
+        trainer pool is pinned to the first slice; on clusters with two or more slices, rollout
+        pools (rollout/reward/teacher) are pinned to the second so they do not wait forever for
+        chips the trainer already holds.
         """
         if accelerator_type is not None:
             return accelerator_type
@@ -490,6 +500,8 @@ class PlatformTPU(PlatformBase):
                             if res.startswith("tpu-group-"):
                                 tpu_slices.add(res)
                 slices = sorted(tpu_slices)
+                if len(slices) >= 2 and _is_rollout_pool(name_prefix):
+                    return slices[1]
                 if slices:
                     return slices[0]
         except Exception as e:
@@ -512,9 +524,11 @@ class PlatformTPU(PlatformBase):
         platform has to provide it.
 
         The slice affinity is requested as a fractional amount so it acts as a label rather
-        than a real reservation.
+        than a real reservation. Rollout pools do not reserve ``TPU`` chips: the vLLM Ray
+        executor requests them itself when it places its workers, so reserving them here as well
+        would leave the chips held by an empty bundle and vLLM waiting forever.
         """
-        if use_gpu:
+        if use_gpu and not _is_rollout_pool(name_prefix):
             bundle[device_name] = 1
         if accelerator_type is not None:
             bundle[accelerator_type] = 1e-4
