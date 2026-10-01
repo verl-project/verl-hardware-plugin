@@ -26,6 +26,14 @@ from verl.plugin.platform.platform_manager import PlatformRegistry
 
 logger = logging.getLogger(__name__)
 
+_ROLLOUT_POOL_KEYWORDS = ("rollout", "reward", "teacher")
+
+
+def _is_rollout_pool(name_prefix: Optional[str]) -> bool:
+    """Whether a resource pool hosts vLLM servers (rollout, reward or teacher models)."""
+    name = (name_prefix or "").lower()
+    return any(k in name for k in _ROLLOUT_POOL_KEYWORDS)
+
 
 def _ensure_torch_tpu() -> bool:
     """Try to import torch_tpu, which registers the ``tpu_dist`` distributed backend.
@@ -201,7 +209,18 @@ class TPUDeviceModuleProxy:
     def __init__(self, original_module):
         self.__dict__["_original_module"] = original_module
 
+    def __reduce__(self):
+        # The wrapped ``torch.tpu`` module is process-local; rebuild the proxy from the local
+        # module on the receiving side instead of trying to serialize the module object.
+        return (_rebuild_tpu_device_module_proxy, ())
+
     def __getattr__(self, name):
+        # Only called when normal lookup fails. ``_original_module`` lives in ``__dict__``
+        # after ``__init__``; if it is missing (object created by pickle without ``__init__``)
+        # answering with a lookup on it would recurse into this method forever.
+        if name.startswith("_"):
+            raise AttributeError(f"'TPUDeviceModuleProxy' object has no attribute '{name}'")
+
         if name == "set_device":
             return self.set_device
 
@@ -297,10 +316,15 @@ class TPUDeviceModuleProxy:
                 logger.warning(f"Failed to clear TPU cache: {e}")
 
 
+def _rebuild_tpu_device_module_proxy() -> "TPUDeviceModuleProxy":
+    """Unpickling target for ``TPUDeviceModuleProxy``: wrap whatever ``torch.tpu`` exists locally."""
+    return TPUDeviceModuleProxy(getattr(torch, "tpu", DummyTpuDeviceModule()))
+
+
 def patch_ray_worker() -> None:
     """Ray ``worker_process_setup_hook`` for GKE TPU pods.
 
-    Runs once in every Ray worker process before any task. It does two things:
+    Runs once in every Ray worker process before any task. It does three things:
 
     1. Pins ``VERL_PLATFORM=tpu`` so a worker that did not inherit the driver's environment still
        resolves the TPU platform.
@@ -308,6 +332,14 @@ def patch_ray_worker() -> None:
        the host's TPU chips, so a host-level index lookup can run off the end of the visible list
        and raise ``IndexError``. Returning an empty list is correct here: verl assigns chips itself
        via ``TPU_VISIBLE_CHIPS``.
+    3. Installs the plugin-side patches for the verl-core call sites that do not yet consult
+       ``PlatformTPU`` (``verl_hardware_plugin/patches/tpu/``). This is the authoritative place to
+       do so: the process is fresh, so the target modules can be imported in a controlled order.
+
+    verl main does not call ``PlatformTPU.get_ray_init_kwargs()``, so install this hook through
+    the trainer config::
+
+        +ray_kwargs.ray_init.runtime_env.worker_process_setup_hook=verl_hardware_plugin.platforms.platform_tpu.patch_ray_worker
     """
     os.environ["VERL_PLATFORM"] = "tpu"
 
@@ -325,6 +357,15 @@ def patch_ray_worker() -> None:
     except Exception as e:
         logger.warning(f"Failed to apply Ray worker accelerator patch: {e}")
 
+    try:
+        from verl.plugin.platform import get_platform
+        from verl_hardware_plugin.patches.tpu import apply_all
+
+        installed = apply_all(get_platform(), import_targets=True)
+        logger.info("TPU verl-core patches installed in Ray worker: %s", installed)
+    except Exception as e:
+        logger.warning(f"Failed to apply TPU verl-core patches in Ray worker: {e}")
+
 
 @PlatformRegistry.register(platform="tpu")
 class PlatformTPU(PlatformBase):
@@ -339,6 +380,17 @@ class PlatformTPU(PlatformBase):
         super().__init__()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         self._device_module = TPUDeviceModuleProxy(original_tpu)
+        self._warned_unpatched_pool = False
+
+        # Install the plugin-side patches for the verl-core call sites that do not yet consult
+        # this platform (see ``verl_hardware_plugin/patches/tpu/__init__.py``). Only now, when
+        # verl has actually selected TPU for this process; the XPU platform follows the same
+        # pattern. ``import_targets=False`` because this may run from a module-level
+        # ``get_device_name()`` while verl is still importing -- targets not fully imported yet
+        # are picked up by ``patch_ray_worker`` (authoritative) and the Worker patch.
+        from verl_hardware_plugin.patches.tpu import apply_all
+
+        apply_all(self, import_targets=False)
 
     @property
     def vendor_name(self) -> str:
@@ -475,8 +527,15 @@ class PlatformTPU(PlatformBase):
         platform has to provide it.
 
         A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per slice. Without
-        an affinity label a pool can straddle two slices, which the TPU mesh cannot span, so pin
-        it to the first slice.
+        an affinity label a pool can straddle two slices, which the TPU mesh cannot span. The
+        trainer pool is pinned to the first slice; on clusters with two or more slices, rollout
+        pools (rollout/reward/teacher) are pinned to the second so they do not wait forever for
+        chips the trainer already holds.
+
+        TODO(tpu): Schedule ``TPUvLLMHttpServer`` inside the replica's placement group with
+        ``placement_group_capture_child_tasks=True`` so rollout bundles can keep ``{"TPU": 1}``
+        and Ray's placement-group scheduler can place N rollout replicas across N slices without
+        hardcoding ``slices[0]`` / ``slices[1]``.
         """
         if accelerator_type is not None:
             return accelerator_type
@@ -490,6 +549,8 @@ class PlatformTPU(PlatformBase):
                             if res.startswith("tpu-group-"):
                                 tpu_slices.add(res)
                 slices = sorted(tpu_slices)
+                if len(slices) >= 2 and _is_rollout_pool(name_prefix):
+                    return slices[1]
                 if slices:
                     return slices[0]
         except Exception as e:
@@ -512,9 +573,11 @@ class PlatformTPU(PlatformBase):
         platform has to provide it.
 
         The slice affinity is requested as a fractional amount so it acts as a label rather
-        than a real reservation.
+        than a real reservation. Rollout pools do not reserve ``TPU`` chips: the vLLM Ray
+        executor requests them itself when it places its workers, so reserving them here as well
+        would leave the chips held by an empty bundle and vLLM waiting forever.
         """
-        if use_gpu:
+        if use_gpu and not _is_rollout_pool(name_prefix):
             bundle[device_name] = 1
         if accelerator_type is not None:
             bundle[accelerator_type] = 1e-4
@@ -528,33 +591,18 @@ class PlatformTPU(PlatformBase):
         name_prefix: str,
         pgs: list,
     ) -> dict[str, str]:
-        """Generate TPU-specific distributed environment variables for PJRT mesh initialization."""
+        """Generate TPU-specific distributed environment variables for PJRT mesh initialization.
+
+        ``pgs`` are the placement groups of the worker's resource pool. A pool is pinned to one
+        slice (see ``auto_assign_accelerator_type``), so its bundles, in placement-group and
+        bundle order, are exactly the processes of the PJRT mesh. This runs in the process that
+        creates the workers (the trainer's TaskRunner), so nothing here may depend on the IP of
+        the calling process -- it can be the head node or any TPU host.
+        """
         node_ip_map = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes() if node.get("Alive", False)}
         bundle_ips = []
-        local_ip = ray.util.get_node_ip_address()
-        clean_prefix = name_prefix.lower().split("_")[0] if name_prefix else ""
-        matching_pgs = []
 
-        # 1. Primary filter: Select placement group containing current worker's node IP
-        for p in pgs:
-            specs = ray._private.state.state.placement_group_table(p.id)
-            if specs.get("state") != "CREATED":
-                continue
-            bundles_map = specs.get("bundles_to_node_id", {})
-            pg_ips = [node_ip_map[node_id] for b_idx, node_id in sorted(bundles_map.items()) if node_id in node_ip_map]
-            if local_ip in pg_ips:
-                matching_pgs.append(p)
-
-        # 2. Secondary fallback: Filter by clean_prefix if placement group names are explicitly set
-        if not matching_pgs and clean_prefix:
-            for p in pgs:
-                p_name = ray._private.state.state.placement_group_table(p.id).get("name", "").lower()
-                if clean_prefix in p_name:
-                    matching_pgs.append(p)
-
-        target_pgs = matching_pgs if matching_pgs else pgs
-
-        for pg in target_pgs:
+        for pg in pgs:
             specs = ray._private.state.state.placement_group_table(pg.id)
             if specs.get("state") != "CREATED":
                 continue
@@ -611,6 +659,20 @@ class PlatformTPU(PlatformBase):
         device_name: str,
     ) -> dict[str, str]:
         """Return platform-specific TPU environment variables for worker nodes."""
+        from verl_hardware_plugin.patches.tpu import is_applied
+
+        if not is_applied("ray_resource_pool_patch") and not getattr(self, "_warned_unpatched_pool", False):
+            # verl-core built this pool's placement groups without consulting
+            # auto_assign_accelerator_type / configure_placement_group_bundle. On a multi-slice
+            # cluster that is a hang, not an error, so say it here where the pool is first used.
+            self._warned_unpatched_pool = True
+            logger.error(
+                "RayResourcePool was created before the TPU core patches were installed; placement "
+                "groups have no slice affinity and rollout bundles reserve TPU chips. Configure "
+                "+ray_kwargs.ray_init.runtime_env.worker_process_setup_hook="
+                "verl_hardware_plugin.platforms.platform_tpu.patch_ray_worker"
+            )
+
         env_vars = {}
         if "VERL_PLATFORM" in os.environ:
             env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]

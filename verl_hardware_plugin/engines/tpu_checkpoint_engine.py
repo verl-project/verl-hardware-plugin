@@ -567,6 +567,17 @@ async def update_tpu_weights(manager: Any, global_steps: int | None = None) -> d
     ]
     results = await asyncio.gather(*futures)
 
+    # Drop prefix/KV cache computed with the old weights and tell the servers which weight
+    # version they serve now. The trainer stamps every trajectory with that version
+    # (``min_global_steps`` / ``max_global_steps``) and its staleness metrics require an int.
+    cache_and_step_futures = []
+    for replica in manager.replicas:
+        cache_and_step_futures.append(replica.server_handle.clear_kv_cache.remote())
+        if global_steps is not None:
+            cache_and_step_futures.append(replica.server_handle.set_global_steps.remote(global_steps))
+    if cache_and_step_futures:
+        await asyncio.gather(*cache_and_step_futures)
+
     try:
         await registry.clear.remote()
     except Exception:
@@ -622,7 +633,7 @@ def apply_tpu_checkpoint_engine_hooks() -> None:
         import verl.checkpoint_engine.base as ckpt_base
         from verl.plugin.platform import get_platform
 
-        if not getattr(ckpt_base, "_verl_tpu_ckpt_patched", False):
+        if not getattr(ckpt_base.CheckpointEngineManager.update_weights, "_verl_tpu_ckpt_patched", False):
             _orig_worker_init = ckpt_base.CheckpointEngineWorker.__init__
             _orig_mgr_update = ckpt_base.CheckpointEngineManager.update_weights
 
@@ -650,7 +661,7 @@ def apply_tpu_checkpoint_engine_hooks() -> None:
 
             ckpt_base.CheckpointEngineWorker.__init__ = _patched_worker_init
             ckpt_base.CheckpointEngineManager.update_weights = _patched_mgr_update
-            ckpt_base._verl_tpu_ckpt_patched = True
+            _patched_mgr_update._verl_tpu_ckpt_patched = True  # type: ignore[attr-defined]
     except Exception as e:
         logger.debug("Failed to patch CheckpointEngineWorker/Manager for TPU: %s", e)
 

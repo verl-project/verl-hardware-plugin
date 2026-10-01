@@ -351,6 +351,47 @@ class TestPlatformRegistration:
 
         assert PlatformTPU().visible_devices_envvar() == "CUDA_VISIBLE_DEVICES"
 
+    def test_tpu_env_vars_cover_whole_pool_regardless_of_caller_node(self):
+        """The PJRT mesh spans every bundle of the pool's placement groups.
+
+        get_worker_env_vars() runs in the TaskRunner, whose node Ray picks freely. An earlier
+        version kept only the placement group containing the *caller's* IP, which produced a
+        4-address slice-builder list on an 8-chip pool whenever the TaskRunner landed on a
+        TPU host ("Expected 8 worker addresses, got 4").
+        """
+        from unittest import mock
+
+        import ray
+
+        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+
+        nodes = [
+            {"NodeID": "n0", "NodeManagerAddress": "10.0.0.1", "Alive": True, "Resources": {"TPU": 4}, "Labels": {}},
+            {"NodeID": "n1", "NodeManagerAddress": "10.0.0.2", "Alive": True, "Resources": {"TPU": 4}, "Labels": {}},
+        ]
+        tables = {
+            "pg0": {"state": "CREATED", "bundles_to_node_id": {i: "n0" for i in range(4)}},
+            "pg1": {"state": "CREATED", "bundles_to_node_id": {i: "n1" for i in range(4)}},
+        }
+        pgs = [mock.Mock(id="pg0"), mock.Mock(id="pg1")]
+
+        def env_for_caller(caller_ip):
+            with (
+                mock.patch.object(ray, "nodes", return_value=nodes),
+                mock.patch.object(ray._private.state.state, "placement_group_table", side_effect=tables.__getitem__),
+                mock.patch.object(ray.util, "get_node_ip_address", return_value=caller_ip),
+            ):
+                return PlatformTPU().get_tpu_env_vars(
+                    rank=5, world_size=8, local_rank=1, local_world_size=4, name_prefix="global_pool", pgs=pgs
+                )
+
+        head = env_for_caller("10.0.9.9")
+        on_slice_host = env_for_caller("10.0.0.1")
+        assert head == on_slice_host
+        assert head["TPU_WORKER_HOSTNAMES"] == "10.0.0.1,10.0.0.2"
+        assert len(head["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 8
+        assert head["CLOUD_TPU_TASK_ID"] == "1" and head["TPU_VISIBLE_CHIPS"] == "1"
+
     def test_tpu_cudart_returns_none(self):
         """There is no CUDA runtime on a TPU host; PlatformBase documents None as the answer."""
         from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
