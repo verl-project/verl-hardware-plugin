@@ -385,12 +385,3 @@ def test_resolve_tpu_topology_bounds_env_override():
 
     with mock.patch.dict(os.environ, {"TORCH_TPU_TOPOLOGY": "4,4,1", "VLLM_TPU_CHIPS_PER_HOST": "8"}):
         assert _resolve_tpu_topology_bounds(16, 2) == ("4,4,1", "4,4,1", "1,1,1", "8")
-
-
-def test_server_max_concurrency_prefers_config_and_falls_back_to_replica(tpu_vllm):
-    _server_max_concurrency = tpu_vllm._server_max_concurrency
-
-    upstream = SimpleNamespace(config=SimpleNamespace(ray_actor_max_concurrency=1234), max_concurrency=1)
-    assert _server_max_concurrency(upstream) == 1234
-    older = SimpleNamespace(config=SimpleNamespace(), max_concurrency=1100)
-    assert _server_max_concurrency(older) == 1100

@@ -24,9 +24,6 @@ registered before it, so other platforms are unaffected. No verl core file is mo
 | `vLLMHttpServer._preprocess_engine_kwargs` | `distributed_executor_backend=external_launcher`, `enable_sleep_mode=False`, `TPU_MULTIHOST_BACKEND=ray`, `VLLM_DISABLE_COMPILE_CACHE=1` | `patch_vllm_for_tpu` then selects the Ray executor for multi-host engines at config time. Sleep mode is off because rollout runs on its own slice (TPU chips cannot be shared between colocated worker groups), so nothing needs the HBM back. |
 | `PlatformTPU.auto_assign_accelerator_type` | gives each pool the first `tpu-group-<n>` slice that no earlier pool claimed | Keeps every host of a multi-host pool within one slice and puts the trainer and rollout pools on different slices. |
 
-The server actor's Ray `max_concurrency` comes from `RolloutConfig.ray_actor_max_concurrency` when
-verl has it and from `vLLMReplica.max_concurrency` otherwise.
-
 ## Where each patch runs and when it can be removed
 
 A multi-slice TPU rollout job involves five kinds of processes:

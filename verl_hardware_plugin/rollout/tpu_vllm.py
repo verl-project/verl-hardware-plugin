@@ -277,16 +277,6 @@ def _tpu_preflight_log(message: str, tag: str = "TPU preflight") -> None:
     print(f"[{tag}] {message}", flush=True)
 
 
-def _server_max_concurrency(replica: vLLMReplica) -> int:
-    """Ray ``max_concurrency`` for the server actor.
-
-    Upstream verl reads ``RolloutConfig.ray_actor_max_concurrency``; older builds (including the
-    TPU fork) only expose ``vLLMReplica.max_concurrency``.
-    """
-    value = getattr(replica.config, "ray_actor_max_concurrency", None)
-    return value if value is not None else replica.max_concurrency
-
-
 async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
     """Launch the vLLM rollout server actor for a TPU replica."""
     if replica.config.data_parallel_size > 1:
@@ -356,7 +346,7 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
         ),
         runtime_env={"env_vars": env_vars},
         name=name,
-        max_concurrency=_server_max_concurrency(replica),
+        max_concurrency=replica.config.ray_actor_max_concurrency,
     ).remote(
         config=replica.config,
         model_config=replica.model_config,
