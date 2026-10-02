@@ -113,7 +113,6 @@ def patch_vllm_for_tpu() -> None:
 
     # Environment side effects. Cheap and safe to repeat in every process that calls this.
     patch_multiprocessing_for_tpu()
-    os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
     # vLLM can reload a degenerate AOT compile artifact (num_artifacts=0) that silently runs the
     # model eagerly; eager execution then hits the XLA:TPU unaligned-DUS CHECK (b/501165531).
     os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
