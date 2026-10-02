@@ -62,7 +62,6 @@ actor (via `RayWorkerWrapper.__init__`).
 | Patch | Process where it executes | What it does |
 |---|---|---|
 | `allow_in_graph` on `c10d_functional` ops | `EngineCoreProc` & `RayWorkerWrapper` | Keeps PyTorch functional collectives inside the `torch.compile` / Dynamo graph. |
-| `os.environ.__setitem__` guard | `EngineCoreProc` & `RayWorkerWrapper` | Prevents the driver's single-host/default topology env vars from overwriting a TPU pod's own topology; strips `megachip_tccontrol` from `LIBTPU_INIT_ARGS`. |
 | `initialize_ray_cluster`: reuse verl placement groups via `VERL_TPU_PG_IDS` | `EngineCoreProc` | Connects to Ray with vLLM's `ray_runtime_env` (preserving `py_modules`) and attaches directly to the replica's `RayResourcePool` placement groups (`VERL_TPU_PG_IDS`) instead of creating a duplicate placement group. |
 | `initialize_dummy_weights` no-op, `torch.set_grad_enabled(False)` in `init_worker` | `RayWorkerWrapper` | Skips random weight initialization under `load_format=dummy` because trainer weights are synced right after engine init. |
 | `EngineArgs.create_engine_config` | `TPUvLLMHttpServer` & `EngineCoreProc` | Selects the `ray` executor with `async_scheduling=False` for multi-host slices, and the local executor with `async_scheduling=True` for single-host slices; clears stale DP fields when `data_parallel_size <= 1`. |

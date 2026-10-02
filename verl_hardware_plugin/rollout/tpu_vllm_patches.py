@@ -262,24 +262,6 @@ def patch_vllm_for_tpu() -> None:
         TPUWorker.reset_encoder_cache = dummy_reset_encoder_cache
         logger.info("Patched TPUWorker.reset_encoder_cache with no-op stub.")
 
-        original_driver_environ_setitem = os.environ.__class__.__setitem__
-
-        def patched_driver_environ_setitem(self, key, value):
-            if key in (
-                "TORCH_TPU_SLICEBUILDER_ADDRESSES",
-                "TPU_PROCESS_ADDRESSES",
-                "TPU_CHIPS_PER_HOST_BOUNDS",
-                "TPU_HOST_BOUNDS",
-                "TORCH_TPU_TOPOLOGY",
-                "TPU_WORKER_HOSTNAMES",
-            ):
-                value = os.environ.get(key, value)
-            elif key == "LIBTPU_INIT_ARGS":
-                value = value.replace("--deepsea_chip_config_name=megachip_tccontrol", "")
-            original_driver_environ_setitem(self, key, value)
-
-        os.environ.__class__.__setitem__ = patched_driver_environ_setitem  # type: ignore[method-assign]
-
         orig_init_ray_cluster = v1_ray_utils.initialize_ray_cluster
 
         def patched_initialize_ray_cluster(parallel_config, ray_address=None, *args, **kwargs):
