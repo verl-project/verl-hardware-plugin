@@ -114,12 +114,6 @@ async def get_tpu_server_launch_config(workers):
     return node_id, visible_chips, tpu_env_vars
 
 
-def _tpu_preflight_log(message: str, tag: str = "TPU preflight") -> None:
-    """Emit a preflight message via both logging and stdout."""
-    logger.warning("[%s] %s", tag, message)
-    print(f"[{tag}] {message}", flush=True)
-
-
 async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
     """Launch the vLLM rollout server actor for a TPU replica."""
     if replica.config.data_parallel_size > 1:
@@ -144,41 +138,16 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
     else:
         name = f"{prefix}server_{replica.replica_rank}_0{replica.name_suffix}"
 
-    platform_env_vars = get_platform().rollout_env_vars()
     env_vars = {
         **{var: "1" for var in get_platform().ray_noset_envvars()},
-        **platform_env_vars,
+        **get_platform().rollout_env_vars(),
         **tpu_env_vars,
     }
     if "VERL_PLATFORM" in os.environ:
         env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
-
-    flags_to_copy = set()
-    resource_pool = getattr(replica, "resource_pool", None)
-    if resource_pool is not None:
-        pgs = resource_pool.get_placement_groups(device_name=get_device_name())
-        if pgs:
-            env_vars["VERL_TPU_PG_IDS"] = ",".join(pg.id.hex() for pg in pgs)
-            flags_to_copy.add("VERL_TPU_PG_IDS")
-
-    for flag_var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS"):
-        base_value = platform_env_vars.get(flag_var) or tpu_env_vars.get(flag_var)
-        extra_value = os.environ.get(f"VERL_TPU_EXTRA_{flag_var}")
-        resolved = " ".join(v for v in (base_value, extra_value) if v)
-        _tpu_preflight_log(
-            f"{flag_var}: base={base_value!r} extra={extra_value!r} -> engine={resolved or None!r}",
-            tag="TPU env",
-        )
-        if resolved:
-            env_vars[flag_var] = resolved
-            flags_to_copy.add(flag_var)
-
-    if flags_to_copy:
-        copy_var = "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"
-        existing = env_vars.get(copy_var) or os.environ.get(copy_var) or ""
-        names = {tok.strip() for tok in existing.split(",") if tok.strip()}
-        env_vars[copy_var] = ",".join(sorted(names | flags_to_copy))
-        _tpu_preflight_log(f"{copy_var}={env_vars[copy_var]}", tag="TPU env")
+    # The initialize_ray_cluster patch in patch_vllm_for_tpu attaches vLLM to these placement groups.
+    pgs = replica.resource_pool.get_placement_groups(device_name=get_device_name())
+    env_vars["VERL_TPU_PG_IDS"] = ",".join(pg.id.hex() for pg in pgs)
 
     server = replica.server_class.options(
         scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(

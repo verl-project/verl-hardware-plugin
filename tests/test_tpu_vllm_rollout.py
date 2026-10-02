@@ -252,10 +252,7 @@ def test_launch_tpu_vllm_servers_single_server_spanning_all_workers(tpu_vllm):
     platform = SimpleNamespace(ray_noset_envvars=lambda: ["RAY_NOSET"], rollout_env_vars=lambda: {})
 
     async def run():
-        with (
-            mock.patch.object(tpu_vllm, "get_platform", return_value=platform),
-            mock.patch.dict(os.environ, {"VERL_TPU_EXTRA_LIBTPU_INIT_ARGS": "--extra"}),
-        ):
+        with mock.patch.object(tpu_vllm, "get_platform", return_value=platform):
             await tpu_vllm.launch_tpu_vllm_servers(replica)
 
     asyncio.run(run())
@@ -269,9 +266,8 @@ def test_launch_tpu_vllm_servers_single_server_spanning_all_workers(tpu_vllm):
     assert env_vars["RAY_NOSET"] == "1"
     assert env_vars["TPU_WORKER_ID"] == "0"
     assert "UNRELATED" not in env_vars
-    assert env_vars["LIBTPU_INIT_ARGS"] == "--base --extra"
+    assert env_vars["LIBTPU_INIT_ARGS"] == "--base"
     assert env_vars["VERL_TPU_PG_IDS"] == "pg0hex,pg1hex"
-    assert env_vars["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == "LIBTPU_INIT_ARGS,VERL_TPU_PG_IDS"
 
     init = server_class.init_kwargs
     assert init["workers"] is replica.workers
