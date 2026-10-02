@@ -125,10 +125,7 @@ def patch_vllm_for_tpu() -> None:
     # time: if they are absent, leave _PATCHES_APPLIED=False so a rollout process can still
     # install the executor patches when vLLM is available.
     try:
-        import torch
         import vllm.envs as vllm_envs
-        import vllm.model_executor.model_loader.dummy_loader as vllm_dummy_loader
-        import vllm.model_executor.model_loader.weight_utils as vllm_weight_utils
         import vllm.v1.executor.ray_executor as v1_ray_executor
         import vllm.v1.executor.ray_utils as v1_ray_utils
         import vllm_torchtpu.envs as tpu_envs
@@ -243,7 +240,6 @@ def patch_vllm_for_tpu() -> None:
         v1_ray_executor.initialize_ray_cluster = patched_initialize_ray_cluster
 
         OriginalRayWorkerWrapper = ray_distributed_executor.RayWorkerWrapper
-        original_init_worker = OriginalRayWorkerWrapper.init_worker
         original_wrapper_init = OriginalRayWorkerWrapper.__init__
 
         def patched_wrapper_init(self, *args, **kwargs):
@@ -252,17 +248,6 @@ def patch_vllm_for_tpu() -> None:
             return original_wrapper_init(self, *args, **kwargs)
 
         OriginalRayWorkerWrapper.__init__ = patched_wrapper_init
-
-        def patched_init_worker(self, *args, **kwargs):
-            patch_vllm_for_tpu()
-            # Weights are transferred from the trainer before generation starts, so skip random
-            # weight initialization under load_format=dummy to save startup time and HBM.
-            vllm_weight_utils.initialize_dummy_weights = lambda *a, **kw: None
-            vllm_dummy_loader.initialize_dummy_weights = lambda *a, **kw: None
-            torch.set_grad_enabled(False)
-            return original_init_worker(self, *args, **kwargs)
-
-        OriginalRayWorkerWrapper.init_worker = patched_init_worker
 
         def patched_init_workers_ray(self, placement_group, **ray_remote_kwargs):
             RayWorkerWrapper_local = ray_distributed_executor.RayWorkerWrapper
