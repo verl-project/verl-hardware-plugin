@@ -16,7 +16,6 @@ import multiprocessing.process
 import os
 import time
 from collections import defaultdict
-from typing import Any
 
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -104,56 +103,6 @@ def patch_multiprocessing_for_tpu() -> None:
     multiprocessing.process.BaseProcess._tpu_patched = True  # type: ignore[attr-defined]
 
 
-def _register_c10d_ops_in_dynamo() -> None:
-    """Allow PyTorch c10d functional collective ops inside torch.compile / Dynamo graphs."""
-    try:
-        import torch
-        import torch._dynamo
-        import torch._ops
-        import torch.compiler
-    except ImportError as exc:
-        logger.debug("Skipping c10d Dynamo registration (torch not available): %s", exc)
-        return
-
-    allow_fns = [
-        fn
-        for fn in (
-            getattr(torch.compiler, "allow_in_graph", None),
-            getattr(torch._dynamo, "allow_in_graph", None),
-        )
-        if fn is not None
-    ]
-    if not allow_fns:
-        return
-
-    def _allow(op: Any) -> None:
-        if op is None:
-            return
-        for fn in allow_fns:
-            try:
-                fn(op)
-            except Exception:
-                # Non-callable attributes on the OpNamespace (e.g. __doc__, __name__) cannot
-                # be registered with allow_in_graph and are expected to raise TypeError.
-                continue
-
-    for ns_name in ("_c10d_functional", "c10d_functional"):
-        ns = getattr(torch.ops, ns_name, None)
-        if ns is None:
-            continue
-        _allow(ns)
-        for name in dir(ns):
-            if name.startswith("_"):
-                continue
-            try:
-                attr = getattr(ns, name)
-            except Exception:
-                continue
-            _allow(attr)
-            if hasattr(attr, "default"):
-                _allow(attr.default)
-
-
 def patch_vllm_for_tpu() -> None:
     """
     Apply TPU-specific patches and workarounds to vLLM and vllm-torchtpu workers.
@@ -171,8 +120,6 @@ def patch_vllm_for_tpu() -> None:
 
     if _PATCHES_APPLIED:
         return
-
-    _register_c10d_ops_in_dynamo()
 
     # CPU unit tests and non-rollout processes may not have vllm or vllm_torchtpu installed.
     # Import all required vLLM / vllm-torchtpu symbols once here rather than at module import

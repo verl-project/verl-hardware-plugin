@@ -353,9 +353,10 @@ def test_patch_vllm_for_tpu_env_side_effects_without_torchtpu(isolated_patches):
 
 def test_patch_vllm_for_tpu_is_a_no_op_once_applied(isolated_patches):
     isolated_patches._PATCHES_APPLIED = True
-    with mock.patch.object(isolated_patches, "_register_c10d_ops_in_dynamo") as register:
+    # vLLM is made unimportable, so getting past the guard would log "Skipping vLLM TPU executor patches".
+    with mock.patch.dict(sys.modules, {"vllm": None}), mock.patch.object(isolated_patches.logger, "debug") as debug:
         isolated_patches.patch_vllm_for_tpu()
-    register.assert_not_called()
+    debug.assert_not_called()
     assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "1"  # env side effects still re-applied
 
 
