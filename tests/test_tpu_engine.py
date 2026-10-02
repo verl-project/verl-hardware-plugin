@@ -164,7 +164,7 @@ def test_auto_assign_accelerator_type_single_slice_shares_slice():
         assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-0"
 
 
-def test_configure_placement_group_bundle_rollout_pool_does_not_reserve_tpu():
+def test_configure_placement_group_bundle_reserves_tpu_for_all_gpu_pools():
     from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
 
     platform = PlatformTPU()
@@ -174,4 +174,4 @@ def test_configure_placement_group_bundle_rollout_pool_does_not_reserve_tpu():
 
     rollout: dict = {"CPU": 1}
     platform.configure_placement_group_bundle(rollout, True, "TPU", "rollout_pool_0", "tpu-group-1")
-    assert rollout == {"CPU": 1, "tpu-group-1": 1e-4}
+    assert rollout == {"CPU": 1, "TPU": 1, "tpu-group-1": 1e-4}

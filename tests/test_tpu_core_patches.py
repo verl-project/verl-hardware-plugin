@@ -160,8 +160,7 @@ def test_ray_resource_pool_patch_shapes_bundles(platform, _restore_module_attrs,
     trainer_bundles = next(b for n, b in created.items() if n.startswith("global_pool"))
     rollout_bundles = next(b for n, b in created.items() if n.startswith("rollout_pool"))
     assert trainer_bundles == [{"CPU": 1, "TPU": 1, "tpu-group-0": 1e-4}] * 2
-    # vLLM's Ray executor reserves the chips itself; the pool only carries the slice label.
-    assert rollout_bundles == [{"CPU": 1, "tpu-group-1": 1e-4}] * 2
+    assert rollout_bundles == [{"CPU": 1, "TPU": 1, "tpu-group-1": 1e-4}] * 2
 
 
 # ---------------------------------------------------------------------------

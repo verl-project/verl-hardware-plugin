@@ -341,42 +341,28 @@ def patch_vllm_for_tpu() -> None:
             # without the job's py_modules / working_dir.
             if not ray.is_initialized():
                 ray.init(address=ray_address, runtime_env=getattr(parallel_config, "ray_runtime_env", None))
-            if parallel_config.placement_group is None:
-                curr_pg = ray.util.get_current_placement_group()
-                if curr_pg is None:
-                    try:
-                        pgs = ray.util.placement_group_table()
-                        for pg_id, pg_info in pgs.items():
-                            state = (
-                                pg_info.get("state") if isinstance(pg_info, dict) else getattr(pg_info, "state", None)
-                            )
-                            if hasattr(state, "name"):
-                                state = state.name
-                            name = pg_info.get("name") if isinstance(pg_info, dict) else getattr(pg_info, "name", None)
-                            if (
-                                str(state) in ("CREATED", "1")
-                                and name
-                                and ("rollout" in str(name) or "global" in str(name))
-                            ):
-                                try:
-                                    candidate_pg = ray.util.get_placement_group(name)
-                                    if candidate_pg is not None:
-                                        num_bundles = len(getattr(candidate_pg, "bundle_specs", []))
-                                        if num_bundles >= parallel_config.world_size:
-                                            curr_pg = candidate_pg
-                                            break
-                                except Exception as pg_lookup_err:
-                                    logger.debug("Ignoring unresolvable placement group %s: %s", name, pg_lookup_err)
-                    except Exception as pg_table_err:
-                        logger.warning("Failed to query Ray placement_group_table for TPU rollout: %s", pg_table_err)
-                parallel_config.placement_group = curr_pg
-            try:
-                return orig_init_ray_cluster(parallel_config, ray_address, *args, **kwargs)
-            except ValueError as e:
-                if "exceeds the total number of available" in str(e) or "placement group" in str(e):
-                    logger.warning("Bypassed vLLM placement group size validation on multi-node TPU: %s", e)
+            pg_ids_str = os.environ.get("VERL_TPU_PG_IDS", "")
+            if pg_ids_str:
+                from ray._raylet import PlacementGroupID
+                from ray.util.placement_group import PlacementGroup
+
+                verl_pgs = [
+                    PlacementGroup(PlacementGroupID.from_hex(pg_hex.strip()))
+                    for pg_hex in pg_ids_str.split(",")
+                    if pg_hex.strip()
+                ]
+                if verl_pgs:
+                    parallel_config.placement_group = verl_pgs[0]
+                    parallel_config._verl_tpu_placement_groups = verl_pgs
+                    logger.info(
+                        "Reusing %d verl placement group(s) for TPU rollout: %s",
+                        len(verl_pgs),
+                        [pg.id.hex() for pg in verl_pgs],
+                    )
                     return
-                raise
+            if parallel_config.placement_group is None:
+                parallel_config.placement_group = ray.util.get_current_placement_group()
+            return orig_init_ray_cluster(parallel_config, ray_address, *args, **kwargs)
 
         v1_ray_executor.initialize_ray_cluster = patched_initialize_ray_cluster
 
@@ -422,8 +408,9 @@ def patch_vllm_for_tpu() -> None:
             if self.parallel_config.ray_workers_use_nsight:
                 ray_remote_kwargs = self._configure_ray_workers_use_nsight(ray_remote_kwargs)
 
-            bundle_indices = []
-            if vllm_envs.VLLM_RAY_BUNDLE_INDICES:
+            verl_pgs = getattr(self.parallel_config, "_verl_tpu_placement_groups", None) or [placement_group]
+            pg_bundle_pairs = []
+            if vllm_envs.VLLM_RAY_BUNDLE_INDICES and len(verl_pgs) == 1:
                 bundle_indices = list(map(int, vllm_envs.VLLM_RAY_BUNDLE_INDICES.split(",")))
                 assert len(bundle_indices) == self.parallel_config.world_size, (
                     "VLLM_RAY_BUNDLE_INDICES must have the same size"
@@ -433,17 +420,19 @@ def patch_vllm_for_tpu() -> None:
                 assert len(set(bundle_indices)) == len(bundle_indices), (
                     f"VLLM_RAY_BUNDLE_INDICES cannot have duplicate values, but got {bundle_indices=}"
                 )
+                pg_bundle_pairs = [(verl_pgs[0], b_id) for b_id in bundle_indices]
             else:
-                for bundle_id, bundle in enumerate(placement_group.bundle_specs):
-                    if bundle.get(current_platform.ray_device_key, 0):
-                        bundle_indices.append(bundle_id)
+                for pg in verl_pgs:
+                    for bundle_id, bundle in enumerate(pg.bundle_specs):
+                        if bundle.get(current_platform.ray_device_key, 0):
+                            pg_bundle_pairs.append((pg, bundle_id))
 
             worker_metadata = []
             driver_ip = get_ip()
             num_tpu_per_worker = 1.0
-            for rank, bundle_id in enumerate(bundle_indices):
+            for rank, (pg, bundle_id) in enumerate(pg_bundle_pairs[: self.parallel_config.world_size]):
                 scheduling_strategy = PlacementGroupSchedulingStrategy(
-                    placement_group=placement_group,
+                    placement_group=pg,
                     placement_group_capture_child_tasks=True,
                     placement_group_bundle_index=bundle_id,
                 )

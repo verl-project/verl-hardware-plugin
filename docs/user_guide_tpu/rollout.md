@@ -24,7 +24,7 @@ registered before it, so other platforms are unaffected. No verl core file is mo
 | `RolloutReplica.init_standalone` | copy with `use_gpu=self.rollout_worker_use_gpu()` | verl hardcodes `use_gpu=True` in standalone mode. Drop the override once verl asks the hook, as `init_colocated` already does. |
 | `vLLMHttpServer._preprocess_engine_kwargs` | `distributed_executor_backend=external_launcher`, `enable_sleep_mode=False`, `TPU_MULTIHOST_BACKEND=ray`, `VLLM_DISABLE_COMPILE_CACHE=1` | `patch_vllm_for_tpu` then selects the Ray executor for multi-host engines at config time. Sleep mode is off because rollout runs on its own slice (TPU chips cannot be shared between colocated worker groups), so nothing needs the HBM back. |
 | `vLLMHttpServer.collective_rpc` | returns the engine result | verl's version awaits `engine.collective_rpc` and returns `None`. The TPU weight-sync paths need the per-worker return values. |
-| `PlatformTPU.auto_assign_accelerator_type` / `configure_placement_group_bundle` | rollout/reward/teacher pools pinned to the second `tpu-group-<n>` slice; their bundles do not reserve `TPU` | Otherwise the rollout placement groups ask for the slice the trainer already holds and wait forever; vLLM's Ray executor claims the chips itself. |
+| `PlatformTPU.auto_assign_accelerator_type` / `configure_placement_group_bundle` | assigns each pool to the next available `tpu-group-<n>` slice with sufficient free `TPU` capacity; every GPU/TPU pool reserves `TPU: 1` per bundle | Keeps all hosts of a multi-host pool within a single physical TPU slice while allowing `N` trainer/rollout/reward/teacher pools to scale across `N` slices via Ray placement groups (`VERL_TPU_PG_IDS`). |
 
 The server actor's Ray `max_concurrency` comes from `RolloutConfig.ray_actor_max_concurrency` when
 verl has it and from `vLLMReplica.max_concurrency` otherwise.
@@ -47,7 +47,7 @@ through; **both are temporary and should be deleted once upstream `verl` calls t
 
 | Patch | Process where it executes | verl call site | What it routes | Removal condition |
 |---|---|---|---|---|
-| `ray_resource_pool_patch` | **`TaskRunner` actor** (on the head/coordinator node, where resource pools and placement groups are created) | `RayResourcePool.__init__` / `get_placement_groups` | `auto_assign_accelerator_type` (rollout pools go to the second slice) and `configure_placement_group_bundle` (rollout bundles do not reserve `TPU`). | Upstream `verl` calls `auto_assign_accelerator_type` and `configure_placement_group_bundle` in `RayResourcePool`. |
+| `ray_resource_pool_patch` | **`TaskRunner` actor** (on the head/coordinator node, where resource pools and placement groups are created) | `RayResourcePool.__init__` / `get_placement_groups` | `auto_assign_accelerator_type` (assigns each pool to a `tpu-group-<n>` slice with sufficient free `TPU` capacity) and `configure_placement_group_bundle`. | Upstream `verl` calls `auto_assign_accelerator_type` and `configure_placement_group_bundle` in `RayResourcePool`. |
 | `worker_local_rank_patch` | **Every verl `Worker` & `CheckpointEngineWorker` actor** (on the TPU worker nodes) | `Worker._setup_env_cuda_visible_devices` | `ray_local_rank_override` (`LOCAL_RANK` from `TPU_VISIBLE_CHIPS`) and skips eager `set_device` in `CheckpointEngineWorker`. | Upstream `verl` calls `ray_local_rank_override` in `Worker._setup_env_cuda_visible_devices`. |
 
 verl main also does not call `PlatformTPU.get_ray_init_kwargs()`, so the Ray
@@ -78,7 +78,7 @@ vLLM `RayWorkerWrapper` actor (via `RayWorkerWrapper.__init__`).
 | Strip `worker_process_setup_hook` from `ray.init` | `TPUvLLMHttpServer` & `EngineCoreProc` | Ray forbids passing a job-level `worker_process_setup_hook` when a child process calls `ray.init` to attach to an existing cluster. |
 | `os.environ.__setitem__` guard | `EngineCoreProc` & `RayWorkerWrapper` | Prevents the driver's single-host/default topology env vars from overwriting a TPU pod's own topology; strips `megachip_tccontrol` from `LIBTPU_INIT_ARGS`. |
 | `available_resources_per_node` forces `TPU >= 4` | `EngineCoreProc` | Satisfies vLLM's per-node TPU resource check when verl's placement group is already created. |
-| `initialize_ray_cluster`: PG discovery and swallowed size-validation `ValueError` | `EngineCoreProc` | Connects to Ray with vLLM's `ray_runtime_env` (preserving `py_modules`), attaches to verl's `rollout_pool` placement group, and bypasses vLLM's bundle-resource validation (since rollout bundles intentionally omit `TPU: 1`). |
+| `initialize_ray_cluster`: reuse verl placement groups via `VERL_TPU_PG_IDS` | `EngineCoreProc` | Connects to Ray with vLLM's `ray_runtime_env` (preserving `py_modules`) and attaches directly to the replica's `RayResourcePool` placement groups (`VERL_TPU_PG_IDS`) instead of creating a duplicate placement group. |
 | `initialize_dummy_weights` no-op, `torch.set_grad_enabled(False)` in `init_worker` | `RayWorkerWrapper` | Skips random weight initialization under `load_format=dummy` because trainer weights are synced right after engine init. |
 | `EngineArgs.create_engine_config` | `TPUvLLMHttpServer` & `EngineCoreProc` | Selects the `ray` executor with `async_scheduling=False` for multi-host slices, and the local executor with `async_scheduling=True` for single-host slices; clears stale DP fields when `data_parallel_size <= 1`. |
 

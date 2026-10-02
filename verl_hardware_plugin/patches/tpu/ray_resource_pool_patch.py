@@ -95,7 +95,9 @@ def _patched_pool_init(self, *args, **kwargs):
 
     _original_pool_init(self, *args, **kwargs)
     if self.accelerator_type is None:
-        self.accelerator_type = platform.auto_assign_accelerator_type(self.name_prefix, None)
+        self.accelerator_type = platform.auto_assign_accelerator_type(
+            self.name_prefix, None, required_tpus=self.world_size
+        )
 
 
 def apply(platform) -> bool:

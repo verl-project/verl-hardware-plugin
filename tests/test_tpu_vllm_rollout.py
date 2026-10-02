@@ -113,7 +113,6 @@ def test_vllm_loader_defers_off_tpu_and_picks_tpu_replica_on_tpu():
 
 
 def test_module_import_does_not_patch_off_tpu(tpu_vllm):
-
     assert not tpu_vllm.is_tpu_vllm_run()
     assert not tpu_vllm_patches._PATCHES_APPLIED
 
@@ -248,6 +247,12 @@ def _fake_replica(data_parallel_size=1):
         is_teacher_model=False,
         gpus_per_replica_node=4,
         nnodes=2,
+        resource_pool=SimpleNamespace(
+            get_placement_groups=lambda device_name=None: [
+                SimpleNamespace(id=SimpleNamespace(hex=lambda: "pg0hex")),
+                SimpleNamespace(id=SimpleNamespace(hex=lambda: "pg1hex")),
+            ]
+        ),
         servers=[],
         server_class=_FakeServerClass(),
         _get_server_name_prefix=lambda: "vllm_",
@@ -278,7 +283,8 @@ def test_launch_tpu_vllm_servers_single_server_spanning_all_workers(tpu_vllm):
     assert env_vars["TPU_WORKER_ID"] == "0"
     assert "UNRELATED" not in env_vars
     assert env_vars["LIBTPU_INIT_ARGS"] == "--base --extra"
-    assert env_vars["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == "LIBTPU_INIT_ARGS"
+    assert env_vars["VERL_TPU_PG_IDS"] == "pg0hex,pg1hex"
+    assert env_vars["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == "LIBTPU_INIT_ARGS,VERL_TPU_PG_IDS"
 
     init = server_class.init_kwargs
     assert init["workers"] is replica.workers
@@ -375,7 +381,6 @@ def test_patched_ray_init_strips_worker_process_setup_hook(isolated_patches):
 
 
 def test_pickleable_process_wrapper_applies_patches_before_target():
-
     wrapper = pickle.loads(pickle.dumps(tpu_vllm_patches.PickleableProcessWrapper(len)))
     with mock.patch.object(tpu_vllm_patches, "patch_vllm_for_tpu") as patch:
         assert wrapper([1, 2, 3]) == 3

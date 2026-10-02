@@ -326,6 +326,13 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
         env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
 
     flags_to_copy = set()
+    resource_pool = getattr(replica, "resource_pool", None)
+    if resource_pool is not None:
+        pgs = resource_pool.get_placement_groups(device_name=get_device_name())
+        if pgs:
+            env_vars["VERL_TPU_PG_IDS"] = ",".join(pg.id.hex() for pg in pgs)
+            flags_to_copy.add("VERL_TPU_PG_IDS")
+
     for flag_var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS"):
         base_value = platform_env_vars.get(flag_var) or tpu_env_vars.get(flag_var)
         extra_value = os.environ.get(f"VERL_TPU_EXTRA_{flag_var}")
@@ -345,9 +352,6 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
         env_vars[copy_var] = ",".join(sorted(names | flags_to_copy))
         _tpu_preflight_log(f"{copy_var}={env_vars[copy_var]}", tag="TPU env")
 
-    # TODO(tpu): Schedule TPUvLLMHttpServer into replica.resource_pool's placement group
-    # (placement_group_capture_child_tasks=True) instead of NodeAffinitySchedulingStrategy so
-    # vLLM inherits the replica's placement group directly via ray.util.get_current_placement_group().
     server = replica.server_class.options(
         scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
             node_id=node_id,

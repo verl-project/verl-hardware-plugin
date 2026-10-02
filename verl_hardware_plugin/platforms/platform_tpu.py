@@ -26,14 +26,6 @@ from verl.plugin.platform.platform_manager import PlatformRegistry
 
 logger = logging.getLogger(__name__)
 
-_ROLLOUT_POOL_KEYWORDS = ("rollout", "reward", "teacher")
-
-
-def _is_rollout_pool(name_prefix: Optional[str]) -> bool:
-    """Whether a resource pool hosts vLLM servers (rollout, reward or teacher models)."""
-    name = (name_prefix or "").lower()
-    return any(k in name for k in _ROLLOUT_POOL_KEYWORDS)
-
 
 def _ensure_torch_tpu() -> bool:
     """Try to import torch_tpu, which registers the ``tpu_dist`` distributed backend.
@@ -381,6 +373,7 @@ class PlatformTPU(PlatformBase):
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         self._device_module = TPUDeviceModuleProxy(original_tpu)
         self._warned_unpatched_pool = False
+        self._claimed_slices: set[str] = set()
 
         # Install the plugin-side patches for the verl-core call sites that do not yet consult
         # this platform (see ``verl_hardware_plugin/patches/tpu/__init__.py``). Only now, when
@@ -519,40 +512,71 @@ class PlatformTPU(PlatformBase):
             }
         }
 
-    def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
-        """Pin a resource pool to a TPU slice on multi-slice clusters.
+    def auto_assign_accelerator_type(
+        self,
+        name_prefix: str,
+        accelerator_type: Optional[str],
+        required_tpus: Optional[int] = None,
+    ) -> Optional[str]:
+        """Pin a resource pool to a TPU slice with sufficient free capacity on multi-slice clusters.
 
-        Called unconditionally from ``verl.single_controller.ray.base.RayResourcePool.__init__``
-        whenever ``device_name == "tpu"``; ``PlatformBase`` does not declare it, so the TPU
-        platform has to provide it.
+        A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per physical slice.
+        Because ``RayResourcePool`` creates one ``STRICT_PACK`` placement group per host, all hosts
+        of a multi-host pool must carry the same ``tpu-group-<n>`` label so the pool does not
+        straddle two slices (which the TPU ICI mesh cannot span).
 
-        A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per slice. Without
-        an affinity label a pool can straddle two slices, which the TPU mesh cannot span. The
-        trainer pool is pinned to the first slice; on clusters with two or more slices, rollout
-        pools (rollout/reward/teacher) are pinned to the second so they do not wait forever for
-        chips the trainer already holds.
-
-        TODO(tpu): Schedule ``TPUvLLMHttpServer`` inside the replica's placement group with
-        ``placement_group_capture_child_tasks=True`` so rollout bundles can keep ``{"TPU": 1}``
-        and Ray's placement-group scheduler can place N rollout replicas across N slices without
-        hardcoding ``slices[0]`` / ``slices[1]``.
+        Both trainer and rollout pools reserve ``{"TPU": 1}`` per bundle (and vLLM reuses the
+        rollout replica's placement groups directly via ``VERL_TPU_PG_IDS``), so slice selection
+        simply picks the first unclaimed ``tpu-group-<n>`` slice with enough unreserved ``TPU``
+        chips rather than special-casing pool names.
         """
         if accelerator_type is not None:
             return accelerator_type
 
         try:
             if ray.is_initialized():
-                tpu_slices = set()
+                slice_total_tpus: dict[str, float] = {}
+                slice_node_ids: dict[str, list[str]] = {}
                 for node in ray.nodes():
-                    if node.get("Alive"):
-                        for res in node.get("Resources", {}):
-                            if res.startswith("tpu-group-"):
-                                tpu_slices.add(res)
-                slices = sorted(tpu_slices)
-                if len(slices) >= 2 and _is_rollout_pool(name_prefix):
-                    return slices[1]
-                if slices:
-                    return slices[0]
+                    if not node.get("Alive"):
+                        continue
+                    resources = node.get("Resources", {})
+                    node_tpus = float(resources.get("TPU", 0.0))
+                    node_id = node.get("NodeID")
+                    for res in resources:
+                        if res.startswith("tpu-group-"):
+                            slice_total_tpus[res] = slice_total_tpus.get(res, 0.0) + node_tpus
+                            if node_id:
+                                slice_node_ids.setdefault(res, []).append(node_id)
+
+                slices = sorted(slice_total_tpus)
+                if not slices:
+                    return accelerator_type
+
+                avail_by_node: dict[str, dict[str, float]] = {}
+                try:
+                    raw_avail = ray._private.state.available_resources_per_node()
+                    if isinstance(raw_avail, dict):
+                        avail_by_node = raw_avail
+                except Exception:
+                    avail_by_node = {}
+
+                for s in slices:
+                    if s in self._claimed_slices:
+                        continue
+                    total_on_slice = slice_total_tpus[s]
+                    needed = float(required_tpus) if required_tpus is not None else max(1.0, total_on_slice)
+                    node_ids = slice_node_ids.get(s, [])
+                    if node_ids and avail_by_node and all(nid in avail_by_node for nid in node_ids):
+                        live_avail = sum(float(avail_by_node[nid].get("TPU", 0.0)) for nid in node_ids)
+                    else:
+                        live_avail = total_on_slice
+
+                    if live_avail >= needed:
+                        self._claimed_slices.add(s)
+                        return s
+
+                return slices[-1]
         except Exception as e:
             logger.debug("Could not auto-assign a TPU slice for %r: %s", name_prefix, e)
 
@@ -568,16 +592,13 @@ class PlatformTPU(PlatformBase):
     ) -> None:
         """Shape a placement-group bundle for GKE TPU.
 
-        Called unconditionally from ``verl.single_controller.ray.base.RayResourcePool``
-        whenever ``device_name == "tpu"``; ``PlatformBase`` does not declare it, so the TPU
-        platform has to provide it.
-
-        The slice affinity is requested as a fractional amount so it acts as a label rather
-        than a real reservation. Rollout pools do not reserve ``TPU`` chips: the vLLM Ray
-        executor requests them itself when it places its workers, so reserving them here as well
-        would leave the chips held by an empty bundle and vLLM waiting forever.
+        Every GPU/TPU resource pool (trainer and rollout alike) reserves ``bundle[device_name] = 1``
+        plus the fractional ``tpu-group-<n>`` slice label. Rollout replicas pass their placement
+        group IDs to vLLM via ``VERL_TPU_PG_IDS`` so vLLM schedules its ``RayWorkerWrapper``
+        actors directly into these bundles instead of creating a duplicate placement group.
         """
-        if use_gpu and not _is_rollout_pool(name_prefix):
+        del name_prefix
+        if use_gpu:
             bundle[device_name] = 1
         if accelerator_type is not None:
             bundle[accelerator_type] = 1e-4
