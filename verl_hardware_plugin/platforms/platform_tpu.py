@@ -201,18 +201,7 @@ class TPUDeviceModuleProxy:
     def __init__(self, original_module):
         self.__dict__["_original_module"] = original_module
 
-    def __reduce__(self):
-        # The wrapped ``torch.tpu`` module is process-local; rebuild the proxy from the local
-        # module on the receiving side instead of trying to serialize the module object.
-        return (_rebuild_tpu_device_module_proxy, ())
-
     def __getattr__(self, name):
-        # Only called when normal lookup fails. ``_original_module`` lives in ``__dict__``
-        # after ``__init__``; if it is missing (object created by pickle without ``__init__``)
-        # answering with a lookup on it would recurse into this method forever.
-        if name.startswith("_"):
-            raise AttributeError(f"'TPUDeviceModuleProxy' object has no attribute '{name}'")
-
         if name == "set_device":
             return self.set_device
 
@@ -306,11 +295,6 @@ class TPUDeviceModuleProxy:
                 self._original_module._clear_cache()
             except Exception as e:
                 logger.warning(f"Failed to clear TPU cache: {e}")
-
-
-def _rebuild_tpu_device_module_proxy() -> "TPUDeviceModuleProxy":
-    """Unpickling target for ``TPUDeviceModuleProxy``: wrap whatever ``torch.tpu`` exists locally."""
-    return TPUDeviceModuleProxy(getattr(torch, "tpu", DummyTpuDeviceModule()))
 
 
 def patch_ray_worker() -> None:
