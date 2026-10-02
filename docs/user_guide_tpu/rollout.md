@@ -54,8 +54,8 @@ upstreamed, they live on the `pr34-grpo-0.6b-core-fixes` branch of
 
 `patch_vllm_for_tpu()` targets the pinned stack (vLLM `v0.29.0`, vllm-torchtpu `9faafb17`). It is
 installed in `TPUvLLMHttpServer`, propagated into the `EngineCoreProc` subprocess (via the
-`multiprocessing.process.BaseProcess` and `run_engine_core` wrappers), and invoked in each pooled
-vLLM `RayWorkerWrapper` actor (via `RayWorkerWrapper.__init__`).
+`multiprocessing.process.BaseProcess` wrapper), and invoked in each pooled vLLM `RayWorkerWrapper`
+actor (via `RayWorkerWrapper.__init__`).
 
 #### Group A — verl ↔ vLLM Ray integration (permanent plugin glue unless vLLM adds native hooks)
 

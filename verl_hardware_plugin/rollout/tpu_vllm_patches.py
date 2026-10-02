@@ -56,14 +56,16 @@ def _resolve_tpu_topology_bounds(total_chips: int, num_nodes: int) -> tuple[str,
     return topology, host_bounds, chips_per_host_bounds, chips_per_host
 
 
-_orig_run_engine_core: Any = None
 _PATCHES_APPLIED = False
 
 
 class PickleableProcessWrapper:
-    """
-    A pickle-compatible wrapper for multiprocessing target functions to ensure
-    vLLM-on-TPU worker patches are automatically applied in the spawned processes.
+    """Process target that runs ``patch_vllm_for_tpu`` in the child before ``target``.
+
+    This is how the patches reach vLLM's EngineCore. Inside a Ray actor vLLM always uses the
+    ``spawn`` start method, and the EngineCore target is ``EngineCoreProc.run_engine_core``, which
+    vllm-torchtpu replaces with its own wrapper. A spawned child imports only the modules its pickled
+    target names, so without this wrapper it would never import the plugin.
     """
 
     def __init__(self, target):
@@ -76,10 +78,7 @@ class PickleableProcessWrapper:
 
 
 def patch_multiprocessing_for_tpu() -> None:
-    """
-    Monkey-patch multiprocessing.process.BaseProcess to wrap target entrypoints
-    with PickleableProcessWrapper, propagating vLLM-on-TPU patches to child processes.
-    """
+    """Wrap the target of every ``multiprocessing`` process started from now on in ``PickleableProcessWrapper``."""
     if getattr(multiprocessing.process.BaseProcess, "_tpu_patched", False):
         return
 
@@ -103,26 +102,6 @@ def patch_multiprocessing_for_tpu() -> None:
 
     multiprocessing.process.BaseProcess.__init__ = patched_init  # type: ignore[method-assign]
     multiprocessing.process.BaseProcess._tpu_patched = True  # type: ignore[attr-defined]
-
-
-def _patched_run_engine_core(*args, **kwargs):
-    try:
-        patch_vllm_for_tpu()
-    except Exception as e:
-        logger.warning("Failed to re-apply TPU vLLM patches in EngineCoreProc: %s", e)
-
-    global _orig_run_engine_core
-    if _orig_run_engine_core is None:
-        import vllm.v1.engine.core as v1_core
-
-        _orig_run_engine_core = getattr(v1_core.EngineCoreProc, "_unpatched_run_engine_core", None)
-
-    if hasattr(_orig_run_engine_core, "__func__"):
-        _orig_run_engine_core = _orig_run_engine_core.__func__
-
-    if _orig_run_engine_core is not None:
-        return _orig_run_engine_core(*args, **kwargs)
-    raise RuntimeError("[TPU ERROR] _orig_run_engine_core could not be resolved in _patched_run_engine_core")
 
 
 def _register_c10d_ops_in_dynamo() -> None:
@@ -204,7 +183,6 @@ def patch_vllm_for_tpu() -> None:
         import vllm.envs as vllm_envs
         import vllm.model_executor.model_loader.dummy_loader as vllm_dummy_loader
         import vllm.model_executor.model_loader.weight_utils as vllm_weight_utils
-        import vllm.v1.engine.core as v1_core
         import vllm.v1.executor.ray_executor as v1_ray_executor
         import vllm.v1.executor.ray_utils as v1_ray_utils
         import vllm_torchtpu.envs as tpu_envs
@@ -335,17 +313,6 @@ def patch_vllm_for_tpu() -> None:
             return orig_init_ray_cluster(parallel_config, ray_address, *args, **kwargs)
 
         v1_ray_executor.initialize_ray_cluster = patched_initialize_ray_cluster
-
-        if not getattr(v1_core, "_verl_tpu_patched", False):
-            v1_core._verl_tpu_patched = True
-            global _orig_run_engine_core
-            raw_fn = v1_core.EngineCoreProc.run_engine_core
-            if hasattr(raw_fn, "__func__"):
-                raw_fn = raw_fn.__func__
-            _orig_run_engine_core = raw_fn
-            v1_core.EngineCoreProc._unpatched_run_engine_core = raw_fn
-            v1_core.EngineCoreProc.run_engine_core = staticmethod(_patched_run_engine_core)
-            v1_core.run_engine_core = _patched_run_engine_core
 
         OriginalRayWorkerWrapper = ray_distributed_executor.RayWorkerWrapper
         original_init_worker = OriginalRayWorkerWrapper.init_worker
