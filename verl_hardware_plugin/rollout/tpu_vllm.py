@@ -20,7 +20,6 @@ The same logic previously lived behind ``get_resource_name() == "TPU"`` branches
 """
 
 import asyncio
-import logging
 import os
 
 import ray
@@ -31,29 +30,10 @@ from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 from verl_hardware_plugin.rollout.tpu_vllm_patches import patch_vllm_for_tpu
 
-logger = logging.getLogger(__name__)
-
 
 def is_tpu_vllm_run() -> bool:
     """Returns True if executing on a Google TPU resource."""
     return get_resource_name() == "TPU"
-
-
-def prepare_tpu_server_env() -> None:
-    """Routes vllm-torchtpu to its Ray multi-host backend in the server process."""
-    os.environ["TPU_MULTIHOST_BACKEND"] = "ray"
-    os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] = "0"
-    # See patch_vllm_for_tpu: a reloaded empty AOT artifact runs the model eagerly (b/501165531).
-    os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
-
-    try:
-        import vllm_torchtpu.envs as tpu_envs
-
-        tpu_envs.TPU_MULTIHOST_BACKEND = "ray"
-        if hasattr(tpu_envs, "__getattr__") and hasattr(tpu_envs.__getattr__, "cache_clear"):
-            tpu_envs.__getattr__.cache_clear()
-    except Exception as env_err:
-        logger.warning(f"Failed to force TPU_MULTIHOST_BACKEND to ray: {env_err}")
 
 
 async def get_tpu_server_launch_config(workers):
@@ -142,6 +122,10 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
         **{var: "1" for var in get_platform().ray_noset_envvars()},
         **get_platform().rollout_env_vars(),
         **tpu_env_vars,
+        # One engine spans all of the replica's hosts through Ray. patch_vllm_for_tpu builds on
+        # vllm-torchtpu's Ray multi-host backend with the V1 executor, not the V2 one.
+        "TPU_MULTIHOST_BACKEND": "ray",
+        "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": "0",
     }
     if "VERL_PLATFORM" in os.environ:
         env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
@@ -193,7 +177,6 @@ class TPUvLLMHttpServer(vLLMHttpServer):
         # patch_vllm_for_tpu switches a multi-host engine to the Ray executor at config time.
         engine_kwargs["distributed_executor_backend"] = "external_launcher"
         engine_kwargs["enable_sleep_mode"] = False
-        prepare_tpu_server_env()
 
 
 class TPUvLLMReplica(vLLMReplica):

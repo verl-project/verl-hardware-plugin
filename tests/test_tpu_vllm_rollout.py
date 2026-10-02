@@ -63,7 +63,7 @@ def tpu_vllm():
     vas = ModuleType(VAS)
     vas.vLLMHttpServer = _FakeHttpServer
     vas.vLLMReplica = _FakeReplica
-    env = {k: v for k, v in os.environ.items() if k not in ("VERL_PLATFORM", "VLLM_DISABLE_COMPILE_CACHE")}
+    env = {k: v for k, v in os.environ.items() if k != "VERL_PLATFORM"}
     with mock.patch.dict(sys.modules, {VAS: vas}), mock.patch.dict(os.environ, env, clear=True):
         sys.modules.pop("verl_hardware_plugin.rollout.tpu_vllm", None)
         module = importlib.import_module("verl_hardware_plugin.rollout.tpu_vllm")
@@ -120,8 +120,7 @@ def test_module_import_does_not_patch_off_tpu(tpu_vllm):
 def test_server_engine_kwargs_force_tpu_executor(tpu_vllm):
     server = tpu_vllm.TPUvLLMHttpServer()
     engine_kwargs = {"distributed_executor_backend": "mp", "enable_sleep_mode": True}
-    with mock.patch.object(tpu_vllm, "prepare_tpu_server_env") as prepare_env:
-        server._preprocess_engine_kwargs(engine_kwargs)
+    server._preprocess_engine_kwargs(engine_kwargs)
 
     assert server.calls == ["preprocess"]  # upstream validation still runs first
     assert engine_kwargs == {
@@ -129,14 +128,6 @@ def test_server_engine_kwargs_force_tpu_executor(tpu_vllm):
         "enable_sleep_mode": False,
         "from_upstream": True,
     }
-    prepare_env.assert_called_once_with()
-
-
-def test_prepare_tpu_server_env_selects_ray_multihost_backend(tpu_vllm):
-    tpu_vllm.prepare_tpu_server_env()
-    assert os.environ["TPU_MULTIHOST_BACKEND"] == "ray"
-    assert os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] == "0"
-    assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "1"
 
 
 def test_server_worker_extension_defers_to_upstream(tpu_vllm):
@@ -268,6 +259,8 @@ def test_launch_tpu_vllm_servers_single_server_spanning_all_workers(tpu_vllm):
     assert "UNRELATED" not in env_vars
     assert env_vars["LIBTPU_INIT_ARGS"] == "--base"
     assert env_vars["VERL_TPU_PG_IDS"] == "pg0hex,pg1hex"
+    assert env_vars["TPU_MULTIHOST_BACKEND"] == "ray"
+    assert env_vars["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] == "0"
 
     init = server_class.init_kwargs
     assert init["workers"] is replica.workers
