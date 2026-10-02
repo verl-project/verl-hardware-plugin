@@ -128,8 +128,7 @@ def patch_vllm_for_tpu() -> None:
         import vllm.envs as vllm_envs
         import vllm.v1.executor.ray_executor as v1_ray_executor
         import vllm.v1.executor.ray_utils as v1_ray_utils
-        import vllm_torchtpu.envs as tpu_envs
-        from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+        from vllm.engine.arg_utils import EngineArgs
         from vllm.platforms import current_platform
         from vllm.ray.ray_env import get_env_vars_to_copy
         from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
@@ -145,59 +144,17 @@ def patch_vllm_for_tpu() -> None:
         orig_create_engine_config = EngineArgs.create_engine_config
 
         def patched_create_engine_config(self, *args, **kwargs):
-            is_multi_host = (
-                self.tensor_parallel_size > 4
-                or int(os.environ.get("NNODES_ROLLOUT", "1")) > 1
-                or os.environ.get("TPU_MULTIHOST_BACKEND") == "ray"
-            )
-
-            if getattr(self, "data_parallel_size", 1) <= 1:
-                if hasattr(self, "data_parallel_external_lb"):
-                    self.data_parallel_external_lb = False
-                if hasattr(self, "data_parallel_rank"):
-                    self.data_parallel_rank = None
-                if hasattr(self, "data_parallel_size_local"):
-                    self.data_parallel_size_local = None
-                if hasattr(self, "data_parallel_start_rank"):
-                    self.data_parallel_start_rank = None
-                if hasattr(self, "data_parallel_hybrid_lb"):
-                    self.data_parallel_hybrid_lb = False
-
-            if not is_multi_host:
-                if "TPU_MULTIHOST_BACKEND" in os.environ:
-                    del os.environ["TPU_MULTIHOST_BACKEND"]
-                if hasattr(vllm_envs, "TPU_MULTIHOST_BACKEND"):
-                    vllm_envs.TPU_MULTIHOST_BACKEND = None
-                if hasattr(tpu_envs, "TPU_MULTIHOST_BACKEND"):
-                    tpu_envs.TPU_MULTIHOST_BACKEND = None
-
-                vllm_config = orig_create_engine_config(self, *args, **kwargs)
-
-                logger.info("Single-host TPU rollout detected; using local executor backend.")
-                if hasattr(vllm_config, "scheduler_config") and hasattr(
-                    vllm_config.scheduler_config, "async_scheduling"
-                ):
-                    vllm_config.scheduler_config.async_scheduling = True
-                    logger.info("Enabled async_scheduling on TPU for single-host rollout.")
-            else:
-                os.environ["TPU_MULTIHOST_BACKEND"] = "ray"
-                if hasattr(vllm_envs, "TPU_MULTIHOST_BACKEND"):
-                    vllm_envs.TPU_MULTIHOST_BACKEND = "ray"
-                if hasattr(tpu_envs, "TPU_MULTIHOST_BACKEND"):
-                    tpu_envs.TPU_MULTIHOST_BACKEND = "ray"
-
-                vllm_config = orig_create_engine_config(self, *args, **kwargs)
-                vllm_config.parallel_config.distributed_executor_backend = "ray"
-                logger.info("Multi-host TPU rollout detected; using Ray distributed executor backend.")
-                if hasattr(vllm_config, "scheduler_config") and hasattr(
-                    vllm_config.scheduler_config, "async_scheduling"
-                ):
-                    vllm_config.scheduler_config.async_scheduling = False
-                    logger.info("Disabled async_scheduling on TPU for multi-host Ray rollout.")
+            vllm_config = orig_create_engine_config(self, *args, **kwargs)
+            # vllm-torchtpu picked its own Ray executor, which takes a single placement group,
+            # but verl creates one per host. Use vLLM's generic Ray executor: the patches below
+            # attach it to verl's placement groups and adapt its worker start-up and dispatch to
+            # TPU. It does not support async scheduling, which vLLM resolved to on for the
+            # external_launcher backend that TPUvLLMHttpServer passes in.
+            vllm_config.parallel_config.distributed_executor_backend = "ray"
+            vllm_config.scheduler_config.async_scheduling = False
             return vllm_config
 
         EngineArgs.create_engine_config = patched_create_engine_config
-        AsyncEngineArgs.create_engine_config = patched_create_engine_config
 
         def dummy_reset_encoder_cache(*args, **kwargs):
             pass

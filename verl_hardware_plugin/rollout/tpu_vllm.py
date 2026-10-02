@@ -174,7 +174,7 @@ class TPUvLLMHttpServer(vLLMHttpServer):
     def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:
         super()._preprocess_engine_kwargs(engine_kwargs)
         # engine_kwargs is merged last into the vLLM CLI args, so these win over the defaults.
-        # patch_vllm_for_tpu switches a multi-host engine to the Ray executor at config time.
+        # patch_vllm_for_tpu switches the engine to vLLM's Ray executor at config time.
         engine_kwargs["distributed_executor_backend"] = "external_launcher"
         engine_kwargs["enable_sleep_mode"] = False
 

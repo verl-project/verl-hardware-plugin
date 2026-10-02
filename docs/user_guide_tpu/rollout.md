@@ -22,7 +22,7 @@ changes; they are listed under [verl-core requirements](#1-verl-core-requirement
 |---|---|---|
 | `vLLMReplica.launch_servers` | `launch_tpu_vllm_servers` | One server actor per replica, on the first worker's node, with every TPU env var forwarded. vLLM spans the hosts through its Ray executor instead of one `mp` server per node: the actor starts with `TPU_MULTIHOST_BACKEND=ray` and `VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0`. `data_parallel_size > 1` is rejected: the TPU runtime compiles one XLA program for the whole mesh of the slice, while a DP group would only span `tensor_model_parallel_size` chips. Use `data_parallel_size=1`; verl then creates one replica per `tensor_model_parallel_size` chips, which gives the same parallelism. |
 | `RolloutReplica.rollout_worker_use_gpu` | `False` | Rollout workers must not claim a `GPU` resource. |
-| `vLLMHttpServer._preprocess_engine_kwargs` | `distributed_executor_backend=external_launcher`, `enable_sleep_mode=False` | `patch_vllm_for_tpu` then selects the Ray executor for multi-host engines at config time. Sleep mode is off because rollout runs on its own slice (TPU chips cannot be shared between colocated worker groups), so nothing needs the HBM back. |
+| `vLLMHttpServer._preprocess_engine_kwargs` | `distributed_executor_backend=external_launcher`, `enable_sleep_mode=False` | `patch_vllm_for_tpu` then switches the engine to vLLM's Ray executor at config time. Sleep mode is off because rollout runs on its own slice (TPU chips cannot be shared between colocated worker groups), so nothing needs the HBM back. |
 | `PlatformTPU.auto_assign_accelerator_type` | gives each pool the first `tpu-group-<n>` slice that no earlier pool claimed | Keeps every host of a multi-host pool within one slice and puts the trainer and rollout pools on different slices. |
 
 ## Where each patch runs and when it can be removed
@@ -61,7 +61,7 @@ actor (via `RayWorkerWrapper.__init__`).
 | Patch | Process where it executes | What it does |
 |---|---|---|
 | `initialize_ray_cluster`: reuse verl placement groups via `VERL_TPU_PG_IDS` | `EngineCoreProc` | Connects to Ray with vLLM's `ray_runtime_env` (preserving `py_modules`) and attaches directly to the replica's `RayResourcePool` placement groups (`VERL_TPU_PG_IDS`) instead of creating a duplicate placement group. |
-| `EngineArgs.create_engine_config` | `TPUvLLMHttpServer` & `EngineCoreProc` | Selects the `ray` executor with `async_scheduling=False` for multi-host slices, and the local executor with `async_scheduling=True` for single-host slices; clears stale DP fields when `data_parallel_size <= 1`. |
+| `EngineArgs.create_engine_config` | `TPUvLLMHttpServer` | Swaps vllm-torchtpu's Ray executor, which takes a single placement group, for vLLM's generic Ray executor, which the other patches attach to verl's per-host placement groups; turns off async scheduling, which that executor does not support. |
 
 #### Group B — Upstream bugs / gaps to file against `vllm-torchtpu` and `vllm` (removable once fixed upstream)
 
