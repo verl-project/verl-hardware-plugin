@@ -22,7 +22,6 @@ registered before it, so other platforms are unaffected. No verl core file is mo
 | `vLLMReplica.launch_servers` | `launch_tpu_vllm_servers` | One server actor per replica, on the first worker's node, with every TPU env var forwarded. vLLM spans the hosts through its Ray executor instead of one `mp` server per node. `data_parallel_size > 1` is rejected: the TPU runtime compiles one XLA program for the whole mesh of the slice, while a DP group would only span `tensor_model_parallel_size` chips. Use `data_parallel_size=1`; verl then creates one replica per `tensor_model_parallel_size` chips, which gives the same parallelism. |
 | `RolloutReplica.rollout_worker_use_gpu` | `False` | Rollout workers must not claim a `GPU` resource. |
 | `vLLMHttpServer._preprocess_engine_kwargs` | `distributed_executor_backend=external_launcher`, `enable_sleep_mode=False`, `TPU_MULTIHOST_BACKEND=ray`, `VLLM_DISABLE_COMPILE_CACHE=1` | `patch_vllm_for_tpu` then selects the Ray executor for multi-host engines at config time. Sleep mode is off because rollout runs on its own slice (TPU chips cannot be shared between colocated worker groups), so nothing needs the HBM back. |
-| `vLLMHttpServer.collective_rpc` | returns the engine result | verl's version awaits `engine.collective_rpc` and returns `None`. The TPU weight-sync paths need the per-worker return values. |
 | `PlatformTPU.auto_assign_accelerator_type` | gives each pool the first `tpu-group-<n>` slice that no earlier pool claimed | Keeps every host of a multi-host pool within one slice and puts the trainer and rollout pools on different slices. |
 
 The server actor's Ray `max_concurrency` comes from `RolloutConfig.ray_actor_max_concurrency` when
@@ -49,6 +48,7 @@ upstreamed, they live on the `pr34-grpo-0.6b-core-fixes` branch of
 | `Worker._setup_env_cuda_visible_devices` takes `LOCAL_RANK` from `TPU_VISIBLE_CHIPS` on TPU | `get_worker_env_vars` pins each worker to one chip through `TPU_VISIBLE_CHIPS`; Ray cannot map its host-level chip id into that one-chip list, so the generic lookup raises `IndexError`. |
 | `RayResourcePool.get_placement_groups` labels TPU bundles with `auto_assign_accelerator_type` | Ray places each per-host placement group independently; without the label a multi-host pool can straddle two slices. |
 | `RolloutReplica.init_standalone` sets `use_gpu=supports_colocated_worker_groups()` | The replica's `CheckpointEngineWorker`s must not take the chips that vLLM's own workers need. |
+| `vLLMHttpServer.collective_rpc` returns the engine's per-worker results | `update_tpu_weights` checks the tensor count that each worker's `load_weights_from_ray_registry` returns. |
 
 ### 2. vLLM / vllm-torchtpu runtime patches (`patch_vllm_for_tpu`)
 

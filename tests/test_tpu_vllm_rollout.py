@@ -148,16 +148,6 @@ def test_server_worker_extension_defers_to_upstream(tpu_vllm):
     assert "run_server" not in tpu_vllm.TPUvLLMHttpServer.__dict__
 
 
-def test_server_collective_rpc_returns_engine_result(tpu_vllm):
-    server = tpu_vllm.TPUvLLMHttpServer()
-
-    async def fake_collective_rpc(**kwargs):
-        return [kwargs["method"], kwargs["args"]]
-
-    server.engine = SimpleNamespace(collective_rpc=fake_collective_rpc)
-    assert asyncio.run(server.collective_rpc("probe", args=(1,))) == ["probe", (1,)]
-
-
 def test_replica_uses_tpu_server_and_no_gpu(tpu_vllm):
     replica = tpu_vllm.TPUvLLMReplica(0, "config", "model_config")
     assert replica.rollout_worker_use_gpu() is False

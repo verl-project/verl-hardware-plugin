@@ -22,7 +22,6 @@ The same logic previously lived behind ``get_resource_name() == "TPU"`` branches
 import asyncio
 import logging
 import os
-from typing import Any, Callable, Optional
 
 import ray
 
@@ -387,21 +386,6 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
 
 class TPUvLLMHttpServer(vLLMHttpServer):
     """``vLLMHttpServer`` with the TPU engine arguments."""
-
-    async def collective_rpc(
-        self,
-        method: str | Callable,
-        timeout: Optional[float] = None,
-        args: tuple = (),
-        kwargs: Optional[dict[str, Any]] = None,
-    ):
-        # Upstream drops the result. The TPU weight-sync paths read per-worker return values.
-        return await self.engine.collective_rpc(
-            method=method,
-            timeout=timeout,
-            args=args,
-            kwargs=kwargs,
-        )
 
     def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:
         super()._preprocess_engine_kwargs(engine_kwargs)
