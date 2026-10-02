@@ -185,8 +185,6 @@ def patch_vllm_for_tpu() -> None:
 
     # Environment side effects. Cheap and safe to repeat in every process that calls this.
     patch_multiprocessing_for_tpu()
-    if "RAY_RUNTIME_ENV_WORKER_PROCESS_SETUP_HOOK" in os.environ:
-        del os.environ["RAY_RUNTIME_ENV_WORKER_PROCESS_SETUP_HOOK"]
     os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
     # vLLM can reload a degenerate AOT compile artifact (num_artifacts=0) that silently runs the
     # model eagerly; eager execution then hits the XLA:TPU unaligned-DUS CHECK (b/501165531).
@@ -196,24 +194,6 @@ def patch_vllm_for_tpu() -> None:
         return
 
     _register_c10d_ops_in_dynamo()
-
-    try:
-        orig_ray_init = ray.init
-
-        def patched_ray_init(*args, **kwargs):
-            if "runtime_env" in kwargs and kwargs["runtime_env"]:
-                rt_env = kwargs["runtime_env"]
-                if isinstance(rt_env, dict) and "worker_process_setup_hook" in rt_env:
-                    rt_env = dict(rt_env)
-                    del rt_env["worker_process_setup_hook"]
-                    kwargs["runtime_env"] = rt_env
-            if "RAY_RUNTIME_ENV_WORKER_PROCESS_SETUP_HOOK" in os.environ:
-                del os.environ["RAY_RUNTIME_ENV_WORKER_PROCESS_SETUP_HOOK"]
-            return orig_ray_init(*args, **kwargs)
-
-        ray.init = patched_ray_init
-    except Exception as e:
-        logger.warning("Failed to patch ray.init to clear worker_process_setup_hook: %s", e)
 
     # CPU unit tests and non-rollout processes may not have vllm or vllm_torchtpu installed.
     # Import all required vLLM / vllm-torchtpu symbols once here rather than at module import

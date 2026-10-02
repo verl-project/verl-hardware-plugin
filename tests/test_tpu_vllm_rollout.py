@@ -331,10 +331,8 @@ def isolated_patches():
     saved_init = base_process.__init__
     had_flag = "_tpu_patched" in base_process.__dict__
     env = {k: v for k, v in os.environ.items() if k != "VLLM_DISABLE_COMPILE_CACHE"}
-    env["RAY_RUNTIME_ENV_WORKER_PROCESS_SETUP_HOOK"] = "hook"
     with (
         mock.patch.dict(os.environ, env, clear=True),
-        mock.patch.object(ray, "init", ray.init),
         mock.patch.object(tpu_vllm_patches, "_PATCHES_APPLIED", False),
     ):
         yield tpu_vllm_patches
@@ -348,7 +346,6 @@ def test_patch_vllm_for_tpu_env_side_effects_without_torchtpu(isolated_patches):
 
     assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "1"
     assert "VLLM_USE_V1" not in os.environ  # V0 is gone in vLLM v0.29; the flag is not set anymore
-    assert "RAY_RUNTIME_ENV_WORKER_PROCESS_SETUP_HOOK" not in os.environ
     assert multiprocessing.process.BaseProcess._tpu_patched is True
     # The executor patches need vllm-torchtpu, so the guard stays open for a later retry.
     assert isolated_patches._PATCHES_APPLIED is False
@@ -356,9 +353,9 @@ def test_patch_vllm_for_tpu_env_side_effects_without_torchtpu(isolated_patches):
 
 def test_patch_vllm_for_tpu_is_a_no_op_once_applied(isolated_patches):
     isolated_patches._PATCHES_APPLIED = True
-    original_ray_init = ray.init
-    isolated_patches.patch_vllm_for_tpu()
-    assert ray.init is original_ray_init
+    with mock.patch.object(isolated_patches, "_register_c10d_ops_in_dynamo") as register:
+        isolated_patches.patch_vllm_for_tpu()
+    register.assert_not_called()
     assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "1"  # env side effects still re-applied
 
 
@@ -366,18 +363,6 @@ def test_patch_vllm_for_tpu_keeps_explicit_compile_cache_setting(isolated_patche
     os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "0"
     isolated_patches.patch_vllm_for_tpu()
     assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "0"
-
-
-def test_patched_ray_init_strips_worker_process_setup_hook(isolated_patches):
-    seen = {}
-
-    def fake_init(*args, **kwargs):
-        seen.update(kwargs)
-
-    with mock.patch.object(ray, "init", fake_init):
-        isolated_patches.patch_vllm_for_tpu()
-        ray.init(runtime_env={"worker_process_setup_hook": "x", "env_vars": {"A": "1"}})
-    assert seen["runtime_env"] == {"env_vars": {"A": "1"}}
 
 
 def test_pickleable_process_wrapper_applies_patches_before_target():

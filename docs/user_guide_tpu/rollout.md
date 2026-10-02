@@ -62,7 +62,6 @@ vLLM `RayWorkerWrapper` actor (via `RayWorkerWrapper.__init__`).
 | Patch | Process where it executes | What it does |
 |---|---|---|
 | `allow_in_graph` on `c10d_functional` ops | `EngineCoreProc` & `RayWorkerWrapper` | Keeps PyTorch functional collectives inside the `torch.compile` / Dynamo graph. |
-| Strip `worker_process_setup_hook` from `ray.init` | `TPUvLLMHttpServer` & `EngineCoreProc` | Ray forbids passing a job-level `worker_process_setup_hook` when a child process calls `ray.init` to attach to an existing cluster. |
 | `os.environ.__setitem__` guard | `EngineCoreProc` & `RayWorkerWrapper` | Prevents the driver's single-host/default topology env vars from overwriting a TPU pod's own topology; strips `megachip_tccontrol` from `LIBTPU_INIT_ARGS`. |
 | `available_resources_per_node` forces `TPU >= 4` | `EngineCoreProc` | Satisfies vLLM's per-node TPU resource check when verl's placement group is already created. |
 | `initialize_ray_cluster`: reuse verl placement groups via `VERL_TPU_PG_IDS` | `EngineCoreProc` | Connects to Ray with vLLM's `ray_runtime_env` (preserving `py_modules`) and attaches directly to the replica's `RayResourcePool` placement groups (`VERL_TPU_PG_IDS`) instead of creating a duplicate placement group. |
