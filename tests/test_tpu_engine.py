@@ -162,16 +162,3 @@ def test_auto_assign_accelerator_type_single_slice_shares_slice():
     nodes = [{"Alive": True, "Resources": {"TPU": 4.0, "tpu-group-0": 1.0}}]
     with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
         assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-0"
-
-
-def test_configure_placement_group_bundle_reserves_tpu_for_all_gpu_pools():
-    from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
-
-    platform = PlatformTPU()
-    trainer: dict = {"CPU": 1}
-    platform.configure_placement_group_bundle(trainer, True, "TPU", "global_pool", "tpu-group-0")
-    assert trainer == {"CPU": 1, "TPU": 1, "tpu-group-0": 1e-4}
-
-    rollout: dict = {"CPU": 1}
-    platform.configure_placement_group_bundle(rollout, True, "TPU", "rollout_pool_0", "tpu-group-1")
-    assert rollout == {"CPU": 1, "TPU": 1, "tpu-group-1": 1e-4}

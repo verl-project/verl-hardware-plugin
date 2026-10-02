@@ -23,7 +23,7 @@ registered before it, so other platforms are unaffected. No verl core file is mo
 | `RolloutReplica.rollout_worker_use_gpu` | `False` | Rollout workers must not claim a `GPU` resource. |
 | `vLLMHttpServer._preprocess_engine_kwargs` | `distributed_executor_backend=external_launcher`, `enable_sleep_mode=False`, `TPU_MULTIHOST_BACKEND=ray`, `VLLM_DISABLE_COMPILE_CACHE=1` | `patch_vllm_for_tpu` then selects the Ray executor for multi-host engines at config time. Sleep mode is off because rollout runs on its own slice (TPU chips cannot be shared between colocated worker groups), so nothing needs the HBM back. |
 | `vLLMHttpServer.collective_rpc` | returns the engine result | verl's version awaits `engine.collective_rpc` and returns `None`. The TPU weight-sync paths need the per-worker return values. |
-| `PlatformTPU.auto_assign_accelerator_type` / `configure_placement_group_bundle` | assigns each pool to the next available `tpu-group-<n>` slice with sufficient free `TPU` capacity; every GPU/TPU pool reserves `TPU: 1` per bundle | Keeps all hosts of a multi-host pool within a single physical TPU slice while allowing `N` trainer/rollout/reward/teacher pools to scale across `N` slices via Ray placement groups (`VERL_TPU_PG_IDS`). |
+| `PlatformTPU.auto_assign_accelerator_type` | gives each pool the first `tpu-group-<n>` slice that no earlier pool claimed | Keeps every host of a multi-host pool within one slice and puts the trainer and rollout pools on different slices. |
 
 The server actor's Ray `max_concurrency` comes from `RolloutConfig.ray_actor_max_concurrency` when
 verl has it and from `vLLMReplica.max_concurrency` otherwise.
