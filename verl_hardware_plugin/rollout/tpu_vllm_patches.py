@@ -302,16 +302,6 @@ def patch_vllm_for_tpu() -> None:
 
         os.environ.__class__.__setitem__ = patched_driver_environ_setitem  # type: ignore[method-assign]
 
-        orig_avail_res = v1_ray_utils.available_resources_per_node
-
-        def patched_avail_res(*args, **kwargs):
-            res_map = orig_avail_res(*args, **kwargs)
-            for node_id, res in res_map.items():
-                res["TPU"] = max(res.get("TPU", 0.0), 4.0)
-            return res_map
-
-        v1_ray_utils.available_resources_per_node = patched_avail_res
-
         orig_init_ray_cluster = v1_ray_utils.initialize_ray_cluster
 
         def patched_initialize_ray_cluster(parallel_config, ray_address=None, *args, **kwargs):
