@@ -15,13 +15,14 @@ verl_hardware_plugin/rollout/
 
 `register_all_rollouts()` wraps the `vllm` entry of `RolloutReplicaRegistry`. The loader returns
 `TPUvLLMReplica` when `get_resource_name() == "TPU"` and otherwise calls the loader that was
-registered before it, so other platforms are unaffected. No verl core file is modified.
+registered before it, so other platforms are unaffected. The rollout still needs a few verl-core
+changes; they are listed under [verl-core requirements](#1-verl-core-requirements).
 
 | Hook (verl) | TPU override | Why |
 |---|---|---|
 | `vLLMReplica.launch_servers` | `launch_tpu_vllm_servers` | One server actor per replica, on the first worker's node, with every TPU env var forwarded. vLLM spans the hosts through its Ray executor instead of one `mp` server per node. `data_parallel_size > 1` is rejected: the TPU runtime compiles one XLA program for the whole mesh of the slice, while a DP group would only span `tensor_model_parallel_size` chips. Use `data_parallel_size=1`; verl then creates one replica per `tensor_model_parallel_size` chips, which gives the same parallelism. |
 | `RolloutReplica.rollout_worker_use_gpu` | `False` | Rollout workers must not claim a `GPU` resource. |
-| `vLLMHttpServer._preprocess_engine_kwargs` | `distributed_executor_backend=external_launcher`, `enable_sleep_mode=False`, `TPU_MULTIHOST_BACKEND=ray`, `VLLM_DISABLE_COMPILE_CACHE=1` | `patch_vllm_for_tpu` then selects the Ray executor for multi-host engines at config time. Sleep mode is off because rollout runs on its own slice (TPU chips cannot be shared between colocated worker groups), so nothing needs the HBM back. |
+| `vLLMHttpServer._preprocess_engine_kwargs` | `distributed_executor_backend=external_launcher`, `enable_sleep_mode=False`, `TPU_MULTIHOST_BACKEND=ray`, `VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0`, `VLLM_DISABLE_COMPILE_CACHE=1` | `patch_vllm_for_tpu` then selects the Ray executor for multi-host engines at config time. Sleep mode is off because rollout runs on its own slice (TPU chips cannot be shared between colocated worker groups), so nothing needs the HBM back. |
 | `PlatformTPU.auto_assign_accelerator_type` | gives each pool the first `tpu-group-<n>` slice that no earlier pool claimed | Keeps every host of a multi-host pool within one slice and puts the trainer and rollout pools on different slices. |
 
 ## Where each patch runs and when it can be removed
@@ -42,6 +43,7 @@ upstreamed, they live on the `pr34-grpo-0.6b-core-fixes` branch of
 
 | verl change | Why |
 |---|---|
+| `main_ppo` merges `get_platform().get_ray_init_kwargs()["runtime_env"]` into `ray.init` | `PlatformTPU` installs the GKE TPU worker setup hook (`patch_ray_worker`) and sets `VERL_PLATFORM=tpu` in every Ray worker. Without the hook, Ray's accelerator-id lookup raises `IndexError` in every trainer worker that is not on chip 0. |
 | `Worker._setup_env_cuda_visible_devices` takes `LOCAL_RANK` from `TPU_VISIBLE_CHIPS` on TPU | `get_worker_env_vars` pins each worker to one chip through `TPU_VISIBLE_CHIPS`; Ray cannot map its host-level chip id into that one-chip list, so the generic lookup raises `IndexError`. |
 | `RayResourcePool.get_placement_groups` labels TPU bundles with `auto_assign_accelerator_type` | Ray places each per-host placement group independently; without the label a multi-host pool can straddle two slices. |
 | `RolloutReplica.init_standalone` sets `use_gpu=supports_colocated_worker_groups()` | The replica's `CheckpointEngineWorker`s must not take the chips that vLLM's own workers need. |
@@ -91,9 +93,10 @@ pytest -q tests
 without vLLM or a TPU.
 
 TPU (GKE, two slices of 2 hosts x 4 v6e chips): run
-`examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh` with `SMOKE_TEST=1` against verl main, with the
-plugin shipped through Ray `py_modules` and `VERL_USE_EXTERNAL_MODULES=verl_hardware_plugin`, then
-check the log with `tests/special_tpu/verify_tpu_e2e_log.py grpo <log> 1` and that it contains
+`examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh` with `SMOKE_TEST=1` against verl with the
+verl-core changes above, with the plugin shipped through Ray `py_modules` and
+`VERL_USE_EXTERNAL_MODULES=verl_hardware_plugin`. Then check the log with
+`tests/special_tpu/verify_tpu_e2e_log.py grpo <log> 1` and that it contains
 `Registered rollout replica loader: vllm (TPU-aware)`, no `Traceback` during training and no
 `IsFusibleUnalignedDUS`. Cover `checkpoint_engine.backend=tpu` twice on the same pods (cold, then
 warm compile cache).
