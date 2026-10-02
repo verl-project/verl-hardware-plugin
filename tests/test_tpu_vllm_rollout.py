@@ -174,8 +174,6 @@ class _FakeWorker:
         self.__ray_call__ = _FakeRemoteMethod(self._call)
 
     def _call(self, fn):
-        if getattr(fn, "__name__", "") == "probe_stale_tpu_engines":
-            return {"hostname": f"host-{self._node_id}", "zombies": 0, "engines": 0}
         # get_tpu_server_launch_config sends two lambdas: (node, chips) and the env filter.
         with (
             mock.patch("ray.get_runtime_context", return_value=SimpleNamespace(get_node_id=lambda: self._node_id)),
@@ -256,7 +254,6 @@ def test_launch_tpu_vllm_servers_single_server_spanning_all_workers(tpu_vllm):
     async def run():
         with (
             mock.patch.object(tpu_vllm, "get_platform", return_value=platform),
-            mock.patch.object(tpu_vllm, "is_tpu_vllm_run", return_value=True),
             mock.patch.dict(os.environ, {"VERL_TPU_EXTRA_LIBTPU_INIT_ARGS": "--extra"}),
         ):
             await tpu_vllm.launch_tpu_vllm_servers(replica)
@@ -290,22 +287,6 @@ def test_launch_tpu_vllm_servers_single_server_spanning_all_workers(tpu_vllm):
 def test_launch_tpu_vllm_servers_rejects_data_parallel(tpu_vllm):
     with pytest.raises(NotImplementedError, match="data_parallel_size"):
         asyncio.run(tpu_vllm.launch_tpu_vllm_servers(_fake_replica(data_parallel_size=2)))
-
-
-def test_report_stale_tpu_engines_enforces_limit(tpu_vllm):
-    workers = [SimpleNamespace(__ray_call__=_FakeRemoteMethod({"hostname": "h0", "zombies": 7, "engines": 5}))]
-
-    async def run(limit):
-        with (
-            mock.patch.object(tpu_vllm, "is_tpu_vllm_run", return_value=True),
-            mock.patch.dict(os.environ, {"VERL_TPU_MAX_STALE_ENGINES": limit}),
-        ):
-            await tpu_vllm.report_stale_tpu_engines(workers)
-
-    asyncio.run(run("-1"))  # report only
-    asyncio.run(run("5"))  # at the limit
-    with pytest.raises(RuntimeError, match="VERL_TPU_MAX_STALE_ENGINES=4"):
-        asyncio.run(run("4"))
 
 
 # ---------------------------------------------------------------------------
