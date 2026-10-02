@@ -633,7 +633,7 @@ def apply_tpu_checkpoint_engine_hooks() -> None:
         import verl.checkpoint_engine.base as ckpt_base
         from verl.plugin.platform import get_platform
 
-        if not getattr(ckpt_base.CheckpointEngineManager.update_weights, "_verl_tpu_ckpt_patched", False):
+        if not getattr(ckpt_base, "_verl_tpu_ckpt_patched", False):
             _orig_worker_init = ckpt_base.CheckpointEngineWorker.__init__
             _orig_mgr_update = ckpt_base.CheckpointEngineManager.update_weights
 
@@ -661,7 +661,7 @@ def apply_tpu_checkpoint_engine_hooks() -> None:
 
             ckpt_base.CheckpointEngineWorker.__init__ = _patched_worker_init
             ckpt_base.CheckpointEngineManager.update_weights = _patched_mgr_update
-            _patched_mgr_update._verl_tpu_ckpt_patched = True  # type: ignore[attr-defined]
+            ckpt_base._verl_tpu_ckpt_patched = True
     except Exception as e:
         logger.debug("Failed to patch CheckpointEngineWorker/Manager for TPU: %s", e)
 
