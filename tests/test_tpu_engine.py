@@ -162,3 +162,14 @@ def test_auto_assign_accelerator_type_single_slice_shares_slice():
     nodes = [{"Alive": True, "Resources": {"TPU": 4.0, "tpu-group-0": 1.0}}]
     with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
         assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-0"
+
+
+def test_get_ray_init_kwargs_names_the_setup_hook_by_module_path():
+    import importlib
+
+    from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU, patch_ray_worker
+
+    hook = PlatformTPU().get_ray_init_kwargs()["runtime_env"]["worker_process_setup_hook"]
+    assert hook == "verl_hardware_plugin.platforms.platform_tpu.patch_ray_worker"
+    module_name, _, func_name = hook.rpartition(".")
+    assert getattr(importlib.import_module(module_name), func_name) is patch_ray_worker

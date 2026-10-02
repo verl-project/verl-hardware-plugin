@@ -50,15 +50,6 @@ upstreamed, they live on the `pr34-grpo-0.6b-core-fixes` branch of
 | `RayResourcePool.get_placement_groups` labels TPU bundles with `auto_assign_accelerator_type` | Ray places each per-host placement group independently; without the label a multi-host pool can straddle two slices. |
 | `RolloutReplica.init_standalone` sets `use_gpu=supports_colocated_worker_groups()` | The replica's `CheckpointEngineWorker`s must not take the chips that vLLM's own workers need. |
 
-verl main also does not call `PlatformTPU.get_ray_init_kwargs()`, so the Ray
-`worker_process_setup_hook` (`patch_ray_worker`) has to be set on the command line:
-
-```bash
-python3 -m verl.trainer.main_ppo \
-    +ray_kwargs.ray_init.runtime_env.worker_process_setup_hook=verl_hardware_plugin.platforms.platform_tpu.patch_ray_worker \
-    ...
-```
-
 ### 2. vLLM / vllm-torchtpu runtime patches (`patch_vllm_for_tpu`)
 
 `patch_vllm_for_tpu()` targets the pinned stack (vLLM `v0.29.0`, vllm-torchtpu `9faafb17`). It is

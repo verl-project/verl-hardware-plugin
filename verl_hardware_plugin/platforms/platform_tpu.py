@@ -324,11 +324,6 @@ def patch_ray_worker() -> None:
        the host's TPU chips, so a host-level index lookup can run off the end of the visible list
        and raise ``IndexError``. Returning an empty list is correct here: verl assigns chips itself
        via ``TPU_VISIBLE_CHIPS``.
-
-    verl main does not call ``PlatformTPU.get_ray_init_kwargs()``, so install this hook through
-    the trainer config::
-
-        +ray_kwargs.ray_init.runtime_env.worker_process_setup_hook=verl_hardware_plugin.platforms.platform_tpu.patch_ray_worker
     """
     os.environ["VERL_PLATFORM"] = "tpu"
 
@@ -481,10 +476,16 @@ class PlatformTPU(PlatformBase):
         return False
 
     def get_ray_init_kwargs(self) -> dict[str, Any]:
-        """Install the GKE TPU worker setup hook and pin the platform inside Ray workers."""
+        """Install the GKE TPU worker setup hook and pin the platform inside Ray workers.
+
+        The hook is passed as a module path rather than the function. Ray exports a function under
+        a generated key and keeps only the function's name in the job's runtime env. vLLM's
+        EngineCore calls ``ray.init`` again with the runtime env it captured from the server actor,
+        and Ray rejects that name as conflicting with the key. A module path round-trips unchanged.
+        """
         return {
             "runtime_env": {
-                "worker_process_setup_hook": patch_ray_worker,
+                "worker_process_setup_hook": f"{patch_ray_worker.__module__}.{patch_ray_worker.__qualname__}",
                 "env_vars": {"VERL_PLATFORM": "tpu"},
             }
         }
