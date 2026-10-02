@@ -39,29 +39,26 @@ A multi-slice TPU rollout job involves five kinds of processes:
 4. **`TPUvLLMHttpServer` Ray actor & `EngineCoreProc` child process** — the per-replica vLLM HTTP server actor on the first rollout node and the `VLLM::EngineCore` subprocess it spawns via `multiprocessing`.
 5. **`RayWorkerWrapper` Ray actors** — the per-chip TPU worker actors spawned by vLLM's `RayDistributedExecutor`.
 
-### 1. verl-core bridge patches (`verl_hardware_plugin/patches/tpu/`)
+### 1. verl-core requirements
 
-verl main calls only part of the platform interface. Two call sites are bridged by small
-patches in `verl_hardware_plugin/patches/tpu/` that route the existing `PlatformTPU` hooks
-through; **both are temporary and should be deleted once upstream `verl` calls those hooks directly**:
+The TPU rollout needs TPU call sites in verl core that verl main does not have yet. Until they are
+upstreamed, they live on the `pr34-grpo-0.6b-core-fixes` branch of
+[jialei777/verl-upstream](https://github.com/jialei777/verl-upstream/tree/pr34-grpo-0.6b-core-fixes):
 
-| Patch | Process where it executes | verl call site | What it routes | Removal condition |
-|---|---|---|---|---|
-| `ray_resource_pool_patch` | **`TaskRunner` actor** (on the head/coordinator node, where resource pools and placement groups are created) | `RayResourcePool.__init__` / `get_placement_groups` | `auto_assign_accelerator_type` (assigns each pool to a `tpu-group-<n>` slice with sufficient free `TPU` capacity) and `configure_placement_group_bundle`. | Upstream `verl` calls `auto_assign_accelerator_type` and `configure_placement_group_bundle` in `RayResourcePool`. |
-| `worker_local_rank_patch` | **Every verl `Worker` & `CheckpointEngineWorker` actor** (on the TPU worker nodes) | `Worker._setup_env_cuda_visible_devices` | `ray_local_rank_override` (`LOCAL_RANK` from `TPU_VISIBLE_CHIPS`) and skips eager `set_device` in `CheckpointEngineWorker`. | Upstream `verl` calls `ray_local_rank_override` in `Worker._setup_env_cuda_visible_devices`. |
+| verl change | Why |
+|---|---|
+| `Worker._setup_env_cuda_visible_devices` takes `LOCAL_RANK` from `TPU_VISIBLE_CHIPS` on TPU | `get_worker_env_vars` pins each worker to one chip through `TPU_VISIBLE_CHIPS`; Ray cannot map its host-level chip id into that one-chip list, so the generic lookup raises `IndexError`. |
+| `RayResourcePool.get_placement_groups` labels TPU bundles with `auto_assign_accelerator_type` | Ray places each per-host placement group independently; without the label a multi-host pool can straddle two slices. |
+| `RolloutReplica.init_standalone` sets `use_gpu=supports_colocated_worker_groups()` | The replica's `CheckpointEngineWorker`s must not take the chips that vLLM's own workers need. |
 
 verl main also does not call `PlatformTPU.get_ray_init_kwargs()`, so the Ray
-`worker_process_setup_hook` that installs these patches in every Ray worker process has to be set on
-the command line:
+`worker_process_setup_hook` (`patch_ray_worker`) has to be set on the command line:
 
 ```bash
 python3 -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.runtime_env.worker_process_setup_hook=verl_hardware_plugin.platforms.platform_tpu.patch_ray_worker \
     ...
 ```
-
-If the hook is missing, `PlatformTPU.get_worker_env_vars` logs an error the first time a pool is
-used instead of letting the job hang.
 
 ### 2. vLLM / vllm-torchtpu runtime patches (`patch_vllm_for_tpu`)
 

@@ -316,7 +316,7 @@ def _rebuild_tpu_device_module_proxy() -> "TPUDeviceModuleProxy":
 def patch_ray_worker() -> None:
     """Ray ``worker_process_setup_hook`` for GKE TPU pods.
 
-    Runs once in every Ray worker process before any task. It does three things:
+    Runs once in every Ray worker process before any task. It does two things:
 
     1. Pins ``VERL_PLATFORM=tpu`` so a worker that did not inherit the driver's environment still
        resolves the TPU platform.
@@ -324,9 +324,6 @@ def patch_ray_worker() -> None:
        the host's TPU chips, so a host-level index lookup can run off the end of the visible list
        and raise ``IndexError``. Returning an empty list is correct here: verl assigns chips itself
        via ``TPU_VISIBLE_CHIPS``.
-    3. Installs the plugin-side patches for the verl-core call sites that do not yet consult
-       ``PlatformTPU`` (``verl_hardware_plugin/patches/tpu/``). This is the authoritative place to
-       do so: the process is fresh, so the target modules can be imported in a controlled order.
 
     verl main does not call ``PlatformTPU.get_ray_init_kwargs()``, so install this hook through
     the trainer config::
@@ -349,15 +346,6 @@ def patch_ray_worker() -> None:
     except Exception as e:
         logger.warning(f"Failed to apply Ray worker accelerator patch: {e}")
 
-    try:
-        from verl.plugin.platform import get_platform
-        from verl_hardware_plugin.patches.tpu import apply_all
-
-        installed = apply_all(get_platform(), import_targets=True)
-        logger.info("TPU verl-core patches installed in Ray worker: %s", installed)
-    except Exception as e:
-        logger.warning(f"Failed to apply TPU verl-core patches in Ray worker: {e}")
-
 
 @PlatformRegistry.register(platform="tpu")
 class PlatformTPU(PlatformBase):
@@ -372,18 +360,7 @@ class PlatformTPU(PlatformBase):
         super().__init__()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         self._device_module = TPUDeviceModuleProxy(original_tpu)
-        self._warned_unpatched_pool = False
         self._claimed_slices: set[str] = set()
-
-        # Install the plugin-side patches for the verl-core call sites that do not yet consult
-        # this platform (see ``verl_hardware_plugin/patches/tpu/__init__.py``). Only now, when
-        # verl has actually selected TPU for this process; the XPU platform follows the same
-        # pattern. ``import_targets=False`` because this may run from a module-level
-        # ``get_device_name()`` while verl is still importing -- targets not fully imported yet
-        # are picked up by ``patch_ray_worker`` (authoritative) and the Worker patch.
-        from verl_hardware_plugin.patches.tpu import apply_all
-
-        apply_all(self, import_targets=False)
 
     @property
     def vendor_name(self) -> str:
@@ -680,20 +657,6 @@ class PlatformTPU(PlatformBase):
         device_name: str,
     ) -> dict[str, str]:
         """Return platform-specific TPU environment variables for worker nodes."""
-        from verl_hardware_plugin.patches.tpu import is_applied
-
-        if not is_applied("ray_resource_pool_patch") and not getattr(self, "_warned_unpatched_pool", False):
-            # verl-core built this pool's placement groups without consulting
-            # auto_assign_accelerator_type / configure_placement_group_bundle. On a multi-slice
-            # cluster that is a hang, not an error, so say it here where the pool is first used.
-            self._warned_unpatched_pool = True
-            logger.error(
-                "RayResourcePool was created before the TPU core patches were installed; placement "
-                "groups have no slice affinity and rollout bundles reserve TPU chips. Configure "
-                "+ray_kwargs.ray_init.runtime_env.worker_process_setup_hook="
-                "verl_hardware_plugin.platforms.platform_tpu.patch_ray_worker"
-            )
-
         env_vars = {}
         if "VERL_PLATFORM" in os.environ:
             env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
