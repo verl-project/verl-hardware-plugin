@@ -162,16 +162,13 @@ class _FakeRemoteMethod:
 
 
 class _FakeWorker:
-    def __init__(self, node_id, chip):
-        self._node_id, self._env = node_id, {"TPU_VISIBLE_CHIPS": chip}
+    def __init__(self, node_id):
+        self._node_id = node_id
         self.__ray_call__ = _FakeRemoteMethod(self._call)
 
     def _call(self, fn):
-        # launch_tpu_vllm_servers asks every worker for its (node id, TPU chip).
-        with (
-            mock.patch("ray.get_runtime_context", return_value=SimpleNamespace(get_node_id=lambda: self._node_id)),
-            mock.patch.dict(os.environ, self._env, clear=True),
-        ):
+        # launch_tpu_vllm_servers asks the first worker for its node id.
+        with mock.patch("ray.get_runtime_context", return_value=SimpleNamespace(get_node_id=lambda: self._node_id)):
             return fn(self)
 
 
@@ -207,7 +204,7 @@ NODE_B = "b" * 56
 
 
 def _fake_replica(data_parallel_size=1):
-    workers = [_FakeWorker(node, str(chip)) for node in (NODE_A, NODE_B) for chip in range(4)]
+    workers = [_FakeWorker(node) for node in (NODE_A, NODE_B) for _ in range(4)]
     return SimpleNamespace(
         config=SimpleNamespace(
             data_parallel_size=data_parallel_size, tensor_model_parallel_size=8, ray_actor_max_concurrency=1234
@@ -261,7 +258,7 @@ def test_launch_tpu_vllm_servers_single_server_spanning_all_workers(tpu_vllm):
     assert init["workers"] is replica.workers
     assert init["node_rank"] == 0
     assert init["nnodes"] == 2
-    assert init["cuda_visible_devices"] == "0,1,2,3,0,1,2,3"
+    assert init["cuda_visible_devices"] == ""
 
     assert server_class.server.launch_kwargs == {"master_address": "10.0.0.1", "master_port": 1234, "dp_rpc_port": 5678}
     assert replica.servers == [server_class.server]

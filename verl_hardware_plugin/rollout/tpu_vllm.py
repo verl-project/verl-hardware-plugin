@@ -17,9 +17,6 @@ The same logic previously lived behind ``get_resource_name() == "TPU"`` branches
 ``vllm_async_server.py`` and ``replica.py``.
 """
 
-import asyncio
-import os
-
 import ray
 
 from verl.plugin.platform import get_platform
@@ -43,18 +40,10 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
             "which is equivalent to engine-internal data parallelism."
         )
 
-    # Upstream asks Ray for each worker's device, but TPU rollout workers hold no TPU resource: the
-    # platform pins each one to a chip through TPU_VISIBLE_CHIPS.
-    worker_infos = await asyncio.gather(
-        *[
-            worker.__ray_call__.remote(
-                lambda self: (ray.get_runtime_context().get_node_id(), os.environ.get("TPU_VISIBLE_CHIPS", "0"))
-            )
-            for worker in replica.workers
-        ]
-    )
-    node_id = worker_infos[0][0]
-    visible_chips = ",".join(chip for _, chip in worker_infos)
+    # Upstream starts one server per node and gives it the node's devices. On TPU one server, on the
+    # first worker's node, drives all of the replica's hosts and holds no chips: patch_vllm_for_tpu
+    # gives each of vLLM's own workers a chip.
+    node_id = await replica.workers[0].__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
 
     prefix = replica._get_server_name_prefix()
     if replica.is_reward_model:
@@ -93,7 +82,7 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
         node_rank=0,
         gpus_per_node=replica.gpus_per_replica_node,
         nnodes=replica.nnodes,
-        cuda_visible_devices=visible_chips,
+        cuda_visible_devices="",
     )
     replica.servers.append(server)
 
