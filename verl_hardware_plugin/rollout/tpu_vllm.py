@@ -12,7 +12,6 @@ and changes only what TPU needs:
 * ``distributed_executor_backend=external_launcher`` and ``enable_sleep_mode=False``: the
   multi-host executor is selected by ``patch_vllm_for_tpu``, and vllm-torchtpu has no sleep
   mode.
-* Standalone rollout workers do not claim a GPU resource.
 
 The same logic previously lived behind ``get_resource_name() == "TPU"`` branches in verl's
 ``vllm_async_server.py`` and ``replica.py``.
@@ -130,14 +129,11 @@ class TPUvLLMHttpServer(vLLMHttpServer):
 
 
 class TPUvLLMReplica(vLLMReplica):
-    """vLLM rollout replica for TPU: one server actor per replica, no GPU resource claims."""
+    """vLLM rollout replica for TPU: one server actor drives all of the replica's hosts."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.server_class = ray.remote(TPUvLLMHttpServer)
-
-    def rollout_worker_use_gpu(self) -> bool:
-        return False
 
     async def launch_servers(self):
         assert len(self.workers) == self.world_size, (

@@ -145,9 +145,8 @@ def test_server_worker_extension_defers_to_upstream(tpu_vllm):
     assert "run_server" not in tpu_vllm.TPUvLLMHttpServer.__dict__
 
 
-def test_replica_uses_tpu_server_and_no_gpu(tpu_vllm):
+def test_replica_uses_tpu_server(tpu_vllm):
     replica = tpu_vllm.TPUvLLMReplica(0, "config", "model_config")
-    assert replica.rollout_worker_use_gpu() is False
     assert replica.server_class is not None
     assert replica.args == (0, "config", "model_config")
 
