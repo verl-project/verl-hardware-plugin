@@ -1,102 +1,89 @@
-# TPU vLLM Rollout
+# Google TPU vLLM Rollout
 
-This page covers the vLLM rollout path on Google TPU: how it plugs into verl, which process runs
-each patch, which patches are temporary workarounds for upstream repos (`verl`, `vllm-torchtpu`,
-`vllm`), and how to test it.
+The plugin runs verl's vLLM rollout on TPU. With `VERL_PLATFORM=tpu`, the usual
+`actor_rollout_ref.rollout.name=vllm` setting selects the TPU rollout; other platforms keep verl's
+stock vLLM rollout.
 
-## How it plugs in
+Training and rollout run on separate TPU slices (a slice is a group of TPU hosts joined by a fast
+chip interconnect). One vLLM engine spans all chips of the rollout slice and receives the trainer's
+updated weights through the `tpu` checkpoint engine.
 
-```text
-verl_hardware_plugin/rollout/
-├── __init__.py                 # registers a TPU-aware "vllm" loader in RolloutReplicaRegistry
-├── tpu_vllm.py                 # TPUvLLMReplica, TPUvLLMHttpServer, launch_tpu_vllm_servers
-└── tpu_vllm_patches.py         # patch_vllm_for_tpu(): vLLM / vllm-torchtpu runtime patches
-```
+## Requirements
 
-`register_all_rollouts()` wraps the `vllm` entry of `RolloutReplicaRegistry`. The loader returns
-`TPUvLLMReplica` when `get_resource_name() == "TPU"` and otherwise calls the loader that was
-registered before it, so other platforms are unaffected. The rollout still needs a few verl-core
-changes; they are listed under [verl-core requirements](#1-verl-core-requirements).
+- The prerequisites from the [Installation Guide](./install_guidance.md), plus vLLM `v0.29.0` and
+  vllm-torchtpu `9faafb17`, the versions the rollout is tested with (image
+  `us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261001-tsync990787257`).
+- A verl checkout with the TPU rollout changes. Until they are merged into verl, use the
+  `pr34-grpo-0.6b-core-fixes` branch of
+  [jialei777/verl-upstream](https://github.com/jialei777/verl-upstream/tree/pr34-grpo-0.6b-core-fixes).
+- At least two TPU slices, one for training and one for rollout. A TPU chip belongs to a single
+  process, so training and rollout cannot share chips.
+- On KubeRay, a TPU worker group named `tpu-group` with one replica per slice. Ray then labels the
+  slices `tpu-group-0`, `tpu-group-1`, ..., which the plugin uses to give training and rollout a
+  slice each.
 
-| Hook (verl) | TPU override | Why |
-|---|---|---|
-| `vLLMReplica.launch_servers` | `launch_tpu_vllm_servers` | One server actor per replica, on the first worker's node, with every TPU env var forwarded. vLLM spans the hosts through its Ray executor instead of one `mp` server per node: the actor starts with `TPU_MULTIHOST_BACKEND=ray` and `VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0`. `data_parallel_size > 1` is rejected: the TPU runtime compiles one XLA program for the whole mesh of the slice, while a DP group would only span `tensor_model_parallel_size` chips. Use `data_parallel_size=1`; verl then creates one replica per `tensor_model_parallel_size` chips, which gives the same parallelism. |
-| `RolloutReplica.rollout_worker_use_gpu` | `False` | Rollout workers must not claim a `GPU` resource. |
-| `vLLMHttpServer._preprocess_engine_kwargs` | `distributed_executor_backend=external_launcher`, `enable_sleep_mode=False` | `patch_vllm_for_tpu` then switches the engine to vLLM's Ray executor at config time. Sleep mode is off because rollout runs on its own slice (TPU chips cannot be shared between colocated worker groups), so nothing needs the HBM back. |
-| `PlatformTPU.auto_assign_accelerator_type` | gives each pool the first `tpu-group-<n>` slice that no earlier pool claimed | Keeps every host of a multi-host pool within one slice and puts the trainer and rollout pools on different slices. |
+## Run
 
-## Where each patch runs and when it can be removed
-
-A multi-slice TPU rollout job involves five kinds of processes:
-
-1. **Driver (`main_ppo`)** — starts the Ray job on the head node and launches `TaskRunner`.
-2. **`TaskRunner` Ray actor** — creates `RayResourcePool` placement groups and spawns trainer and rollout worker actors + `TPUvLLMReplica`.
-3. **`Worker` / `CheckpointEngineWorker` Ray actors** — verl worker actors placed in the trainer and rollout placement groups.
-4. **`TPUvLLMHttpServer` Ray actor & `EngineCoreProc` child process** — the per-replica vLLM HTTP server actor on the first rollout node and the `VLLM::EngineCore` subprocess it spawns via `multiprocessing`.
-5. **`RayWorkerWrapper` Ray actors** — the per-chip TPU worker actors spawned by vLLM's `RayDistributedExecutor`.
-
-### 1. verl-core requirements
-
-The TPU rollout needs TPU call sites in verl core that verl main does not have yet. Until they are
-upstreamed, they live on the `pr34-grpo-0.6b-core-fixes` branch of
-[jialei777/verl-upstream](https://github.com/jialei777/verl-upstream/tree/pr34-grpo-0.6b-core-fixes):
-
-| verl change | Why |
-|---|---|
-| `main_ppo` merges `get_platform().get_ray_init_kwargs()["runtime_env"]` into `ray.init` | `PlatformTPU` installs the GKE TPU worker setup hook (`patch_ray_worker`) and sets `VERL_PLATFORM=tpu` in every Ray worker. Without the hook, Ray's accelerator-id lookup raises `IndexError` in every trainer worker that is not on chip 0. |
-| `Worker._setup_env_cuda_visible_devices` takes `LOCAL_RANK` from `TPU_VISIBLE_CHIPS` on TPU | `get_worker_env_vars` pins each worker to one chip through `TPU_VISIBLE_CHIPS`; Ray cannot map its host-level chip id into that one-chip list, so the generic lookup raises `IndexError`. |
-| `RayResourcePool.get_placement_groups` labels TPU bundles with `auto_assign_accelerator_type` | Ray places each per-host placement group independently; without the label a multi-host pool can straddle two slices. |
-| `RolloutReplica.init_standalone` sets `use_gpu=supports_colocated_worker_groups()` | The replica's `CheckpointEngineWorker`s must not take the chips that vLLM's own workers need. |
-| `vLLMHttpServer.collective_rpc` returns the engine's per-worker results | `update_tpu_weights` checks the tensor count that each worker's `load_weights_from_ray_registry` returns. |
-
-### 2. vLLM / vllm-torchtpu runtime patches (`patch_vllm_for_tpu`)
-
-`patch_vllm_for_tpu()` targets the pinned stack (vLLM `v0.29.0`, vllm-torchtpu `9faafb17`). It is
-installed in `TPUvLLMHttpServer`, propagated into the `EngineCoreProc` subprocess (via the
-`multiprocessing.process.BaseProcess` wrapper), and invoked in each pooled vLLM `RayWorkerWrapper`
-actor (via `RayWorkerWrapper.__init__`).
-
-#### Group A — verl ↔ vLLM Ray integration (permanent plugin glue unless vLLM adds native hooks)
-
-| Patch | Process where it executes | What it does |
-|---|---|---|
-| `initialize_ray_cluster`: reuse verl placement groups via `VERL_TPU_PG_IDS` | `EngineCoreProc` | Connects to Ray with vLLM's `ray_runtime_env` (preserving `py_modules`) and attaches directly to the replica's `RayResourcePool` placement groups (`VERL_TPU_PG_IDS`) instead of creating a duplicate placement group. |
-| `EngineArgs.create_engine_config` | `TPUvLLMHttpServer` | Swaps vllm-torchtpu's Ray executor, which takes a single placement group, for vLLM's generic Ray executor, which the other patches attach to verl's per-host placement groups; turns off async scheduling, which that executor does not support. |
-
-#### Group B — Upstream bugs / gaps to file against `vllm-torchtpu` and `vllm` (removable once fixed upstream)
-
-These patches exist only because of missing methods or bugs in `vllm-torchtpu` (`9faafb17`) or
-`vllm` (`v0.29.0`). They can be filed as an upstream issue list and removed from the plugin as soon
-as `vllm-torchtpu` / `vllm` lands the fixes:
-
-| # | Target repo | File / Symbol in upstream | Bug / Gap description | Suggested upstream fix | Plugin workaround today |
-|---|---|---|---|---|---|
-| 1 | `vllm-torchtpu` | `vllm_torchtpu/worker/tpu_worker.py` (`TPUWorker.reset_encoder_cache`) | `TPUWorker` does not implement `reset_encoder_cache()`. When verl calls `clear_kv_cache` / `reset_prefix_cache` after weight sync, vLLM V1 invokes `worker.reset_encoder_cache()` and crashes with `NotImplementedError` / `AttributeError`. | Implement a no-op (or encoder cache clear) `reset_encoder_cache(self)` method on `TPUWorker`. | Monkey-patches `TPUWorker.reset_encoder_cache` with a no-op stub in `EngineCoreProc` & `RayWorkerWrapper`. |
-| 2 | `vllm-torchtpu` | `vllm_torchtpu/executors/ray_distributed_executor.py` (`RayDistributedExecutor`) | When `distributed_executor_backend="ray"` is selected, vLLM resolves to its generic `vllm.v1.executor.ray_executor.RayDistributedExecutor` instead of `vllm_torchtpu`'s `RayDistributedExecutor`, or `vllm_torchtpu`'s `_init_workers_ray` fails under an external Ray placement group because it assumes bundles reserve `TPU` and does not compute per-host `CLOUD_TPU_TASK_ID`, `TPU_VISIBLE_CHIPS`, `TPU_PROCESS_PORT`, `TORCH_TPU_SLICEBUILDER_ADDRESSES`, and `TPU_PROCESS_ADDRESSES` from the placement group's assigned nodes. | Register `vllm_torchtpu`'s `RayDistributedExecutor` as the TPU V1 Ray executor and support placement groups whose bundles do not pre-reserve `TPU` (or compute per-worker TPU mesh env vars in `vllm_torchtpu`'s `_init_workers_ray`). | Replaces `RayDistributedExecutor._init_workers_ray` in `EngineCoreProc` to spawn `RayWorkerWrapper` actors and populate per-worker TPU mesh env vars. |
-| 3 | `vllm-torchtpu` / `vllm` | `vllm/v1/executor/ray_executor.py` (`RayDistributedExecutor._execute_dag`) | vLLM V1's `RayDistributedExecutor` uses a Ray compiled DAG (`forward_dag`) by default, which hangs or fails with TPU `RayWorkerWrapper` actors across multiple hosts. | Disable Ray compiled DAG on TPU (`VLLM_USE_RAY_COMPILED_DAG=0` by default on `tpu_platform`) or fall back to standard `ray.get([w.execute_model_ray.remote(...)])` fan-out in `vllm-torchtpu`. | Replaces `RayDistributedExecutor._execute_dag` in `EngineCoreProc` with a direct `ray.get` fan-out. |
-| 4 | `vllm` / `vllm-torchtpu` | `vllm` AOT compile cache (`VLLM_DISABLE_COMPILE_CACHE`) | On warm starts, vLLM can reload a degenerate AOT compile artifact (`num_artifacts=0`) that silently skips `torch.compile` and runs the model eagerly on TPU, triggering a fatal `libtpu` `IsFusibleUnalignedDUS` `CHECK` crash (`b/501165531`). | Validate that a reloaded AOT artifact on TPU has `num_artifacts > 0` before skipping compilation, or default `VLLM_DISABLE_COMPILE_CACHE=1` in `vllm-torchtpu` until AOT cache serialization supports PJRT/TPU artifacts. | Sets `VLLM_DISABLE_COMPILE_CACHE=1` by default in `patch_vllm_for_tpu`. |
-
-## Testing
-
-CPU (same as the plugin's GitHub Actions):
+The reference recipe is `examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh` on the verl branch above:
+GRPO on GSM8K with Qwen3-0.6B, on two v6e-8 slices of 2 hosts x 4 chips. Submit it as a Ray job
+from the verl checkout, with the plugin loaded in every Ray worker:
 
 ```bash
-ruff check . && ruff format --check .
-mypy --ignore-missing-imports verl_hardware_plugin/
-python scripts/check_license.py --directories .
-python scripts/check_bytedance_copyright.py --directories .
-python scripts/check_verl_api.py --plugin-root . --verl-root /path/to/verl/verl
-pytest -q tests
+ray job submit --address "${RAY_ADDRESS}" \
+  --working-dir . \
+  --runtime-env-json '{
+    "py_modules": ["/path/to/verl-hardware-plugin/verl_hardware_plugin"],
+    "excludes": [".git", "logs", "*.log", "*.pt", "*.bin"],
+    "env_vars": {
+      "PYTHONPATH": ".",
+      "PYTHONUNBUFFERED": "1",
+      "VERL_PLATFORM": "tpu",
+      "VERL_USE_EXTERNAL_MODULES": "verl_hardware_plugin",
+      "VERL_LOGGING_LEVEL": "INFO",
+      "VLLM_USE_V1": "0",
+      "RAY_memory_monitor_refresh_ms": "0",
+      "RAY_memory_usage_threshold": "0.99",
+      "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS": "1",
+      "RAY_OVERRIDE_JOB_RUNTIME_ENV": "1"
+    }
+  }' \
+  -- bash -c 'SMOKE_TEST=1 bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh'
 ```
 
-`tests/test_tpu_vllm_rollout.py` stubs `vllm_async_server` and every Ray handle, so it runs
-without vLLM or a TPU.
+`SMOKE_TEST=1` runs a 5-step bring-up check; drop it for the full 100-step run. Drop `py_modules`
+if the plugin is installed in the image.
 
-TPU (GKE, two slices of 2 hosts x 4 v6e chips): run
-`examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh` with `SMOKE_TEST=1` against verl with the
-verl-core changes above, with the plugin shipped through Ray `py_modules` and
-`VERL_USE_EXTERNAL_MODULES=verl_hardware_plugin`. Then check the log with
-`tests/special_tpu/verify_tpu_e2e_log.py grpo <log> 1` and that it contains
-`Registered rollout replica loader: vllm (TPU-aware)`, no `Traceback` during training and no
-`IsFusibleUnalignedDUS`. Cover `checkpoint_engine.backend=tpu` twice on the same pods (cold, then
-warm compile cache).
+The rollout settings that matter on TPU (the recipe already sets them):
+
+| Setting | Value on TPU |
+|---------|--------------|
+| `actor_rollout_ref.rollout.name` | `vllm` |
+| `actor_rollout_ref.rollout.tensor_model_parallel_size` | All chips of the rollout slice, e.g. `8` on v6e-8 |
+| `actor_rollout_ref.rollout.data_parallel_size` | `1` (the default); larger values are rejected |
+| `actor_rollout_ref.rollout.checkpoint_engine.backend` | `tpu` |
+| `actor_rollout_ref.hybrid_engine` | `False` |
+
+## Verify
+
+On any host, without vLLM or a TPU:
+
+```bash
+pytest tests/test_tpu_vllm_rollout.py -v
+```
+
+On TPU, the job log contains
+
+```text
+Registered rollout replica loader: vllm (TPU-aware)
+Reusing 2 verl placement group(s) for TPU rollout
+```
+
+where `2` is the number of rollout hosts, and the job ends with status `SUCCEEDED`. The rollout is
+tested with Qwen3-0.6B and Qwen3-4B on two v6e-8 slices.
+
+## Related Documentation
+
+- [User Guide](./README.md)
+- [Installation Guide](./install_guidance.md)
+- For developers: the code in `verl_hardware_plugin/rollout/` documents how each part works and which
+  upstream fix would make each vLLM patch unnecessary.

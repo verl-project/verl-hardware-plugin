@@ -3,10 +3,24 @@
 
 """vLLM / vllm-torchtpu runtime patches for multi-host TPU rollout.
 
-``patch_vllm_for_tpu`` makes a vLLM TP engine spanning one or more TPU hosts start and run
-under Ray when launched by verl. Every patch here works around a specific gap in vLLM,
-vllm-torchtpu, or Ray; ``docs/user_guide_tpu/rollout.md`` documents which process runs each
-patch and which upstream project owns the permanent fix.
+``patch_vllm_for_tpu`` lets the vLLM engine of a ``TPUvLLMHttpServer`` run on all hosts of a TPU
+slice through Ray. Each patch fills a gap in the pinned vLLM (v0.29.0) and vllm-torchtpu
+(9faafb17) and can be dropped once upstream closes it:
+
+* ``EngineArgs.create_engine_config``, ``initialize_ray_cluster`` and
+  ``RayDistributedExecutor._init_workers_ray``: run the engine on vLLM's generic Ray executor,
+  attached to the placement groups verl reserved for the replica (one per host), with one worker
+  per chip that gets the TPU multi-host environment. vllm-torchtpu's own Ray executor can reuse
+  only a single placement group. Upstream fix: let it run on several.
+* ``RayDistributedExecutor._execute_dag``: run each step with plain Ray calls instead of a
+  compiled Ray graph, which was reported to hang across TPU hosts.
+* ``TPUWorker.reset_encoder_cache``: no-op. verl resets vLLM's caches after every weight update,
+  and vllm-torchtpu's worker does not implement this call. Upstream fix: implement it.
+* ``VLLM_DISABLE_COMPILE_CACHE=1``: a reloaded compile-cache artifact can make vLLM run the model
+  eagerly, which crashes libtpu (b/501165531). Upstream fix: that bug.
+* ``multiprocessing.process.BaseProcess.__init__`` and ``RayWorkerWrapper.__init__``: install
+  these patches in the EngineCore process and in vLLM's worker actors, neither of which imports
+  the plugin.
 """
 
 import copy
