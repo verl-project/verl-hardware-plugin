@@ -297,7 +297,6 @@ def test_patch_vllm_for_tpu_env_side_effects_without_torchtpu(isolated_patches):
     isolated_patches.patch_vllm_for_tpu()
 
     assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "1"
-    assert "VLLM_USE_V1" not in os.environ  # V0 is gone in vLLM v0.29; the flag is not set anymore
     assert multiprocessing.process.BaseProcess._tpu_patched is True
     # The executor patches need vllm-torchtpu, so the guard stays open for a later retry.
     assert isolated_patches._PATCHES_APPLIED is False

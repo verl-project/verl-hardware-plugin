@@ -40,7 +40,6 @@ ray job submit --address "${RAY_ADDRESS}" \
       "VERL_PLATFORM": "tpu",
       "VERL_USE_EXTERNAL_MODULES": "verl_hardware_plugin",
       "VERL_LOGGING_LEVEL": "INFO",
-      "VLLM_USE_V1": "0",
       "RAY_memory_monitor_refresh_ms": "0",
       "RAY_memory_usage_threshold": "0.99",
       "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS": "1",
