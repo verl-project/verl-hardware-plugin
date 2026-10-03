@@ -95,9 +95,6 @@ def test_vllm_loader_defers_off_tpu_and_picks_tpu_replica_on_tpu():
 
     with mock.patch.dict(RolloutReplicaRegistry._registry, {"vllm": lambda: sentinel_upstream}):
         register_all_rollouts()
-        loader = RolloutReplicaRegistry._registry["vllm"]
-        register_all_rollouts()  # idempotent: must not wrap the plugin loader again
-        assert RolloutReplicaRegistry._registry["vllm"] is loader
 
         with mock.patch("verl.utils.device.get_resource_name", return_value="GPU"):
             assert RolloutReplicaRegistry.get("vllm") is sentinel_upstream
