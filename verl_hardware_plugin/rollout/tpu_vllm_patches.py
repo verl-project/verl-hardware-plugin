@@ -13,7 +13,9 @@ slice through Ray. Each patch fills a gap in the pinned vLLM (v0.29.0) and vllm-
   per chip that gets the TPU multi-host environment. vllm-torchtpu's own Ray executor can reuse
   only a single placement group. Upstream fix: let it run on several.
 * ``RayDistributedExecutor._execute_dag``: run each step with plain Ray calls instead of a
-  compiled Ray graph, which was reported to hang across TPU hosts.
+  compiled Ray graph. The graph runs the model on a background thread, where vllm-torchtpu's
+  raised torch.compile recompile limit does not apply, so the first request fails. Upstream fix:
+  raise the limit on every thread.
 * ``TPUWorker.reset_encoder_cache``: no-op. verl resets vLLM's caches after every weight update,
   and vllm-torchtpu's worker does not implement this call. Upstream fix: implement it.
 * ``VLLM_DISABLE_COMPILE_CACHE=1``: a reloaded compile-cache artifact can make vLLM run the model
@@ -289,27 +291,18 @@ def patch_vllm_for_tpu() -> None:
             self.collective_rpc("init_device")
             self.collective_rpc("load_model")
 
-        def patched_execute_dag(
-            self,
-            scheduler_output,
-            grammar_output,
-            non_block: bool = False,
-        ):
+        def patched_execute_dag(self, scheduler_output, grammar_output, non_block=False):
+            # Plain Ray calls instead of vLLM's compiled Ray graph. The graph runs the model on a
+            # background thread, where torch.compile's recompile limit is still the default 8:
+            # vllm-torchtpu raises it to 1024 on the main thread only (dynamo config overrides
+            # are per thread), and the first request fails with FailOnRecompileLimitHit. verl uses
+            # no KV connector, so rank 0's output is the step's result.
             refs = [worker.execute_model_ray.remote((scheduler_output, grammar_output)) for worker in self.workers]
-            if not self.has_connector:
-                if not non_block:
-                    all_results = ray.get(refs)
-                    detach_zero_copy_from_model_runner_output(all_results[0])
-                    return all_results[0]
+            if non_block:
                 return FutureWrapper(refs[0])
-
-            assert self.kv_output_aggregator is not None
-            if not non_block:
-                outputs = ray.get(refs)
-                for output in outputs:
-                    detach_zero_copy_from_model_runner_output(output)
-                return self.kv_output_aggregator.aggregate(outputs)
-            return FutureWrapper(refs, self.kv_output_aggregator)
+            output = ray.get(refs)[0]
+            detach_zero_copy_from_model_runner_output(output)
+            return output
 
         # create_engine_config sets distributed_executor_backend="ray", which resolves to vLLM V1's
         # generic RayDistributedExecutor, so that is the class to patch.
