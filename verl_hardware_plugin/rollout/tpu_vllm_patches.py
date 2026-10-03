@@ -9,9 +9,9 @@ slice through Ray. Each patch fills a gap in the pinned vLLM (v0.29.0) and vllm-
 
 * ``EngineArgs.create_engine_config``, ``initialize_ray_cluster`` and
   ``RayDistributedExecutor._init_workers_ray``: run the engine on vLLM's generic Ray executor,
-  attached to the placement groups verl reserved for the replica (one per host), with one worker
-  per chip that gets the TPU multi-host environment. vllm-torchtpu's own Ray executor can reuse
-  only a single placement group. Upstream fix: let it run on several.
+  on the placement groups verl reserved for the replica (one per host), with one worker per chip
+  that gets the TPU multi-host environment. vllm-torchtpu's own Ray executor can use only a
+  single placement group. Upstream fix: let it use several.
 * ``RayDistributedExecutor._execute_dag``: run each step with plain Ray calls instead of a
   compiled Ray graph. The graph runs the model on a background thread, where vllm-torchtpu's
   raised torch.compile recompile limit does not apply, so the first request fails. Upstream fix:
@@ -26,7 +26,6 @@ slice through Ray. Each patch fills a gap in the pinned vLLM (v0.29.0) and vllm-
 """
 
 import logging
-import multiprocessing
 import multiprocessing.process
 import os
 from collections import Counter
@@ -38,6 +37,151 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from verl_hardware_plugin.platforms.platform_tpu import resolve_tpu_topology_bounds
 
 logger = logging.getLogger(__name__)
+
+_PATCHES_APPLIED = False
+
+
+def patch_vllm_for_tpu() -> None:
+    """Install the patches in this process. Later calls return at once."""
+    global _PATCHES_APPLIED
+    if _PATCHES_APPLIED:
+        return
+
+    patch_multiprocessing_for_tpu()
+    # vLLM can reload a degenerate AOT compile artifact (num_artifacts=0) that silently runs the
+    # model eagerly; eager execution then hits the XLA:TPU unaligned-DUS CHECK (b/501165531).
+    os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+
+    # Imported here: CPU tests and processes outside the rollout may lack vLLM or vllm-torchtpu.
+    try:
+        import vllm.v1.executor.ray_executor as ray_executor
+        from vllm.engine.arg_utils import EngineArgs
+        from vllm_torchtpu.executors.ray_distributed_executor import RayWorkerWrapper
+        from vllm_torchtpu.worker.tpu_worker import TPUWorker
+    except ImportError as exc:
+        logger.debug("Skipping vLLM TPU executor patches (vllm / vllm_torchtpu not installed): %s", exc)
+        return
+
+    try:
+        original_create_engine_config = EngineArgs.create_engine_config
+
+        def create_engine_config(self, *args, **kwargs):
+            # vllm-torchtpu picks its own Ray executor, which takes a single placement group, but
+            # verl reserves one per host. Use vLLM's generic Ray executor, which the patches below
+            # adapt to TPU. It does not support async scheduling, which vLLM turned on for the
+            # external_launcher backend that TPUvLLMHttpServer passes in.
+            vllm_config = original_create_engine_config(self, *args, **kwargs)
+            vllm_config.parallel_config.distributed_executor_backend = "ray"
+            vllm_config.scheduler_config.async_scheduling = False
+            return vllm_config
+
+        original_worker_init = RayWorkerWrapper.__init__
+
+        def worker_init(self, *args, **kwargs):
+            # vLLM's worker actors never import the plugin. Ray sends this method to them with the
+            # actor class, so it installs the patches there.
+            patch_vllm_for_tpu()
+            original_worker_init(self, *args, **kwargs)
+
+        EngineArgs.create_engine_config = create_engine_config
+        RayWorkerWrapper.__init__ = worker_init
+        TPUWorker.reset_encoder_cache = _reset_encoder_cache
+        ray_executor.initialize_ray_cluster = _initialize_ray_cluster
+        ray_executor.RayDistributedExecutor._init_workers_ray = _init_workers_ray
+        ray_executor.RayDistributedExecutor._execute_dag = _execute_dag
+        _PATCHES_APPLIED = True
+        logger.info("Successfully applied all TPU patches to vLLM and vllm-torchtpu.")
+    except Exception as e:
+        logger.warning("Failed to apply TPU vLLM patches: %s", e, exc_info=True)
+
+
+def _initialize_ray_cluster(parallel_config, ray_address=None) -> None:
+    """Connect to Ray as vLLM does, but create no placement group: ``_init_workers_ray`` uses verl's."""
+    if not ray.is_initialized():
+        ray.init(address=ray_address, runtime_env=parallel_config.ray_runtime_env)
+
+
+def _init_workers_ray(self, placement_group, **ray_remote_kwargs) -> None:
+    """Start and initialize one vLLM worker per TPU chip of the replica.
+
+    vLLM's version uses the single ``placement_group`` (unset here) and leaves the TPU environment
+    to vllm-torchtpu's executor. This one places the workers on the placement groups verl reserved
+    for the replica (``VERL_TPU_PG_IDS``, one per host) and gives each worker its chip's TPU
+    environment.
+    """
+    from vllm.platforms import current_platform
+    from vllm.ray.ray_env import get_env_vars_to_copy
+    from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
+    from vllm.v1.executor.ray_utils import WORKER_SPECIFIC_ENV_VARS
+    from vllm_torchtpu import envs as vllm_torchtpu_envs
+    from vllm_torchtpu.executors.ray_distributed_executor import RayWorkerWrapper
+
+    pg_ids = os.environ["VERL_TPU_PG_IDS"].split(",")
+    logger.info("Reusing %d verl placement group(s) for TPU rollout: %s", len(pg_ids), pg_ids)
+    bundles = [
+        (pg, bundle_index)
+        for pg in (PlacementGroup(ray.PlacementGroupID.from_hex(pg_id)) for pg_id in pg_ids)
+        for bundle_index, bundle in enumerate(pg.bundle_specs)
+        if bundle.get(current_platform.ray_device_key, 0)
+    ][: self.parallel_config.world_size]
+    self.workers = [
+        ray.remote(
+            num_cpus=0,
+            num_gpus=0,
+            resources={current_platform.ray_device_key: 1},
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_capture_child_tasks=True,
+                placement_group_bundle_index=bundle_index,
+            ),
+            **ray_remote_kwargs,
+        )(RayWorkerWrapper).remote(rpc_rank=rank)
+        for rank, (pg, bundle_index) in enumerate(bundles)
+    ]
+
+    # Rank the workers as vLLM does: the driver's host first, because rank 0 serves the
+    # torch.distributed store at the driver's address, then each host's workers together.
+    driver_ip = get_ip()
+    ips = ray.get([worker.get_node_ip.remote() for worker in self.workers])
+    workers_per_ip = Counter(ips)
+    order = sorted(range(len(ips)), key=lambda i: (ips[i] != driver_ip, workers_per_ip[ips[i]], ips[i]))
+    self.workers = [self.workers[i] for i in order]
+    ips = [ips[i] for i in order]
+    self.collective_rpc("adjust_rank", args=({created: rank for rank, created in enumerate(order)},))
+
+    driver_env = {
+        name: os.environ[name]
+        for name in get_env_vars_to_copy(
+            exclude_vars=WORKER_SPECIFIC_ENV_VARS,
+            additional_vars=set(current_platform.additional_env_vars),
+            destination="workers",
+        )
+        if name in os.environ
+    }
+    # torch_tpu's own rendezvous, separate from the torch.distributed one below.
+    torch_tpu_master = {"MASTER_ADDR": ips[0], "MASTER_PORT": str(get_open_port())}
+    self._env_vars_for_all_workers = [
+        {**driver_env, **torch_tpu_master, **tpu_env}
+        for tpu_env in _tpu_worker_envs(ips, vllm_torchtpu_envs.TORCH_TPU_BASE_PORT)
+    ]
+    self.collective_rpc("update_environment_variables", args=(self._get_env_vars_to_be_updated(),))
+    logger.info("TPU rollout process addresses: %s", self._env_vars_for_all_workers[0]["TPU_PROCESS_ADDRESSES"])
+
+    distributed_init_method = get_distributed_init_method(driver_ip, get_open_port())
+    local_ranks = _local_ranks(ips)
+    all_kwargs = [
+        dict(
+            vllm_config=self.vllm_config,
+            local_rank=local_ranks[rank],
+            rank=rank,
+            distributed_init_method=distributed_init_method,
+            is_driver_worker=rank % self.parallel_config.tensor_parallel_size == 0,
+        )
+        for rank in range(len(self.workers))
+    ]
+    self.collective_rpc("init_worker", args=(all_kwargs,))
+    self.collective_rpc("init_device")
+    self.collective_rpc("load_model")
 
 
 def _local_ranks(worker_ips: list[str]) -> list[int]:
@@ -74,7 +218,29 @@ def _tpu_worker_envs(worker_ips: list[str], base_port: int) -> list[dict[str, st
     ]
 
 
-_PATCHES_APPLIED = False
+def _execute_dag(self, scheduler_output, grammar_output, non_block=False):
+    """Run one step on every worker with plain Ray calls instead of vLLM's compiled Ray graph.
+
+    The graph runs the model on a background thread, where torch.compile's recompile limit is
+    still the default 8: vllm-torchtpu raises it to 1024 on the main thread only (dynamo config
+    overrides are per thread), and the first request fails with FailOnRecompileLimitHit. verl uses
+    no KV connector, so rank 0's output is the step's result.
+    """
+    from vllm.v1.executor.ray_utils import FutureWrapper, detach_zero_copy_from_model_runner_output
+
+    refs = [worker.execute_model_ray.remote((scheduler_output, grammar_output)) for worker in self.workers]
+    if non_block:
+        return FutureWrapper(refs[0])
+    output = ray.get(refs)[0]
+    detach_zero_copy_from_model_runner_output(output)
+    return output
+
+
+def _reset_encoder_cache(self) -> None:
+    """``TPUWorker.reset_encoder_cache``, which verl calls after every weight update: a no-op.
+
+    The encoder cache holds multimodal encoder outputs; text models have none to reset.
+    """
 
 
 class PickleableProcessWrapper:
@@ -120,174 +286,3 @@ def patch_multiprocessing_for_tpu() -> None:
 
     multiprocessing.process.BaseProcess.__init__ = patched_init  # type: ignore[method-assign]
     multiprocessing.process.BaseProcess._tpu_patched = True  # type: ignore[attr-defined]
-
-
-def patch_vllm_for_tpu() -> None:
-    """
-    Apply TPU-specific patches and workarounds to vLLM and vllm-torchtpu workers.
-    Ensures correct topology routing, un-clashed TCP ports, and driver-worker environment
-    synchronization on GKE TPU slices.
-    """
-    global _PATCHES_APPLIED
-
-    # Environment side effects. Cheap and safe to repeat in every process that calls this.
-    patch_multiprocessing_for_tpu()
-    # vLLM can reload a degenerate AOT compile artifact (num_artifacts=0) that silently runs the
-    # model eagerly; eager execution then hits the XLA:TPU unaligned-DUS CHECK (b/501165531).
-    os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
-
-    if _PATCHES_APPLIED:
-        return
-
-    # CPU unit tests and non-rollout processes may not have vllm or vllm_torchtpu installed.
-    # Import all required vLLM / vllm-torchtpu symbols once here rather than at module import
-    # time: if they are absent, leave _PATCHES_APPLIED=False so a rollout process can still
-    # install the executor patches when vLLM is available.
-    try:
-        import vllm.v1.executor.ray_executor as v1_ray_executor
-        import vllm.v1.executor.ray_utils as v1_ray_utils
-        from vllm.engine.arg_utils import EngineArgs
-        from vllm.platforms import current_platform
-        from vllm.ray.ray_env import get_env_vars_to_copy
-        from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
-        from vllm.v1.executor.ray_utils import FutureWrapper, detach_zero_copy_from_model_runner_output
-        from vllm_torchtpu import envs as vllm_torchtpu_envs
-        from vllm_torchtpu.executors import ray_distributed_executor
-        from vllm_torchtpu.worker.tpu_worker import TPUWorker
-    except ImportError as exc:
-        logger.debug("Skipping vLLM TPU executor patches (vllm / vllm_torchtpu not installed): %s", exc)
-        return
-
-    try:
-        orig_create_engine_config = EngineArgs.create_engine_config
-
-        def patched_create_engine_config(self, *args, **kwargs):
-            vllm_config = orig_create_engine_config(self, *args, **kwargs)
-            # vllm-torchtpu picked its own Ray executor, which takes a single placement group,
-            # but verl creates one per host. Use vLLM's generic Ray executor: the patches below
-            # attach it to verl's placement groups and adapt its worker start-up and dispatch to
-            # TPU. It does not support async scheduling, which vLLM resolved to on for the
-            # external_launcher backend that TPUvLLMHttpServer passes in.
-            vllm_config.parallel_config.distributed_executor_backend = "ray"
-            vllm_config.scheduler_config.async_scheduling = False
-            return vllm_config
-
-        EngineArgs.create_engine_config = patched_create_engine_config
-
-        def dummy_reset_encoder_cache(*args, **kwargs):
-            pass
-
-        TPUWorker.reset_encoder_cache = dummy_reset_encoder_cache
-        logger.info("Patched TPUWorker.reset_encoder_cache with no-op stub.")
-
-        def patched_initialize_ray_cluster(parallel_config, ray_address=None):
-            # Connect to Ray as vLLM's own version does, but create no placement group: the
-            # workers go on the ones verl reserved (patched_init_workers_ray).
-            if not ray.is_initialized():
-                ray.init(address=ray_address, runtime_env=parallel_config.ray_runtime_env)
-
-        v1_ray_executor.initialize_ray_cluster = patched_initialize_ray_cluster
-
-        OriginalRayWorkerWrapper = ray_distributed_executor.RayWorkerWrapper
-        original_wrapper_init = OriginalRayWorkerWrapper.__init__
-
-        def patched_wrapper_init(self, *args, **kwargs):
-            # Pooled vLLM Ray workers never import the plugin; this is how the patches reach them.
-            patch_vllm_for_tpu()
-            return original_wrapper_init(self, *args, **kwargs)
-
-        OriginalRayWorkerWrapper.__init__ = patched_wrapper_init
-
-        def patched_init_workers_ray(self, placement_group, **ray_remote_kwargs):
-            # One worker per TPU bundle of the placement groups verl reserved for this replica, one
-            # per host. vLLM's own version takes the single placement_group, which is unset here.
-            pg_ids = os.environ["VERL_TPU_PG_IDS"].split(",")
-            logger.info("Reusing %d verl placement group(s) for TPU rollout: %s", len(pg_ids), pg_ids)
-            bundles = [
-                (pg, bundle_index)
-                for pg in (PlacementGroup(ray.PlacementGroupID.from_hex(pg_id)) for pg_id in pg_ids)
-                for bundle_index, bundle in enumerate(pg.bundle_specs)
-                if bundle.get(current_platform.ray_device_key, 0)
-            ][: self.parallel_config.world_size]
-            self.workers = [
-                ray.remote(
-                    num_cpus=0,
-                    num_gpus=0,
-                    resources={current_platform.ray_device_key: 1},
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg,
-                        placement_group_capture_child_tasks=True,
-                        placement_group_bundle_index=bundle_index,
-                    ),
-                    **ray_remote_kwargs,
-                )(ray_distributed_executor.RayWorkerWrapper).remote(rpc_rank=rank)
-                for rank, (pg, bundle_index) in enumerate(bundles)
-            ]
-
-            # Rank the workers as vLLM does: the driver's host first, because rank 0 serves the
-            # torch.distributed store at the driver's address, then each host's workers together.
-            driver_ip = get_ip()
-            ips = ray.get([worker.get_node_ip.remote() for worker in self.workers])
-            workers_per_ip = Counter(ips)
-            order = sorted(range(len(ips)), key=lambda i: (ips[i] != driver_ip, workers_per_ip[ips[i]], ips[i]))
-            self.workers = [self.workers[i] for i in order]
-            ips = [ips[i] for i in order]
-            self.collective_rpc("adjust_rank", args=({created: rank for rank, created in enumerate(order)},))
-
-            driver_env = {
-                name: os.environ[name]
-                for name in get_env_vars_to_copy(
-                    exclude_vars=v1_ray_utils.WORKER_SPECIFIC_ENV_VARS,
-                    additional_vars=set(current_platform.additional_env_vars),
-                    destination="workers",
-                )
-                if name in os.environ
-            }
-            # torch_tpu's own rendezvous, separate from the torch.distributed one below.
-            torch_tpu_master = {"MASTER_ADDR": ips[0], "MASTER_PORT": str(get_open_port())}
-            self._env_vars_for_all_workers = [
-                {**driver_env, **torch_tpu_master, **tpu_env}
-                for tpu_env in _tpu_worker_envs(ips, vllm_torchtpu_envs.TORCH_TPU_BASE_PORT)
-            ]
-            self.collective_rpc("update_environment_variables", args=(self._get_env_vars_to_be_updated(),))
-            logger.info("TPU rollout process addresses: %s", self._env_vars_for_all_workers[0]["TPU_PROCESS_ADDRESSES"])
-
-            distributed_init_method = get_distributed_init_method(driver_ip, get_open_port())
-            local_ranks = _local_ranks(ips)
-            all_kwargs = [
-                dict(
-                    vllm_config=self.vllm_config,
-                    local_rank=local_ranks[rank],
-                    rank=rank,
-                    distributed_init_method=distributed_init_method,
-                    is_driver_worker=rank % self.parallel_config.tensor_parallel_size == 0,
-                )
-                for rank in range(len(self.workers))
-            ]
-            self.collective_rpc("init_worker", args=(all_kwargs,))
-            self.collective_rpc("init_device")
-            self.collective_rpc("load_model")
-
-        def patched_execute_dag(self, scheduler_output, grammar_output, non_block=False):
-            # Plain Ray calls instead of vLLM's compiled Ray graph. The graph runs the model on a
-            # background thread, where torch.compile's recompile limit is still the default 8:
-            # vllm-torchtpu raises it to 1024 on the main thread only (dynamo config overrides
-            # are per thread), and the first request fails with FailOnRecompileLimitHit. verl uses
-            # no KV connector, so rank 0's output is the step's result.
-            refs = [worker.execute_model_ray.remote((scheduler_output, grammar_output)) for worker in self.workers]
-            if non_block:
-                return FutureWrapper(refs[0])
-            output = ray.get(refs)[0]
-            detach_zero_copy_from_model_runner_output(output)
-            return output
-
-        # create_engine_config sets distributed_executor_backend="ray", which resolves to vLLM V1's
-        # generic RayDistributedExecutor, so that is the class to patch.
-        v1_ray_executor.RayDistributedExecutor._init_workers_ray = patched_init_workers_ray
-        v1_ray_executor.RayDistributedExecutor._execute_dag = patched_execute_dag
-
-        _PATCHES_APPLIED = True
-
-        logger.info("Successfully applied all TPU patches to vLLM and vllm-torchtpu.")
-    except Exception as e:
-        logger.warning("Failed to apply TPU vLLM patches: %s", e, exc_info=True)

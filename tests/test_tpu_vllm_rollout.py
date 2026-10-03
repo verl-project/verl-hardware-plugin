@@ -312,7 +312,7 @@ def test_patch_vllm_for_tpu_is_a_no_op_once_applied(isolated_patches):
     with mock.patch.dict(sys.modules, {"vllm": None}), mock.patch.object(isolated_patches.logger, "debug") as debug:
         isolated_patches.patch_vllm_for_tpu()
     debug.assert_not_called()
-    assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "1"  # env side effects still re-applied
+    assert "VLLM_DISABLE_COMPILE_CACHE" not in os.environ
 
 
 def test_patch_vllm_for_tpu_keeps_explicit_compile_cache_setting(isolated_patches):
