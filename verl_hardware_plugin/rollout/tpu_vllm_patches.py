@@ -23,7 +23,6 @@ slice through Ray. Each patch fills a gap in the pinned vLLM (v0.29.0) and vllm-
   the plugin.
 """
 
-import copy
 import logging
 import multiprocessing
 import multiprocessing.process
@@ -139,7 +138,6 @@ def patch_vllm_for_tpu() -> None:
     # time: if they are absent, leave _PATCHES_APPLIED=False so a rollout process can still
     # install the executor patches when vLLM is available.
     try:
-        import vllm.envs as vllm_envs
         import vllm.v1.executor.ray_executor as v1_ray_executor
         import vllm.v1.executor.ray_utils as v1_ray_utils
         from vllm.engine.arg_utils import EngineArgs
@@ -224,29 +222,13 @@ def patch_vllm_for_tpu() -> None:
             RayWorkerWrapper_local = ray_distributed_executor.RayWorkerWrapper
 
             self.workers = []
-            self.pp_tp_workers = []
-
-            if self.parallel_config.ray_workers_use_nsight:
-                ray_remote_kwargs = self._configure_ray_workers_use_nsight(ray_remote_kwargs)
 
             verl_pgs = getattr(self.parallel_config, "_verl_tpu_placement_groups", None) or [placement_group]
             pg_bundle_pairs = []
-            if vllm_envs.VLLM_RAY_BUNDLE_INDICES and len(verl_pgs) == 1:
-                bundle_indices = list(map(int, vllm_envs.VLLM_RAY_BUNDLE_INDICES.split(",")))
-                assert len(bundle_indices) == self.parallel_config.world_size, (
-                    "VLLM_RAY_BUNDLE_INDICES must have the same size"
-                    f" as the world size, but got {bundle_indices=} "
-                    f"and {self.parallel_config.world_size=}"
-                )
-                assert len(set(bundle_indices)) == len(bundle_indices), (
-                    f"VLLM_RAY_BUNDLE_INDICES cannot have duplicate values, but got {bundle_indices=}"
-                )
-                pg_bundle_pairs = [(verl_pgs[0], b_id) for b_id in bundle_indices]
-            else:
-                for pg in verl_pgs:
-                    for bundle_id, bundle in enumerate(pg.bundle_specs):
-                        if bundle.get(current_platform.ray_device_key, 0):
-                            pg_bundle_pairs.append((pg, bundle_id))
+            for pg in verl_pgs:
+                for bundle_id, bundle in enumerate(pg.bundle_specs):
+                    if bundle.get(current_platform.ray_device_key, 0):
+                        pg_bundle_pairs.append((pg, bundle_id))
 
             worker_metadata = []
             driver_ip = get_ip()
@@ -291,12 +273,9 @@ def patch_vllm_for_tpu() -> None:
             rerank_mapping = {item.created_rank: item.adjusted_rank for item in sorted_worker_metadata}
             self.collective_rpc("adjust_rank", args=(rerank_mapping,))
 
-            worker_node_and_tpu_ids = []
-            for worker in self.workers:
-                if hasattr(worker, "get_node_and_gpu_ids"):
-                    worker_node_and_tpu_ids.append(ray.get(worker.get_node_and_gpu_ids.remote()))
-                else:
-                    worker_node_and_tpu_ids.append(ray.get(worker.get_node_and_physical_gpu_ids.remote()))
+            worker_node_and_tpu_ids = [
+                ray.get(worker.get_node_and_physical_gpu_ids.remote()) for worker in self.workers
+            ]
 
             node_workers = defaultdict(list)
             node_tpus = defaultdict(list)
@@ -308,20 +287,6 @@ def patch_vllm_for_tpu() -> None:
             for node_id, tpu_ids in node_tpus.items():
                 node_tpus[node_id] = sorted(tpu_ids)
             logger.info("RayDistributedExecutor | node_workers=%s | node_tpus=%s", node_workers, node_tpus)
-
-            all_ips = set(worker_ips + [driver_ip])
-            n_ips = len(all_ips)
-            n_nodes = len(node_workers)
-
-            if n_nodes != n_ips:
-                logger.warning(
-                    "Got %d nodes but with %d IP addresses. "
-                    "This is not a typical production setup whose "
-                    "number of nodes and IPs is equal. This setup may "
-                    "lead to unexpected behaviors.",
-                    n_nodes,
-                    n_ips,
-                )
 
             unique_node_ids = list(node_workers.keys())
             num_nodes = len(unique_node_ids)
@@ -422,26 +387,14 @@ def patch_vllm_for_tpu() -> None:
             self.collective_rpc("update_environment_variables", args=(self._get_env_vars_to_be_updated(),))
 
             distributed_init_method = get_distributed_init_method(driver_ip, get_open_port())
-            driver_node_id = ray.get_runtime_context().get_node_id()
 
             all_kwargs = []
             for rank, (node_id, _) in enumerate(worker_node_and_tpu_ids):
                 local_rank = node_workers[node_id].index(rank)
                 ip = sorted_worker_metadata[rank].ip
 
-                worker_vllm_config = self.vllm_config
-
-                if (
-                    node_id != driver_node_id
-                    and getattr(self.vllm_config, "model_config", None)
-                    and getattr(self.vllm_config.model_config, "model_weights", None)
-                ):
-                    worker_vllm_config = copy.deepcopy(self.vllm_config)
-                    worker_vllm_config.model_config.model = worker_vllm_config.model_config.model_weights
-                    worker_vllm_config.model_config.model_weights = None
-
                 kwargs = dict(
-                    vllm_config=worker_vllm_config,
+                    vllm_config=self.vllm_config,
                     local_rank=local_rank,
                     rank=rank,
                     distributed_init_method=distributed_init_method,
@@ -453,19 +406,7 @@ def patch_vllm_for_tpu() -> None:
                 all_kwargs.append(kwargs)
             self.collective_rpc("init_worker", args=(all_kwargs,))
             self.collective_rpc("init_device")
-            if self.parallel_config.pipeline_parallel_size > 1:
-                self.collective_rpc("initialize_pp_transfer_connect")
             self.collective_rpc("load_model")
-            if hasattr(self, "pp_tp_workers"):
-                self.pp_tp_workers = []
-                pp_size = self.parallel_config.pipeline_parallel_size if self.parallel_config else 1
-                tp_size = self.parallel_config.tensor_parallel_size if self.parallel_config else len(self.workers)
-                for pp_rank in range(pp_size):
-                    self.pp_tp_workers.append([])
-                    for tp_rank in range(tp_size):
-                        rank = (pp_rank * tp_size) + tp_rank
-                        if rank < len(self.workers):
-                            self.pp_tp_workers[pp_rank].append(self.workers[rank])
 
         def patched_execute_dag(
             self,
@@ -489,10 +430,8 @@ def patch_vllm_for_tpu() -> None:
                 return self.kv_output_aggregator.aggregate(outputs)
             return FutureWrapper(refs, self.kv_output_aggregator)
 
-        # Install onto both vllm-torchtpu's subclass and vLLM V1's generic RayDistributedExecutor
-        # (create_engine_config sets distributed_executor_backend="ray", which resolves to vLLM V1's
-        # RayDistributedExecutor).
-        ray_distributed_executor.RayDistributedExecutor._init_workers_ray = patched_init_workers_ray
+        # create_engine_config sets distributed_executor_backend="ray", which resolves to vLLM V1's
+        # generic RayDistributedExecutor, so that is the class to patch.
         v1_ray_executor.RayDistributedExecutor._init_workers_ray = patched_init_workers_ray
         v1_ray_executor.RayDistributedExecutor._execute_dag = patched_execute_dag
 
