@@ -32,6 +32,7 @@ import os
 from collections import Counter
 
 import ray
+from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from verl_hardware_plugin.platforms.platform_tpu import resolve_tpu_topology_bounds
@@ -179,37 +180,11 @@ def patch_vllm_for_tpu() -> None:
         TPUWorker.reset_encoder_cache = dummy_reset_encoder_cache
         logger.info("Patched TPUWorker.reset_encoder_cache with no-op stub.")
 
-        orig_init_ray_cluster = v1_ray_utils.initialize_ray_cluster
-
-        def patched_initialize_ray_cluster(parallel_config, ray_address=None, *args, **kwargs):
-            # Connect with the runtime_env vLLM captured from the server actor *before* any
-            # other Ray call below: those would auto-init Ray with an empty runtime_env, vLLM
-            # would then skip its own ray.init, and the RayWorkerWrapper actors would start
-            # without the job's py_modules / working_dir.
+        def patched_initialize_ray_cluster(parallel_config, ray_address=None):
+            # Connect to Ray as vLLM's own version does, but create no placement group: the
+            # workers go on the ones verl reserved (patched_init_workers_ray).
             if not ray.is_initialized():
-                ray.init(address=ray_address, runtime_env=getattr(parallel_config, "ray_runtime_env", None))
-            pg_ids_str = os.environ.get("VERL_TPU_PG_IDS", "")
-            if pg_ids_str:
-                from ray._raylet import PlacementGroupID
-                from ray.util.placement_group import PlacementGroup
-
-                verl_pgs = [
-                    PlacementGroup(PlacementGroupID.from_hex(pg_hex.strip()))
-                    for pg_hex in pg_ids_str.split(",")
-                    if pg_hex.strip()
-                ]
-                if verl_pgs:
-                    parallel_config.placement_group = verl_pgs[0]
-                    parallel_config._verl_tpu_placement_groups = verl_pgs
-                    logger.info(
-                        "Reusing %d verl placement group(s) for TPU rollout: %s",
-                        len(verl_pgs),
-                        [pg.id.hex() for pg in verl_pgs],
-                    )
-                    return
-            if parallel_config.placement_group is None:
-                parallel_config.placement_group = ray.util.get_current_placement_group()
-            return orig_init_ray_cluster(parallel_config, ray_address, *args, **kwargs)
+                ray.init(address=ray_address, runtime_env=parallel_config.ray_runtime_env)
 
         v1_ray_executor.initialize_ray_cluster = patched_initialize_ray_cluster
 
@@ -224,11 +199,13 @@ def patch_vllm_for_tpu() -> None:
         OriginalRayWorkerWrapper.__init__ = patched_wrapper_init
 
         def patched_init_workers_ray(self, placement_group, **ray_remote_kwargs):
-            # One worker per TPU bundle of verl's placement groups.
-            verl_pgs = getattr(self.parallel_config, "_verl_tpu_placement_groups", None) or [placement_group]
+            # One worker per TPU bundle of the placement groups verl reserved for this replica, one
+            # per host. vLLM's own version takes the single placement_group, which is unset here.
+            pg_ids = os.environ["VERL_TPU_PG_IDS"].split(",")
+            logger.info("Reusing %d verl placement group(s) for TPU rollout: %s", len(pg_ids), pg_ids)
             bundles = [
                 (pg, bundle_index)
-                for pg in verl_pgs
+                for pg in (PlacementGroup(ray.PlacementGroupID.from_hex(pg_id)) for pg_id in pg_ids)
                 for bundle_index, bundle in enumerate(pg.bundle_specs)
                 if bundle.get(current_platform.ray_device_key, 0)
             ][: self.parallel_config.world_size]
