@@ -131,3 +131,45 @@ def test_resolve_tpu_topology_bounds_raises_on_unknown_slice():
     # Guessing "1,1,1" here would train on a subset of the slice without any error.
     with pytest.raises(ValueError, match="TORCH_TPU_TOPOLOGY"):
         resolve_tpu_topology_bounds(total_chips=6, num_nodes=2)
+
+
+def _two_slice_nodes():
+    return [
+        {"Alive": True, "Resources": {"TPU": 4.0, "tpu-group-1": 1.0}},
+        {"Alive": True, "Resources": {"TPU": 4.0, "tpu-group-0": 1.0}},
+        {"Alive": False, "Resources": {"TPU": 4.0, "tpu-group-9": 1.0}},
+    ]
+
+
+def test_auto_assign_accelerator_type_splits_trainer_and_rollout_slices():
+    from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+
+    platform = PlatformTPU()
+    with (
+        mock.patch("ray.is_initialized", return_value=True),
+        mock.patch("ray.nodes", return_value=_two_slice_nodes()),
+    ):
+        assert platform.auto_assign_accelerator_type("global_pool", None) == "tpu-group-0"
+        assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-1"
+        assert platform.auto_assign_accelerator_type("rollout_pool_reward_0", None) == "tpu-group-1"
+        assert platform.auto_assign_accelerator_type("rollout_pool_0", "tpu-group-7") == "tpu-group-7"
+
+
+def test_auto_assign_accelerator_type_single_slice_shares_slice():
+    from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+
+    platform = PlatformTPU()
+    nodes = [{"Alive": True, "Resources": {"TPU": 4.0, "tpu-group-0": 1.0}}]
+    with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
+        assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-0"
+
+
+def test_get_ray_init_kwargs_names_the_setup_hook_by_module_path():
+    import importlib
+
+    from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU, patch_ray_worker
+
+    hook = PlatformTPU().get_ray_init_kwargs()["runtime_env"]["worker_process_setup_hook"]
+    assert hook == "verl_hardware_plugin.platforms.platform_tpu.patch_ray_worker"
+    module_name, _, func_name = hook.rpartition(".")
+    assert getattr(importlib.import_module(module_name), func_name) is patch_ray_worker

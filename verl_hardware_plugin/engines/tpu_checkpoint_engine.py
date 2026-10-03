@@ -567,6 +567,17 @@ async def update_tpu_weights(manager: Any, global_steps: int | None = None) -> d
     ]
     results = await asyncio.gather(*futures)
 
+    # Drop prefix/KV cache computed with the old weights and tell the servers which weight
+    # version they serve now. The trainer stamps every trajectory with that version
+    # (``min_global_steps`` / ``max_global_steps``) and its staleness metrics require an int.
+    cache_and_step_futures = []
+    for replica in manager.replicas:
+        cache_and_step_futures.append(replica.server_handle.clear_kv_cache.remote())
+        if global_steps is not None:
+            cache_and_step_futures.append(replica.server_handle.set_global_steps.remote(global_steps))
+    if cache_and_step_futures:
+        await asyncio.gather(*cache_and_step_futures)
+
     try:
         await registry.clear.remote()
     except Exception:

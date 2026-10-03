@@ -62,9 +62,9 @@ TPU_HBM_BYTES_MAP = {
 # Fallback HBM capacity when the chip generation cannot be determined.
 HBM_BYTES_TPU_DEFAULT = HBM_BYTES_TPU_V6E
 
-# TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice.
-# Mirrors DEFAULT_TPU_TOPOLOGY_MAP in verl's rollout-side TPU utils so the trainer mesh and
-# the rollout mesh agree on the physical layout of a given slice size.
+# TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice. The vLLM
+# rollout (``rollout/tpu_vllm_patches.py``) resolves its mesh here too, so the trainer and the
+# rollout agree on the physical layout of a given slice size.
 DEFAULT_TPU_TOPOLOGY_MAP = {
     1: "1,1,1",
     2: "1,2,1",
@@ -339,6 +339,7 @@ class PlatformTPU(PlatformBase):
         super().__init__()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         self._device_module = TPUDeviceModuleProxy(original_tpu)
+        self._claimed_slices: set[str] = set()
 
     @property
     def vendor_name(self) -> str:
@@ -459,24 +460,31 @@ class PlatformTPU(PlatformBase):
         return False
 
     def get_ray_init_kwargs(self) -> dict[str, Any]:
-        """Install the GKE TPU worker setup hook and pin the platform inside Ray workers."""
+        """Install the GKE TPU worker setup hook and pin the platform inside Ray workers.
+
+        The hook is passed as a module path rather than the function. Ray exports a function under
+        a generated key and keeps only the function's name in the job's runtime env. vLLM's
+        EngineCore calls ``ray.init`` again with the runtime env it captured from the server actor,
+        and Ray rejects that name as conflicting with the key. A module path round-trips unchanged.
+        """
         return {
             "runtime_env": {
-                "worker_process_setup_hook": patch_ray_worker,
+                "worker_process_setup_hook": f"{patch_ray_worker.__module__}.{patch_ray_worker.__qualname__}",
                 "env_vars": {"VERL_PLATFORM": "tpu"},
             }
         }
 
     def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
-        """Pin a resource pool to a TPU slice on multi-slice clusters.
+        """Pin a resource pool to its own TPU slice on multi-slice clusters.
 
-        Called unconditionally from ``verl.single_controller.ray.base.RayResourcePool.__init__``
+        Called from ``verl.single_controller.ray.base.RayResourcePool.get_placement_groups``
         whenever ``device_name == "tpu"``; ``PlatformBase`` does not declare it, so the TPU
         platform has to provide it.
 
         A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per slice. Without
-        an affinity label a pool can straddle two slices, which the TPU mesh cannot span, so pin
-        it to the first slice.
+        an affinity label a pool can straddle two slices, which the TPU mesh cannot span. Each pool
+        gets the first slice that no earlier pool claimed, so the trainer and rollout pools land on
+        different slices; once every slice is claimed, further pools share the last one.
         """
         if accelerator_type is not None:
             return accelerator_type
@@ -490,8 +498,12 @@ class PlatformTPU(PlatformBase):
                             if res.startswith("tpu-group-"):
                                 tpu_slices.add(res)
                 slices = sorted(tpu_slices)
+                for tpu_slice in slices:
+                    if tpu_slice not in self._claimed_slices:
+                        self._claimed_slices.add(tpu_slice)
+                        return tpu_slice
                 if slices:
-                    return slices[0]
+                    return slices[-1]
         except Exception as e:
             logger.debug("Could not auto-assign a TPU slice for %r: %s", name_prefix, e)
 
@@ -528,33 +540,18 @@ class PlatformTPU(PlatformBase):
         name_prefix: str,
         pgs: list,
     ) -> dict[str, str]:
-        """Generate TPU-specific distributed environment variables for PJRT mesh initialization."""
+        """Generate TPU-specific distributed environment variables for PJRT mesh initialization.
+
+        ``pgs`` are the placement groups of the worker's resource pool. A pool is pinned to one
+        slice (see ``auto_assign_accelerator_type``), so its bundles, in placement-group and
+        bundle order, are exactly the processes of the PJRT mesh. This runs in the process that
+        creates the workers (the trainer's TaskRunner), so nothing here may depend on the IP of
+        the calling process -- it can be the head node or any TPU host.
+        """
         node_ip_map = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes() if node.get("Alive", False)}
         bundle_ips = []
-        local_ip = ray.util.get_node_ip_address()
-        clean_prefix = name_prefix.lower().split("_")[0] if name_prefix else ""
-        matching_pgs = []
 
-        # 1. Primary filter: Select placement group containing current worker's node IP
-        for p in pgs:
-            specs = ray._private.state.state.placement_group_table(p.id)
-            if specs.get("state") != "CREATED":
-                continue
-            bundles_map = specs.get("bundles_to_node_id", {})
-            pg_ips = [node_ip_map[node_id] for b_idx, node_id in sorted(bundles_map.items()) if node_id in node_ip_map]
-            if local_ip in pg_ips:
-                matching_pgs.append(p)
-
-        # 2. Secondary fallback: Filter by clean_prefix if placement group names are explicitly set
-        if not matching_pgs and clean_prefix:
-            for p in pgs:
-                p_name = ray._private.state.state.placement_group_table(p.id).get("name", "").lower()
-                if clean_prefix in p_name:
-                    matching_pgs.append(p)
-
-        target_pgs = matching_pgs if matching_pgs else pgs
-
-        for pg in target_pgs:
+        for pg in pgs:
             specs = ray._private.state.state.placement_group_table(pg.id)
             if specs.get("state") != "CREATED":
                 continue

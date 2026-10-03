@@ -16,9 +16,9 @@ for _mod_name in ("uvicorn", "fastapi"):
             __import__(_mod_name)
         except ImportError:
             _stub = ModuleType(_mod_name)
-            _stub.FastAPI = object
-            _stub.Server = object
-            _stub.Config = object
+            _stub.FastAPI = object  # type: ignore[attr-defined]
+            _stub.Server = object  # type: ignore[attr-defined]
+            _stub.Config = object  # type: ignore[attr-defined]
             sys.modules[_mod_name] = _stub
 
 from verl_hardware_plugin.engines.ray_weight_registry import RayWeightRegistryState  # noqa: E402
@@ -117,3 +117,47 @@ def test_pack_and_load_weights_with_qkv_fusion_and_tp_sharding():
     model_flipped = _DummyRolloutModel(tp_size=2, flipped=True)
     load_weights_on_worker(model_flipped, state_dict, rank=0, target_device="cpu")
     assert torch.equal(model_flipped.layers[0]["self_attn"].qkv_proj.weight.data, expected_r0_qkv.T)
+
+
+def test_update_tpu_weights_clears_kv_cache_and_sets_global_steps(monkeypatch):
+    """After loading new weights every replica must drop its KV cache and learn the weight version.
+
+    upstream verl stamps each trajectory with the server's ``global_steps`` and converts it with
+    ``dtype=int`` in ``_compute_metrics``; a server that was never told its version yields None
+    there and the first training step dies.
+    """
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    import ray
+
+    from verl_hardware_plugin.engines import tpu_checkpoint_engine as engine_mod
+
+    fake_registry = SimpleNamespace(
+        get_weights=SimpleNamespace(remote=MagicMock(return_value="published")),
+        clear=SimpleNamespace(remote=MagicMock(side_effect=lambda: AsyncMock()())),
+    )
+    monkeypatch.setattr(ray, "get_actor", MagicMock(return_value=fake_registry))
+    monkeypatch.setattr(ray, "get", MagicMock(side_effect=lambda ref: ref))
+
+    fake_server_handle = SimpleNamespace(
+        collective_rpc=SimpleNamespace(remote=MagicMock(side_effect=lambda **kw: AsyncMock(return_value=[3])())),
+        clear_kv_cache=SimpleNamespace(remote=MagicMock(side_effect=lambda: AsyncMock()())),
+        set_global_steps=SimpleNamespace(remote=MagicMock(side_effect=lambda s: AsyncMock()())),
+    )
+    fake_manager = SimpleNamespace(
+        backend="tpu",
+        actor_wg=SimpleNamespace(update_weights=MagicMock(return_value=None)),
+        replicas=[SimpleNamespace(server_handle=fake_server_handle)],
+        abort_replicas=AsyncMock(),
+        resume_generation_replicas=AsyncMock(),
+    )
+
+    asyncio.run(engine_mod.update_tpu_weights(fake_manager, global_steps=5))
+
+    fake_manager.abort_replicas.assert_awaited_once()
+    fake_server_handle.collective_rpc.remote.assert_called_once_with(method="load_weights_from_ray_registry", args=(5,))
+    fake_server_handle.clear_kv_cache.remote.assert_called_once()
+    fake_server_handle.set_global_steps.remote.assert_called_once_with(5)
+    fake_manager.resume_generation_replicas.assert_awaited_once()
