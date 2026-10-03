@@ -16,9 +16,9 @@ for _mod_name in ("uvicorn", "fastapi"):
             __import__(_mod_name)
         except ImportError:
             _stub = ModuleType(_mod_name)
-            _stub.FastAPI = object
-            _stub.Server = object
-            _stub.Config = object
+            _stub.FastAPI = object  # type: ignore[attr-defined]
+            _stub.Server = object  # type: ignore[attr-defined]
+            _stub.Config = object  # type: ignore[attr-defined]
             sys.modules[_mod_name] = _stub
 
 from verl_hardware_plugin.engines.ray_weight_registry import RayWeightRegistryState  # noqa: E402

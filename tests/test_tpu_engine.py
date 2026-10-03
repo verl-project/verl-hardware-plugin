@@ -164,14 +164,12 @@ def test_auto_assign_accelerator_type_single_slice_shares_slice():
         assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-0"
 
 
-def test_configure_placement_group_bundle_reserves_tpu_for_all_gpu_pools():
-    from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+def test_get_ray_init_kwargs_names_the_setup_hook_by_module_path():
+    import importlib
 
-    platform = PlatformTPU()
-    trainer: dict = {"CPU": 1}
-    platform.configure_placement_group_bundle(trainer, True, "TPU", "global_pool", "tpu-group-0")
-    assert trainer == {"CPU": 1, "TPU": 1, "tpu-group-0": 1e-4}
+    from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU, patch_ray_worker
 
-    rollout: dict = {"CPU": 1}
-    platform.configure_placement_group_bundle(rollout, True, "TPU", "rollout_pool_0", "tpu-group-1")
-    assert rollout == {"CPU": 1, "TPU": 1, "tpu-group-1": 1e-4}
+    hook = PlatformTPU().get_ray_init_kwargs()["runtime_env"]["worker_process_setup_hook"]
+    assert hook == "verl_hardware_plugin.platforms.platform_tpu.patch_ray_worker"
+    module_name, _, func_name = hook.rpartition(".")
+    assert getattr(importlib.import_module(module_name), func_name) is patch_ray_worker
