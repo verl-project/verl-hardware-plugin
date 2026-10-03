@@ -62,9 +62,9 @@ TPU_HBM_BYTES_MAP = {
 # Fallback HBM capacity when the chip generation cannot be determined.
 HBM_BYTES_TPU_DEFAULT = HBM_BYTES_TPU_V6E
 
-# TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice.
-# Mirrors DEFAULT_TPU_TOPOLOGY_MAP in verl's rollout-side TPU utils so the trainer mesh and
-# the rollout mesh agree on the physical layout of a given slice size.
+# TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice. The vLLM
+# rollout (``rollout/tpu_vllm_patches.py``) resolves its mesh here too, so the trainer and the
+# rollout agree on the physical layout of a given slice size.
 DEFAULT_TPU_TOPOLOGY_MAP = {
     1: "1,1,1",
     2: "1,2,1",

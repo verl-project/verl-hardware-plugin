@@ -328,25 +328,28 @@ def test_pickleable_process_wrapper_applies_patches_before_target():
     patch.assert_called_once_with()
 
 
-@pytest.mark.parametrize(
-    "total_chips,num_nodes,expected",
-    [
-        (8, 2, ("2,4,1", "2,4,1", "1,1,1", "4")),
-        (4, 1, ("2,2,1", "1,1,1", "2,2,1", "4")),
-        (4, 2, ("2,2,1", "1,1,1", "1,1,1", "2")),
-        (32, 8, ("4,8,1", "4,8,1", "1,1,1", "4")),
-    ],
-)
-def test_resolve_tpu_topology_bounds(total_chips, num_nodes, expected):
-    from verl_hardware_plugin.rollout.tpu_vllm_patches import _resolve_tpu_topology_bounds
+def test_local_ranks_count_workers_per_host_in_rank_order():
+    assert tpu_vllm_patches._local_ranks(["b", "b", "a", "a", "a"]) == [0, 1, 0, 1, 2]
 
-    env = {k: v for k, v in os.environ.items() if k not in ("TORCH_TPU_TOPOLOGY", "VLLM_TPU_CHIPS_PER_HOST")}
+
+def test_tpu_worker_envs_two_hosts_of_four_chips():
+    ips = ["10.0.0.2"] * 4 + ["10.0.0.1"] * 4  # rank order: the driver's host first
+    env = {k: v for k, v in os.environ.items() if k != "TORCH_TPU_TOPOLOGY"}
     with mock.patch.dict(os.environ, env, clear=True):
-        assert _resolve_tpu_topology_bounds(total_chips, num_nodes) == expected
+        envs = tpu_vllm_patches._tpu_worker_envs(ips, base_port=8070)
 
-
-def test_resolve_tpu_topology_bounds_env_override():
-    from verl_hardware_plugin.rollout.tpu_vllm_patches import _resolve_tpu_topology_bounds
-
-    with mock.patch.dict(os.environ, {"TORCH_TPU_TOPOLOGY": "4,4,1", "VLLM_TPU_CHIPS_PER_HOST": "8"}):
-        assert _resolve_tpu_topology_bounds(16, 2) == ("4,4,1", "4,4,1", "1,1,1", "8")
+    addresses = ",".join(f"{ip}:{8070 + chip}" for ip in ("10.0.0.2", "10.0.0.1") for chip in range(4))
+    assert envs[5] == {
+        "TPU_VISIBLE_CHIPS": "1",
+        "TPU_PROCESS_PORT": "8071",
+        "TPU_PROCESS_ADDRESSES": addresses,
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES": addresses,
+        "CLOUD_TPU_TASK_ID": "1",
+        "TPU_WORKER_HOSTNAMES": "10.0.0.2,10.0.0.1",
+        # One process per chip: libtpu sees 8 single-chip "hosts" laid out as the 2x4 slice.
+        "TORCH_TPU_TOPOLOGY": "2,4,1",
+        "TPU_HOST_BOUNDS": "2,4,1",
+        "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
+    }
+    assert [e["TPU_VISIBLE_CHIPS"] for e in envs] == ["0", "1", "2", "3"] * 2
+    assert [e["CLOUD_TPU_TASK_ID"] for e in envs] == ["0"] * 4 + ["1"] * 4

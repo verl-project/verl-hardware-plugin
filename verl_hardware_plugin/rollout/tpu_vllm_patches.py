@@ -27,45 +27,48 @@ import logging
 import multiprocessing
 import multiprocessing.process
 import os
-import time
-from collections import defaultdict
+from collections import Counter
 
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from verl_hardware_plugin.platforms.platform_tpu import resolve_tpu_topology_bounds
+
 logger = logging.getLogger(__name__)
 
-# Base port for the rollout slice builder mesh. Each local chip takes ``base + local_rank``.
-# Distinct from the trainer's 8471 so a colocated trainer and rollout never collide.
-TPU_ROLLOUT_BASE_PORT = 8070
-DEFAULT_TPU_TOPOLOGY_MAP = {
-    1: "1,1,1",
-    2: "1,2,1",
-    4: "2,2,1",
-    8: "2,4,1",
-    16: "4,4,1",
-    32: "4,8,1",
-    64: "8,8,1",
-    128: "8,16,1",
-    256: "16,16,1",
-}
+
+def _local_ranks(worker_ips: list[str]) -> list[int]:
+    """Index of each worker among the workers on its host, for workers in rank order."""
+    return [worker_ips[:rank].count(ip) for rank, ip in enumerate(worker_ips)]
 
 
-# TODO: consolidate with platform_tpu.resolve_tpu_topology_bounds once the TPU platform PR lands.
-def _resolve_tpu_topology_bounds(total_chips: int, num_nodes: int) -> tuple[str, str, str, str]:
-    """Dynamically resolves (topology, host_bounds, chips_per_host_bounds, chips_per_host) for TPU slices."""
-    topology = os.environ.get("TORCH_TPU_TOPOLOGY") or DEFAULT_TPU_TOPOLOGY_MAP.get(total_chips, "1,1,1")
-    inferred_chips_per_host = max(1, total_chips // max(1, num_nodes))
-    chips_per_host = str(os.environ.get("VLLM_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
+def _tpu_worker_envs(worker_ips: list[str], base_port: int) -> list[dict[str, str]]:
+    """The TPU multi-host environment of each vLLM worker, for workers in rank order.
 
-    if total_chips <= 4:
-        host_bounds = "1,1,1"
-        chips_per_host_bounds = topology if num_nodes == 1 else "1,1,1"
-    else:
-        host_bounds = topology
-        chips_per_host_bounds = "1,1,1"
-
-    return topology, host_bounds, chips_per_host_bounds, chips_per_host
+    Ranks on one host must be contiguous. A worker drives chip ``local_rank`` of its host and serves
+    the slice builder on ``base_port + local_rank``. These are the variables libtpu and torch_tpu
+    read to join the workers into one TPU mesh.
+    """
+    hosts = list(dict.fromkeys(worker_ips))
+    local_ranks = _local_ranks(worker_ips)
+    addresses = ",".join(
+        f"{ip}:{base_port + local_rank}" for ip, local_rank in zip(worker_ips, local_ranks, strict=True)
+    )
+    topology, host_bounds, chips_per_host_bounds, _ = resolve_tpu_topology_bounds(len(worker_ips), len(hosts))
+    return [
+        {
+            "TPU_VISIBLE_CHIPS": str(local_rank),
+            "TPU_PROCESS_PORT": str(base_port + local_rank),
+            "TPU_PROCESS_ADDRESSES": addresses,
+            "TORCH_TPU_SLICEBUILDER_ADDRESSES": addresses,
+            "CLOUD_TPU_TASK_ID": str(hosts.index(ip)),
+            "TPU_WORKER_HOSTNAMES": ",".join(hosts),
+            "TORCH_TPU_TOPOLOGY": topology,
+            "TPU_HOST_BOUNDS": host_bounds,
+            "TPU_CHIPS_PER_HOST_BOUNDS": chips_per_host_bounds,
+        }
+        for ip, local_rank in zip(worker_ips, local_ranks, strict=True)
+    ]
 
 
 _PATCHES_APPLIED = False
@@ -144,8 +147,8 @@ def patch_vllm_for_tpu() -> None:
         from vllm.platforms import current_platform
         from vllm.ray.ray_env import get_env_vars_to_copy
         from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
-        from vllm.v1.executor.ray_executor import RayWorkerMetaData
         from vllm.v1.executor.ray_utils import FutureWrapper, detach_zero_copy_from_model_runner_output
+        from vllm_torchtpu import envs as vllm_torchtpu_envs
         from vllm_torchtpu.executors import ray_distributed_executor
         from vllm_torchtpu.worker.tpu_worker import TPUWorker
     except ImportError as exc:
@@ -219,191 +222,69 @@ def patch_vllm_for_tpu() -> None:
         OriginalRayWorkerWrapper.__init__ = patched_wrapper_init
 
         def patched_init_workers_ray(self, placement_group, **ray_remote_kwargs):
-            RayWorkerWrapper_local = ray_distributed_executor.RayWorkerWrapper
-
-            self.workers = []
-
+            # One worker per TPU bundle of verl's placement groups.
             verl_pgs = getattr(self.parallel_config, "_verl_tpu_placement_groups", None) or [placement_group]
-            pg_bundle_pairs = []
-            for pg in verl_pgs:
-                for bundle_id, bundle in enumerate(pg.bundle_specs):
-                    if bundle.get(current_platform.ray_device_key, 0):
-                        pg_bundle_pairs.append((pg, bundle_id))
-
-            worker_metadata = []
-            driver_ip = get_ip()
-            num_tpu_per_worker = 1.0
-            for rank, (pg, bundle_id) in enumerate(pg_bundle_pairs[: self.parallel_config.world_size]):
-                scheduling_strategy = PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    placement_group_capture_child_tasks=True,
-                    placement_group_bundle_index=bundle_id,
-                )
-                worker = ray.remote(
+            bundles = [
+                (pg, bundle_index)
+                for pg in verl_pgs
+                for bundle_index, bundle in enumerate(pg.bundle_specs)
+                if bundle.get(current_platform.ray_device_key, 0)
+            ][: self.parallel_config.world_size]
+            self.workers = [
+                ray.remote(
                     num_cpus=0,
                     num_gpus=0,
-                    resources={current_platform.ray_device_key: num_tpu_per_worker},
-                    scheduling_strategy=scheduling_strategy,
+                    resources={current_platform.ray_device_key: 1},
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg,
+                        placement_group_capture_child_tasks=True,
+                        placement_group_bundle_index=bundle_index,
+                    ),
                     **ray_remote_kwargs,
-                )(RayWorkerWrapper_local).remote(rpc_rank=rank)
-                worker_metadata.append(RayWorkerMetaData(worker=worker, created_rank=rank))
-
-            worker_ips = ray.get([each.worker.get_node_ip.remote() for each in worker_metadata])
-
-            for each, ip in zip(worker_metadata, worker_ips, strict=False):
-                each.ip = ip
-
-            logger.info("Initialized worker_metadata: %s", worker_metadata)
-
-            ip_counts = {}
-            for ip in worker_ips:
-                ip_counts[ip] = ip_counts.get(ip, 0) + 1
-
-            def sort_by_driver_then_worker_ip(item):
-                ip = item.ip
-                return (0 if ip == driver_ip else 1, ip_counts[ip], ip)
-
-            sorted_worker_metadata = sorted(worker_metadata, key=sort_by_driver_then_worker_ip)
-            start_rank = 0
-            for i, item in enumerate(sorted_worker_metadata):
-                item.adjusted_rank = i + start_rank
-            logger.info("Initialized sorted worker_metadata: %s", sorted_worker_metadata)
-
-            self.workers = [item.worker for item in sorted_worker_metadata]
-            rerank_mapping = {item.created_rank: item.adjusted_rank for item in sorted_worker_metadata}
-            self.collective_rpc("adjust_rank", args=(rerank_mapping,))
-
-            worker_node_and_tpu_ids = [
-                ray.get(worker.get_node_and_physical_gpu_ids.remote()) for worker in self.workers
+                )(ray_distributed_executor.RayWorkerWrapper).remote(rpc_rank=rank)
+                for rank, (pg, bundle_index) in enumerate(bundles)
             ]
 
-            node_workers = defaultdict(list)
-            node_tpus = defaultdict(list)
+            # Rank the workers as vLLM does: the driver's host first, because rank 0 serves the
+            # torch.distributed store at the driver's address, then each host's workers together.
+            driver_ip = get_ip()
+            ips = ray.get([worker.get_node_ip.remote() for worker in self.workers])
+            workers_per_ip = Counter(ips)
+            order = sorted(range(len(ips)), key=lambda i: (ips[i] != driver_ip, workers_per_ip[ips[i]], ips[i]))
+            self.workers = [self.workers[i] for i in order]
+            ips = [ips[i] for i in order]
+            self.collective_rpc("adjust_rank", args=({created: rank for rank, created in enumerate(order)},))
 
-            for i, (node_id, tpu_ids) in enumerate(worker_node_and_tpu_ids):
-                node_workers[node_id].append(i)
-                tpu_ids = [int(x) for x in tpu_ids]
-                node_tpus[node_id].extend(tpu_ids)
-            for node_id, tpu_ids in node_tpus.items():
-                node_tpus[node_id] = sorted(tpu_ids)
-            logger.info("RayDistributedExecutor | node_workers=%s | node_tpus=%s", node_workers, node_tpus)
-
-            unique_node_ids = list(node_workers.keys())
-            num_nodes = len(unique_node_ids)
-
-            sb_addresses = []
-            base_port = int(os.environ.get("TORCH_TPU_BASE_PORT", TPU_ROLLOUT_BASE_PORT))
-            for node_id in unique_node_ids:
-                w_idx = node_workers[node_id][0]
-                host_ip = sorted_worker_metadata[w_idx].ip
-                chips_on_node = len(node_workers[node_id])
-                for lr in range(chips_on_node):
-                    sb_addresses.append(f"{host_ip}:{base_port + lr}")
-
-            sb_addresses_str = ",".join(sb_addresses)
-            os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = sb_addresses_str
-            logger.info("Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: %s", sb_addresses_str)
-
-            total_chips = len(self.workers)
-            topology, host_bounds, chips_per_host_bounds, chips_per_host = _resolve_tpu_topology_bounds(
-                total_chips=total_chips,
-                num_nodes=num_nodes,
-            )
-
-            rank_0_node_id = unique_node_ids[0]
-            rank_0_worker_index = node_workers[rank_0_node_id][0]
-            master_addr = sorted_worker_metadata[rank_0_worker_index].ip
-            master_port = str(get_open_port())
-
-            all_args_to_update_environment_variables = []
-            for i in range(total_chips):
-                node_id = worker_node_and_tpu_ids[i][0]
-                node_rank = unique_node_ids.index(node_id)
-                args = {
-                    "NNODES": str(num_nodes),
-                    "NODE_RANK": str(node_rank),
-                    "MASTER_ADDR": master_addr,
-                    "MASTER_PORT": master_port,
-                    "TORCH_TPU_TOPOLOGY": topology,
-                    "LOCAL_WORLD_SIZE": str(len(node_tpus[node_id])),
-                    "TPU_NUM_HOSTS": str(num_nodes),
-                }
-                if "TORCH_TPU_XPROF_SESSION_ID" not in os.environ:
-                    os.environ["TORCH_TPU_XPROF_SESSION_ID"] = str(time.time_ns())
-
-                args["TORCH_TPU_XPROF_SESSION_ID"] = os.environ["TORCH_TPU_XPROF_SESSION_ID"]
-                all_args_to_update_environment_variables.append(args)
-
-            exclude_vars = getattr(self, "WORKER_SPECIFIC_ENV_VARS", None)
-            if exclude_vars is None:
-                exclude_vars = getattr(v1_ray_utils, "WORKER_SPECIFIC_ENV_VARS", set())
-            env_vars_to_copy_list = get_env_vars_to_copy(
-                exclude_vars=exclude_vars,
-                additional_vars=set(current_platform.additional_env_vars),
-                destination="workers",
-            )
-
-            for i, args in enumerate(all_args_to_update_environment_variables):
-                for name in env_vars_to_copy_list:
-                    if name in os.environ:
-                        args[name] = os.environ[name]
-                logger.debug("RayDistributedExecutor | Worker %d environment variables before patch: %s", i, args)
-
-            self._env_vars_for_all_workers = all_args_to_update_environment_variables
-
-            unique_host_ips = [sorted_worker_metadata[node_workers[nid][0]].ip for nid in unique_node_ids]
-            host_names_str = ",".join(unique_host_ips)
-            for i, worker in enumerate(self.workers):
-                node_id = worker_node_and_tpu_ids[i][0]
-                host_idx = unique_node_ids.index(node_id)
-                local_chip_id = node_workers[node_id].index(i)
-                args = self._env_vars_for_all_workers[i]
-                args["RANK"] = str(i)
-                args["LOCAL_RANK"] = str(local_chip_id)
-                args["TPU_VISIBLE_CHIPS"] = str(local_chip_id)
-                args["TPU_PROCESS_PORT"] = str(base_port + local_chip_id)
-                args["CLOUD_TPU_TASK_ID"] = str(host_idx)
-                args["TPU_WORKER_HOSTNAMES"] = host_names_str
-                args["TPU_HOST_BOUNDS"] = host_bounds
-                args["TPU_CHIPS_PER_HOST_BOUNDS"] = chips_per_host_bounds
-                args["CHIPS_PER_HOST"] = chips_per_host
-                args["TORCH_TPU_TOPOLOGY"] = topology
-                args["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = sb_addresses_str
-                args["TPU_PROCESS_ADDRESSES"] = sb_addresses_str
-                if total_chips > 4 or num_nodes > 1:
-                    args["TPU_MULTIHOST_BACKEND"] = "ray"
-
-                logger.info(
-                    "Configured TPU worker %d (host %d, chip %d) env vars: "
-                    "TPU_VISIBLE_CHIPS=%d, TPU_PROCESS_PORT=%d, CLOUD_TPU_TASK_ID=%d",
-                    i,
-                    host_idx,
-                    local_chip_id,
-                    local_chip_id,
-                    base_port + local_chip_id,
-                    host_idx,
+            driver_env = {
+                name: os.environ[name]
+                for name in get_env_vars_to_copy(
+                    exclude_vars=v1_ray_utils.WORKER_SPECIFIC_ENV_VARS,
+                    additional_vars=set(current_platform.additional_env_vars),
+                    destination="workers",
                 )
-
+                if name in os.environ
+            }
+            # torch_tpu's own rendezvous, separate from the torch.distributed one below.
+            torch_tpu_master = {"MASTER_ADDR": ips[0], "MASTER_PORT": str(get_open_port())}
+            self._env_vars_for_all_workers = [
+                {**driver_env, **torch_tpu_master, **tpu_env}
+                for tpu_env in _tpu_worker_envs(ips, vllm_torchtpu_envs.TORCH_TPU_BASE_PORT)
+            ]
             self.collective_rpc("update_environment_variables", args=(self._get_env_vars_to_be_updated(),))
+            logger.info("TPU rollout process addresses: %s", self._env_vars_for_all_workers[0]["TPU_PROCESS_ADDRESSES"])
 
             distributed_init_method = get_distributed_init_method(driver_ip, get_open_port())
-
-            all_kwargs = []
-            for rank, (node_id, _) in enumerate(worker_node_and_tpu_ids):
-                local_rank = node_workers[node_id].index(rank)
-                ip = sorted_worker_metadata[rank].ip
-
-                kwargs = dict(
+            local_ranks = _local_ranks(ips)
+            all_kwargs = [
+                dict(
                     vllm_config=self.vllm_config,
-                    local_rank=local_rank,
+                    local_rank=local_ranks[rank],
                     rank=rank,
                     distributed_init_method=distributed_init_method,
-                    is_driver_worker=(not self.parallel_config)
-                    or (rank % self.parallel_config.tensor_parallel_size == 0),
-                    ip=ip,
-                    assigned_physical_gpu_ids=sorted(node_tpus[node_id]),
+                    is_driver_worker=rank % self.parallel_config.tensor_parallel_size == 0,
                 )
-                all_kwargs.append(kwargs)
+                for rank in range(len(self.workers))
+            ]
             self.collective_rpc("init_worker", args=(all_kwargs,))
             self.collective_rpc("init_device")
             self.collective_rpc("load_model")
