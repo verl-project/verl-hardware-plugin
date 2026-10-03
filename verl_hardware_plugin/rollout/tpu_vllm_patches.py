@@ -62,37 +62,34 @@ def patch_vllm_for_tpu() -> None:
         logger.debug("Skipping vLLM TPU executor patches (vllm / vllm_torchtpu not installed): %s", exc)
         return
 
-    try:
-        original_create_engine_config = EngineArgs.create_engine_config
+    original_create_engine_config = EngineArgs.create_engine_config
 
-        def create_engine_config(self, *args, **kwargs):
-            # vllm-torchtpu picks its own Ray executor, which takes a single placement group, but
-            # verl reserves one per host. Use vLLM's generic Ray executor, which the patches below
-            # adapt to TPU. It does not support async scheduling, which vLLM turned on for the
-            # external_launcher backend that TPUvLLMHttpServer passes in.
-            vllm_config = original_create_engine_config(self, *args, **kwargs)
-            vllm_config.parallel_config.distributed_executor_backend = "ray"
-            vllm_config.scheduler_config.async_scheduling = False
-            return vllm_config
+    def create_engine_config(self, *args, **kwargs):
+        # vllm-torchtpu picks its own Ray executor, which takes a single placement group, but verl
+        # reserves one per host. Use vLLM's generic Ray executor, which the patches below adapt to
+        # TPU. It does not support async scheduling, which vLLM turned on for the
+        # external_launcher backend that TPUvLLMHttpServer passes in.
+        vllm_config = original_create_engine_config(self, *args, **kwargs)
+        vllm_config.parallel_config.distributed_executor_backend = "ray"
+        vllm_config.scheduler_config.async_scheduling = False
+        return vllm_config
 
-        original_worker_init = RayWorkerWrapper.__init__
+    original_worker_init = RayWorkerWrapper.__init__
 
-        def worker_init(self, *args, **kwargs):
-            # vLLM's worker actors never import the plugin. Ray sends this method to them with the
-            # actor class, so it installs the patches there.
-            patch_vllm_for_tpu()
-            original_worker_init(self, *args, **kwargs)
+    def worker_init(self, *args, **kwargs):
+        # vLLM's worker actors never import the plugin. Ray sends this method to them with the
+        # actor class, so it installs the patches there.
+        patch_vllm_for_tpu()
+        original_worker_init(self, *args, **kwargs)
 
-        EngineArgs.create_engine_config = create_engine_config
-        RayWorkerWrapper.__init__ = worker_init
-        TPUWorker.reset_encoder_cache = _reset_encoder_cache
-        ray_executor.initialize_ray_cluster = _initialize_ray_cluster
-        ray_executor.RayDistributedExecutor._init_workers_ray = _init_workers_ray
-        ray_executor.RayDistributedExecutor._execute_dag = _execute_dag
-        _PATCHES_APPLIED = True
-        logger.info("Successfully applied all TPU patches to vLLM and vllm-torchtpu.")
-    except Exception as e:
-        logger.warning("Failed to apply TPU vLLM patches: %s", e, exc_info=True)
+    EngineArgs.create_engine_config = create_engine_config
+    RayWorkerWrapper.__init__ = worker_init
+    TPUWorker.reset_encoder_cache = _reset_encoder_cache
+    ray_executor.initialize_ray_cluster = _initialize_ray_cluster
+    ray_executor.RayDistributedExecutor._init_workers_ray = _init_workers_ray
+    ray_executor.RayDistributedExecutor._execute_dag = _execute_dag
+    _PATCHES_APPLIED = True
+    logger.info("Successfully applied all TPU patches to vLLM and vllm-torchtpu.")
 
 
 def _initialize_ray_cluster(parallel_config, ray_address=None) -> None:
