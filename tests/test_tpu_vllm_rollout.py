@@ -328,6 +328,14 @@ def test_pickleable_process_wrapper_applies_patches_before_target():
     patch.assert_called_once_with()
 
 
+def test_multiprocessing_patch_wraps_keyword_and_positional_targets(isolated_patches):
+    isolated_patches.patch_multiprocessing_for_tpu()
+    for process in (multiprocessing.Process(target=len), multiprocessing.Process(None, len)):
+        assert isinstance(process._target, isolated_patches.PickleableProcessWrapper)
+        assert process._target.target is len
+    assert multiprocessing.Process()._target is None
+
+
 def test_local_ranks_count_workers_per_host_in_rank_order():
     assert tpu_vllm_patches._local_ranks(["b", "b", "a", "a", "a"]) == [0, 1, 0, 1, 2]
 

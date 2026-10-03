@@ -254,32 +254,20 @@ class PickleableProcessWrapper:
 
     def __call__(self, *args, **kwargs):
         patch_vllm_for_tpu()
-        if self.target is not None:
-            return self.target(*args, **kwargs)
+        return self.target(*args, **kwargs)
 
 
 def patch_multiprocessing_for_tpu() -> None:
     """Wrap the target of every ``multiprocessing`` process started from now on in ``PickleableProcessWrapper``."""
-    if getattr(multiprocessing.process.BaseProcess, "_tpu_patched", False):
+    base_process = multiprocessing.process.BaseProcess
+    if getattr(base_process, "_tpu_patched", False):
         return
+    original_init = base_process.__init__
 
-    original_init = multiprocessing.process.BaseProcess.__init__
-
-    def patched_init(self, *args, **kwargs):
-        target = kwargs.get("target", None)
-        if target is None and len(args) > 1:
-            target = args[1]
-
+    def patched_init(self, group=None, target=None, *args, **kwargs):
         if target is not None:
-            wrapped_target = PickleableProcessWrapper(target)
-            if "target" in kwargs:
-                kwargs["target"] = wrapped_target
-            elif len(args) > 1:
-                args = list(args)
-                args[1] = wrapped_target
-                args = tuple(args)
+            target = PickleableProcessWrapper(target)
+        original_init(self, group, target, *args, **kwargs)
 
-        original_init(self, *args, **kwargs)
-
-    multiprocessing.process.BaseProcess.__init__ = patched_init  # type: ignore[method-assign]
-    multiprocessing.process.BaseProcess._tpu_patched = True  # type: ignore[attr-defined]
+    base_process.__init__ = patched_init  # type: ignore[method-assign]
+    base_process._tpu_patched = True  # type: ignore[attr-defined]
