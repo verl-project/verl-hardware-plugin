@@ -1,0 +1,222 @@
+# syntax=docker/dockerfile:1
+
+# verl-hardware-plugin (Intel XPU) on top of verl
+#
+# Builds a combined image: verl core, cloned at a pinned ref, plus this
+# plugin (verl_hardware_plugin) installed from the local build context on
+# top of it. vLLM is installed from the prebuilt XPU wheel for rollout.
+#
+# Design goals:
+# - Match vLLM's Intel GPU container workflow (DLE base + uv + oneCCL setup).
+# - Keep versions explicit and reproducible.
+# - Keep torch/vLLM alignment owned by vLLM requirements/xpu.txt.
+#
+# Build context is THIS repo (verl-hardware-plugin), not verl-core: verl is
+# pulled in via VERL_GIT_REPO/VERL_REF rather than COPY'd from a local
+# checkout, since the intended user already has this plugin checked out and
+# wants a known-good verl paired with it, not the reverse.
+#
+# Build:
+#   docker build -t verl-intel-gpu:latest -f docker/intel_gpu/Dockerfile.intel_gpu .
+#
+# Behind a corporate proxy:
+#   docker build --build-arg http_proxy=... --build-arg https_proxy=... ...
+#
+# Run (mount GPU devices + render group):
+#   RENDER_GID=$(getent group render | cut -d: -f3)
+#   docker run -it --rm \
+#     --device /dev/dri --group-add ${RENDER_GID} \
+#     --shm-size 16g \
+#     -v $HOME/data:/root/data \
+#     verl-intel-gpu:latest
+#
+# Quick Intel GPU sanity check:
+#   docker run --rm --device /dev/dri --group-add ${RENDER_GID} verl-intel-gpu:latest \
+#     python3 -c "import torch; print(torch.__version__); print(torch.xpu.is_available()); print(torch.xpu.device_count())"
+
+# Base: DLE 2026.1.0 / ubuntu24.04. UBUNTU flavor is load-bearing — the 2026.1
+# ubuntu26.04 variant SIGSEGVs on torch init (glibc/SYCL ABI mismatch on that
+# beta distro). ubuntu24.04 is stable and ships python3.12-dev as an apt package,
+# which the vLLM CMake build requires.
+#
+# oneCCL: intentionally NOT installed separately. The 2026.1.0 DLE base already
+# ships a torch-2.13-compatible oneCCL (Gold-2022.1.0, linked against the base's
+# libsycl.so.9) at /opt/intel/oneapi/ccl/2022.1, and bakes CCL_ROOT,
+# LD_LIBRARY_PATH, and CMAKE_PREFIX_PATH (lib/cmake/oneCCL) into the image ENV
+# with no sourcing required. The torch 2.13.0+xpu wheel also bundles its own
+# oneCCL, but the base's 2022.1.0 takes precedence via LD_LIBRARY_PATH and is
+# the one torch-xpu-ops links against at wheel-build time — so they match.
+FROM intel/deep-learning-essentials:2026.1.0-devel-ubuntu24.04@sha256:6d0c782487d1f5d6e7d6772523cc2c3928d0aaa2213dbe88ad54733657c82332
+
+LABEL org.opencontainers.image.title="verl-intel-gpu"
+LABEL org.opencontainers.image.description="verl + verl-hardware-plugin development image for Intel GPU"
+LABEL org.opencontainers.image.vendor="verl-hardware-plugin"
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PYTHON_VERSION=3.12
+
+# vLLM stays pinned to v0.29.0 — the last version confirmed end-to-end on real
+# B60 hardware (real GRPO training step, throughput 53.4-56.3).
+#
+# v0.30.0 was also evaluated (installs cleanly, same torch==2.13.0 +
+# vllm_xpu_kernels==0.1.14.1 pairing) and a live devctl GRPO run on it hit a
+# reproducible crash during rollout weight-sync (AutoWeightsLoader
+# tied-embedding check tripped when lm_head.weight/model.embed_tokens.weight
+# landed in different buckets) — but a same-day rerun proved this is NOT
+# version-specific: v0.29.0 hits the exact same crash under the current
+# fork/verl checkout. Root cause is therefore something in that checkout
+# (or verl's bucketed weight-sync generally), not the vLLM version. Staying
+# on v0.29.0 anyway since it's the version with a confirmed-good historical
+# run; the checkout-side bug still needs isolating separately.
+#
+# Still installed from the prebuilt XPU wheel (see Layer 1) instead of built
+# from source, though — that swap is orthogonal to the version pin and cuts
+# the image build down by the CMake/SYCL compile step regardless of which
+# vLLM version is selected.
+ARG VLLM_VERSION=v0.29.0
+
+# torch version is intentionally not pinned here. vLLM's requirements/xpu.txt
+# owns the tested torch+xpu pairing for each vLLM commit.
+ARG PIP_INDEX_URL="https://download.pytorch.org/whl/xpu"
+ARG PIP_EXTRA_INDEX_URL="https://pypi.org/simple"
+
+# Intel userspace driver/component versions (explicit for reproducible builds).
+ARG IGC_VERSION=2.34.4
+ARG IGC_BUILD=21428
+ARG COMPUTE_RUNTIME_VERSION=26.18.38308.1
+ARG IGDGMM_VERSION=22.10.0
+ARG LEVEL_ZERO_VERSION=1.28.2+u24.04
+
+# verl-core, pulled in at a pinned ref — NOT the local build context (that's
+# this plugin, see Layer 3). Until verl-project/verl#7917 (the PlatformBase
+# hooks is_reduce_avg_supported()/attention_utils_module()/profiler_markers()/
+# dist_profiler_cls() that this plugin's platform_xpu.py and profilers/
+# override) merges upstream, default to the fork+branch that actually has
+# them. Switch VERL_GIT_REPO to https://github.com/verl-project/verl.git and
+# VERL_REF to a released tag once #7917 lands.
+ARG VERL_GIT_REPO=https://github.com/kahlun/verl.git
+ARG VERL_REF=intel-xpu-plugin-e2e-vllm
+
+WORKDIR /workspace
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# --- System dependencies ---
+# python${PYTHON_VERSION}-dev is required: vLLM's XPU extension is compiled from
+# source (uv pip install --no-build-isolation .), and its CMake step needs the
+# CPython development headers (Python_INCLUDE_DIRS / Development.Module). The
+# ubuntu24.04 DLE base ships python3.12 + python3.12-dev as apt packages.
+RUN set -eux && \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        g++ \
+        gcc \
+        git \
+        libnuma-dev \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-dev \
+        python3-pip \
+        wget && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- uv: fast, deterministic resolver ---
+ENV PATH="/root/.local/bin:${PATH}"
+ENV VIRTUAL_ENV="/opt/venv"
+ENV UV_PYTHON_INSTALL_DIR="/opt/uv/python"
+RUN set -eux && \
+    curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# --- Intel GPU user-mode drivers (UMD) ---
+# Bumped to compute-runtime 26.18: fixes vllm's request_memory reading free=0 on
+# device xpu:0 with 26.09 (getMemoryInfo bug). 26.18 reports free memory correctly.
+RUN set -eux && \
+    tmp_dir="$(mktemp -d)" && \
+    cd "${tmp_dir}" && \
+    wget -q "https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION}/intel-igc-core-2_${IGC_VERSION}+${IGC_BUILD}_amd64.deb" && \
+    wget -q "https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION}/intel-igc-opencl-2_${IGC_VERSION}+${IGC_BUILD}_amd64.deb" && \
+    wget -q "https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}/intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    wget -q "https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    wget -q "https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}/libigdgmm12_${IGDGMM_VERSION}_amd64.deb" && \
+    wget -q "https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION%%+*}/level-zero_${LEVEL_ZERO_VERSION}_amd64.deb" && \
+    wget -q "https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION%%+*}/level-zero-devel_${LEVEL_ZERO_VERSION}_amd64.deb" && \
+    dpkg -i --force-overwrite ./*.deb && \
+    cd / && \
+    rm -rf "${tmp_dir}"
+
+# No oneAPI/oneCCL sourcing needed: the 2026.1.0 base bakes CCL_ROOT,
+# LD_LIBRARY_PATH and CMAKE_PREFIX_PATH (ccl/2022.1/lib/cmake/oneCCL) into the
+# image ENV, so vLLM's XPU build finds oneCCL headers/cmake directly.
+
+ENV UV_HTTP_TIMEOUT=500
+# XPU index is primary, PyPI is extra. This avoids pulling CPU-only torch from PyPI.
+ENV UV_INDEX_URL="${PIP_INDEX_URL}"
+ENV UV_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL}"
+ENV UV_INDEX_STRATEGY="unsafe-best-match"
+ENV UV_LINK_MODE="copy"
+ENV VLLM_TARGET_DEVICE="xpu"
+
+# --- Layer 1: vLLM + torch Intel GPU ---
+# install VLLM intel xpu wheel
+# refer here for latest information
+# https://docs.vllm.ai/en/latest/getting_started/installation/gpu/#pre-built-wheels
+RUN --mount=type=cache,target=/root/.cache/uv set -ex && \
+    uv pip install "vllm==${VLLM_VERSION#v}+xpu" \
+        --extra-index-url "https://wheels.vllm.ai/${VLLM_VERSION#v}/xpu" \
+        --extra-index-url "https://wheels.vllm.ai/xpu" \
+        --extra-index-url "${PIP_EXTRA_INDEX_URL}" \
+        --index-strategy unsafe-best-match
+
+# --- Layer 2: verl core, cloned at a pinned ref (see VERL_GIT_REPO/VERL_REF above) ---
+RUN set -eux && \
+    git clone "${VERL_GIT_REPO}" /opt/verl && \
+    cd /opt/verl && \
+    git checkout "${VERL_REF}"
+
+COPY docker/intel_gpu/requirements-intel-gpu.txt /tmp/requirements-intel-gpu.txt
+RUN --mount=type=cache,target=/root/.cache/uv set -eux && uv pip install -r /tmp/requirements-intel-gpu.txt
+
+# pyzes >= 0.1.2, installed separately and deliberately overriding torch's own
+# for future PYNVML equivalent
+RUN --mount=type=cache,target=/root/.cache/uv set -eux && \
+    uv pip install --no-deps "pyzes>=0.1.2"
+
+RUN --mount=type=cache,target=/root/.cache/uv set -eux && cd /opt/verl && uv pip install --no-deps -e .
+
+# xgrammar (via vLLM's common.txt) pulls in plain triton as a transitive dep.
+# Plain triton is for NVIDIA only — replace with triton-xpu per official vLLM XPU docs.
+# See: https://docs.vllm.ai/en/latest/getting_started/xpu-installation.html
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip uninstall triton triton-xpu -y 2>/dev/null || true && \
+    uv pip install triton-xpu==3.7.1 --extra-index-url https://download.pytorch.org/whl/xpu
+
+# --- Layer 3: this plugin (verl_hardware_plugin), from the local build context ---
+# Installed at /opt/, NOT /workspace/ — devctl (and similar workspace-PVC
+# tooling) mounts a session PVC AT /workspace, replacing everything image-baked
+# under it with only /workspace/local + /workspace/remote. An editable install
+# rooted under /workspace would go invisible the moment such a PVC mounts,
+# exactly like verl-core did before it was moved to /opt/verl above.
+WORKDIR /opt/verl-hardware-plugin
+COPY . /opt/verl-hardware-plugin
+# --no-deps: pyproject.toml declares "verl>=0.7.0" as a dependency, but we want
+# the pinned checkout installed at /opt/verl above (Layer 2), not a PyPI verl
+# release silently overwriting it.
+RUN --mount=type=cache,target=/root/.cache/uv set -eux && uv pip install --no-deps -e .
+
+# No VERL_USE_EXTERNAL_MODULES needed: this plugin is auto-discovered via the
+# `verl.plugins` setuptools entry_points group declared in pyproject.toml
+# ([project.entry-points."verl.plugins"] hardware = "verl_hardware_plugin"),
+# which verl's platform_manager.py loads by default
+# (VERL_USE_EXTERNAL_PLUGINS=auto). Set VERL_USE_EXTERNAL_PLUGINS=none to
+# disable discovery, e.g. for isolating a bug to this plugin.
+
+WORKDIR /opt/verl
+
+CMD ["bash", "-c", "exec bash"]
