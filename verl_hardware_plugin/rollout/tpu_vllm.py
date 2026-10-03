@@ -25,15 +25,10 @@ import os
 import ray
 
 from verl.plugin.platform import get_platform
-from verl.utils.device import get_device_name, get_resource_name
+from verl.utils.device import get_device_name
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 from verl_hardware_plugin.rollout.tpu_vllm_patches import patch_vllm_for_tpu
-
-
-def is_tpu_vllm_run() -> bool:
-    """Returns True if executing on a Google TPU resource."""
-    return get_resource_name() == "TPU"
 
 
 async def get_tpu_server_launch_config(workers):
@@ -171,6 +166,12 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
 class TPUvLLMHttpServer(vLLMHttpServer):
     """``vLLMHttpServer`` with the TPU engine arguments."""
 
+    def __init__(self, *args, **kwargs):
+        # This actor builds the vLLM engine and starts its EngineCore process, so patch vLLM before
+        # anything else. The patches carry themselves into the EngineCore and vLLM's workers.
+        patch_vllm_for_tpu()
+        super().__init__(*args, **kwargs)
+
     def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:
         super()._preprocess_engine_kwargs(engine_kwargs)
         # engine_kwargs is merged last into the vLLM CLI args, so these win over the defaults.
@@ -194,9 +195,3 @@ class TPUvLLMReplica(vLLMReplica):
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
         await launch_tpu_vllm_servers(self)
-
-
-# This module is imported by the driver (through the ``vllm`` replica loader) and by every
-# TPUvLLMHttpServer actor, which is the process that spawns the vLLM EngineCore.
-if is_tpu_vllm_run():
-    patch_vllm_for_tpu()

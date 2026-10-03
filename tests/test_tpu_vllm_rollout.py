@@ -59,12 +59,14 @@ class _FakeReplica:
 
 @pytest.fixture
 def tpu_vllm():
-    """Import ``tpu_vllm`` against a stubbed ``vllm_async_server`` on a non-TPU host."""
+    """Import ``tpu_vllm`` against a stubbed ``vllm_async_server``, with ``patch_vllm_for_tpu`` mocked."""
     vas = ModuleType(VAS)
     vas.vLLMHttpServer = _FakeHttpServer
     vas.vLLMReplica = _FakeReplica
-    env = {k: v for k, v in os.environ.items() if k != "VERL_PLATFORM"}
-    with mock.patch.dict(sys.modules, {VAS: vas}), mock.patch.dict(os.environ, env, clear=True):
+    with (
+        mock.patch.dict(sys.modules, {VAS: vas}),
+        mock.patch.object(tpu_vllm_patches, "patch_vllm_for_tpu"),
+    ):
         sys.modules.pop("verl_hardware_plugin.rollout.tpu_vllm", None)
         module = importlib.import_module("verl_hardware_plugin.rollout.tpu_vllm")
         yield module
@@ -112,9 +114,13 @@ def test_vllm_loader_defers_off_tpu_and_picks_tpu_replica_on_tpu():
 # ---------------------------------------------------------------------------
 
 
-def test_module_import_does_not_patch_off_tpu(tpu_vllm):
-    assert not tpu_vllm.is_tpu_vllm_run()
-    assert not tpu_vllm_patches._PATCHES_APPLIED
+def test_server_patches_vllm_before_upstream_init(tpu_vllm):
+    assert not tpu_vllm.patch_vllm_for_tpu.called  # importing the module patches nothing
+    order = []
+    tpu_vllm.patch_vllm_for_tpu.side_effect = lambda: order.append("patch")
+    with mock.patch.object(_FakeHttpServer, "__init__", lambda self: order.append("upstream init")):
+        tpu_vllm.TPUvLLMHttpServer()
+    assert order == ["patch", "upstream init"]
 
 
 def test_server_engine_kwargs_force_tpu_executor(tpu_vllm):
