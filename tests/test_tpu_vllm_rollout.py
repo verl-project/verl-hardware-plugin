@@ -166,12 +166,12 @@ class _FakeRemoteMethod:
 
 
 class _FakeWorker:
-    def __init__(self, node_id, chip, env):
-        self._node_id, self._chip, self._env = node_id, chip, env
+    def __init__(self, node_id, chip):
+        self._node_id, self._env = node_id, {"TPU_VISIBLE_CHIPS": chip}
         self.__ray_call__ = _FakeRemoteMethod(self._call)
 
     def _call(self, fn):
-        # get_tpu_server_launch_config sends two lambdas: (node, chips) and the env filter.
+        # launch_tpu_vllm_servers asks every worker for its (node id, TPU chip).
         with (
             mock.patch("ray.get_runtime_context", return_value=SimpleNamespace(get_node_id=lambda: self._node_id)),
             mock.patch.dict(os.environ, self._env, clear=True),
@@ -211,14 +211,7 @@ NODE_B = "b" * 56
 
 
 def _fake_replica(data_parallel_size=1):
-    worker_env = {
-        "TPU_VISIBLE_CHIPS": "0",
-        "TPU_WORKER_ID": "0",
-        "LIBTPU_INIT_ARGS": "--base",
-        "UNRELATED": "dropped",
-    }
-    workers = [_FakeWorker(NODE_A, str(i), {**worker_env, "TPU_VISIBLE_CHIPS": str(i)}) for i in range(4)]
-    workers += [_FakeWorker(NODE_B, str(i), {**worker_env, "TPU_VISIBLE_CHIPS": str(i)}) for i in range(4)]
+    workers = [_FakeWorker(node, str(chip)) for node in (NODE_A, NODE_B) for chip in range(4)]
     return SimpleNamespace(
         config=SimpleNamespace(
             data_parallel_size=data_parallel_size, tensor_model_parallel_size=8, ray_actor_max_concurrency=1234
@@ -259,14 +252,14 @@ def test_launch_tpu_vllm_servers_single_server_spanning_all_workers(tpu_vllm):
     assert options["name"] == "vllm_server_3_0"
     assert options["max_concurrency"] == 1234
     assert options["scheduling_strategy"].node_id == NODE_A
-    env_vars = options["runtime_env"]["env_vars"]
-    assert env_vars["RAY_NOSET"] == "1"
-    assert env_vars["TPU_WORKER_ID"] == "0"
-    assert "UNRELATED" not in env_vars
-    assert env_vars["LIBTPU_INIT_ARGS"] == "--base"
-    assert env_vars["VERL_TPU_PG_IDS"] == "pg0hex,pg1hex"
-    assert env_vars["TPU_MULTIHOST_BACKEND"] == "ray"
-    assert env_vars["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] == "0"
+    assert options["runtime_env"] == {
+        "env_vars": {
+            "RAY_NOSET": "1",
+            "TPU_MULTIHOST_BACKEND": "ray",
+            "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": "0",
+            "VERL_TPU_PG_IDS": "pg0hex,pg1hex",
+        }
+    }
 
     init = server_class.init_kwargs
     assert init["workers"] is replica.workers

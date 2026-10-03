@@ -7,9 +7,8 @@ Upstream verl builds the vLLM rollout through ``RolloutReplicaRegistry``. On TPU
 registers a ``vllm`` loader that returns :class:`TPUvLLMReplica`. It keeps upstream's HTTP server
 and changes only what TPU needs:
 
-* One server actor per replica, on the first worker's node, with every worker's TPU
-  environment forwarded (``launch_tpu_vllm_servers``). vLLM then spans the hosts through its
-  Ray executor instead of verl's per-node ``mp`` launch.
+* One server actor per replica, on the first worker's node (``launch_tpu_vllm_servers``). vLLM
+  then spans the replica's hosts through its Ray executor, instead of verl's one server per node.
 * ``distributed_executor_backend=external_launcher`` and ``enable_sleep_mode=False``: the
   multi-host executor is selected by ``patch_vllm_for_tpu``, and vllm-torchtpu has no sleep
   mode.
@@ -31,64 +30,6 @@ from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, 
 from verl_hardware_plugin.rollout.tpu_vllm_patches import patch_vllm_for_tpu
 
 
-async def get_tpu_server_launch_config(workers):
-    """
-    Asynchronously queries node ID, visible chips, and TPU specific environment
-    variables from all TPU workers for launching the server actor on TPU.
-    """
-    worker_infos = await asyncio.gather(
-        *[
-            worker.__ray_call__.remote(
-                lambda self: (
-                    ray.get_runtime_context().get_node_id(),
-                    os.environ.get("TPU_VISIBLE_CHIPS", "0"),
-                )
-            )
-            for worker in workers
-        ]
-    )
-
-    worker_tpu_envs = await asyncio.gather(
-        *[
-            worker.__ray_call__.remote(
-                lambda self: {
-                    k: v
-                    for k, v in os.environ.items()
-                    if k.startswith("TPU_")
-                    or k.startswith("TORCH_TPU_")
-                    or k
-                    in (
-                        "CLOUD_TPU_TASK_ID",
-                        "CHIPS_PER_HOST",
-                        "JAX_MEM_FRACTION",
-                        "JAX_THREE_G_MEM_ALLOC_ON_FREE",
-                        "XLA_PYTHON_CLIENT_PREALLOCATE",
-                        "XLA_PYTHON_CLIENT_MEM_FRACTION",
-                        "LIBTPU_INIT_ARGS",
-                        "TORCH_DYNAMO_RECOMPILE_LIMIT",
-                        "SKIP_JAX_PRECOMPILE",
-                        "VLLM_ENABLE_V1_MULTIPROCESSING",
-                        # Keep the vLLM AOT compile cache disabled in the server
-                        # process too: a reloaded artifact degrades the model to
-                        # eager execution and reintroduces the unaligned-DUS
-                        # crash (b/501165531). See patch_vllm_for_tpu().
-                        "VLLM_DISABLE_COMPILE_CACHE",
-                        "VERL_PLATFORM",
-                        "XLA_FLAGS",
-                    )
-                }
-            )
-            for worker in workers
-        ]
-    )
-
-    node_id = worker_infos[0][0]
-    visible_chips = ",".join([info[1] for info in worker_infos])
-    tpu_env_vars = worker_tpu_envs[0] if worker_tpu_envs else {}
-
-    return node_id, visible_chips, tpu_env_vars
-
-
 async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
     """Launch the vLLM rollout server actor for a TPU replica."""
     if replica.config.data_parallel_size > 1:
@@ -103,7 +44,18 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
             "which is equivalent to engine-internal data parallelism."
         )
 
-    node_id, visible_chips, tpu_env_vars = await get_tpu_server_launch_config(replica.workers)
+    # Upstream asks Ray for each worker's device, but TPU rollout workers hold no TPU resource: the
+    # platform pins each one to a chip through TPU_VISIBLE_CHIPS.
+    worker_infos = await asyncio.gather(
+        *[
+            worker.__ray_call__.remote(
+                lambda self: (ray.get_runtime_context().get_node_id(), os.environ.get("TPU_VISIBLE_CHIPS", "0"))
+            )
+            for worker in replica.workers
+        ]
+    )
+    node_id = worker_infos[0][0]
+    visible_chips = ",".join(chip for _, chip in worker_infos)
 
     prefix = replica._get_server_name_prefix()
     if replica.is_reward_model:
@@ -113,20 +65,17 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
     else:
         name = f"{prefix}server_{replica.replica_rank}_0{replica.name_suffix}"
 
+    pgs = replica.resource_pool.get_placement_groups(device_name=get_device_name())
     env_vars = {
         **{var: "1" for var in get_platform().ray_noset_envvars()},
         **get_platform().rollout_env_vars(),
-        **tpu_env_vars,
         # One engine spans all of the replica's hosts through Ray. patch_vllm_for_tpu builds on
         # vllm-torchtpu's Ray multi-host backend with the V1 executor, not the V2 one.
         "TPU_MULTIHOST_BACKEND": "ray",
         "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": "0",
+        # The initialize_ray_cluster patch in patch_vllm_for_tpu attaches vLLM to these placement groups.
+        "VERL_TPU_PG_IDS": ",".join(pg.id.hex() for pg in pgs),
     }
-    if "VERL_PLATFORM" in os.environ:
-        env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
-    # The initialize_ray_cluster patch in patch_vllm_for_tpu attaches vLLM to these placement groups.
-    pgs = replica.resource_pool.get_placement_groups(device_name=get_device_name())
-    env_vars["VERL_TPU_PG_IDS"] = ",".join(pg.id.hex() for pg in pgs)
 
     server = replica.server_class.options(
         scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
