@@ -20,13 +20,15 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
-from verl_hardware_plugin.engines.ray_weight_registry import RayWeightRegistry
+from verl_hardware_plugin.engines.ray_weight_registry import (
+    RAY_WEIGHT_REGISTRY_ACTOR_NAME,
+    RAY_WEIGHT_REGISTRY_NAMESPACE,
+    get_ray_weight_registry,
+)
 
 logger = logging.getLogger(__name__)
 
 TPU_COPY_CHUNK_SIZE_PARAMETERS = 30
-RAY_WEIGHT_REGISTRY_ACTOR_NAME = "RayWeightRegistry"
-RAY_WEIGHT_REGISTRY_NAMESPACE = "verl"
 
 # vLLM stores q/k/v and gate/up as single fused parameters, while TorchTitan
 # exports them under their original HuggingFace names.
@@ -417,19 +419,7 @@ class TPUCheckpointEngine(CheckpointEngine):
         self.registry: Any = None
 
         if ray.is_initialized():
-            try:
-                self.registry = ray.get_actor(RAY_WEIGHT_REGISTRY_ACTOR_NAME, namespace=RAY_WEIGHT_REGISTRY_NAMESPACE)
-            except ValueError:
-                try:
-                    self.registry = RayWeightRegistry.options(
-                        name=RAY_WEIGHT_REGISTRY_ACTOR_NAME,
-                        namespace=RAY_WEIGHT_REGISTRY_NAMESPACE,
-                        lifetime="detached",
-                    ).remote()
-                except Exception:
-                    self.registry = ray.get_actor(
-                        RAY_WEIGHT_REGISTRY_ACTOR_NAME, namespace=RAY_WEIGHT_REGISTRY_NAMESPACE
-                    )
+            self.registry = get_ray_weight_registry()
 
             if self.is_master and self.registry is not None:
                 try:
@@ -654,6 +644,10 @@ def apply_tpu_checkpoint_engine_hooks() -> None:
             async def _patched_mgr_update(self, global_steps: int | None = None):
                 if self.backend == "tpu":
                     return await update_tpu_weights(self, global_steps=global_steps)
+                if self.backend == "raiden":
+                    from verl_hardware_plugin.engines.raiden_checkpoint_engine import update_raiden_weights
+
+                    return await update_raiden_weights(self, global_steps=global_steps)
                 res = _orig_mgr_update(self, global_steps=global_steps)
                 if inspect.isawaitable(res):
                     return await res

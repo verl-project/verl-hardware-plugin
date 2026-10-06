@@ -172,3 +172,12 @@ def register_all_engines():
         logger.info("Registered engines: tpu_checkpoint_engine")
     except Exception as e:
         logger.debug("TPU Checkpoint engine not registered: %s", e)
+
+    # Google TPU Raiden checkpoint engine (P2P weight sync; tpu-sync is imported only when a sync runs).
+    # tpu_checkpoint_engine installs the CheckpointEngineManager hook that routes backend=raiden.
+    try:
+        from verl_hardware_plugin.engines import raiden_checkpoint_engine, tpu_checkpoint_engine  # noqa: F401
+
+        logger.info("Registered engines: raiden_checkpoint_engine")
+    except Exception as e:
+        logger.debug("Raiden Checkpoint engine not registered: %s", e)

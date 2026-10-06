@@ -12,6 +12,8 @@ and changes only what TPU needs:
 * ``distributed_executor_backend=external_launcher`` and ``enable_sleep_mode=False``: the
   multi-host executor is selected by ``patch_vllm_for_tpu``, and vllm-torchtpu has no sleep
   mode.
+* With ``checkpoint_engine.backend=raiden``, vLLM's workers load the Raiden worker extension
+  (``tpu_raiden.py``), which receives the trainer's weights over the network.
 
 The same logic previously lived behind ``get_resource_name() == "TPU"`` branches in verl's
 ``vllm_async_server.py`` and ``replica.py``.
@@ -24,6 +26,9 @@ from verl.utils.device import get_device_name
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 from verl_hardware_plugin.rollout.tpu_vllm_patches import patch_vllm_for_tpu
+
+# vLLM imports the worker extension by name in its worker processes.
+RAIDEN_WORKER_EXTENSION_CLS = "verl_hardware_plugin.rollout.tpu_raiden.vLLMRaidenWorkerExtension"
 
 
 async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
@@ -115,6 +120,14 @@ class TPUvLLMHttpServer(vLLMHttpServer):
         # patch_vllm_for_tpu switches the engine to vLLM's Ray executor at config time.
         engine_kwargs["distributed_executor_backend"] = "external_launcher"
         engine_kwargs["enable_sleep_mode"] = False
+
+    def _get_worker_extension_cls(self) -> str:
+        # The raiden checkpoint engine transfers weights straight into vLLM's workers, which need the
+        # methods of the Raiden worker extension. Other backends keep upstream's extension.
+        checkpoint_engine = getattr(getattr(self, "config", None), "checkpoint_engine", None)
+        if getattr(checkpoint_engine, "backend", None) == "raiden":
+            return RAIDEN_WORKER_EXTENSION_CLS
+        return super()._get_worker_extension_cls()
 
 
 class TPUvLLMReplica(vLLMReplica):

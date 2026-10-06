@@ -6,13 +6,13 @@ stock vLLM rollout.
 
 Training and rollout run on separate TPU slices (a slice is a group of TPU hosts joined by a fast
 chip interconnect). One vLLM engine spans all chips of the rollout slice and receives the trainer's
-updated weights through the `tpu` checkpoint engine.
+updated weights through the `tpu` or `raiden` checkpoint engine (see [Weight Sync](./weight_sync.md)).
 
 ## Requirements
 
 - The prerequisites from the [Installation Guide](./install_guidance.md), plus vLLM `v0.29.0` and
   vllm-torchtpu `9faafb17`, the versions the rollout is tested with (image
-  `us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261001-tsync990787257`).
+  `us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261007-tsync1001132139`).
 - A verl checkout with the TPU rollout changes. Until they are merged into verl, use the
   `pr34-grpo-0.6b-core-fixes` branch of
   [jialei777/verl-upstream](https://github.com/jialei777/verl-upstream/tree/pr34-grpo-0.6b-core-fixes).
@@ -40,6 +40,7 @@ ray job submit --address "${RAY_ADDRESS}" \
       "VERL_PLATFORM": "tpu",
       "VERL_USE_EXTERNAL_MODULES": "verl_hardware_plugin",
       "VERL_LOGGING_LEVEL": "INFO",
+      "SAGEMAKER_CONTAINER_LOG_LEVEL": "INFO",
       "RAY_memory_monitor_refresh_ms": "0",
       "RAY_memory_usage_threshold": "0.99",
       "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS": "1",
@@ -50,7 +51,8 @@ ray job submit --address "${RAY_ADDRESS}" \
 ```
 
 `SMOKE_TEST=1` runs a 5-step bring-up check; drop it for the full 100-step run. Drop `py_modules`
-if the plugin is installed in the image.
+if the plugin is installed in the image. `SAGEMAKER_CONTAINER_LOG_LEVEL=INFO` keeps the plugin's `INFO`
+logs from the driver process, such as the weight-sync timings (see [Weight Sync](./weight_sync.md#verify)).
 
 The rollout settings that matter on TPU (the recipe already sets them):
 
@@ -59,7 +61,7 @@ The rollout settings that matter on TPU (the recipe already sets them):
 | `actor_rollout_ref.rollout.name` | `vllm` |
 | `actor_rollout_ref.rollout.tensor_model_parallel_size` | All chips of the rollout slice, e.g. `8` on v6e-8 |
 | `actor_rollout_ref.rollout.data_parallel_size` | `1` (the default); larger values are rejected |
-| `actor_rollout_ref.rollout.checkpoint_engine.backend` | `tpu` |
+| `actor_rollout_ref.rollout.checkpoint_engine.backend` | `tpu`, or `raiden` (see [Weight Sync](./weight_sync.md)) |
 | `actor_rollout_ref.hybrid_engine` | `False` |
 
 ## Verify
