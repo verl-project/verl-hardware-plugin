@@ -10,18 +10,41 @@ plugin system.
 Discovered automatically via setuptools entry_points (verl.plugins group).
 """
 
+import importlib
 import logging
 import os
-
-from verl_hardware_plugin.registration import register_all
-from verl_hardware_plugin.registration.engines import register_all_engines  # noqa: F401
-from verl_hardware_plugin.registration.platforms import register_all_platforms  # noqa: F401
-from verl_hardware_plugin.registration.profilers import register_all_profiles  # noqa: F401
-from verl_hardware_plugin.registration.rollout import register_all_rollouts  # noqa: F401
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-register_all()
+BACKEND_MODULES = (
+    "verl_hardware_plugin.integrations.flagos",
+    "verl_hardware_plugin.accelerators.xpu",
+    "verl_hardware_plugin.accelerators.mlu",
+    "verl_hardware_plugin.accelerators.metax",
+    "verl_hardware_plugin.accelerators.enflame",
+    "verl_hardware_plugin.accelerators.iluvatar",
+    "verl_hardware_plugin.accelerators.musa",
+    "verl_hardware_plugin.accelerators.tpu",
+    "verl_hardware_plugin.accelerators.supa",
+)
+
+
+def load_backends() -> None:
+    """Import each backend's self-contained registration entry point."""
+    # Upstream engines cache get_platform() during import, so register platforms first.
+    for module_name in BACKEND_MODULES:
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:
+            logger.debug("Failed to load backend %s: %s", module_name, exc)
+    for module_name in BACKEND_MODULES:
+        try:
+            importlib.import_module(f"{module_name}.registration")
+        except Exception as exc:
+            logger.debug("Failed to register backend %s: %s", module_name, exc)
+
+
+load_backends()
 
 logger.info("verl-hardware-plugin loaded successfully")

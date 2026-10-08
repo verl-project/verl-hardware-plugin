@@ -1,9 +1,29 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Google TPU registration declaration and lazy rollout hook."""
+"""Register Google TPU components and a lazy rollout hook when imported."""
 
-from verl_hardware_plugin.registration.backend import BackendRegistration
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+try:
+    from verl_hardware_plugin.accelerators.tpu.engines import (
+        torchtitan_tpu,  # noqa: F401
+        tpu_checkpoint_engine,  # noqa: F401
+    )
+except Exception as exc:
+    logger.debug("TPU TorchTitan engine registration failed: %s", exc)
+
+try:
+    from verl_hardware_plugin.accelerators.tpu.engines import (
+        raiden_checkpoint_engine,  # noqa: F401
+        tpu_checkpoint_engine,  # noqa: F401
+    )
+except Exception as exc:
+    logger.debug("TPU Raiden checkpoint engine registration failed: %s", exc)
 
 
 def register_rollout() -> None:
@@ -24,14 +44,7 @@ def register_rollout() -> None:
     RolloutReplicaRegistry.register("vllm", _load_vllm)
 
 
-BACKEND = BackendRegistration(
-    package=__package__,
-    platform=".platform_tpu",
-    engines=(
-        (".engines.torchtitan_tpu", ".engines.tpu_checkpoint_engine"),
-        (".engines.raiden_checkpoint_engine", ".engines.tpu_checkpoint_engine"),
-    ),
-    rollout=register_rollout,
-    # Preserve the existing order: TPU platform before SUPA, TPU engines after it.
-    engine_order=1,
-)
+try:
+    register_rollout()
+except Exception as exc:
+    logger.debug("TPU rollout registration failed: %s", exc)

@@ -22,8 +22,9 @@ verl (main framework)
             ├── accelerators/<backend>/engines/
             │     → @EngineRegistry.register(device=..., vendor=...)
             ├── integrations/flagos/engines/  → Cross-accelerator engines
-            ├── accelerators/<backend>/registration.py → Backend declaration
-            └── registration/  → One backend list and staged register_all()
+            ├── accelerators/<backend>/__init__.py → Register the platform
+            ├── accelerators/<backend>/registration.py → Register engines and hooks
+            └── __init__.py → One backend list and load_backends()
 ```
 
 The plugin integrates with verl through two registries:
@@ -32,20 +33,26 @@ The plugin integrates with verl through two registries:
 
 ### How Discovery Works
 
-verl discovers plugins through Python's `entry_points` mechanism. When verl starts, it imports all packages registered under the `verl.plugins` group. This triggers the `__init__.py` of the plugin package, which calls `registration.register_all()` to register all platforms, then engines, profilers, and rollout loaders.
+verl discovers plugins through Python's `entry_points` mechanism. When verl starts, it imports all packages registered under the `verl.plugins` group. This triggers the `__init__.py` of the plugin package, which calls `load_backends()`.
 
-The accelerator and integration package `__init__.py` files stay inert. Hardware
-modules are declared in each backend's SDK-free `registration.py`, and the shared
-dispatcher imports them conditionally in stage order. The only central backend
-list is `BACKEND_MODULES` in `registration/registry.py`. The existing
-`registration/{platforms,engines,profilers,rollout}.py` functions remain compatible
-entry points, not additional places to register a backend. Directory names do not
-change platform names, device types, or vendor registry keys.
+The only central backend list is `BACKEND_MODULES` in the plugin's root
+`__init__.py`, containing backend package names. `load_backends()` first imports
+these packages: each accelerator's `__init__.py` registers only its platform, while
+integration package initializers remain inert. It then imports each package's
+`registration.py` for engines and optional profiler/rollout hooks. This ordering
+matters because upstream engine modules cache the selected device during import.
+There is no shared stage framework or separate list for each component type.
+
+Directly importing a backend's `registration.py` also initializes its parent
+package, registering the platform before its other components. Independent
+optional imports are guarded in each backend, and `load_backends()` also isolates
+failures between backends. Directory names do not change platform names, device
+types, or vendor registry keys.
 
 ```toml
 # pyproject.toml of this plugin
 [project.entry-points."verl.plugins"]
-verl_hardware_plugin = "verl_hardware_plugin"
+hardware = "verl_hardware_plugin"
 ```
 
 No manual configuration in verl is needed — just `pip install` the plugin package.
@@ -60,8 +67,9 @@ No manual configuration in verl is needed — just `pip install` the plugin pack
 
 Create a backend directory under `verl_hardware_plugin/accelerators/`, then add the
 platform file, e.g. `verl_hardware_plugin/accelerators/my_vendor/platform_my_vendor.py`.
-Add an inert `__init__.py` to the backend package. Use the same layout for domestic
-and international accelerators, such as Intel XPU, Google TPU, or future AWS Trainium.
+Add an `__init__.py` to the backend package to register the platform as shown in
+Step 2. Use the same layout for domestic and international accelerators, such as
+Intel XPU, Google TPU, or future AWS Trainium.
 
 Below is a **fully annotated template** — every method includes comments explaining what it does and why:
 
@@ -510,28 +518,37 @@ class PlatformMyDevice(PlatformBase):
         return None
 ```
 
-### Step 2: Declare the Backend Once
+### Step 2: Register the Backend Once
 
-Create `verl_hardware_plugin/accelerators/my_vendor/registration.py`. This file
-owns all registration for your accelerator and must not import hardware SDKs or
-implementation modules at module scope:
+In `verl_hardware_plugin/accelerators/my_vendor/__init__.py`, import only the
+platform implementation inside a guarded block. Its decorator registers the
+platform when available, before any backend's engines are loaded:
 
 ```python
-from verl_hardware_plugin.registration.backend import BackendRegistration
+import logging
 
-BACKEND = BackendRegistration(
-    package=__package__,
-    platform=".platform_my_vendor",
-)
+logger = logging.getLogger(__name__)
+
+try:
+    from . import platform_my_vendor  # noqa: F401
+except Exception as exc:
+    logger.debug("MyVendor platform registration unavailable: %s", exc)
 ```
 
-Add `"verl_hardware_plugin.accelerators.my_vendor.registration"` once to
-`BACKEND_MODULES` in `verl_hardware_plugin/registration/registry.py`. No changes to
-the platform, engine, profiler, or rollout compatibility wrappers are needed.
+Create `verl_hardware_plugin/accelerators/my_vendor/registration.py` for this
+backend's engines and optional profiler/rollout hooks. It can be empty if there
+are no such components. Do not import these components from the package
+initializer; engine imports may cache device selection before other platforms
+have registered.
 
-The dispatcher catches each optional import failure so a missing hardware SDK
-does not prevent registration of other backends or stages. Declarations use
-relative module paths, resolved against `package`.
+Add `"verl_hardware_plugin.accelerators.my_vendor"` once to
+`BACKEND_MODULES` in `verl_hardware_plugin/__init__.py`. No other central
+registration lists need to change. The loader imports this package before
+loading any backend's `registration` module.
+
+Keep independent components in separate guarded blocks so a missing optional
+SDK does not prevent the remaining components from registering. The root loader
+also catches registration module failures and continues with the next backend.
 
 ### Step 3: Create the Engine Class (Optional)
 
@@ -629,27 +646,28 @@ class FSDPMyVendorEngineWithValueHead(FSDPEngineWithValueHead):
             self.model.set_force_sum_reduction_for_comms(True)
 ```
 
-Add the engine to the same backend declaration in
+Add the engine import to
 `accelerators/my_vendor/registration.py`:
 
 ```python
-BACKEND = BackendRegistration(
-    package=__package__,
-    platform=".platform_my_vendor",
-    engines=((".engines.fsdp_my_vendor",),),
-)
+import logging
+
+logger = logging.getLogger(__name__)
+
+try:
+    from .engines import fsdp_my_vendor  # noqa: F401
+except Exception as exc:
+    logger.debug("MyVendor FSDP registration unavailable: %s", exc)
 ```
 
-Each tuple in `engines` is an ordered import group with its own exception boundary.
-Use separate groups for independent engines. If an import in a group fails, the
-remaining modules in that group are skipped, and the next group is still tried.
+Use separate guarded blocks for independent engines. Imports that must succeed
+together can share a block; if one fails, later imports in that block are skipped.
 
-Optional `profiler` and `rollout` fields take zero-argument callables declared in
-this same file. Import their implementations inside the callable, not at module
-scope. A rollout hook should install a lazy loader without importing its inference
-runtime. See `accelerators/mlu/registration.py` and `accelerators/tpu/registration.py`
-for these hooks. Cross-accelerator integrations follow the same contract under
-`integrations/<name>/registration.py`.
+Apply optional profiler patches or register rollout loaders from guarded blocks
+in this same file. Keep patches idempotent and install lazy rollout loaders
+without importing their inference runtime. See `accelerators/mlu/registration.py`
+and `accelerators/tpu/registration.py` for examples. Cross-accelerator integrations
+use the same import-time registration pattern under `integrations/<name>/registration.py`.
 
 ### Step 4: Test Registration
 
@@ -887,7 +905,7 @@ self.model.set_force_sum_reduction_for_comms(True)
 
 **Cause**: Top-level imports of vendor SDK at module level.
 
-**Solution**: Use lazy imports inside method bodies, or guard top-level imports in a `_ensure_*()` helper function. Keep `registration.py` declarations SDK-free; the shared dispatcher already isolates implementation imports with try/except.
+**Solution**: Use lazy imports inside method bodies, or guard top-level imports in a `_ensure_*()` helper function. Guard the platform import in the backend's `__init__.py`, and isolate independent component imports in `registration.py` with try/except so missing SDKs do not block other registrations.
 
 ---
 
@@ -897,7 +915,7 @@ self.model.set_force_sum_reduction_for_comms(True)
 verl-hardware-plugin/
 ├── pyproject.toml                         # Package config + entry_points
 ├── verl_hardware_plugin/
-│   ├── __init__.py                        # Entry point: register_all()
+│   ├── __init__.py                        # BACKEND_MODULES and load_backends()
 │   ├── accelerators/
 │   │   ├── xpu/                          # Intel XPU
 │   │   ├── mlu/                          # Cambricon MLU
@@ -909,8 +927,8 @@ verl-hardware-plugin/
 │   │   ├── tpu/                          # Google TPU
 │   │   ├── trainium/                     # Reserved; no implementation or registration
 │   │   └── <backend>/                    # Each implemented backend owns these files
-│   │       ├── __init__.py               # Inert package initializer
-│   │       ├── registration.py           # One declaration for every supported stage
+│   │       ├── __init__.py               # Guarded platform registration only
+│   │       ├── registration.py           # Engine, profiler, and rollout registration
 │   │       ├── platform_<vendor>.py      # Platform implementation
 │   │       ├── engines/                  # FSDP, Megatron, checkpoint engines, etc.
 │   │       ├── rollout/                  # Optional rollout implementations
@@ -919,21 +937,15 @@ verl-hardware-plugin/
 │   │       └── utils/                    # Optional hardware-specific helpers
 │   ├── integrations/
 │   │   └── flagos/                       # Cross-accelerator software integration
-│   │       ├── registration.py           # Same backend declaration contract
+│   │       ├── __init__.py               # Inert; no platform to register
+│   │       ├── registration.py           # Same import-time registration pattern
 │   │       └── engines/
-│   ├── registration/
-│   │   ├── backend.py                    # SDK-free BackendRegistration declaration
-│   │   ├── registry.py                   # Single backend list and staged dispatcher
-│   │   ├── platforms.py                  # Compatibility: register_all_platforms()
-│   │   ├── engines.py                    # Compatibility: register_all_engines()
-│   │   ├── profilers.py                  # Compatibility: register_all_profiles()
-│   │   └── rollout.py                    # Compatibility: register_all_rollouts()
 │   └── utils/
 │       ├── __init__.py
 │       └── config_manager.py             # Shared environment configuration
 ├── tests/
 │   ├── test_plugin_registration.py       # Shared registration checks
-│   ├── test_registration_dispatch.py     # SDK-free declaration and dispatch checks
+│   ├── test_registration_dispatch.py     # SDK-free backend loading checks
 │   └── accelerators/<backend>/           # Hardware-specific tests
 ├── scripts/
 │   ├── baseline_grpo_gsm8k.sh             # Shared acceptance baseline

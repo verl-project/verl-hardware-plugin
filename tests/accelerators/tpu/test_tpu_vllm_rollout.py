@@ -86,7 +86,7 @@ def _done(value):
 
 def test_vllm_loader_defers_off_tpu_and_picks_tpu_replica_on_tpu():
     from verl.workers.rollout.replica import RolloutReplicaRegistry
-    from verl_hardware_plugin.registration.rollout import register_all_rollouts
+    from verl_hardware_plugin.accelerators.tpu.registration import register_rollout
 
     sentinel_upstream = type("UpstreamReplica", (), {})
     sentinel_tpu = type("TPUvLLMReplica", (), {})
@@ -94,7 +94,7 @@ def test_vllm_loader_defers_off_tpu_and_picks_tpu_replica_on_tpu():
     fake_tpu_module.TPUvLLMReplica = sentinel_tpu
 
     with mock.patch.dict(RolloutReplicaRegistry._registry, {"vllm": lambda: sentinel_upstream}):
-        register_all_rollouts()
+        register_rollout()
 
         with mock.patch("verl.utils.device.get_resource_name", return_value="GPU"):
             assert RolloutReplicaRegistry.get("vllm") is sentinel_upstream

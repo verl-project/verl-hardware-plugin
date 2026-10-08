@@ -59,6 +59,7 @@ equally to domestic and international hardware, including Intel XPU and Google T
 
 ```text
 verl_hardware_plugin/
+├── __init__.py      # One backend list and load_backends()
 ├── accelerators/
 │   ├── enflame/
 │   ├── iluvatar/
@@ -71,7 +72,6 @@ verl_hardware_plugin/
 │   └── xpu/        # Intel XPU
 ├── integrations/
 │   └── flagos/     # Software integration spanning accelerator backends
-├── registration/   # One backend list and a shared staged dispatcher
 └── utils/          # Shared helpers
 ```
 
@@ -81,12 +81,15 @@ User guides mirror this layout under `docs/accelerators/<backend>/` and
 and scripts stay at their existing top level. The `trainium` directories reserve
 space for future work and do not provide or register AWS Trainium support.
 
-Accelerator and integration package initializers are inert. Each implemented
-backend owns a `registration.py` declaration covering its platform, engines, and
-optional profiler/rollout hooks. Add that module once to `BACKEND_MODULES` in
-`registration/registry.py`; there are no per-stage backend lists to maintain.
-The shared dispatcher preserves conditional imports and runs all platforms,
-then engines, profilers, and rollout loaders in order.
+Add each backend package once to `BACKEND_MODULES` in the plugin's root
+`__init__.py`. `load_backends()` first imports these packages to register their
+platforms, then imports each package's `registration.py` for its engines and
+optional profiler/rollout hooks. Platforms must be available before upstream
+engine imports cache the selected device. Directly importing a backend's
+`registration.py` also initializes its package and registers its platform.
+Independent optional imports are guarded locally; there is no shared stage
+framework or separate component registry list. Integration package initializers
+remain inert because they do not register platforms.
 
 ### Plugin Registration
 
