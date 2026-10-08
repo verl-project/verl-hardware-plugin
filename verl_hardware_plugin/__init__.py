@@ -13,10 +13,10 @@ Discovered automatically via setuptools entry_points (verl.plugins group).
 import logging
 import os
 
-from verl_hardware_plugin.engines import register_all_engines
-from verl_hardware_plugin.platforms import register_all_platforms
-from verl_hardware_plugin.profilers import register_all_profiles
-from verl_hardware_plugin.rollout import register_all_rollouts
+from verl_hardware_plugin.registration.engines import register_all_engines
+from verl_hardware_plugin.registration.platforms import register_all_platforms
+from verl_hardware_plugin.registration.profilers import register_all_profiles
+from verl_hardware_plugin.registration.rollout import register_all_rollouts
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))

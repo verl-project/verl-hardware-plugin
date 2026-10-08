@@ -98,7 +98,7 @@ class TestPlatformRegistration:
 
     def test_xpu_registered(self):
         from verl.plugin.platform.platform_manager import PlatformRegistry
-        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU  # noqa: F401
+        from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU  # noqa: F401
 
         assert "intel" in PlatformRegistry.registered_names()
         cls = PlatformRegistry.get("intel")
@@ -106,7 +106,7 @@ class TestPlatformRegistration:
 
     def test_mlu_registered(self):
         from verl.plugin.platform.platform_manager import PlatformRegistry
-        from verl_hardware_plugin.platforms.platform_mlu import PlatformMLU  # noqa: F401
+        from verl_hardware_plugin.accelerators.mlu.platform_mlu import PlatformMLU  # noqa: F401
 
         assert "cambricon" in PlatformRegistry.registered_names()
         cls = PlatformRegistry.get("cambricon")
@@ -114,7 +114,7 @@ class TestPlatformRegistration:
 
     def test_metax_registered(self):
         from verl.plugin.platform.platform_manager import PlatformRegistry
-        from verl_hardware_plugin.platforms.platform_cuda_metax import PlatformMetaX  # noqa: F401
+        from verl_hardware_plugin.accelerators.metax.platform_cuda_metax import PlatformMetaX  # noqa: F401
 
         assert "metax" in PlatformRegistry.registered_names()
         cls = PlatformRegistry.get("metax")
@@ -122,7 +122,7 @@ class TestPlatformRegistration:
 
     def test_iluvatar_registered(self):
         from verl.plugin.platform.platform_manager import PlatformRegistry
-        from verl_hardware_plugin.platforms.platform_cuda_iluvatar import PlatformIluvatar  # noqa: F401
+        from verl_hardware_plugin.accelerators.iluvatar.platform_cuda_iluvatar import PlatformIluvatar  # noqa: F401
 
         assert "iluvatar" in PlatformRegistry.registered_names()
         cls = PlatformRegistry.get("iluvatar")
@@ -130,7 +130,7 @@ class TestPlatformRegistration:
 
     def test_musa_registered(self):
         from verl.plugin.platform.platform_manager import PlatformRegistry
-        from verl_hardware_plugin.platforms.platform_musa import PlatformMUSA  # noqa: F401
+        from verl_hardware_plugin.accelerators.musa.platform_musa import PlatformMUSA  # noqa: F401
 
         assert "musa" in PlatformRegistry.registered_names()
         cls = PlatformRegistry.get("musa")
@@ -138,7 +138,7 @@ class TestPlatformRegistration:
 
     def test_tpu_registered(self):
         from verl.plugin.platform.platform_manager import PlatformRegistry
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU  # noqa: F401
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU  # noqa: F401
 
         assert "tpu" in PlatformRegistry.registered_names()
         cls = PlatformRegistry.get("tpu")
@@ -146,7 +146,7 @@ class TestPlatformRegistration:
 
     def test_xpu_detection_with_env(self):
         from verl.plugin.platform.platform_manager import _detect_platform_name
-        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU  # noqa: F401
+        from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU  # noqa: F401
 
         with _fresh_registries():
             with mock.patch.dict(os.environ, {"VERL_PLATFORM": "intel"}):
@@ -154,7 +154,7 @@ class TestPlatformRegistration:
 
     def test_mlu_detection_with_env(self):
         from verl.plugin.platform.platform_manager import _detect_platform_name
-        from verl_hardware_plugin.platforms.platform_mlu import PlatformMLU  # noqa: F401
+        from verl_hardware_plugin.accelerators.mlu.platform_mlu import PlatformMLU  # noqa: F401
 
         with _fresh_registries():
             with mock.patch.dict(os.environ, {"VERL_PLATFORM": "cambricon"}):
@@ -162,7 +162,7 @@ class TestPlatformRegistration:
 
     def test_enflame_registered(self):
         from verl.plugin.platform.platform_manager import PlatformRegistry
-        from verl_hardware_plugin.platforms.platform_enflame import PlatformENFLAME  # noqa: F401
+        from verl_hardware_plugin.accelerators.enflame.platform_enflame import PlatformENFLAME  # noqa: F401
 
         assert "enflame" in PlatformRegistry.registered_names()
         cls = PlatformRegistry.get("enflame")
@@ -170,14 +170,14 @@ class TestPlatformRegistration:
 
     def test_enflame_detection_with_env(self):
         from verl.plugin.platform.platform_manager import _detect_platform_name
-        from verl_hardware_plugin.platforms.platform_enflame import PlatformENFLAME  # noqa: F401
+        from verl_hardware_plugin.accelerators.enflame.platform_enflame import PlatformENFLAME  # noqa: F401
 
         with _fresh_registries():
             with mock.patch.dict(os.environ, {"VERL_PLATFORM": "enflame"}):
                 assert _detect_platform_name() == "enflame"
 
     def test_enflame_device_and_vendor_names(self):
-        from verl_hardware_plugin.platforms.platform_enflame import PlatformENFLAME
+        from verl_hardware_plugin.accelerators.enflame.platform_enflame import PlatformENFLAME
 
         platform = PlatformENFLAME()
         assert platform.device_name == "gcu"
@@ -187,7 +187,7 @@ class TestPlatformRegistration:
         from types import ModuleType
         from unittest import mock
 
-        import verl_hardware_plugin.platforms.platform_enflame as platform_enflame
+        import verl_hardware_plugin.accelerators.enflame.platform_enflame as platform_enflame
 
         fake_gcu = ModuleType("gcu")
         old_patched = platform_enflame._gcu_runtime_patched
@@ -203,7 +203,7 @@ class TestPlatformRegistration:
             platform_enflame._gcu_runtime_patched = old_patched
 
     def test_enflame_communication_backend(self):
-        from verl_hardware_plugin.platforms.platform_enflame import PlatformENFLAME
+        from verl_hardware_plugin.accelerators.enflame.platform_enflame import PlatformENFLAME
 
         with mock.patch.dict(os.environ, {}, clear=True):
             assert PlatformENFLAME().communication_backend_name() == "eccl"
@@ -212,7 +212,7 @@ class TestPlatformRegistration:
 
     def test_metax_detection_with_env(self):
         from verl.plugin.platform.platform_manager import _detect_platform_name
-        from verl_hardware_plugin.platforms.platform_cuda_metax import PlatformMetaX  # noqa: F401
+        from verl_hardware_plugin.accelerators.metax.platform_cuda_metax import PlatformMetaX  # noqa: F401
 
         with _fresh_registries():
             with mock.patch.dict(os.environ, {"VERL_PLATFORM": "metax"}):
@@ -220,7 +220,7 @@ class TestPlatformRegistration:
 
     def test_iluvatar_detection_with_env(self):
         from verl.plugin.platform.platform_manager import _detect_platform_name
-        from verl_hardware_plugin.platforms.platform_cuda_iluvatar import PlatformIluvatar  # noqa: F401
+        from verl_hardware_plugin.accelerators.iluvatar.platform_cuda_iluvatar import PlatformIluvatar  # noqa: F401
 
         with _fresh_registries():
             with mock.patch.dict(os.environ, {"VERL_PLATFORM": "iluvatar"}):
@@ -228,7 +228,7 @@ class TestPlatformRegistration:
 
     def test_musa_detection_with_env(self):
         from verl.plugin.platform.platform_manager import _detect_platform_name
-        from verl_hardware_plugin.platforms.platform_musa import PlatformMUSA  # noqa: F401
+        from verl_hardware_plugin.accelerators.musa.platform_musa import PlatformMUSA  # noqa: F401
 
         with _fresh_registries():
             with mock.patch.dict(os.environ, {"VERL_PLATFORM": "musa"}):
@@ -236,14 +236,14 @@ class TestPlatformRegistration:
 
     def test_tpu_detection_with_env(self):
         from verl.plugin.platform.platform_manager import _detect_platform_name
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU  # noqa: F401
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU  # noqa: F401
 
         with _fresh_registries():
             with mock.patch.dict(os.environ, {"VERL_PLATFORM": "tpu"}):
                 assert _detect_platform_name() == "tpu"
 
     def test_musa_device_and_vendor_names(self):
-        from verl_hardware_plugin.platforms.platform_musa import PlatformMUSA
+        from verl_hardware_plugin.accelerators.musa.platform_musa import PlatformMUSA
 
         platform = PlatformMUSA()
         assert platform.device_name == "musa"
@@ -251,7 +251,7 @@ class TestPlatformRegistration:
         assert platform.communication_backend_name() == "mccl"
 
     def test_tpu_device_and_vendor_names(self):
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         platform = PlatformTPU()
         assert platform.device_name == "tpu"
@@ -259,7 +259,7 @@ class TestPlatformRegistration:
         assert platform.communication_backend_name() == "tpu_dist"
 
     def test_tpu_ray_resource_options(self):
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         platform = PlatformTPU()
         assert platform.ray_resource_name() == "TPU"
@@ -272,7 +272,7 @@ class TestPlatformRegistration:
         Inert on verl 0.9.0 -- nothing calls them yet. They are defined
         unconditionally so the plugin needs no change when core lands the call sites.
         """
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         platform = PlatformTPU()
         assert platform.supports_colocated_worker_groups() is False
@@ -289,7 +289,7 @@ class TestPlatformRegistration:
         """
         from verl.plugin.platform.platform_base import PlatformBase
         from verl.plugin.platform.platform_cuda import PlatformCUDA
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         assert issubclass(PlatformTPU, PlatformBase)
         assert not issubclass(PlatformTPU, PlatformCUDA)
@@ -301,7 +301,7 @@ class TestPlatformRegistration:
         cupy's NCCL binding cannot drive a TPU interconnect, and NCCL_CUMEM_ENABLE has no
         meaning in a TPU rollout worker.
         """
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         platform = PlatformTPU()
         assert platform.get_collective_module() is None
@@ -309,7 +309,7 @@ class TestPlatformRegistration:
 
     def test_tpu_memory_and_capability_methods(self):
         """empty_cache() must reach the TPU device module, never torch.cuda.empty_cache()."""
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         platform = PlatformTPU()
         assert platform.empty_cache() is None
@@ -322,7 +322,7 @@ class TestPlatformRegistration:
         visible_devices_envvar() deliberately returns CUDA_VISIBLE_DEVICES, so Ray must be
         told not to manage that variable either. Dropping it breaks rank mapping.
         """
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         assert PlatformTPU().ray_noset_envvars() == [
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
@@ -336,7 +336,7 @@ class TestPlatformRegistration:
         transfer down the CUDA IPC path, which cannot work on TPU: torch in the TPU image is
         a CPU build and ``_share_cuda_()`` raises.
         """
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         assert PlatformTPU().is_ipc_supported() is False
 
@@ -347,7 +347,7 @@ class TestPlatformRegistration:
         chip index that get_worker_env_vars() writes and ray_local_rank_override()
         reads. See spec D4.
         """
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         assert PlatformTPU().visible_devices_envvar() == "CUDA_VISIBLE_DEVICES"
 
@@ -363,7 +363,7 @@ class TestPlatformRegistration:
 
         import ray
 
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         nodes = [
             {"NodeID": "n0", "NodeManagerAddress": "10.0.0.1", "Alive": True, "Resources": {"TPU": 4}, "Labels": {}},
@@ -394,7 +394,7 @@ class TestPlatformRegistration:
 
     def test_tpu_cudart_returns_none(self):
         """There is no CUDA runtime on a TPU host; PlatformBase documents None as the answer."""
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         assert PlatformTPU().cudart() is None
 
@@ -404,7 +404,7 @@ class TestPlatformRegistration:
         verl calls both from utils/profiler/nvtx_profile.py; a CUDA implementation would
         raise AssertionError ("Torch not compiled with CUDA enabled") on a TPU host.
         """
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         platform = PlatformTPU()
         assert platform.profiler_start() is None
@@ -412,7 +412,7 @@ class TestPlatformRegistration:
 
     def test_tpu_nvtx_range_yields(self):
         """nvtx_range must yield immediately; inherited torch.cuda.nvtx raises without NVTX."""
-        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+        from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         entered = False
         with PlatformTPU().nvtx_range("tpu-test"):
@@ -421,14 +421,14 @@ class TestPlatformRegistration:
 
     def test_supa_detection_with_env(self):
         from verl.plugin.platform.platform_manager import _detect_platform_name
-        from verl_hardware_plugin.platforms.platform_supa import PlatformSupa  # noqa: F401
+        from verl_hardware_plugin.accelerators.supa.platform_supa import PlatformSupa  # noqa: F401
 
         with _fresh_registries():
             with mock.patch.dict(os.environ, {"VERL_PLATFORM": "biren"}):
                 assert _detect_platform_name() == "biren"
 
     def test_supa_device_and_vendor_names(self):
-        from verl_hardware_plugin.platforms.platform_supa import PlatformSupa
+        from verl_hardware_plugin.accelerators.supa.platform_supa import PlatformSupa
 
         platform = PlatformSupa()
         assert platform.device_name == "supa"
@@ -441,7 +441,7 @@ class TestEngineRegistration:
 
     def test_fsdp_flagos_engines_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.fsdp_flagos import (
+        from verl_hardware_plugin.integrations.flagos.engines.fsdp_flagos import (
             FSDPFlagOSEngineWithLMHead,
             FSDPFlagOSEngineWithValueHead,
         )
@@ -452,7 +452,7 @@ class TestEngineRegistration:
 
     def test_fsdp_xpu_engines_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.fsdp_xpu import (
+        from verl_hardware_plugin.accelerators.xpu.engines.fsdp_xpu import (
             FSDPXPUEngineWithLMHead,
             FSDPXPUEngineWithValueHead,
         )
@@ -462,7 +462,7 @@ class TestEngineRegistration:
 
     def test_fsdp_mlu_engines_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.fsdp_mlu import (
+        from verl_hardware_plugin.accelerators.mlu.engines.fsdp_mlu import (
             FSDPMLUEngineWithLMHead,
             FSDPMLUEngineWithValueHead,
         )
@@ -472,7 +472,7 @@ class TestEngineRegistration:
 
     def test_fsdp_metax_engines_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.fsdp_metax import (
+        from verl_hardware_plugin.accelerators.metax.engines.fsdp_metax import (
             FSDPMetaXEngineWithLMHead,
             FSDPMetaXEngineWithValueHead,
         )
@@ -482,7 +482,7 @@ class TestEngineRegistration:
 
     def test_fsdp_iluvatar_engines_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.fsdp_iluvatar import (
+        from verl_hardware_plugin.accelerators.iluvatar.engines.fsdp_iluvatar import (
             FSDPIluvatarEngineWithLMHead,
             FSDPIluvatarEngineWithValueHead,
         )
@@ -492,7 +492,7 @@ class TestEngineRegistration:
 
     def test_megatron_flagos_engine_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.megatron_flagos import MegatronFlagOSEngineWithLMHead
+        from verl_hardware_plugin.integrations.flagos.engines.megatron_flagos import MegatronFlagOSEngineWithLMHead
 
         assert (
             EngineRegistry._engines["language_model"]["megatron"][("cuda", "flagos")] is MegatronFlagOSEngineWithLMHead
@@ -500,13 +500,13 @@ class TestEngineRegistration:
 
     def test_megatron_xpu_engine_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.megatron_xpu import MegatronXPUEngineWithLMHead
+        from verl_hardware_plugin.accelerators.xpu.engines.megatron_xpu import MegatronXPUEngineWithLMHead
 
         assert EngineRegistry._engines["language_model"]["megatron"][("xpu", "intel")] is MegatronXPUEngineWithLMHead
 
     def test_megatron_mlu_engine_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.megatron_mlu import MegatronMLUEngineWithLMHead
+        from verl_hardware_plugin.accelerators.mlu.engines.megatron_mlu import MegatronMLUEngineWithLMHead
 
         assert (
             EngineRegistry._engines["language_model"]["megatron"][("mlu", "cambricon")] is MegatronMLUEngineWithLMHead
@@ -514,13 +514,15 @@ class TestEngineRegistration:
 
     def test_megatron_metax_engine_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.megatron_metax import MegatronMetaXEngineWithLMHead
+        from verl_hardware_plugin.accelerators.metax.engines.megatron_metax import MegatronMetaXEngineWithLMHead
 
         assert EngineRegistry._engines["language_model"]["megatron"][("cuda", "metax")] is MegatronMetaXEngineWithLMHead
 
     def test_megatron_iluvatar_engine_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.megatron_iluvatar import MegatronIluvatarEngineWithLMHead
+        from verl_hardware_plugin.accelerators.iluvatar.engines.megatron_iluvatar import (
+            MegatronIluvatarEngineWithLMHead,
+        )
 
         assert (
             EngineRegistry._engines["language_model"]["megatron"][("cuda", "iluvatar")]
@@ -529,7 +531,7 @@ class TestEngineRegistration:
 
     def test_megatron_musa_engine_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.megatron_musa import (
+        from verl_hardware_plugin.accelerators.musa.engines.megatron_musa import (
             MegatronMUSAEngineWithLMHead,
             MegatronMUSAEngineWithValueHead,
         )
@@ -545,7 +547,7 @@ class TestEngineRegistration:
 
     def test_fsdp_musa_engines_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.fsdp_musa import (
+        from verl_hardware_plugin.accelerators.musa.engines.fsdp_musa import (
             FSDPMUSAEngineWithLMHead,
             FSDPMUSAEngineWithValueHead,
         )
@@ -562,7 +564,7 @@ class TestEngineRegistration:
 
     def test_fsdp_enflame_engines_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.fsdp_enflame import (
+        from verl_hardware_plugin.accelerators.enflame.engines.fsdp_enflame import (
             FSDPEnflameEngineWithLMHead,
             FSDPEnflameEngineWithValueHead,
         )
@@ -572,7 +574,7 @@ class TestEngineRegistration:
 
     def test_megatron_enflame_engine_registered(self):
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.megatron_enflame import MegatronEnflameEngineWithLMHead
+        from verl_hardware_plugin.accelerators.enflame.engines.megatron_enflame import MegatronEnflameEngineWithLMHead
 
         assert (
             EngineRegistry._engines["language_model"]["megatron"][("gcu", "enflame")] is MegatronEnflameEngineWithLMHead
@@ -588,7 +590,7 @@ class TestEngineRegistration:
             pytest.skip("verl.workers.engine.utils.detach_tree is required by the TPU engine (verl > 0.9.0)")
 
         from verl.workers.engine.base import EngineRegistry
-        from verl_hardware_plugin.engines.torchtitan_tpu import TorchTitanTPUEngineWithLMHead
+        from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngineWithLMHead
 
         assert (
             EngineRegistry._engines["language_model"]["torchtitan"][("tpu", "google")] is TorchTitanTPUEngineWithLMHead
@@ -773,9 +775,9 @@ class TestReduceAvgPatchWiring:
     """
 
     def test_platform_xpu_init_applies_patches(self):
-        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+        from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU
 
-        with mock.patch("verl_hardware_plugin.patches.xpu.reduce_avg_allreduce_patch.apply") as fake_apply:
+        with mock.patch("verl_hardware_plugin.accelerators.xpu.patches.reduce_avg_allreduce_patch.apply") as fake_apply:
             PlatformXPU()
 
         fake_apply.assert_called_once()
@@ -802,7 +804,7 @@ class TestReduceAvgAllReducePatch:
     def _reset_patch_state(self):
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+        from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch as patch_mod
 
         original_all_reduce = dist.all_reduce
         patch_mod._applied = False
@@ -813,7 +815,7 @@ class TestReduceAvgAllReducePatch:
     def test_noop_when_xpu_unavailable(self):
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+        from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch as patch_mod
 
         before = dist.all_reduce
         with mock.patch.object(patch_mod, "_xpu_available", return_value=False):
@@ -825,7 +827,7 @@ class TestReduceAvgAllReducePatch:
         import torch
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+        from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch as patch_mod
 
         fake_original = mock.MagicMock()
         tensor = torch.tensor([4.0])
@@ -847,7 +849,7 @@ class TestReduceAvgAllReducePatch:
         import torch
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+        from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch as patch_mod
 
         fake_original = mock.MagicMock()
         tensor = torch.tensor([4.0])
@@ -863,7 +865,7 @@ class TestReduceAvgAllReducePatch:
         import torch
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+        from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch as patch_mod
 
         fake_original = mock.MagicMock()
         tensor = torch.tensor([4.0])
@@ -878,7 +880,7 @@ class TestReduceAvgAllReducePatch:
         import torch
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+        from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch as patch_mod
 
         fake_original = mock.MagicMock()
         tensor = torch.tensor([4.0])
@@ -892,7 +894,7 @@ class TestReduceAvgAllReducePatch:
     def test_idempotent(self):
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+        from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch as patch_mod
 
         with mock.patch.object(patch_mod, "_xpu_available", return_value=True):
             patch_mod.apply()

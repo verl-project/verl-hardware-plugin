@@ -23,16 +23,16 @@ The platforms and engines in this repository are **reference implementations** �
 
 | Platform | Device | Communication | Status | Doc |
 |----------|--------|---------------|--------|-----|
-| FlagOS | NVIDIA GPU (verified) | FlagCX / NCCL | ✅ Supported | [User Guide](docs/user_guide_flagos/nvidia/README.md) |
-| Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Example (requires vendor support) | [User Guide](docs/user_guide_xpu/README.md) |
-| Cambricon MLU | MLU | CNCL | ✅ Supported | [User Guide](docs/user_guide_mlu/README.md) |
-| MetaX | MetaX GPUs (CUDA-compatible) | NCCL API / MCCL | ✅ Supported | [User Guide](docs/user_guide_metax/README.md) |
-| Enflame GCU | GCU | ECCL / FlagCX | ✅ Example (requires vendor support) | [User Guide](docs/user_guide_enflame/README.md) |
+| FlagOS | NVIDIA GPU (verified) | FlagCX / NCCL | ✅ Supported | [User Guide](docs/integrations/flagos/nvidia/README.md) |
+| Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Example (requires vendor support) | [User Guide](docs/accelerators/xpu/README.md) |
+| Cambricon MLU | MLU | CNCL | ✅ Supported | [User Guide](docs/accelerators/mlu/README.md) |
+| MetaX | MetaX GPUs (CUDA-compatible) | NCCL API / MCCL | ✅ Supported | [User Guide](docs/accelerators/metax/README.md) |
+| Enflame GCU | GCU | ECCL / FlagCX | ✅ Example (requires vendor support) | [User Guide](docs/accelerators/enflame/README.md) |
 | Huawei NPU | Ascend 910B | HCCL | Built-in (verl core) | [Ascend Tutorial](https://github.com/verl-project/verl/tree/main/docs/ascend_tutorial) |
-| Iluvatar | BI-V150 (CUDA-compatible) | IXCCL | ✅ Supported | [User Guide](docs/user_guide_iluvatar/README.md) |
-| Moore Threads | MUSA | MCCL | ✅ Supported | [User Guide](docs/user_guide_musa/README.md) |
-| Google TPU | v6e | tpu_dist | Developing and testing | [User Guide](docs/user_guide_tpu/README.md) |
-| Biren | SUPA (CUDA-compatible) | BCCL | ✅ Example (requires vendor support) | [User Guide](docs/user_guide_biren/README.md) |
+| Iluvatar | BI-V150 (CUDA-compatible) | IXCCL | ✅ Supported | [User Guide](docs/accelerators/iluvatar/README.md) |
+| Moore Threads | MUSA | MCCL | ✅ Supported | [User Guide](docs/accelerators/musa/README.md) |
+| Google TPU | v6e | tpu_dist | Developing and testing | [User Guide](docs/accelerators/tpu/README.md) |
+| Biren | SUPA (CUDA-compatible) | BCCL | ✅ Example (requires vendor support) | [User Guide](docs/accelerators/supa/README.md) |
 
 
 ## Installation
@@ -49,6 +49,42 @@ After `pip install`, the plugin is automatically discovered by verl through the
 For platform-specific usage and configuration, please refer to each platform's documentation in the [Supported Hardware](#supported-hardware-reference-implementations) table above.
 
 ## Architecture
+
+### Repository Layout
+
+Accelerator-specific code is grouped in `verl_hardware_plugin/accelerators/<backend>/`,
+with each backend owning its platform module and any `engines/`, `rollout/`,
+`profilers/`, `patches/`, or `utils/` subdirectories it needs. The layout applies
+equally to domestic and international hardware, including Intel XPU and Google TPU.
+
+```text
+verl_hardware_plugin/
+├── accelerators/
+│   ├── enflame/
+│   ├── iluvatar/
+│   ├── metax/
+│   ├── mlu/
+│   ├── musa/
+│   ├── supa/       # Biren SUPA
+│   ├── tpu/        # Google TPU
+│   ├── trainium/   # Reserved for a future AWS Trainium integration
+│   └── xpu/        # Intel XPU
+├── integrations/
+│   └── flagos/     # Software integration spanning accelerator backends
+├── registration/   # Central platform, engine, profiler, and rollout registrars
+└── utils/          # Shared helpers
+```
+
+User guides mirror this layout under `docs/accelerators/<backend>/` and
+`docs/integrations/flagos/`. Accelerator-specific tests and scripts live under
+`tests/accelerators/<backend>/` and `scripts/accelerators/<backend>/`; shared tests
+and scripts stay at their existing top level. The `trainium` directories reserve
+space for future work and do not provide or register AWS Trainium support.
+
+Accelerator and integration package initializers are inert. The central registrars
+keep the existing conditional imports and registration order.
+
+### Plugin Registration
 
 ```
 verl (main framework)
@@ -103,15 +139,18 @@ This check is only performed during first-time auto-detection. The `is_available
 
 Each hardware platform provides a standalone user guide (following the structure of [verl/docs/ascend_tutorial](https://github.com/verl-project/verl/tree/main/docs/ascend_tutorial)):
 
-- **[Intel XPU](docs/user_guide_xpu/README.md)** — Intel Data Center GPU Max / Arc user guide
-- **[Cambricon MLU](docs/user_guide_mlu/README.md)** — Cambricon MLU user guide
-- **[MetaX GPU](docs/user_guide_metax/README.md)** — MetaX GPU user guide
-- **[FlagOS](docs/user_guide_flagos/README.md)** — FlagOS unified heterogeneous engine user guide ([NVIDIA](docs/user_guide_flagos/nvidia/README.md))
-- **[Enflame GCU](docs/user_guide_enflame/README.md)** — Enflame GCU user guide
-- **[Iluvatar GPU](docs/user_guide_iluvatar/README.md)** — Iluvatar GPU user guide
-- **[Moore Threads GPU](docs/user_guide_musa/README.md)** — Moore Threads GPU user guide
-- **[Google TPU](docs/user_guide_tpu/README.md)** — Google TPU platform guide
-- **[Biren SUPA](docs/user_guide_biren/README.md)** — Biren SUPA accelerator user guide
+- **[Intel XPU](docs/accelerators/xpu/README.md)** — Intel Data Center GPU Max / Arc user guide
+- **[Cambricon MLU](docs/accelerators/mlu/README.md)** — Cambricon MLU user guide
+- **[MetaX GPU](docs/accelerators/metax/README.md)** — MetaX GPU user guide
+- **[FlagOS](docs/integrations/flagos/README.md)** — FlagOS unified heterogeneous engine user guide ([NVIDIA](docs/integrations/flagos/nvidia/README.md))
+- **[Enflame GCU](docs/accelerators/enflame/README.md)** — Enflame GCU user guide
+- **[Iluvatar GPU](docs/accelerators/iluvatar/README.md)** — Iluvatar GPU user guide
+- **[Moore Threads GPU](docs/accelerators/musa/README.md)** — Moore Threads GPU user guide
+- **[Google TPU](docs/accelerators/tpu/README.md)** — Google TPU platform guide
+- **[Biren SUPA](docs/accelerators/supa/README.md)** — Biren SUPA accelerator user guide
+
+Future integration location: [AWS Trainium](docs/accelerators/trainium/README.md)
+(placeholder only; no implementation).
 
 ### Developer Guides
 

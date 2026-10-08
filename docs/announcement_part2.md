@@ -19,7 +19,7 @@ verl (主框架)
     │
     └── entry_points: verl.plugins → verl_hardware_plugin
             │
-            ├── platforms/  硬件无关平台抽象层
+            ├── accelerators/<backend>/  各硬件的平台抽象层
             │     @PlatformRegistry.register(platform="vendor")
             │     ├── PlatformFlagOS   (device=cuda, vendor=flagos)
             │     ├── PlatformMetaX    (device=cuda, vendor=metax)
@@ -30,7 +30,7 @@ verl (主框架)
             │     ├── training 阶段:FlagGems 算子加速 / 白名单 / 黑名单
             │     └── rollout  阶段:vLLM + FlagGems / FlagCX 通信
             │
-            └── engines/  专用 FlagOS 引擎
+            └── integrations/flagos/engines/  专用 FlagOS 引擎
                   @EngineRegistry.register(device=..., vendor=...)
                   ├── FSDPFlagOSEngine     (LMHead / ValueHead)
                   └── MegatronFlagOSEngine (LMHead)
