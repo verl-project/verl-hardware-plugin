@@ -71,7 +71,7 @@ verl_hardware_plugin/
 │   └── xpu/        # Intel XPU
 ├── integrations/
 │   └── flagos/     # Software integration spanning accelerator backends
-├── registration/   # Central platform, engine, profiler, and rollout registrars
+├── registration/   # One backend list and a shared staged dispatcher
 └── utils/          # Shared helpers
 ```
 
@@ -81,8 +81,12 @@ User guides mirror this layout under `docs/accelerators/<backend>/` and
 and scripts stay at their existing top level. The `trainium` directories reserve
 space for future work and do not provide or register AWS Trainium support.
 
-Accelerator and integration package initializers are inert. The central registrars
-keep the existing conditional imports and registration order.
+Accelerator and integration package initializers are inert. Each implemented
+backend owns a `registration.py` declaration covering its platform, engines, and
+optional profiler/rollout hooks. Add that module once to `BACKEND_MODULES` in
+`registration/registry.py`; there are no per-stage backend lists to maintain.
+The shared dispatcher preserves conditional imports and runs all platforms,
+then engines, profilers, and rollout loaders in order.
 
 ### Plugin Registration
 
