@@ -12,7 +12,7 @@ updated weights through the `tpu` or `raiden` checkpoint engine (see [Weight Syn
 
 - The prerequisites from the [Installation Guide](./install_guidance.md), plus vLLM `v0.29.0` and
   vllm-torchtpu `9faafb17`, the versions the rollout is tested with (image
-  `us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261007-tsync1001132139`).
+  `us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261006-tsync1006`).
 - A verl checkout with the TPU rollout changes. Until they are merged into verl, use the
   `pr34-grpo-0.6b-core-fixes` branch of
   [jialei777/verl-upstream](https://github.com/jialei777/verl-upstream/tree/pr34-grpo-0.6b-core-fixes).

@@ -35,11 +35,12 @@ for this backend):
 - `tpu-sync-torch` installed on every trainer and rollout host, built for the installed `torch-tpu`.
   The tpu-sync torch extension is ABI-locked to the `torch-tpu` build it was compiled against. A
   mismatched pair crashes in the first transfer. The backend is tested with `torch-tpu`
-  `0.1.1+release.2026.9.22.20260927223741` and `tpu-sync-torch` `0.0.1.dev20261001132139`.
-  - `WeightSynchronizer.unbind_weights()` needs `tpu-sync-torch` `0.0.1.dev20261006025601` or newer (built
-    for `torch-tpu` `0.1.2.dev20261006000518`). With an older build the trainer logs a warning once and falls
-    back to destroying and re-creating its synchronizer every sync, which adds a few seconds per sync for an
-    8B model.
+  `0.1.2.dev20261006000518` and `tpu-sync-torch` `0.0.1.dev20261006025601` (image
+  `us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261006-tsync1006`).
+  - `WeightSynchronizer.unbind_weights()` needs `tpu-sync-torch` `0.0.1.dev20261006025601` or newer. With
+    an older build (e.g. `0.0.1.dev20261001132139`) the trainer logs a warning once and falls back to
+    destroying and re-creating its synchronizer every sync, which adds a few seconds per sync for an 8B
+    model.
 - Network connectivity between the hosts:
   - from all trainer and rollout hosts to the Raiden controller, which runs in the driver process;
   - from the trainer hosts to the rollout hosts. Rollout worker `k` listens on port `12000 + k`.
