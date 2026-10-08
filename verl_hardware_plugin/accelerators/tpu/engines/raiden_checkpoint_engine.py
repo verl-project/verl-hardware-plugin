@@ -277,6 +277,9 @@ class RaidenCheckpointEngine(CheckpointEngine):
       that the rollout received the trainer's weights.
     * ``tie_word_embeddings`` (default unset): whether ``lm_head`` is tied to the input embedding, so it
       need not be sent. Unset sends ``lm_head``, which is correct for tied and untied models alike.
+    * ``release_buffers_after_sync`` (default True): free the bound send tensors after every transfer
+      (``release_sync_buffers``) instead of keeping them resident until the next sync. The environment
+      variable ``VERL_RAIDEN_RELEASE_BUFFERS`` overrides it.
     """
 
     def __init__(self, bucket_size: int = 0, is_master: bool = False, **kwargs: Any) -> None:
@@ -287,6 +290,15 @@ class RaidenCheckpointEngine(CheckpointEngine):
         self.verify_parity = _as_bool(kwargs.get("verify_parity", False))
         tie_word_embeddings = kwargs.get("tie_word_embeddings")
         self.tie_word_embeddings = None if tie_word_embeddings is None else _as_bool(tie_word_embeddings)
+        # The synchronizer pins the device buffers of every bound tensor (a bf16 copy of the full model on
+        # every trainer chip), so dropping the Python references alone frees nothing. On by default so the
+        # trainer keeps that HBM headroom between syncs; opt out with the engine kwarg or
+        # VERL_RAIDEN_RELEASE_BUFFERS=0 to keep the send tensors resident.
+        release = _as_bool(kwargs.get("release_buffers_after_sync", True))
+        env_release = os.environ.get("VERL_RAIDEN_RELEASE_BUFFERS", "")
+        if env_release:
+            release = _as_bool(env_release)
+        self.release_buffers_after_sync = release
         if torch.distributed.is_initialized():
             self.rank = torch.distributed.get_rank()
         else:
@@ -295,6 +307,13 @@ class RaidenCheckpointEngine(CheckpointEngine):
         self._registry: Any = None
         self._controller_addr: Optional[str] = None
         self._trainer_raiden_ws: Any = None
+        # (name, shape, dtype) of the tensors the live synchronizer was created and registered with; a later
+        # send_weights with the same signature rebinds instead of re-creating it.
+        self._registered_signature: Optional[list[tuple[str, tuple[int, ...], torch.dtype]]] = None
+        # Keeps the bound device buffers alive until release_sync_buffers (the controller-driven push reads
+        # them after send_weights returns).
+        self._bound_tensors: Optional[list[torch.Tensor]] = None
+        self._warned_no_unbind = False
 
     @property
     def registry(self) -> Any:
@@ -318,6 +337,8 @@ class RaidenCheckpointEngine(CheckpointEngine):
 
     def _close_synchronizer(self) -> None:
         ws, self._trainer_raiden_ws = self._trainer_raiden_ws, None
+        self._registered_signature = None
+        self._bound_tensors = None
         close = getattr(ws, "close", None)
         if close is not None:
             try:
@@ -326,7 +347,7 @@ class RaidenCheckpointEngine(CheckpointEngine):
                 logger.debug(f"Trainer Rank {self.rank}: closing the WeightSynchronizer failed: {e}")
 
     async def send_weights(self, weights: Any, global_steps: Optional[int] = None) -> None:
-        """Bind this rank's weights to a new WeightSynchronizer, register them with the controller and stage them
+        """Bind this rank's weights to its WeightSynchronizer, register them with the controller and stage them
         in host memory.
 
         Args:
@@ -334,8 +355,9 @@ class RaidenCheckpointEngine(CheckpointEngine):
                 every trainer rank.
             global_steps: Trainer step of these weights.
 
-        The transfer itself is driven by the controller after this returns, so the synchronizer, which pins the
-        bound tensors, is kept until ``release_sync_buffers``.
+        The transfer itself is driven by the controller after this returns, so the bound tensors are kept until
+        ``release_sync_buffers``. The synchronizer is created and registered on the first sync and reused (rebound
+        through ``bind_weights``) afterwards as long as the tensor names, shapes and dtypes do not change.
         """
         step_key = global_steps if global_steps is not None else 0
         logger.info(f"RaidenCheckpointEngine: [Step {step_key}] Start send_weights...")
@@ -355,7 +377,45 @@ class RaidenCheckpointEngine(CheckpointEngine):
 
         tpu_synchronize(strict=True)
 
-        # A new synchronizer every sync: release_sync_buffers destroys the previous one after its transfer.
+        # Reuse the synchronizer when the tensor signature is unchanged: rebinding keeps the pinned host staging
+        # buffers, listener threads and controller registration, and only swaps the device buffers the D2H reads
+        # from (release_sync_buffers unbinds them between syncs). Re-creating it every sync re-allocates, pins
+        # and first-touches a model-sized host buffer per rank and re-registers with the controller.
+        signature = [(name, tuple(t.shape), t.dtype) for name, t in valid_weights]
+        if self._trainer_raiden_ws is not None and signature == self._registered_signature:
+            logger.info(f"Trainer Rank {self.rank}: rebinding {len(valid_weights)} tensors to the WeightSynchronizer")
+            self._trainer_raiden_ws.bind_weights([[t] for _, t in valid_weights])
+        else:
+            await self._create_and_register(valid_weights)
+            self._registered_signature = signature
+        self._bound_tensors = [t for _, t in valid_weights]
+
+        # Stage weights to host buffer via D2H DMA
+        t_d2h_start = time.perf_counter()
+        self._trainer_raiden_ws.d2h()
+        t_d2h = time.perf_counter() - t_d2h_start
+        logger.info(
+            f"[RAIDEN TELEMETRY | Trainer Worker] Trainer Rank {self.rank}: D2H DMA transfer completed in {t_d2h:.4f}s"
+        )
+
+        # Compute deterministic stats & norms across all sent tensors on rank 0 only: every rank holds the
+        # full model.
+        if not (self.verify_parity and self.is_master):
+            return
+        try:
+            trainer_stats = compute_tensor_stats(valid_weights)
+            trainer_stats["rank"] = self.rank
+            # Post master stats to RayWeightRegistry
+            self.registry.set_stats.remote(step_key, trainer_stats)
+            logger.info(
+                f"[RAIDEN PARITY] Successfully stored trainer rank {self.rank} stats for step {step_key}: "
+                f"L1={trainer_stats['l1_norm']:.4f}, numel={trainer_stats['total_numel']}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record trainer rank {self.rank} stats in RayWeightRegistry: {e}")
+
+    async def _create_and_register(self, valid_weights: list[tuple[str, torch.Tensor]]) -> None:
+        """(Re)creates the WeightSynchronizer over ``valid_weights`` and registers it with the controller."""
         self._close_synchronizer()
 
         logger.info(f"Trainer Rank {self.rank}: binding {len(valid_weights)} tensors to WeightSynchronizer")
@@ -439,50 +499,38 @@ class RaidenCheckpointEngine(CheckpointEngine):
             f"listener_port={self._trainer_raiden_ws.listener_port}"
         )
 
-        # Stage weights to host buffer via D2H DMA
-        t_d2h_start = time.perf_counter()
-        self._trainer_raiden_ws.d2h()
-        t_d2h = time.perf_counter() - t_d2h_start
-        logger.info(
-            f"[RAIDEN TELEMETRY | Trainer Worker] Trainer Rank {self.rank}: D2H DMA transfer completed in {t_d2h:.4f}s"
-        )
-
-        # Compute deterministic stats & norms across all sent tensors on rank 0 only: every rank holds the
-        # full model.
-        if not (self.verify_parity and self.is_master):
-            return
-        try:
-            trainer_stats = compute_tensor_stats(valid_weights)
-            trainer_stats["rank"] = self.rank
-            # Post master stats to RayWeightRegistry
-            self.registry.set_stats.remote(step_key, trainer_stats)
-            logger.info(
-                f"[RAIDEN PARITY] Successfully stored trainer rank {self.rank} stats for step {step_key}: "
-                f"L1={trainer_stats['l1_norm']:.4f}, numel={trainer_stats['total_numel']}"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to record trainer rank {self.rank} stats in RayWeightRegistry: {e}")
-
     def release_sync_buffers(self) -> dict:
-        """Free this rank's WeightSynchronizer, and with it the bound send tensors, after the transfer.
+        """Free this rank's bound send tensors after the transfer, keeping the WeightSynchronizer when possible.
 
-        Must only be called after the controller transfer that reads them has completed. The synchronizer pins
-        the device buffers of every bound tensor (a bf16 copy of the full model on every trainer chip), and
-        tpu_sync has no unbind, so destroying it is the only way to give that HBM back to training before the
-        next sync. The next send_weights creates and registers a new synchronizer.
+        Must only be called after the controller transfer that reads them has completed. A no-op when
+        ``release_buffers_after_sync`` is disabled, in which case the bound tensors stay resident between syncs.
 
-        TODO(tpu): Reuse the synchronizer across syncs instead of creating it again every sync: allocating and
-        pinning its host buffers and registering with the controller cost sync latency that grows with model
-        size. Freeing the HBM between syncs while keeping the rest needs a tpu_sync API to unbind or drop the
-        device buffers.
+        With a ``tpu_sync`` build that has ``WeightSynchronizer.unbind_weights()`` the synchronizer's holds on the
+        bound device buffers are dropped, so dropping our own references returns the HBM. The synchronizer itself,
+        its pinned host staging buffers and its controller registration survive, and the next ``send_weights``
+        rebinds through ``bind_weights()``. Compared to destroying and re-creating the synchronizer each sync, this
+        removes the per-step rebuild (host buffer allocation, pinning and first touch, plus controller
+        re-registration: ~2 s "Trainer init" + ~2 s release on Qwen3-8B, v6e-8) from the sync critical path.
+
+        Older ``tpu_sync`` builds without ``unbind_weights`` fall back to destroying the synchronizer; the next
+        ``send_weights`` then re-creates and re-registers it.
         """
-        if self._trainer_raiden_ws is None:
+        if not self.release_buffers_after_sync or self._trainer_raiden_ws is None:
             return {}
-        # The torch WeightSynchronizer has no close(); the C++ object (which holds references to the
-        # device tensors and the host staging memory) is destroyed when the last Python reference goes.
-        ws, self._trainer_raiden_ws = self._trainer_raiden_ws, None
-        del ws
-        gc.collect()
+        if hasattr(self._trainer_raiden_ws, "unbind_weights"):
+            self._trainer_raiden_ws.unbind_weights()
+            self._bound_tensors = None
+        else:
+            if not self._warned_no_unbind:
+                logger.warning(
+                    f"Trainer Rank {self.rank}: tpu_sync WeightSynchronizer has no unbind_weights(); destroying "
+                    "it to free the send buffers each sync (upgrade tpu-sync-torch to keep it across syncs)."
+                )
+                self._warned_no_unbind = True
+            # The torch WeightSynchronizer has no close(); the C++ object (which holds references to the
+            # device tensors and the host staging memory) is destroyed when the last Python reference goes.
+            self._close_synchronizer()
+            gc.collect()
         # No empty_cache(): on TPU it clears the eager-op compilation cache (forcing recompiles) and the
         # TPU runtime reuses freed HBM without it.
         tpu_synchronize()

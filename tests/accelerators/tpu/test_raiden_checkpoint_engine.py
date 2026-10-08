@@ -182,13 +182,27 @@ class _FakeTpuSync:
                 self.kwargs = kwargs
                 self.d2h_calls = 0
                 self.h2d_calls = 0
+                self.bind_calls = 0
+                self.unbind_calls = 0
+                self.bound = True
                 self.skip_tiling = None
                 world.synchronizers.append(self)
 
             def test_only_set_skip_tiling(self, plan):
                 self.skip_tiling = list(plan)
 
+            def bind_weights(self, device_tensors):
+                assert len(device_tensors) == len(self.tensors), "bind_weights must keep the registered tensor count"
+                self.tensors = [tensors[0] for tensors in device_tensors]
+                self.bind_calls += 1
+                self.bound = True
+
+            def unbind_weights(self):
+                self.unbind_calls += 1
+                self.bound = False
+
             def d2h(self):
+                assert self.bound, "D2H on an unbound WeightSynchronizer"
                 self.d2h_calls += 1
 
             def h2d(self):
@@ -671,23 +685,86 @@ def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu
         )
     assert fake_tpu_sync.registry_state.get_global_shapes() == {n: list(s) for n, s in TRAINER_SHAPES.items()}
 
-    # After the transfer, release_sync_buffers drops the synchronizer; the next sync creates, registers and
-    # stages a new one.
+    # After the transfer, release_sync_buffers unbinds the send tensors but keeps the synchronizer and its
+    # controller registration; the next sync rebinds the new tensors and stages them, without re-registering.
     engine.release_sync_buffers()
-    assert engine._trainer_raiden_ws is None
+    assert engine._trainer_raiden_ws is ws
+    assert (ws.unbind_calls, ws.bound, engine._bound_tensors) == (1, False, None)
     new_weights = _trainer_weights(seed=1)
     asyncio.run(engine.send_weights(iter(new_weights.items()), global_steps=2))
+    assert fake_tpu_sync.synchronizers == [ws]
+    assert (ws.bind_calls, ws.bound, ws.d2h_calls) == (1, True, 2)
+    assert [t.data_ptr() for t in ws.tensors] == [new_weights[n].data_ptr() for n in names]
+    assert fake_tpu_sync.registrations[RaidenId("trainer", "0", "weights")] is registration
+
+    # Without a release in between (a sync that failed after send_weights), the synchronizer is rebound too.
+    asyncio.run(engine.send_weights(iter(new_weights.items()), global_steps=3))
+    assert fake_tpu_sync.synchronizers == [ws] and ws.bind_calls == 2
+
+    # A changed tensor signature (here: a dropped tensor) re-creates and re-registers the synchronizer.
+    engine.release_sync_buffers()
+    fewer = {n: t for n, t in new_weights.items() if n != "lm_head.weight"}
+    asyncio.run(engine.send_weights(iter(fewer.items()), global_steps=4))
     assert len(fake_tpu_sync.synchronizers) == 2
     new_ws = fake_tpu_sync.synchronizers[1]
-    assert [t.data_ptr() for t in new_ws.tensors] == [new_weights[n].data_ptr() for n in names]
-    assert (ws.d2h_calls, new_ws.d2h_calls) == (1, 1)
+    assert engine._trainer_raiden_ws is new_ws and new_ws.d2h_calls == 1
     registration = fake_tpu_sync.registrations[RaidenId("trainer", "0", "weights")]
     assert registration.data_addresses == [f"10.0.0.1:{new_ws.local_port}"]
+    assert [var.name for var in registration.variables] == sorted(fewer)
 
-    # Without a release in between (a sync that failed after send_weights), the synchronizer is replaced too.
-    asyncio.run(engine.send_weights(iter(new_weights.items()), global_steps=3))
-    assert len(fake_tpu_sync.synchronizers) == 3
-    assert engine._trainer_raiden_ws is fake_tpu_sync.synchronizers[2]
+    engine.finalize()
+    assert (engine._trainer_raiden_ws, engine._registered_signature, engine._bound_tensors) == (None, None, None)
+
+
+def test_release_sync_buffers_is_noop_when_disabled_or_before_first_sync(fake_tpu_sync):
+    raiden.setup_raiden_controller()
+    engine = _trainer_engine(rank=0, release_buffers_after_sync=False)
+    assert engine.release_sync_buffers() == {}  # nothing bound yet
+
+    weights = _trainer_weights()
+    asyncio.run(engine.send_weights(iter(weights.items()), global_steps=1))
+    (ws,) = fake_tpu_sync.synchronizers
+    assert engine.release_sync_buffers() == {}
+    assert (ws.unbind_calls, ws.bound) == (0, True)
+    assert engine._bound_tensors is not None  # the send tensors stay resident between syncs
+
+
+def test_release_sync_buffers_falls_back_to_destroying_synchronizer_without_unbind(fake_tpu_sync, caplog):
+    raiden.setup_raiden_controller()
+    engine = _trainer_engine(rank=0)
+    weights = _trainer_weights()
+    asyncio.run(engine.send_weights(iter(weights.items()), global_steps=1))
+    (ws,) = fake_tpu_sync.synchronizers
+    del type(ws).unbind_weights  # an older tpu_sync build
+
+    with caplog.at_level(logging.WARNING, logger=raiden.__name__):
+        engine.release_sync_buffers()
+        engine.release_sync_buffers()  # idempotent
+    assert engine._trainer_raiden_ws is None and engine._registered_signature is None
+    assert caplog.text.count("has no unbind_weights()") == 1  # warned once
+
+    # The next sync creates and registers a new synchronizer.
+    asyncio.run(engine.send_weights(iter(weights.items()), global_steps=2))
+    assert len(fake_tpu_sync.synchronizers) == 2 and engine._trainer_raiden_ws is fake_tpu_sync.synchronizers[1]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "env", "expected"),
+    [
+        ({}, None, True),
+        ({"release_buffers_after_sync": False}, None, False),
+        ({"release_buffers_after_sync": "0"}, None, False),
+        ({"release_buffers_after_sync": False}, "1", True),  # the environment variable wins
+        ({}, "false", False),
+        ({}, "", True),  # unset / empty is ignored
+    ],
+)
+def test_release_buffers_flag_from_kwargs_and_env(monkeypatch, kwargs, env, expected):
+    if env is None:
+        monkeypatch.delenv("VERL_RAIDEN_RELEASE_BUFFERS", raising=False)
+    else:
+        monkeypatch.setenv("VERL_RAIDEN_RELEASE_BUFFERS", env)
+    assert raiden.RaidenCheckpointEngine(**kwargs).release_buffers_after_sync is expected
 
 
 def test_send_weights_drops_tied_lm_head(fake_tpu_sync):
@@ -742,10 +819,11 @@ def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie
     assert [sampler._raiden_ws.listener_port for sampler in samplers] == [12000, 12001]
     assert [sampler._raiden_ws.parallelism for sampler in samplers] == [4, 4]
     assert ("lm_head.weight" in fake_tpu_sync.registry_state.get_global_shapes()) is not tie_word_embeddings
-    assert all(engine._trainer_raiden_ws is None for engine in engines)  # released after the transfer
+    # Released after the transfer: the send tensors are unbound, the synchronizers are kept for the next sync.
+    assert all(not engine._trainer_raiden_ws.bound and engine._bound_tensors is None for engine in engines)
 
-    # Next step: new weights. The controller and the rollout registrations are reused; every trainer rank
-    # creates, registers and stages a new synchronizer.
+    # Next step: new weights. The controller, the rollout registrations and the trainer synchronizers are
+    # reused; every trainer rank rebinds and stages its new tensors.
     weights["current"] = _trainer_weights(seed=1)
     events.clear()
     with caplog.at_level(logging.INFO, logger=raiden.__name__):
@@ -768,8 +846,9 @@ def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie
     assert [sampler._raiden_ws.h2d_calls for sampler in samplers] == [2, 2]
     sampler_synchronizers = [sampler._raiden_ws for sampler in samplers]
     trainer_synchronizers = [ws for ws in fake_tpu_sync.synchronizers if ws not in sampler_synchronizers]
-    assert [ws.d2h_calls for ws in trainer_synchronizers] == [1] * (2 * trainer_ranks)
-    assert all(engine._trainer_raiden_ws is None for engine in engines)
+    assert [ws.d2h_calls for ws in trainer_synchronizers] == [2] * trainer_ranks  # one synchronizer per rank
+    bind_state = [(ws.bind_calls, ws.unbind_calls, ws.bound) for ws in trainer_synchronizers]
+    assert bind_state == [(1, 2, False)] * trainer_ranks  # rebound once, unbound after each transfer
     assert "RAIDEN PARITY VERIFIED | Step 1" in caplog.text
     assert "MISMATCH" not in caplog.text
 
