@@ -78,7 +78,7 @@ class PlatformXPU(PlatformBase):
     """
 
     def __init__(self) -> None:
-        # Apply this platform's monkeypatch only now, when XPU is actually
+        # Apply this platform's monkeypatches only now, when XPU is actually
         # the platform verl selected for this process (verl.plugin.platform.
         # platform_manager._create_platform() only constructs PlatformXPU()
         # when platform detection -- explicit VERL_PLATFORM=intel or
@@ -89,9 +89,15 @@ class PlatformXPU(PlatformBase):
         # host with VERL_PLATFORM=nvidia explicitly set would still get its
         # process-wide torch.distributed.all_reduce(op=AVG) semantics
         # changed for no reason.
+        #
+        # Each apply() below still does its own live-device check, because
+        # auto-detection constructs every registered platform to probe it:
+        # being instantiated does not prove XPU was the one selected.
         from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch
+        from verl_hardware_plugin.accelerators.xpu.profilers.register_vtune import apply_vtune_profiler_patch
 
         reduce_avg_allreduce_patch.apply()
+        apply_vtune_profiler_patch()
 
     # ------------------------------------------------------------------
     # Core device management
@@ -230,6 +236,19 @@ class PlatformXPU(PlatformBase):
     def profiler_stop(self) -> None:
         # No-op: see profiler_start
         pass
+
+    def profiler_markers(self):
+        # Intel VTune (ITT) tracing markers. verl core asks the platform for
+        # these first, before falling back to nvtx/mstx/generic markers -- see
+        # verl/utils/profiler/__init__.py for how it discovers them.
+        from verl_hardware_plugin.accelerators.xpu.profilers import itt_profile_xpu
+
+        return (
+            itt_profile_xpu.mark_start_range,
+            itt_profile_xpu.mark_end_range,
+            itt_profile_xpu.mark_annotate,
+            itt_profile_xpu.marked_timer,
+        )
 
     # ------------------------------------------------------------------
     # Model patches

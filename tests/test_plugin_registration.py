@@ -903,5 +903,160 @@ class TestReduceAvgAllReducePatch:
             assert dist.all_reduce is patched_once
 
 
+class TestProfilerMarkersHook:
+    """``profiler_markers()`` is the one ``PlatformBase`` hook this plugin implements.
+
+    verl core calls it to discover trace markers before falling back to nvtx/mstx/generic
+    ones, and unpacks the result positionally, so both the arity and the order matter.
+    """
+
+    @staticmethod
+    def _markers():
+        pytest.importorskip("verl_hardware_plugin.accelerators.xpu.profilers.itt_profile_xpu")
+        from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU
+
+        # Bypass __init__: it applies this platform's monkeypatches, which is not what
+        # is under test here (and self-gates to a no-op on a CPU-only host anyway).
+        return PlatformXPU.profiler_markers(object.__new__(PlatformXPU))
+
+    def test_returns_the_four_itt_markers_in_core_order(self):
+        from verl_hardware_plugin.accelerators.xpu.profilers import itt_profile_xpu
+
+        assert self._markers() == (
+            itt_profile_xpu.mark_start_range,
+            itt_profile_xpu.mark_end_range,
+            itt_profile_xpu.mark_annotate,
+            itt_profile_xpu.marked_timer,
+        )
+
+    def test_markers_are_callable_without_a_collector(self):
+        """ITT is notify-only: with no collector attached these must be no-ops, not errors."""
+        mark_start_range, mark_end_range, mark_annotate, marked_timer = self._markers()
+
+        mark_end_range(mark_start_range("probe"))
+
+        @mark_annotate("decorated")
+        def _work():
+            return 42
+
+        assert _work() == 42
+
+        timing = {}
+        with marked_timer("timed", timing):
+            pass
+        assert "timed" in timing
+
+
+class TestVtuneProfilerToolConfig:
+    """VtuneProfiler must accept any tool_config shape verl core hands it.
+
+    There is no ``tool_config.vtune`` schema entry, so core may pass None or the whole
+    tool_config mapping instead of a per-tool config. Neither may raise, and ``discrete``
+    must default to False.
+    """
+
+    @staticmethod
+    def _vtune_cls():
+        module = pytest.importorskip("verl_hardware_plugin.accelerators.xpu.profilers.itt_profile_xpu")
+        return module.VtuneProfiler
+
+    @pytest.mark.parametrize("enable", [True, False])
+    @pytest.mark.parametrize(
+        "tool_config",
+        [
+            None,
+            {},
+            # What core passes when no `vtune` block exists: the full tool_config mapping.
+            {"nsys": {"discrete": False}, "npu": {}, "torch": {}},
+        ],
+        ids=["none", "empty", "whole-tool_config-mapping"],
+    )
+    def test_discrete_defaults_false_without_vtune_block(self, tool_config, enable):
+        from verl.utils.profiler.config import ProfilerConfig
+
+        profiler = self._vtune_cls()(rank=0, config=ProfilerConfig(ranks=[0], enable=enable), tool_config=tool_config)
+        assert profiler.discrete is False
+
+    def test_explicit_discrete_is_honoured(self):
+        """An explicit `+tool_config.vtune.*` override is still read, even though XPU ignores it."""
+        from verl.utils.profiler.config import NsightToolConfig, ProfilerConfig
+
+        profiler = self._vtune_cls()(
+            rank=0,
+            config=ProfilerConfig(ranks=[0], enable=True),
+            tool_config=NsightToolConfig(discrete=True),
+        )
+        assert profiler.discrete is True
+
+
+class TestVtuneProfilerRegistration:
+    """`profiler.tool: vtune` must resolve to VtuneProfiler once the patch is applied.
+
+    Core's own tool names must keep resolving to their core implementations, and an
+    unrecognised name must still fall through to core's no-op profiler.
+    """
+
+    @pytest.fixture
+    def patched(self):
+        pytest.importorskip("verl_hardware_plugin.accelerators.xpu.profilers.itt_profile_xpu")
+        from verl.utils.profiler.profile import DistProfiler
+        from verl_hardware_plugin.accelerators.xpu.profilers import register_vtune
+
+        original_init = DistProfiler.__init__
+        original_flag = register_vtune._PATCHED
+        register_vtune._PATCHED = False
+        # The patch self-gates on a live XPU device; these tests are CPU-only.
+        with mock.patch.object(register_vtune, "_xpu_available", return_value=True):
+            register_vtune.apply_vtune_profiler_patch()
+        try:
+            yield DistProfiler
+        finally:
+            DistProfiler.__init__ = original_init
+            register_vtune._PATCHED = original_flag
+
+    def test_vtune_tool_resolves_to_vtune_profiler(self, patched):
+        from verl.utils.profiler.config import ProfilerConfig
+        from verl_hardware_plugin.accelerators.xpu.profilers.itt_profile_xpu import VtuneProfiler
+
+        profiler = patched(rank=0, config=ProfilerConfig(ranks=[0], enable=True, tool="vtune"))
+        assert isinstance(profiler._impl, VtuneProfiler)
+
+    def test_builtin_tools_are_untouched(self, patched):
+        """The patch must only claim the `vtune` name, not shadow core's own dispatch."""
+        from verl.utils.profiler.config import ProfilerConfig
+        from verl.utils.profiler.profile import _NoOpProfiler
+        from verl_hardware_plugin.accelerators.xpu.profilers.itt_profile_xpu import VtuneProfiler
+
+        # An unknown tool still falls through to core's no-op, as before.
+        profiler = patched(rank=0, config=ProfilerConfig(ranks=[0], enable=True, tool="not-a-tool"))
+        assert isinstance(profiler._impl, _NoOpProfiler)
+        assert not isinstance(profiler._impl, VtuneProfiler)
+
+    def test_patch_is_idempotent(self, patched):
+        """PlatformXPU may be constructed more than once; the wrapper must not stack."""
+        from verl_hardware_plugin.accelerators.xpu.profilers import register_vtune
+
+        init_after_first = patched.__init__
+        register_vtune.apply_vtune_profiler_patch()
+        assert patched.__init__ is init_after_first
+
+    def test_noop_when_xpu_unavailable(self):
+        """Constructing PlatformXPU on a non-XPU host must leave DistProfiler alone."""
+        from verl.utils.profiler.profile import DistProfiler
+        from verl_hardware_plugin.accelerators.xpu.profilers import register_vtune
+
+        original_init = DistProfiler.__init__
+        original_flag = register_vtune._PATCHED
+        register_vtune._PATCHED = False
+        try:
+            with mock.patch.object(register_vtune, "_xpu_available", return_value=False):
+                register_vtune.apply_vtune_profiler_patch()
+            assert DistProfiler.__init__ is original_init
+            assert register_vtune._PATCHED is False
+        finally:
+            DistProfiler.__init__ = original_init
+            register_vtune._PATCHED = original_flag
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
