@@ -22,15 +22,17 @@ slice through Ray. Each patch fills a gap in the pinned vLLM (v0.29.0) and vllm-
   and draw sampling noise in FP32, avoiding BF16 cancellation and sampling bias.
 * ``VLLM_DISABLE_COMPILE_CACHE=1``: a reloaded compile-cache artifact can make vLLM run the model
   eagerly, which crashes libtpu (b/501165531). Upstream fix: that bug.
-* ``multiprocessing.process.BaseProcess.__init__`` and ``RayWorkerWrapper.__init__``: install
-  these patches in the EngineCore process and in vLLM's worker actors, neither of which imports
-  the plugin.
+
+The patches reach every vLLM process through the ``vllm.general_plugins`` entry point
+``verl_hardware_plugin_vllm:register`` (see ``pyproject.toml``): vLLM loads general plugins in the
+API server process, at the start of ``EngineCore.__init__`` (before the executor is built) and in
+each worker's ``init_worker`` (before the worker and model runner are built). The entry point exists
+only when verl-hardware-plugin is installed; ``assert_vllm_plugin_installed`` checks for it.
 """
 
 import importlib.util
 import inspect
 import logging
-import multiprocessing.process
 import os
 from collections import Counter
 
@@ -42,6 +44,11 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import resolve_tpu_topology_bounds
 
 logger = logging.getLogger(__name__)
+
+# Placement groups verl reserved for the replica; its presence also turns on the vLLM entry point.
+# Keep both in sync with verl_hardware_plugin_vllm, which must not import this package.
+VERL_TPU_PG_IDS_ENV = "VERL_TPU_PG_IDS"
+VLLM_PLUGIN_NAME = "verl_tpu_rollout"
 
 _PATCHES_APPLIED = False
 
@@ -155,13 +162,35 @@ def patch_tpu_sampler() -> None:
     logger.info("Applied TPU generator FP32 sampling-noise patch.")
 
 
+def assert_vllm_plugin_installed() -> None:
+    """Fail fast unless vLLM's EngineCore and workers will load the patches.
+
+    They get them only through the ``vllm.general_plugins`` entry point, which exists only when this
+    distribution is installed. Putting the source directory on ``sys.path`` (e.g. Ray's
+    ``py_modules``) registers no entry point, and the engine would then start unpatched and fail far
+    from the cause.
+    """
+    from importlib.metadata import entry_points
+
+    if not any(ep.name == VLLM_PLUGIN_NAME for ep in entry_points(group="vllm.general_plugins")):
+        raise RuntimeError(
+            f"TPU rollout needs the vllm.general_plugins entry point {VLLM_PLUGIN_NAME!r}, which is "
+            "registered only when verl-hardware-plugin is installed. Install it with `pip install --no-deps`, "
+            "e.g. in the image or through Ray's runtime_env "
+            '{"pip": {"packages": ["<wheel or git URL>"], "pip_install_options": ["--no-deps"]}}, '
+            "instead of passing the verl_hardware_plugin source directory in py_modules."
+        )
+    allowed = os.environ.get("VLLM_PLUGINS")
+    if allowed is not None and VLLM_PLUGIN_NAME not in allowed.split(","):
+        raise RuntimeError(f"VLLM_PLUGINS={allowed!r} must include {VLLM_PLUGIN_NAME!r} for TPU rollout.")
+
+
 def patch_vllm_for_tpu() -> None:
     """Install the patches in this process. Later calls return at once."""
     global _PATCHES_APPLIED
     if _PATCHES_APPLIED:
         return
 
-    patch_multiprocessing_for_tpu()
     # vLLM can reload a degenerate AOT compile artifact (num_artifacts=0) that silently runs the
     # model eagerly; eager execution then hits the XLA:TPU unaligned-DUS CHECK (b/501165531).
     os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
@@ -170,7 +199,6 @@ def patch_vllm_for_tpu() -> None:
     try:
         import vllm.v1.executor.ray_executor as ray_executor
         from vllm.engine.arg_utils import EngineArgs
-        from vllm_torchtpu.executors.ray_distributed_executor import RayWorkerWrapper
         from vllm_torchtpu.worker.tpu_worker import TPUWorker
     except ImportError as exc:
         logger.debug("Skipping vLLM TPU executor patches (vllm / vllm_torchtpu not installed): %s", exc)
@@ -191,16 +219,7 @@ def patch_vllm_for_tpu() -> None:
         vllm_config.scheduler_config.async_scheduling = False
         return vllm_config
 
-    original_worker_init = RayWorkerWrapper.__init__
-
-    def worker_init(self, *args, **kwargs):
-        # vLLM's worker actors never import the plugin. Ray sends this method to them with the
-        # actor class, so it installs the patches there.
-        patch_vllm_for_tpu()
-        original_worker_init(self, *args, **kwargs)
-
     EngineArgs.create_engine_config = create_engine_config
-    RayWorkerWrapper.__init__ = worker_init
     TPUWorker.reset_encoder_cache = _reset_encoder_cache
     ray_executor.initialize_ray_cluster = _initialize_ray_cluster
     ray_executor.RayDistributedExecutor._init_workers_ray = _init_workers_ray
@@ -230,7 +249,7 @@ def _init_workers_ray(self, placement_group, **ray_remote_kwargs) -> None:
     from vllm_torchtpu import envs as vllm_torchtpu_envs
     from vllm_torchtpu.executors.ray_distributed_executor import RayWorkerWrapper
 
-    pg_ids = os.environ["VERL_TPU_PG_IDS"].split(",")
+    pg_ids = os.environ[VERL_TPU_PG_IDS_ENV].split(",")
     logger.info("Reusing %d verl placement group(s) for TPU rollout: %s", len(pg_ids), pg_ids)
     bundles = [
         (pg, bundle_index)
@@ -355,36 +374,3 @@ def _reset_encoder_cache(self) -> None:
 
     The encoder cache holds multimodal encoder outputs; text models have none to reset.
     """
-
-
-class PickleableProcessWrapper:
-    """Process target that runs ``patch_vllm_for_tpu`` in the child before ``target``.
-
-    This is how the patches reach vLLM's EngineCore. Inside a Ray actor vLLM always uses the
-    ``spawn`` start method, and the EngineCore target is ``EngineCoreProc.run_engine_core``, which
-    vllm-torchtpu replaces with its own wrapper. A spawned child imports only the modules its pickled
-    target names, so without this wrapper it would never import the plugin.
-    """
-
-    def __init__(self, target):
-        self.target = target
-
-    def __call__(self, *args, **kwargs):
-        patch_vllm_for_tpu()
-        return self.target(*args, **kwargs)
-
-
-def patch_multiprocessing_for_tpu() -> None:
-    """Wrap the target of every ``multiprocessing`` process started from now on in ``PickleableProcessWrapper``."""
-    base_process = multiprocessing.process.BaseProcess
-    if getattr(base_process, "_tpu_patched", False):
-        return
-    original_init = base_process.__init__
-
-    def patched_init(self, group=None, target=None, *args, **kwargs):
-        if target is not None:
-            target = PickleableProcessWrapper(target)
-        original_init(self, group, target, *args, **kwargs)
-
-    base_process.__init__ = patched_init  # type: ignore[method-assign]
-    base_process._tpu_patched = True  # type: ignore[attr-defined]

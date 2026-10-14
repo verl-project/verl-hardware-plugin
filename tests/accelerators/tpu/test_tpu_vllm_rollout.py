@@ -10,9 +10,8 @@ upstream verl (which hooks are overridden and what they return) and the launch a
 
 import asyncio
 import importlib
-import multiprocessing.process
 import os
-import pickle
+import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest import mock
@@ -21,10 +20,13 @@ import pytest
 import ray
 import ray.util.scheduling_strategies  # noqa: F401  (tpu_vllm reaches it through ``ray.util``)
 
+import verl_hardware_plugin_vllm
+
 # Import before any test patches sys.modules, so mock.patch.dict never evicts it.
 from verl_hardware_plugin.accelerators.tpu.rollout import tpu_vllm_patches
 
 VAS = "verl.workers.rollout.vllm_rollout.vllm_async_server"
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 
 class _FakeHttpServer:
@@ -66,6 +68,7 @@ def tpu_vllm():
     with (
         mock.patch.dict(sys.modules, {VAS: vas}),
         mock.patch.object(tpu_vllm_patches, "patch_vllm_for_tpu"),
+        mock.patch.object(tpu_vllm_patches, "assert_vllm_plugin_installed"),
     ):
         sys.modules.pop("verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm", None)
         module = importlib.import_module("verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm")
@@ -114,10 +117,11 @@ def test_vllm_loader_defers_off_tpu_and_picks_tpu_replica_on_tpu():
 def test_server_patches_vllm_before_upstream_init(tpu_vllm):
     assert not tpu_vllm.patch_vllm_for_tpu.called  # importing the module patches nothing
     order = []
+    tpu_vllm.assert_vllm_plugin_installed.side_effect = lambda: order.append("check plugin")
     tpu_vllm.patch_vllm_for_tpu.side_effect = lambda: order.append("patch")
     with mock.patch.object(_FakeHttpServer, "__init__", lambda self: order.append("upstream init")):
         tpu_vllm.TPUvLLMHttpServer()
-    assert order == ["patch", "upstream init"]
+    assert order == ["check plugin", "patch", "upstream init"]
 
 
 def test_server_engine_kwargs_force_tpu_executor(tpu_vllm):
@@ -293,25 +297,22 @@ def test_launch_tpu_vllm_servers_rejects_data_parallel(tpu_vllm):
 def isolated_patches():
     """Run patch_vllm_for_tpu with its process-global side effects rolled back afterwards."""
 
-    base_process = multiprocessing.process.BaseProcess
-    saved_init = base_process.__init__
-    had_flag = "_tpu_patched" in base_process.__dict__
-    env = {k: v for k, v in os.environ.items() if k != "VLLM_DISABLE_COMPILE_CACHE"}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("VLLM_DISABLE_COMPILE_CACHE", "VERL_TPU_PG_IDS", "VLLM_PLUGINS")
+    }
     with (
         mock.patch.dict(os.environ, env, clear=True),
         mock.patch.object(tpu_vllm_patches, "_PATCHES_APPLIED", False),
     ):
         yield tpu_vllm_patches
-    base_process.__init__ = saved_init
-    if not had_flag and "_tpu_patched" in base_process.__dict__:
-        del base_process._tpu_patched
 
 
 def test_patch_vllm_for_tpu_env_side_effects_without_torchtpu(isolated_patches):
     isolated_patches.patch_vllm_for_tpu()
 
     assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "1"
-    assert multiprocessing.process.BaseProcess._tpu_patched is True
     # The executor patches need vllm-torchtpu, so the guard stays open for a later retry.
     assert isolated_patches._PATCHES_APPLIED is False
 
@@ -331,19 +332,62 @@ def test_patch_vllm_for_tpu_keeps_explicit_compile_cache_setting(isolated_patche
     assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "0"
 
 
-def test_pickleable_process_wrapper_applies_patches_before_target():
-    wrapper = pickle.loads(pickle.dumps(tpu_vllm_patches.PickleableProcessWrapper(len)))
-    with mock.patch.object(tpu_vllm_patches, "patch_vllm_for_tpu") as patch:
-        assert wrapper([1, 2, 3]) == 3
+def test_vllm_entry_point_imports_nothing_outside_a_verl_tpu_replica():
+    # A fresh interpreter: this one has already imported verl_hardware_plugin.
+    env = {k: v for k, v in os.environ.items() if k != "VERL_TPU_PG_IDS"}
+    code = (
+        "import sys, verl_hardware_plugin_vllm as m; m.register(); "
+        "assert not [n for n in sys.modules if n.split('.')[0] == 'verl_hardware_plugin'], sorted(sys.modules)"
+    )
+    subprocess.run([sys.executable, "-c", code], env=env, check=True, cwd=_REPO_ROOT)
+
+
+def test_vllm_entry_point_patches_a_verl_tpu_replica(isolated_patches):
+    os.environ[verl_hardware_plugin_vllm.VERL_TPU_PG_IDS_ENV] = "pg0hex,pg1hex"
+    with mock.patch.object(isolated_patches, "patch_vllm_for_tpu") as patch:
+        verl_hardware_plugin_vllm.register()
     patch.assert_called_once_with()
 
 
-def test_multiprocessing_patch_wraps_keyword_and_positional_targets(isolated_patches):
-    isolated_patches.patch_multiprocessing_for_tpu()
-    for process in (multiprocessing.Process(target=len), multiprocessing.Process(None, len)):
-        assert isinstance(process._target, isolated_patches.PickleableProcessWrapper)
-        assert process._target.target is len
-    assert multiprocessing.Process()._target is None
+def test_vllm_entry_point_names_match_the_patches_module():
+    assert verl_hardware_plugin_vllm.VERL_TPU_PG_IDS_ENV == tpu_vllm_patches.VERL_TPU_PG_IDS_ENV
+    assert verl_hardware_plugin_vllm.VLLM_PLUGIN_NAME == tpu_vllm_patches.VLLM_PLUGIN_NAME
+
+
+def test_pyproject_registers_and_packages_the_vllm_entry_point():
+    tomllib = pytest.importorskip("tomllib")
+    with open(os.path.join(_REPO_ROOT, "pyproject.toml"), "rb") as f:
+        pyproject = tomllib.load(f)
+    entry_points = pyproject["project"]["entry-points"]["vllm.general_plugins"]
+    module, _, attr = entry_points[tpu_vllm_patches.VLLM_PLUGIN_NAME].partition(":")
+    assert getattr(importlib.import_module(module), attr) is verl_hardware_plugin_vllm.register
+    assert module in pyproject["tool"]["setuptools"]["py-modules"]
+
+
+def _entry_point(name):
+    return SimpleNamespace(name=name)
+
+
+def test_plugin_check_passes_when_the_entry_point_is_installed(isolated_patches):
+    with mock.patch("importlib.metadata.entry_points", return_value=[_entry_point("verl_tpu_rollout")]):
+        isolated_patches.assert_vllm_plugin_installed()
+
+
+def test_plugin_check_rejects_a_source_tree_without_the_entry_point(isolated_patches):
+    with (
+        mock.patch("importlib.metadata.entry_points", return_value=[_entry_point("torchtpu_layers")]),
+        pytest.raises(RuntimeError, match="py_modules"),
+    ):
+        isolated_patches.assert_vllm_plugin_installed()
+
+
+def test_plugin_check_rejects_vllm_plugins_without_it(isolated_patches):
+    os.environ["VLLM_PLUGINS"] = "torchtpu_layers"
+    with (
+        mock.patch("importlib.metadata.entry_points", return_value=[_entry_point("verl_tpu_rollout")]),
+        pytest.raises(RuntimeError, match="VLLM_PLUGINS"),
+    ):
+        isolated_patches.assert_vllm_plugin_installed()
 
 
 def test_local_ranks_count_workers_per_host_in_rank_order():

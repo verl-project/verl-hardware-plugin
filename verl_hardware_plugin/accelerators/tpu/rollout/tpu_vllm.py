@@ -26,7 +26,11 @@ from verl.utils.device import get_device_name
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 from verl_hardware_plugin.accelerators.tpu.engines.weight_sync_backends import TPU_SYNC_BACKEND, canonical_backend
-from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import patch_vllm_for_tpu
+from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import (
+    VERL_TPU_PG_IDS_ENV,
+    assert_vllm_plugin_installed,
+    patch_vllm_for_tpu,
+)
 
 # vLLM imports the worker extension by name in its worker processes.
 RAIDEN_WORKER_EXTENSION_CLS = "verl_hardware_plugin.accelerators.tpu.rollout.tpu_raiden.vLLMRaidenWorkerExtension"
@@ -68,7 +72,8 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
         "TPU_MULTIHOST_BACKEND": "ray",
         "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": "0",
         # The initialize_ray_cluster patch in patch_vllm_for_tpu attaches vLLM to these placement groups.
-        "VERL_TPU_PG_IDS": ",".join(pg.id.hex() for pg in pgs),
+        # Its presence also turns on the vllm.general_plugins entry point in vLLM's processes.
+        VERL_TPU_PG_IDS_ENV: ",".join(pg.id.hex() for pg in pgs),
     }
 
     server = replica.server_class.options(
@@ -110,8 +115,11 @@ class TPUvLLMHttpServer(vLLMHttpServer):
     """``vLLMHttpServer`` with the TPU engine arguments."""
 
     def __init__(self, *args, **kwargs):
-        # This actor builds the vLLM engine and starts its EngineCore process, so patch vLLM before
-        # anything else. The patches carry themselves into the EngineCore and vLLM's workers.
+        # This actor builds the vLLM engine, so patch vLLM before anything else. The
+        # vllm.general_plugins entry point patches the EngineCore process and vLLM's workers, so make
+        # sure it is installed; calling patch_vllm_for_tpu here as well keeps this process independent
+        # of when vLLM first loads its plugins.
+        assert_vllm_plugin_installed()
         patch_vllm_for_tpu()
         super().__init__(*args, **kwargs)
 
