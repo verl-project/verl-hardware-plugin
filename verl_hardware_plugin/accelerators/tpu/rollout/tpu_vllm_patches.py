@@ -24,9 +24,10 @@ slice through Ray. Each patch fills a gap in the pinned vLLM (v0.29.0) and vllm-
   eagerly, which crashes libtpu (b/501165531). Upstream fix: that bug.
 
 The patches reach every vLLM process through the ``vllm.general_plugins`` entry point
-``verl_hardware_plugin_vllm:register`` (see ``pyproject.toml``): vLLM loads general plugins in the
-API server process, at the start of ``EngineCore.__init__`` (before the executor is built) and in
-each worker's ``init_worker`` (before the worker and model runner are built). The entry point exists
+``verl_hardware_plugin.accelerators.tpu.rollout.vllm_plugin:register`` (see ``pyproject.toml``):
+vLLM loads general plugins in the API server process, at the start of ``EngineCore.__init__``
+(before the executor is built) and in each worker's ``init_worker`` (before the worker and model
+runner are built). The entry point exists
 only when verl-hardware-plugin is installed; ``assert_vllm_plugin_installed`` checks for it.
 """
 
@@ -43,11 +44,11 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import resolve_tpu_topology_bounds
 
+# Placement groups verl reserved for the replica; its presence also turns on the vLLM entry point.
+from verl_hardware_plugin.accelerators.tpu.rollout.vllm_plugin import VERL_TPU_PG_IDS_ENV
+
 logger = logging.getLogger(__name__)
 
-# Placement groups verl reserved for the replica; its presence also turns on the vLLM entry point.
-# Keep in sync with verl_hardware_plugin_vllm, which must not import this package.
-VERL_TPU_PG_IDS_ENV = "VERL_TPU_PG_IDS"
 # Name of the vllm.general_plugins entry point in pyproject.toml; VLLM_PLUGINS must list it when set.
 VLLM_PLUGIN_NAME = "verl_tpu_rollout"
 

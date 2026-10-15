@@ -23,13 +23,9 @@ dev = [
 hardware = "verl_hardware_plugin"
 
 # Loaded by vLLM in all of its processes (API server, EngineCore, workers). It patches vLLM only in
-# processes that serve a verl TPU rollout replica, and imports nothing from verl_hardware_plugin
-# elsewhere.
+# processes that serve a verl TPU rollout replica (see vllm_plugin.py for the import cost elsewhere).
 [project.entry-points."vllm.general_plugins"]
-verl_tpu_rollout = "verl_hardware_plugin_vllm:register"
-
-[tool.setuptools]
-py-modules = ["verl_hardware_plugin_vllm"]
+verl_tpu_rollout = "verl_hardware_plugin.accelerators.tpu.rollout.vllm_plugin:register"
 
 [tool.setuptools.packages.find]
 include = ["verl_hardware_plugin*"]

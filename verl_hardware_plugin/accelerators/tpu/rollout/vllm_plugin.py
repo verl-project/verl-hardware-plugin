@@ -1,13 +1,17 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""``vllm.general_plugins`` entry point of verl-hardware-plugin.
+"""``vllm.general_plugins`` entry point for the TPU rollout (``verl_tpu_rollout`` in pyproject.toml).
 
 vLLM loads general plugins in every one of its processes (API server, EngineCore, workers) on any
-machine where this distribution is installed, including processes unrelated to verl or to TPU. This
-module therefore lives outside the ``verl_hardware_plugin`` package, whose import loads every
-accelerator backend, and imports nothing until it knows the process serves a verl TPU rollout
-replica.
+machine where verl-hardware-plugin is installed, including processes unrelated to verl or to TPU.
+``register`` patches vLLM only in processes that serve a verl TPU rollout replica.
+
+Known cost: importing this module first imports the ``verl_hardware_plugin`` package, whose
+``__init__`` loads every accelerator backend (and verl), so each vLLM process on a machine with the
+plugin installed pays that import even when ``register`` then does nothing. The entry point exists
+only to install the runtime patches in ``tpu_vllm_patches``; it goes away once vLLM /
+vllm-torchtpu no longer need them.
 """
 
 import os

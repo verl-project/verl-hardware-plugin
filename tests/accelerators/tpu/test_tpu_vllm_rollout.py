@@ -20,10 +20,8 @@ import pytest
 import ray
 import ray.util.scheduling_strategies  # noqa: F401  (tpu_vllm reaches it through ``ray.util``)
 
-import verl_hardware_plugin_vllm
-
 # Import before any test patches sys.modules, so mock.patch.dict never evicts it.
-from verl_hardware_plugin.accelerators.tpu.rollout import tpu_vllm_patches
+from verl_hardware_plugin.accelerators.tpu.rollout import tpu_vllm_patches, vllm_plugin
 
 VAS = "verl.workers.rollout.vllm_rollout.vllm_async_server"
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -332,25 +330,23 @@ def test_patch_vllm_for_tpu_keeps_explicit_compile_cache_setting(isolated_patche
     assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "0"
 
 
-def test_vllm_entry_point_imports_nothing_outside_a_verl_tpu_replica():
-    # A fresh interpreter: this one has already imported verl_hardware_plugin.
+def test_vllm_entry_point_does_nothing_outside_a_verl_tpu_replica():
+    # A fresh interpreter: this one has already imported the patches.
     env = {k: v for k, v in os.environ.items() if k != "VERL_TPU_PG_IDS"}
     code = (
-        "import sys, verl_hardware_plugin_vllm as m; m.register(); "
-        "assert not [n for n in sys.modules if n.split('.')[0] == 'verl_hardware_plugin'], sorted(sys.modules)"
+        "import sys\n"
+        "from verl_hardware_plugin.accelerators.tpu.rollout import vllm_plugin\n"
+        "vllm_plugin.register()\n"
+        "assert 'verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches' not in sys.modules\n"
     )
     subprocess.run([sys.executable, "-c", code], env=env, check=True, cwd=_REPO_ROOT)
 
 
 def test_vllm_entry_point_patches_a_verl_tpu_replica(isolated_patches):
-    os.environ[verl_hardware_plugin_vllm.VERL_TPU_PG_IDS_ENV] = "pg0hex,pg1hex"
+    os.environ[vllm_plugin.VERL_TPU_PG_IDS_ENV] = "pg0hex,pg1hex"
     with mock.patch.object(isolated_patches, "patch_vllm_for_tpu") as patch:
-        verl_hardware_plugin_vllm.register()
+        vllm_plugin.register()
     patch.assert_called_once_with()
-
-
-def test_vllm_entry_point_env_var_matches_the_patches_module():
-    assert verl_hardware_plugin_vllm.VERL_TPU_PG_IDS_ENV == tpu_vllm_patches.VERL_TPU_PG_IDS_ENV
 
 
 def test_pyproject_registers_and_packages_the_vllm_entry_point():
@@ -359,8 +355,7 @@ def test_pyproject_registers_and_packages_the_vllm_entry_point():
         pyproject = tomllib.load(f)
     entry_points = pyproject["project"]["entry-points"]["vllm.general_plugins"]
     module, _, attr = entry_points[tpu_vllm_patches.VLLM_PLUGIN_NAME].partition(":")
-    assert getattr(importlib.import_module(module), attr) is verl_hardware_plugin_vllm.register
-    assert module in pyproject["tool"]["setuptools"]["py-modules"]
+    assert getattr(importlib.import_module(module), attr) is vllm_plugin.register
 
 
 def _entry_point(name):
