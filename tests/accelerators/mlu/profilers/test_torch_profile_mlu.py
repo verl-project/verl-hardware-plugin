@@ -37,7 +37,7 @@ def _installed_get_torch_profiler_supports_new_kwargs() -> bool:
     reason=(
         "installed verl-core predates profile_step/name_mini_batch_window "
         "(verl-project/verl#7408, commit 9097cc4) -- pyproject.toml's declared "
-        "floor (verl>=0.7.0) allows installs older than this"
+        "floor (verl>=0.9.0) allows installs older than this"
     ),
 )
 def test_get_torch_profiler_accepts_new_kwargs_for_non_mlu_contents(tmp_path):
