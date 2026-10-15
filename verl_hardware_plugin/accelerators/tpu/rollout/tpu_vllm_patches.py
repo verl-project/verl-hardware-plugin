@@ -46,8 +46,9 @@ from verl_hardware_plugin.accelerators.tpu.platform_tpu import resolve_tpu_topol
 logger = logging.getLogger(__name__)
 
 # Placement groups verl reserved for the replica; its presence also turns on the vLLM entry point.
-# Keep both in sync with verl_hardware_plugin_vllm, which must not import this package.
+# Keep in sync with verl_hardware_plugin_vllm, which must not import this package.
 VERL_TPU_PG_IDS_ENV = "VERL_TPU_PG_IDS"
+# Name of the vllm.general_plugins entry point in pyproject.toml; VLLM_PLUGINS must list it when set.
 VLLM_PLUGIN_NAME = "verl_tpu_rollout"
 
 _PATCHES_APPLIED = False

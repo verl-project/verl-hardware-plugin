@@ -349,9 +349,8 @@ def test_vllm_entry_point_patches_a_verl_tpu_replica(isolated_patches):
     patch.assert_called_once_with()
 
 
-def test_vllm_entry_point_names_match_the_patches_module():
+def test_vllm_entry_point_env_var_matches_the_patches_module():
     assert verl_hardware_plugin_vllm.VERL_TPU_PG_IDS_ENV == tpu_vllm_patches.VERL_TPU_PG_IDS_ENV
-    assert verl_hardware_plugin_vllm.VLLM_PLUGIN_NAME == tpu_vllm_patches.VLLM_PLUGIN_NAME
 
 
 def test_pyproject_registers_and_packages_the_vllm_entry_point():
