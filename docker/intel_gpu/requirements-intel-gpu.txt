@@ -1,0 +1,88 @@
+# Requirements for Intel XPU
+#
+# PyTorch with XPU support is installed by docker/intel_gpu/Dockerfile.intel_gpu, NOT here.
+# Version must match vLLM XPU requirements (vLLM v0.29.0 pins torch==2.13.0+xpu).
+# Pinned here as a hard backstop so uv/pip cannot drift to a CUDA or CPU wheel.
+# Do NOT remove this pin.
+torch==2.13.0+xpu
+# Runtime deps imported directly by the verl XPU rollout/training paths.
+cachetools
+#
+# pyzes>=0.1.2 is deliberately NOT listed here — it is installed by the
+# Dockerfile immediately after this file, with --no-deps. Adding it here
+# breaks the build outright:
+#
+#   error: No solution found when resolving dependencies
+#     cause: Because torch==2.13.0+xpu depends on pyzes==0.1.1 ... and because
+#            you require pyzes>=0.1.2, your requirements are unsatisfiable.
+#
+# torch==2.13.0+xpu pins pyzes to an *exact* version (==0.1.1), and this file
+# is installed with dependency resolution on, so the two constraints cannot
+# coexist. See the Dockerfile's "pyzes" step for why 0.1.1 isn't good enough
+# and why overriding torch's pin is safe.
+#
+# vLLM >= 0.17 with XPU support must be built from source:
+#   VLLM_TARGET_DEVICE=xpu pip install --no-build-isolation -v .
+#
+# flash-attn CUDA package is NOT needed — it only ships CUDA wheels.
+# attn_implementation=flash_attention_2 on XPU CONFIRMED WORKING on real B60
+# hardware (2026-09-21): transformers loads kernels-community/flash-attn2 from
+# the HF Hub kernel fallback (modeling_flash_attention_utils.py's
+# FLASH_ATTN_KERNEL_FALLBACK) and runs a real forward pass.
+#
+# This needs transformers>=5.17.0 specifically, NOT verl's project-wide
+# transformers==5.9.0 (pyproject.toml override-dependencies, a CUDA-side pin
+# unrelated to this). Why: kernels-community/flash-attn2 ships multiple major
+# *hub-repo* versions as separate branches — v1 (builds only up to torch212)
+# and v3 (adds torch213-cxx11-xpu20260-x86_64-linux, i.e. exactly what this
+# image's torch==2.13.0+xpu needs). Which major version transformers requests
+# is hardcoded in transformers/integrations/hub_kernels.py's
+# _FLASH_ATTN_KERNEL_VERSION_MAPPING ({2: 3, ...}); that table was added in
+# huggingface/transformers#47863 (merged 2026-08-17, itself testing this exact
+# XPU/BMG/torch213 combo). transformers==5.9.0 predates that PR and always
+# requests v1 — which genuinely has no XPU build for this torch version, no
+# kernels-package version fixes that. transformers>=5.17.0 requests v3 and it
+# resolves correctly. Verified: transformers==5.17.0 + kernels==0.16.2 (the
+# window 5.17.0's own hub_kernels.py accepts — kernels>=0.17 is rejected by
+# transformers itself, a separate, unrelated version gate) loads the model and
+# runs a real forward pass with attn_implementation actually set to
+# kernels-community/flash-attn2.
+#
+# This DIVERGES from pyproject.toml's transformers==5.9.0 override on purpose
+# for this device only: that override runs no risk here because it only takes
+# effect once uv resolves *inside* the verl project (pyproject.toml in scope);
+# this file installs right after verl-core is git-cloned in (Dockerfile Layer
+# 2) but before verl's own pyproject.toml is resolved — both the verl-core
+# install and this plugin's own install (Layer 3) use --no-deps, so nothing
+# after this re-triggers dependency resolution against transformers/kernels.
+# If that ever changes, re-verify this combo survives.
+transformers==5.17.0
+kernels>=0.16.0,<0.17.0
+accelerate
+codetiming
+datasets
+dill
+dpctl
+einops
+fastapi
+hydra-core
+latex2sympy2_extended
+math_verify
+mathruler
+msgspec
+numpy<2.0.0
+packaging>=20.0
+pandas
+peft>=0.15.2
+pyarrow>=15.0.0
+pybind11
+pylatexenc
+qwen_vl_utils
+ray[default]
+TransferQueue==0.1.10
+tensorboard
+tensordict>=0.10.0
+torchdata
+trl<=0.9.6
+uvicorn
+wandb
