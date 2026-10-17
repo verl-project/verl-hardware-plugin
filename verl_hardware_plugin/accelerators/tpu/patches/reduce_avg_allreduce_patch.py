@@ -16,7 +16,7 @@ Why this is needed:
 3. ``verl.utils.distributed.set_numa_affinity`` queries ``pynvml`` (NVIDIA NVML) when
    ``libnuma.so`` is present, and ``verl.utils.torch_functional.logprobs_from_logits``
    falls back to row-wise Python loops (``logprobs_from_logits_v2``) instead of vectorized
-   ``logprobs_from_logits_naive`` on TPU.
+   ``logprobs_from_logits_naive`` (run in fp32, as on GPU) on TPU.
 
 All patches are applied lazily when ``PlatformTPU()`` is constructed (i.e. only when the
 ``tpu`` platform is selected for the process).
@@ -102,7 +102,8 @@ def _apply_verl_runtime_helpers() -> None:
             def _patched_logprobs_from_logits(logits, labels, inplace_backward=True):
                 device = getattr(logits, "device", None)
                 if getattr(device, "type", None) == "tpu":
-                    return naive_logprobs(logits, labels)
+                    # fp32 log-softmax, as flash-attn's cross entropy computes it on GPU.
+                    return naive_logprobs(logits.float(), labels)
                 return orig_logprobs(logits, labels, inplace_backward=inplace_backward)
 
             _patched_logprobs_from_logits._tpu_patched = True  # type: ignore[attr-defined]

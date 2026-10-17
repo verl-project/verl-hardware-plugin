@@ -24,16 +24,15 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     TPUSplashAttention,
     TPUVarlenAttention,
-    apply_splash_attention_tpu,
     bucket_length,
     configure_torch_compile_for_tpu,
     extend_torchtitan_engine_config,
     get_tpu_seq_bucket_size,
     get_tpu_simple_fsdp_parallelize_fn,
     init_states_without_simple_fsdp_parametrization,
+    install_tpu_attention,
     pad_packed_inputs_for_tpu,
     prepare_tpu_loss_inputs,
-    replace_varlen_attention_with_tpu_attention,
     resolve_tpu_torchtitan_options,
     splash_block_size_for,
     unwrap_metadata,
@@ -92,66 +91,48 @@ def test_unwrap_metadata():
     assert unwrap_metadata("flex") == "flex"
 
 
-def test_pad_packed_inputs_for_tpu_builds_4d_document_causal_mask():
+def test_pad_packed_inputs_for_tpu_pads_to_bucket_and_aligned_length():
     # Two packed documents of lengths 3 and 2 -> orig_seq_len = 5
-    input_ids = torch.nested.nested_tensor(
-        [torch.tensor([10, 11, 12]), torch.tensor([20, 21])],
-        layout=torch.jagged,
-    )
-    position_ids = torch.nested.nested_tensor(
-        [torch.tensor([0, 1, 2]), torch.tensor([0, 1])],
-        layout=torch.jagged,
-    )
-    micro_batch = TensorDict({}, batch_size=[])
+    input_ids = torch.nested.nested_tensor([torch.tensor([10, 11, 12]), torch.tensor([20, 21])], layout=torch.jagged)
+    position_ids = torch.nested.nested_tensor([torch.tensor([0, 1, 2]), torch.tensor([0, 1])], layout=torch.jagged)
 
     with mock.patch.dict(os.environ, {"VERL_TPU_SEQ_BUCKET_SIZE": "8"}):
-        _, _, _, attention_masks, orig_seq_len = pad_packed_inputs_for_tpu(
+        ids, pos, labels, orig_seq_len = pad_packed_inputs_for_tpu(
             input_ids=input_ids,
             position_ids=position_ids,
-            micro_batch=micro_batch,
+            micro_batch=TensorDict({}, batch_size=[]),
             device=torch.device("cpu"),
         )
-
     assert orig_seq_len == 5
-    assert attention_masks is not None
-    assert attention_masks.shape == (1, 1, 8, 8)
-    assert attention_masks.dtype == torch.bool
-    # Document 0 (tokens 0..2) attends causally within [0..2] and not to document 1 (tokens 3..4)
-    assert attention_masks[0, 0, 2, 0].item() is True
-    assert attention_masks[0, 0, 0, 2].item() is False
-    assert attention_masks[0, 0, 3, 2].item() is False
-    assert attention_masks[0, 0, 4, 3].item() is True
-    # Padded tail (tokens 5..7) has self-attention only (no cross-token attention)
-    assert attention_masks[0, 0, 6, 6].item() is True
-    assert attention_masks[0, 0, 6, 5].item() is False
+    assert ids.tolist() == [10, 11, 12, 20, 21, 0, 0, 0]
+    # Pad tokens get position 0: each one is its own document for the attention.
+    assert pos.tolist() == [0, 1, 2, 0, 1, 0, 0, 0]
+    assert labels.tolist() == [11, 12, 20, 21, 10, 0, 0, 0]
 
-
-def test_pad_packed_inputs_for_tpu_skips_mask_and_honors_aligned_length():
-    input_ids = torch.nested.nested_tensor(
-        [torch.tensor([10, 11, 12]), torch.tensor([20, 21])],
-        layout=torch.jagged,
-    )
-    position_ids = torch.nested.nested_tensor(
-        [torch.tensor([0, 1, 2]), torch.tensor([0, 1])],
-        layout=torch.jagged,
-    )
+    # The common cross-rank length from align_micro_batch_shapes_across_ranks wins over the local bucket.
     micro_batch = TensorDict({}, batch_size=[])
     tu.assign_non_tensor_data(micro_batch, "tpu_padded_seq_len", 16)
-
     with mock.patch.dict(os.environ, {"VERL_TPU_SEQ_BUCKET_SIZE": "8"}):
-        padded_ids, padded_pos, padded_labels, attention_masks, orig_seq_len = pad_packed_inputs_for_tpu(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            micro_batch=micro_batch,
-            device=torch.device("cpu"),
-            build_attention_mask=False,
-        )
+        ids, pos, labels, _ = pad_packed_inputs_for_tpu(input_ids, position_ids, micro_batch, torch.device("cpu"))
+    assert ids.shape == pos.shape == labels.shape == (16,)
 
-    assert orig_seq_len == 5
-    assert attention_masks is None
-    assert padded_ids.shape == (16,)
-    assert padded_pos.shape == (16,)
-    assert padded_labels.shape == (16,)
+
+def test_tpu_varlen_attention_masks_documents_and_padding():
+    torch.manual_seed(0)
+    q, k, v = torch.randn(3, 8, 4, 16).unbind(0)  # [T=8, H=4, D=16], packed docs of lengths 3 and 2 + 3 pads
+    k, v = k[:, :2], v[:, :2]  # GQA: 2 kv heads
+    positions = torch.tensor([0, 1, 2, 0, 1, 0, 0, 0])
+    out = TPUVarlenAttention()(q, k, v, positions=positions)
+    assert out.shape == (8, 4, 16)
+
+    def reference(lo, hi):  # causal attention restricted to tokens [lo, hi)
+        qd, kd, vd = (t[lo:hi].transpose(0, 1) for t in (q, k.repeat_interleave(2, 1), v.repeat_interleave(2, 1)))
+        return torch.nn.functional.scaled_dot_product_attention(qd, kd, vd, is_causal=True).transpose(0, 1)
+
+    for lo, hi in [(0, 3), (3, 5), (5, 6), (6, 7), (7, 8)]:
+        torch.testing.assert_close(out[lo:hi], reference(lo, hi))
+    with pytest.raises(NotImplementedError, match="out_transform"):
+        TPUVarlenAttention()(q, k, v, positions=positions, out_transform=lambda o, lse: o)
 
 
 def test_splash_block_size_for():
@@ -163,14 +144,11 @@ def test_splash_block_size_for():
     assert splash_block_size_for(64) == 0
 
 
-def test_apply_splash_attention_tpu_and_cpu_fallback():
+def test_install_tpu_attention_splash_with_dense_cpu_fallback():
     class _DummyInnerAttn(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.window_size = (256, 0)
-
-        def forward(self, q, k, v, **kwargs):
-            return q + k + v
 
     class _DummyAttnBlock(torch.nn.Module):
         def __init__(self):
@@ -178,36 +156,20 @@ def test_apply_splash_attention_tpu_and_cpu_fallback():
             self.inner_attention = _DummyInnerAttn()
 
     model = torch.nn.Sequential(_DummyAttnBlock(), _DummyAttnBlock())
-    with mock.patch.dict(sys.modules, _fake_torchtitan_modules()):
-        assert apply_splash_attention_tpu([model]) == 2
-        assert isinstance(model[0].inner_attention, TPUSplashAttention)
-        assert model[0].inner_attention.local_window_size == 256
-        # Idempotent on repeated calls (e.g. __init__ followed by initialize)
-        assert apply_splash_attention_tpu([model]) == 0
-
-    q = torch.ones(256, 2, 4)
-    out = model[0].inner_attention(q, q, q)
-    assert out.shape == (256, 2, 4)
-    assert torch.allclose(out, q * 3)
-
-
-def test_apply_splash_attention_tpu_falls_back_to_tpu_varlen_attention_for_varlen():
-    fake_modules = _fake_torchtitan_modules()
-    VarlenInnerAttention = fake_modules["torchtitan.models.common.attention"].VarlenInnerAttention
-
-    class _AttnBlock(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.inner_attention = VarlenInnerAttention()
-
-    model = torch.nn.Sequential(_AttnBlock())
-    with mock.patch.dict(sys.modules, fake_modules):
-        assert apply_splash_attention_tpu([model]) == 1
+    assert install_tpu_attention([model], use_splash=True) == 2
     splash = model[0].inner_attention
     assert isinstance(splash, TPUSplashAttention)
-    # torchtitan's VarlenInnerAttention needs the CUDA flash-attention varlen op; TPU falls back to dense SDPA.
-    assert isinstance(splash.original_module, TPUVarlenAttention)
-    assert splash.local_window_size is None
+    assert splash.local_window_size == 256
+    assert isinstance(splash.fallback, TPUVarlenAttention) and splash.fallback.local_window_size == 256
+    assert install_tpu_attention([model], use_splash=True) == 0  # already installed
+
+    # On CPU the splash module runs its dense fallback.
+    q = torch.randn(256, 2, 4)
+    positions = torch.cat([torch.arange(100), torch.arange(156)])
+    torch.testing.assert_close(splash(q, q, q, positions=positions), splash.fallback(q, q, q, positions=positions))
+
+    with pytest.raises(ValueError, match="inner_attention"):
+        install_tpu_attention([torch.nn.Linear(2, 2)], use_splash=True)
 
 
 def test_configure_torch_compile_for_tpu():
@@ -253,18 +215,16 @@ def test_resolve_tpu_torchtitan_options_and_config_extension():
         resolve_tpu_torchtitan_options(cfg_tp)
 
 
-def test_replace_varlen_attention_with_tpu_attention():
+def test_install_tpu_attention_dense():
     class _DummyAttnBlock(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.inner_attention = torch.nn.Identity()
 
     model = torch.nn.Sequential(_DummyAttnBlock(), _DummyAttnBlock())
-    assert replace_varlen_attention_with_tpu_attention([model]) == 2
-    assert isinstance(model[0].inner_attention, TPUVarlenAttention)
-    assert isinstance(model[1].inner_attention, TPUVarlenAttention)
-    # Idempotent when called a second time
-    assert replace_varlen_attention_with_tpu_attention([model]) == 0
+    assert install_tpu_attention([model], use_splash=False) == 2
+    assert all(isinstance(block.inner_attention, TPUVarlenAttention) for block in model)
+    assert install_tpu_attention([model], use_splash=False) == 0
 
 
 def test_resolve_tpu_topology_bounds_multi_host():
@@ -602,3 +562,141 @@ def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
     root = SimpleNamespace(modules=lambda: [torch.nn.Linear(2, 2), fsdp_child])
     enable_fsdp_gradient_division(root, 4)
     fsdp_child.set_gradient_divide_factor.assert_called_once_with(4.0)
+
+
+def test_fused_linear_cross_entropy_tpu_and_logprobs():
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+        fused_linear_logprobs_tpu,
+        resolve_tpu_use_fused_linear_cross_entropy,
+    )
+
+    class _FakeFusedLossLinearWrapper(torch.nn.Linear):
+        def forward(self, x: torch.Tensor):
+            return x, self.weight.t()
+
+    seen_calls = []
+
+    def _fake_kernel(hidden_2d, labels_1d, weight_hv, *, reduction="sum", **kwargs):
+        seen_calls.append((hidden_2d.shape, labels_1d.shape, weight_hv.shape, reduction))
+        return torch.full((hidden_2d.shape[0],), 0.5, dtype=torch.float32)
+
+    fake_loss_mod = types.ModuleType("torchtitan.experiments.tpu.kernels.linear_softmax_cross_entropy_loss")
+    fake_loss_mod.linear_softmax_cross_entropy_loss = _fake_kernel
+    fake_loss_mod._verl_reduction_none_patched = True
+    fake_sys_modules = {
+        "torchtitan": types.ModuleType("torchtitan"),
+        "torchtitan.experiments": types.ModuleType("torchtitan.experiments"),
+        "torchtitan.experiments.tpu": types.ModuleType("torchtitan.experiments.tpu"),
+        "torchtitan.experiments.tpu.kernels": types.ModuleType("torchtitan.experiments.tpu.kernels"),
+        "torchtitan.experiments.tpu.kernels.linear_softmax_cross_entropy_loss": fake_loss_mod,
+    }
+    fake_sys_modules["torchtitan"].experiments = fake_sys_modules["torchtitan.experiments"]  # type: ignore[attr-defined]
+    fake_sys_modules["torchtitan.experiments"].tpu = fake_sys_modules["torchtitan.experiments.tpu"]  # type: ignore[attr-defined]
+    fake_sys_modules["torchtitan.experiments.tpu"].kernels = fake_sys_modules["torchtitan.experiments.tpu.kernels"]  # type: ignore[attr-defined]
+    fake_sys_modules["torchtitan.experiments.tpu"].kernels.linear_softmax_cross_entropy_loss = fake_loss_mod  # type: ignore[attr-defined]
+
+    with mock.patch.dict(sys.modules, fake_sys_modules):
+        lm_head = _FakeFusedLossLinearWrapper(16, 32, bias=False)
+        x = torch.randn(2, 5, 16)
+        out_fused = lm_head(x)
+        assert isinstance(out_fused, tuple) and len(out_fused) == 2
+        assert out_fused[0] is x
+        assert out_fused[1].shape == (16, 32)
+        assert (
+            resolve_tpu_use_fused_linear_cross_entropy(
+                SimpleNamespace(use_fused_linear_cross_entropy=None, use_torch_compile=True)
+            )
+            is True
+        )
+        assert (
+            resolve_tpu_use_fused_linear_cross_entropy(
+                SimpleNamespace(use_fused_linear_cross_entropy=False, use_torch_compile=True)
+            )
+            is False
+        )
+        labels = torch.randint(0, 32, (2, 5))
+        logprobs = fused_linear_logprobs_tpu(out_fused[0], labels, out_fused[1])
+        assert logprobs.shape == (10,)
+        assert torch.allclose(logprobs, torch.full((10,), -0.5))
+        # Kernel receives B padded to a multiple of 1024 with reduction="none"
+        assert seen_calls == [(torch.Size([1024, 16]), torch.Size([1024]), torch.Size([16, 32]), "none")]
+
+
+@pytest.mark.parametrize("calculate_entropy", [False, True])
+def test_prepare_model_outputs_takes_log_probs_from_the_fused_kernel_on_every_pass(calculate_entropy):
+    """With the fused LM head, log-probs come from the fused kernel also when entropy is requested.
+
+    The reference, old-log-prob (entropy) and update passes then compute log-probs the same way, so an on-policy
+    PPO ratio is exactly 1. Entropy is taken from the logits in fp32, as on GPU.
+    """
+    import verl.utils.torch_functional as verl_F
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+
+    seq_lens, hidden_dim, vocab = [3, 5], 4, 6
+    total = sum(seq_lens)
+    hidden = torch.randn(1, total, hidden_dim)
+    weight_t = torch.randn(hidden_dim, vocab)
+    labels = torch.randint(0, vocab, (1, total))
+    fused_values = torch.full((total,), -0.25)
+
+    engine = object.__new__(torchtitan_tpu.TorchTitanTPUEngineWithLMHead)
+    engine.parallel_dims = SimpleNamespace(tp_enabled=False)
+    engine.engine_config = SimpleNamespace(entropy_checkpointing=False, entropy_from_logits_with_chunking=False)
+    engine.compute_entropy_from_logits = verl_F.entropy_from_logits
+
+    micro_batch = TensorDict(
+        {
+            "input_ids": torch.nested.as_nested_tensor(
+                [torch.zeros(n, dtype=torch.int64) for n in seq_lens], layout=torch.jagged
+            )
+        },
+        batch_size=[len(seq_lens)],
+    )
+    tu.assign_non_tensor(micro_batch, use_remove_padding=True, calculate_entropy=calculate_entropy, temperature=1.0)
+
+    with mock.patch.object(torchtitan_tpu, "fused_linear_logprobs_tpu", return_value=fused_values) as fused:
+        output = engine.prepare_model_outputs((hidden, weight_t), {"labels": labels}, micro_batch)
+
+    fused.assert_called_once()
+    torch.testing.assert_close(output["log_probs"].values(), fused_values)
+    if calculate_entropy:
+        expected_entropy = verl_F.entropy_from_logits((hidden.squeeze(0) @ weight_t).float())
+        torch.testing.assert_close(output["entropy"].values(), expected_entropy)
+    else:
+        assert "entropy" not in output
+
+
+def test_offload_and_reload_tpu_model_reuses_cached_cpu_copy_for_frozen_models(tmp_path):
+    import torch.distributed as dist
+    from torch.distributed.tensor import DTensor, Shard, init_device_mesh
+
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import move_tpu_params_
+
+    owns_group = not dist.is_initialized()
+    if owns_group:
+        dist.init_process_group("gloo", init_method=f"file://{tmp_path}/pg", rank=0, world_size=1)
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        model = torch.nn.Linear(4, 3, bias=False)
+        local = model.weight.detach().clone()
+        model.weight = torch.nn.Parameter(DTensor.from_local(local, mesh, [Shard(0)]), requires_grad=False)
+        weight = model.weight
+
+        # First offload of a frozen model caches the host shard on the parameter.
+        move_tpu_params_(model, "cpu", cache_cpu_copy=True)
+        cached = weight._tpu_cpu_offload_tensor
+        assert weight._local_tensor is cached
+
+        # "meta" stands in for the TPU: the reload swaps the local shard in place, keeping the DTensor and its mesh.
+        move_tpu_params_(model, "meta")
+        assert model.weight is weight
+        assert weight._local_tensor.device.type == "meta"
+        assert weight.device_mesh is mesh
+
+        # Offloading again reuses the cached host shard (a device-to-host copy from "meta" would raise).
+        move_tpu_params_(model, "cpu", cache_cpu_copy=True)
+        assert weight._local_tensor is cached
+        assert torch.equal(weight._local_tensor, local)
+    finally:
+        if owns_group:
+            dist.destroy_process_group()

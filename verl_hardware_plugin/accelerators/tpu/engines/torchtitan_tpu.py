@@ -13,7 +13,8 @@ decoupled from core verl's GPU TorchTitan engine:
 - ``TPUSplashAttention`` Pallas kernel for packed-document causal attention without dense 4D masks
 - ``SimpleFSDP`` DTensor parameter sharding with ``spmd_safe`` compiled TransformerBlocks and cross-rank shape alignment
 - ``DEFER_AND_FUSE`` eager execution mode for ops outside compiled blocks
-- ``OptimizersContainer.Config(implementation="foreach")`` and ``foreach=False`` grad norm clipping
+- ``OptimizersContainer.Config(implementation="fused")`` (``VERL_TPU_OPTIM_IMPL`` overrides) and ``foreach=False``
+  grad norm clipping
 - Host-side global token counting (avoiding eager device collectives inside the XLA SPMD trace)
 - Graph-break loss synchronization between forward and backward
 - Sequence-length bucketing for both packed (``use_remove_padding=True``) and padded inputs
@@ -23,6 +24,7 @@ decoupled from core verl's GPU TorchTitan engine:
 from __future__ import annotations
 
 import dataclasses
+import gc
 import importlib
 import logging
 import os
@@ -35,7 +37,6 @@ import torch.distributed
 from tensordict import TensorDict
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.experimental._context_parallel._load_balancer import _HeadTailLoadBalancer
 
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
@@ -44,13 +45,11 @@ from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import (
-    load_fsdp_model_to_gpu,
     load_fsdp_optimizer,
-    offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
 )
 from verl.utils.model import extract_multi_modal_inputs
-from verl.utils.torch_functional import logprobs_from_logits, logprobs_from_logits_naive
+from verl.utils.torch_functional import logprobs_from_logits_naive
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
 from verl.workers.engine.utils import (
@@ -61,55 +60,41 @@ from verl.workers.engine.utils import (
 )
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
-    ContextParallelGather,
     align_micro_batch_shapes_across_ranks,
-    apply_splash_attention_tpu,
     bucket_length,
     compute_global_batch_num_tokens,
     configure_torch_compile_for_tpu,
     create_noop_dataloader_config,
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
-    extend_torchtitan_engine_config,
+    fused_linear_logprobs_tpu,
     get_tpu_seq_bucket_size,
     get_tpu_simple_fsdp_parallelize_fn,
+    install_tpu_attention,
+    move_tpu_params_,
     pad_packed_inputs_for_tpu,
     prepare_tpu_loss_inputs,
-    replace_varlen_attention_with_tpu_attention,
     resolve_tpu_torchtitan_options,
+    resolve_tpu_use_fused_linear_cross_entropy,
     tpu_eager_mode_context,
     tpu_synchronize,
     unwrap_metadata,
 )
 
-extend_torchtitan_engine_config()
-
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-def _hf_entry_row_slots(name, spec, place, lidx, lval):
-    """Dim-0 identity slot profile: slot ``e`` IS ``full[e]``, so a position's slot is one divmod away."""
-    from verl.workers.engine.spec import translate_flat_indices
-    from verl.workers.engine.utils import _prodshape
+def _to_jagged(padded: torch.Tensor, cu_seqlens: torch.Tensor, orig_seq_len: Optional[int]) -> torch.Tensor:
+    """Jagged view of a per-token output; for bucket-padded outputs a CPU view that carries the padded device tensor.
 
-    slots = spec.hf_slots
-    n_slots = len(slots)
-    rows = int(spec.full_shape[0])
-    assert n_slots == rows, (
-        f"{name}: dim-0 identity slots need one slot per dim-0 row, got {n_slots} slots for {rows} rows; "
-        "a converter that emits several HF tensors per row belongs on the to_hf_chunk path"
-    )
-    dtype_str = str(lval.dtype).replace("torch.", "")
-    if lidx.numel() == 0:
-        return slots, dtype_str, torch.zeros(n_slots, dtype=torch.int64), lidx.to(torch.int32), lval
-
-    row_numel = max(_prodshape(spec.full_shape[1:]), 1)
-    gidx = translate_flat_indices(lidx, place)
-    edges = torch.arange(n_slots + 1, device=gidx.device, dtype=gidx.dtype) * row_numel
-    # One D2H for the run lengths; the diff's nonzero already synced this stream.
-    counts = torch.searchsorted(gidx, edges).diff().cpu()
-    return slots, dtype_str, counts, (gidx % row_numel).to(torch.int32), lval
+    The loss reads the fixed-shape device tensor (``TPU_PADDED_VALUES_ATTR``), so no new XLA shape per micro-batch.
+    """
+    if orig_seq_len is None:
+        return torch.nested.nested_tensor_from_jagged(padded, cu_seqlens)
+    jagged = torch.nested.nested_tensor_from_jagged(padded.detach().cpu()[:orig_seq_len], cu_seqlens.detach().cpu())
+    setattr(jagged, TPU_PADDED_VALUES_ATTR, padded)
+    return jagged
 
 
 class TPUEngineEvalModeCtx(BaseEngineCtx):
@@ -190,6 +175,8 @@ class TorchTitanTPUEngine(BaseEngine):
         self.optimizer_config = optimizer_config
         self.checkpoint_config = checkpoint_config
 
+        if engine_config.context_parallel_size > 1:
+            raise NotImplementedError("context parallelism is not supported by the TPU TorchTitan engine")
         if engine_config.tensor_parallel_size > 1:
             logger.warning(
                 "tensor_parallel_size=%d is not properly tested on TPU; try "
@@ -202,6 +189,7 @@ class TorchTitanTPUEngine(BaseEngine):
             self._use_simple_fsdp,
             self._tpu_eager_mode,
         ) = resolve_tpu_torchtitan_options(engine_config)
+        self._use_fused_linear_cross_entropy = resolve_tpu_use_fused_linear_cross_entropy(engine_config)
 
         if engine_config.use_torch_compile:
             configure_torch_compile_for_tpu()
@@ -222,8 +210,11 @@ class TorchTitanTPUEngine(BaseEngine):
                 parallelize_fn=get_tpu_simple_fsdp_parallelize_fn(torchtitan_name),
             )
 
+        # torch_tpu's aten::_fused_adamw_ updates params, exp_avg and exp_avg_sq in place (buffer donation): no
+        # param-sized temporary as in the foreach path (+4.2 GB/chip for Qwen3-4B at FSDP=4) and ~2x faster.
+        optim_impl = os.environ.get("VERL_TPU_OPTIM_IMPL", "fused")
         optimizer = OptimizersContainer.Config(
-            implementation="foreach",
+            implementation=optim_impl,
             param_groups=[
                 ParamGroupConfig(
                     pattern=r".*",
@@ -259,11 +250,9 @@ class TorchTitanTPUEngine(BaseEngine):
             spmd_backend=self.engine_config.spmd_backend,
             use_simple_fsdp=self._use_simple_fsdp,
         )
+        # interval=1: save whenever verl calls save_checkpoint (TorchTitan's default 500 skips the other steps).
         checkpoint = CheckpointManager.Config(
-            enable=True,
-            initial_load_in_hf=True,
-            initial_load_model_only=True,
-            initial_load_path=model_config.path,
+            enable=True, interval=1, initial_load_in_hf=True, initial_load_path=model_config.path
         )
         compile_config = CompileConfig(enable=self.engine_config.use_torch_compile, backend="tpu")
 
@@ -272,7 +261,12 @@ class TorchTitanTPUEngine(BaseEngine):
         training_kwargs: dict[str, Any] = {
             "enable_cpu_offload": False,
             "disable_cuda_graphs": True,
+            "max_norm": self.optimizer_config.clip_grad,
         }
+        if self.engine_config.forward_only:
+            engine_dtype = getattr(self.engine_config, "dtype", "bfloat16")
+            if engine_dtype in ("bfloat16", "float32"):
+                training_kwargs["dtype"] = engine_dtype
         if self.engine_config.max_seq_len is not None:
             training_kwargs["max_context_length"] = self.engine_config.max_seq_len
         training = TrainingConfig(**training_kwargs)
@@ -312,25 +306,29 @@ class TorchTitanTPUEngine(BaseEngine):
             # verl uses its own loss function and ignores this one.
             loss=CrossEntropyLoss.Config(),
         )
-        self.trainer = Trainer(self.config)
+        if self._use_fused_linear_cross_entropy:
+            from torchtitan.experiments.tpu.qwen3.config_registry import _FUSED_LOSS_OVERRIDE
 
-        self._init_device_mesh()
+            if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
+                self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+        self.trainer = Trainer(self.config)
+        self.parallel_dims = self.trainer.parallel_dims
+        # Like torchtitan's init_distributed (which verl bypasses): no autograd multithreading, so backward-thread
+        # activation-checkpoint recompute can access the thread-local SPMD mesh / process groups.
+        torch.autograd.set_multithreading_enabled(False)
 
         # Re-enable FSDP's gradient division for verl's loss scaling.
         # TorchTitan disables gradient division by default (for global token normalization),
         # but verl's loss function multiplies by dp_size to compensate for gradient averaging.
-        model_parts = getattr(self.trainer, "model_parts", None)
-        if self.engine_config.data_parallel_shard_size > 1 and model_parts is not None:
+        model_parts = self.trainer.model_parts
+        if self.engine_config.data_parallel_shard_size > 1:
             dp_size = self.get_data_parallel_size()
             for model_part in model_parts:
                 enable_fsdp_gradient_division(model_part, dp_size)
 
-        if self._use_splash_attention:
-            apply_splash_attention_tpu(model_parts)
-        else:
-            replace_varlen_attention_with_tpu_attention(model_parts)
+        install_tpu_attention(model_parts, use_splash=self._use_splash_attention)
 
-        if engine_config.use_torch_compile and model_parts is not None:
+        if engine_config.use_torch_compile:
             n_compiled = sum(
                 getattr(m, "_compiled_call_impl", None) is not None
                 for part in model_parts
@@ -342,7 +340,8 @@ class TorchTitanTPUEngine(BaseEngine):
         if self.engine_config.full_determinism:
             enable_full_determinism(seed=self.engine_config.seed)
 
-        # set FSDP offload params
+        # set FSDP offload params. ``ref.torchtitan.param_offload=True`` keeps the frozen reference model in host
+        # memory outside compute_ref_log_prob: frees its bf16 shard of HBM, costs one host-to-TPU copy per step.
         self._is_offload_param = self.engine_config.param_offload
         self._is_offload_optimizer = self.engine_config.optimizer_offload
         self._simple_fsdp_loss_scale = 1.0 / self.get_data_parallel_size() if self._use_simple_fsdp else None
@@ -394,37 +393,11 @@ class TorchTitanTPUEngine(BaseEngine):
             is_collect = is_collect and (cp_mesh.get_local_rank() == 0)
         return is_collect
 
-    def _init_device_mesh(self):
-        """Initialize the device mesh for TorchTitan parallelism."""
-        from torchtitan.distributed.parallel_dims import ParallelDims
-
-        world_size = torch.distributed.get_world_size()
-        self.parallel_dims = ParallelDims(
-            dp_shard=self.engine_config.data_parallel_shard_size,
-            dp_replicate=self.engine_config.data_parallel_replicate_size,
-            cp=self.engine_config.context_parallel_size,
-            tp=self.engine_config.tensor_parallel_size,
-            pp=self.engine_config.pipeline_parallel_size,
-            ep=self.engine_config.expert_parallel_size,
-            world_size=world_size,
-        )
-        self.device_mesh = self.parallel_dims.build_mesh()
-
-        # Mirror torchtitan's init_distributed (which verl bypasses): disable autograd
-        # multithreading so backward-thread activation-checkpoint recompute can access the
-        # thread-local SPMD mesh / process groups (e.g. current_spmd_mesh().get_group(...)).
-        torch.autograd.set_multithreading_enabled(False)
-
     def _drop_checkpoint_state_dict_cache(self) -> None:
-        """Free torchtitan ``ModelWrapper.cached_state_dict`` after initial HF load."""
-        try:
-            from torchtitan.components.checkpointer import MODEL
+        """Free torchtitan ``ModelWrapper.cached_state_dict`` after the initial HF load."""
+        from torchtitan.components.checkpointer import MODEL
 
-            wrapper = getattr(self.checkpointer, "states", {}).get(MODEL)
-            if wrapper is not None and hasattr(wrapper, "cached_state_dict"):
-                wrapper.cached_state_dict = {}
-        except Exception:
-            pass
+        self.checkpointer.states[MODEL].cached_state_dict = {}
 
     def initialize(self):
         """Initialize model/checkpointer and release unused optimizer state on forward-only reference workers."""
@@ -432,6 +405,7 @@ class TorchTitanTPUEngine(BaseEngine):
         self.checkpointer = self.trainer.checkpointer
         # load initial HF weights
         self.checkpointer.load()
+        tpu_synchronize(wait=True)
 
         if not self.engine_config.forward_only:
             self.optimizer = self.trainer.optimizers
@@ -439,8 +413,6 @@ class TorchTitanTPUEngine(BaseEngine):
         else:
             self.optimizer = None
             self.lr_scheduler = None
-            self.trainer.optimizers = None
-            self.trainer.lr_schedulers = None
 
         self.to(
             device="cpu",
@@ -450,10 +422,6 @@ class TorchTitanTPUEngine(BaseEngine):
         )
 
         self._drop_checkpoint_state_dict_cache()
-        if self._use_splash_attention:
-            apply_splash_attention_tpu(self.module)
-        else:
-            replace_varlen_attention_with_tpu_attention(self.module)
 
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
 
@@ -494,19 +462,6 @@ class TorchTitanTPUEngine(BaseEngine):
     def _get_data_parallel_mesh(self):
         """Data-parallel mesh (dp_replicate x dp_shard). Excludes cp: CP ranks share the same samples."""
         return self.parallel_dims.get_optional_mesh("batch")
-
-    def _gather_context_parallel(self, tensor: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """All-gather a per-token tensor sharded along dim 0 by CP and restore the original token order."""
-        load_balancer_type = self.trainer.config.parallelism.context_parallel_load_balancer
-        load_balancer = None
-        if load_balancer_type == "headtail":
-            load_balancer = _HeadTailLoadBalancer(seq_len, self.parallel_dims.cp, tensor.device)
-        elif load_balancer_type is not None:
-            raise NotImplementedError(f"context_parallel_load_balancer={load_balancer_type!r} is not supported")
-        gathered = ContextParallelGather.apply(tensor, self.get_context_parallel_group())
-        if load_balancer is not None:
-            gathered = gathered[load_balancer._generate_indices(restore=True)[0]]
-        return gathered
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only: bool = False):
         """Perform forward and optionally backward pass with host-side token counting and XLA graph break."""
@@ -568,6 +523,8 @@ class TorchTitanTPUEngine(BaseEngine):
         # Non-PP forward. train_context (SPMD mesh) is set by the caller.
         assert len(model_parts) == 1
         pred = model_parts[0](inputs, **(extra_inputs or {}), **(extra_kwargs or {}))
+        if isinstance(pred, tuple):
+            return tuple(p.full_tensor() if isinstance(p, DTensor) else p for p in pred)
         if isinstance(pred, DTensor):
             pred = pred.full_tensor()
         return pred
@@ -610,25 +567,29 @@ class TorchTitanTPUEngine(BaseEngine):
         """Move model and/or optimizer to CPU or accelerator."""
         super().to(device=device, model=model, optimizer=optimizer, grad=grad)
 
-        if self.engine_config.forward_only:
-            return
-
         device_name = get_device_name()
         assert device in (device_name, "cpu")
-        if device == device_name:
-            if model:
-                for module in self.module:
-                    load_fsdp_model_to_gpu(module)
-            if optimizer and self.optimizer is not None:
-                load_fsdp_optimizer(self.optimizer, device)
-        elif device == "cpu":
-            if model:
-                for module in self.module:
-                    offload_fsdp_model_to_cpu(module)
-            if optimizer and self.optimizer is not None:
-                offload_fsdp_optimizer(self.optimizer)
-        else:
-            raise ValueError(f"Invalid device type: {device}")
+        with tpu_eager_mode_context(self._tpu_eager_mode):
+            if device == device_name:
+                target_device = torch.device(f"{device_name}:{get_device_id()}")
+                if model:
+                    for module in self.module:
+                        move_tpu_params_(module, target_device, include_grad=grad)
+                if not self.engine_config.forward_only and optimizer and self.optimizer is not None:
+                    load_fsdp_optimizer(self.optimizer, target_device)
+            elif device == "cpu":
+                if model:
+                    for module in self.module:
+                        move_tpu_params_(
+                            module, "cpu", cache_cpu_copy=bool(self.engine_config.forward_only), include_grad=grad
+                        )
+                if not self.engine_config.forward_only and optimizer and self.optimizer is not None:
+                    offload_fsdp_optimizer(self.optimizer)
+                if model or optimizer:
+                    gc.collect()
+                    tpu_synchronize(wait=True)
+            else:
+                raise ValueError(f"Invalid device type: {device}")
 
     def save_checkpoint(
         self,
@@ -640,8 +601,7 @@ class TorchTitanTPUEngine(BaseEngine):
     ) -> None:
         """Save checkpoint."""
         if self._is_offload_param:
-            for module in self.module:
-                load_fsdp_model_to_gpu(module)
+            self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
 
         # Override TorchTitan's folder to use verl's path
         parent_dir = os.path.dirname(local_path)
@@ -654,16 +614,14 @@ class TorchTitanTPUEngine(BaseEngine):
 
         torch.distributed.barrier()
         if self._is_offload_param:
-            for module in self.module:
-                offload_fsdp_model_to_cpu(module)
+            self.to(device="cpu", model=True, optimizer=False, grad=False)
 
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
     ) -> None:
         """Load checkpoint."""
         if self._is_offload_param:
-            for module in self.module:
-                load_fsdp_model_to_gpu(module)
+            self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
 
         # Override TorchTitan's folder to use verl's path
         parent_dir = os.path.dirname(local_path)
@@ -677,13 +635,17 @@ class TorchTitanTPUEngine(BaseEngine):
         else:
             # Fallback to latest
             self.checkpointer.load(step=-1)
+        for module in self.module:
+            for p in module.parameters():
+                if hasattr(p, "_tpu_cpu_offload_tensor"):
+                    delattr(p, "_tpu_cpu_offload_tensor")
+        tpu_synchronize(wait=True)
 
         torch.distributed.barrier()
         if self._is_offload_param:
-            for module in self.module:
-                offload_fsdp_model_to_cpu(module)
+            self.to(device="cpu", model=True, optimizer=False, grad=False)
 
-        if self._is_offload_optimizer:
+        if self._is_offload_optimizer and self.optimizer is not None:
             offload_fsdp_optimizer(self.optimizer)
 
     def _to_hf_named_params(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -718,86 +680,17 @@ class TorchTitanTPUEngine(BaseEngine):
         slot_shape = tuple(int(d) for d in param.shape[1:])
         return [(hf_template.format(layer_id, e), slot_shape) for e in range(int(param.shape[0]))]
 
-    def _hf_delta_entry(self, name, spec, place, lidx, lval):
-        """Build one parameter's final HF-coordinate delta entry: expert stack via slots, else identity."""
-        from verl.workers.engine.utils import _hf_entry_identity
-
-        if spec.hf_slots is not None:
-            return _hf_entry_row_slots(name, spec, place, lidx, lval)
-        assert spec.to_hf_chunk is None, (
-            f"{name}: the torchtitan engine has no opaque to-HF converters; "
-            "a spec carrying one did not come from this engine"
-        )
-        return _hf_entry_identity(name, spec, place, lidx, lval)
-
-    def get_per_tensor_param_delta_shard(self, **kwargs):
-        """Yield FINAL HF-coordinate delta entries per parameter; needs a prior :meth:`prime_delta_snapshots`."""
-        from verl.workers.engine.utils import hf_delta_export
-
-        self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
-        gen, _ = self.get_per_tensor_param_shard()
-        return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
-
-    def _assert_shard_export_supported(self) -> None:
-        """Reject PP, the one layout whose local shard is not a block; every FSDP2 layout is one."""
-        pd = self.parallel_dims
-        if pd.pp_enabled:
-            raise NotImplementedError(
-                "the torchtitan sharded delta export does not support pipeline parallelism: "
-                "each stage holds a disjoint slice of the model, so the export order is not "
-                "identical across ranks the way the delta engine's lockstep gather requires "
-                f"(pipeline_parallel_size={pd.pp})"
-            )
-
-    def get_per_tensor_param_shard(self, **kwargs):
-        """Yield this rank's *local* shard ``(hf_name, local_flat_bf16, ShardSpec)`` instead of the full tensor."""
-        self._assert_shard_export_supported()
-        raw = {}
-        for module in self.module:
-            raw.update(module.state_dict())
-
-        # Expert stacks go WHOLE with a slot table; to_hf would name only the local experts, breaking lockstep.
-        stacks = {}
-        for name, param in raw.items():
-            slots = self._expert_stack_slots(name, param)
-            if slots is not None:
-                stacks[name] = slots
-        params = self._to_hf_named_params({k: v for k, v in raw.items() if k not in stacks})
-        device = get_device_id()  # local shards live on CPU under an offload policy
-
-        from verl.workers.engine.spec import ShardSpec
-
-        def _shard(param):
-            p = param.to(device, non_blocking=True)
-            # The wire speaks bf16, but mixed precision keeps fp32 masters: cast before the diff sees them.
-            if p.is_floating_point():
-                p = p.to(torch.bfloat16, non_blocking=True)
-            local = p.to_local() if isinstance(p, DTensor) else p
-            return local.reshape(-1)
-
-        def _gen():
-            for name, param in params.items():
-                yield name, _shard(param), ShardSpec.from_param(param)
-            # Keyed by the torchtitan name: the entry is the stack, not any one HF tensor.
-            for name, slots in stacks.items():
-                spec = ShardSpec.from_param(raw[name])
-                spec.hf_slots = slots
-                yield name, _shard(raw[name]), spec
-
-        return _gen(), None
-
     def get_per_tensor_param(self, **kwargs):
         """Yield HF-named parameters cast to ``bfloat16`` before ``DTensor.full_tensor()`` all-gather."""
-        for module in self.module:
-            load_fsdp_model_to_gpu(module)
+        if self._is_offload_param:
+            self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
 
         params = {}
         for module in self.module:
             params.update(module.state_dict())
 
         if self._is_offload_param:
-            for module in self.module:
-                offload_fsdp_model_to_cpu(module)
+            self.to(device="cpu", model=True, optimizer=False, grad=False)
 
         stacks = {}
         for name, param in params.items():
@@ -811,11 +704,22 @@ class TorchTitanTPUEngine(BaseEngine):
         device = get_device_id()
 
         def _gen():
-            for name, param in dense.items():
+            gathered_tied: dict[int, torch.Tensor] = {}
+            for name in list(dense.keys()):
+                param = dense.pop(name)
                 if isinstance(param, DTensor):
-                    yield name, param.to(device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
+                    pid = id(param)
+                    full = gathered_tied.get(pid)
+                    if full is None:
+                        full = param.to(device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
+                        if name in ("model.embed_tokens.weight", "lm_head.weight"):
+                            gathered_tied[pid] = full
+                    yield name, full
+                    del full
                 else:
                     yield name, param.to(torch.bfloat16, non_blocking=True)
+                del param
+            gathered_tied.clear()
             for stack, slots in expert_stacks:
                 full = stack.to(device, non_blocking=True)
                 if isinstance(full, DTensor):
@@ -854,17 +758,15 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
         bucket_size = get_tpu_seq_bucket_size(self.engine_config)
         if use_remove_padding:
-            input_ids, position_ids, labels, attention_mask, orig_seq_len = pad_packed_inputs_for_tpu(
+            input_ids, position_ids, labels, orig_seq_len = pad_packed_inputs_for_tpu(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 micro_batch=micro_batch,
                 device=get_device_id(),
-                build_attention_mask=not self._use_splash_attention,
                 bucket_size=bucket_size,
             )
             output_args["orig_seq_len"] = orig_seq_len
         else:
-            loss_mask = micro_batch["loss_mask"]
             pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
             batch_size = micro_batch.batch_size[0]
             max_seq_len = bucket_length(int(max(input_ids.offsets().diff())), bucket_size=bucket_size)
@@ -889,48 +791,14 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                     .reshape(-1)
                     .to(get_device_id())
                 )
-
-            attention_mask_list = [torch.ones_like(t, dtype=torch.int32) for t in loss_mask]
-            attention_mask = torch.nested.as_nested_tensor(attention_mask_list, layout=torch.jagged)
-            attention_mask = torch.nested.to_padded_tensor(
-                attention_mask, padding=0, output_size=(batch_size, max_seq_len)
-            ).to(get_device_id())
             output_args["batch_size"] = batch_size
             output_args["max_seq_len"] = max_seq_len
 
-        extra_inputs = {"positions": position_ids}
-        extra_kwargs = {"attention_masks": attention_mask}
-
-        if self.parallel_dims.cp_enabled:
-            from torchtitan.distributed.context_parallel import prepare_context_parallel_input
-
-            cp_batch = {
-                "input": input_ids,
-                "labels": labels,
-                "positions": extra_inputs["positions"],
-                **extra_kwargs,
-            }
-            prepare_context_parallel_input(
-                cp_batch,
-                None,
-                self.parallel_dims.get_mesh("cp"),
-                self.trainer.config.parallelism.context_parallel_load_balancer,
-                self.trainer.config.parallelism.context_parallel_ptrr_mask_key,
-            )
-            input_ids = cp_batch.pop("input")
-            labels = cp_batch.pop("labels")
-            extra_inputs["positions"] = cp_batch.pop("positions")
-            extra_kwargs = cp_batch
-
-        extra_inputs.update(multi_modal_inputs)
-        output_args["labels"] = labels
-
-        # Ensure all model inputs and kwargs are contiguous on TPU.
-        input_ids = input_ids.contiguous()
+        # Rows restart at position 0, so attention derives document (and row) boundaries from the positions.
+        extra_inputs = {"positions": position_ids, **multi_modal_inputs}
         extra_inputs = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_inputs.items()}
-        extra_kwargs = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_kwargs.items()}
-
-        return input_ids, extra_inputs, extra_kwargs, output_args
+        output_args["labels"] = labels
+        return input_ids.contiguous(), extra_inputs, {}, output_args
 
     def prepare_model_outputs(self, logits: torch.Tensor, output_args: dict, micro_batch: TensorDict):
         """Convert TPU model logits into jagged log_probs/entropy while retaining bucket-padded device buffers."""
@@ -951,20 +819,38 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
         input_ids = micro_batch["input_ids"]
         cu_seqlens = input_ids.offsets()
+        fused_log_probs = None
+        if isinstance(logits, tuple):
+            hidden_states, lm_head_weight_t = logits
+            if use_remove_padding and not self.parallel_dims.tp_enabled:
+                if labels.dim() > 1:
+                    labels = labels.squeeze(0)
+                hidden_rmpad = hidden_states.squeeze(0) if hidden_states.dim() > 2 else hidden_states
+                fused_log_probs = fused_linear_logprobs_tpu(
+                    hidden_rmpad,
+                    labels,
+                    lm_head_weight_t,
+                    temperature=temperature,
+                )
+                if not calculate_entropy:
+                    model_output["log_probs"] = _to_jagged(fused_log_probs, cu_seqlens, output_args.get("orig_seq_len"))
+                    return model_output
+            # Entropy needs the logits. The log-probs still come from the fused kernel, so the reference, old-log-prob
+            # and update passes all compute them the same way (an on-policy PPO ratio is exactly 1).
+            logits = hidden_states @ lm_head_weight_t
+
         if use_remove_padding:
             if labels.dim() > 1:
                 labels = labels.squeeze(0)
             logits_rmpad = (logits.squeeze(0) if logits.dim() > 2 else logits) / temperature
 
-            if logits_rmpad.device.type == "tpu":
-                log_probs = logprobs_from_logits_naive(logits_rmpad, labels)
+            # Like verl's GPU path (flash-attn cross entropy, CUDA autocast), take the log-softmax and entropy of
+            # the bf16 logits in fp32; torch_tpu's autocast would leave them in bf16.
+            logits_rmpad = logits_rmpad.float()
+            if fused_log_probs is not None:
+                log_probs = fused_log_probs
             else:
-                inplace_backward = not calculate_entropy
-                log_probs = logprobs_from_logits(
-                    logits=logits_rmpad,
-                    labels=labels,
-                    inplace_backward=inplace_backward,
-                )
+                log_probs = logprobs_from_logits_naive(logits_rmpad, labels)
 
             if calculate_entropy:
                 if not self.engine_config.entropy_checkpointing:
@@ -978,25 +864,14 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                 else:
                     entropy_rmpad = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
 
-            padded_log_probs = log_probs.squeeze(0) if log_probs.dim() > 1 else log_probs
             orig_seq_len = output_args.get("orig_seq_len")
-            if orig_seq_len is not None:
-                cu_seqlens_cpu = cu_seqlens.detach().cpu()
-                unpadded_log_probs = padded_log_probs.detach().cpu()[:orig_seq_len]
-                log_probs = torch.nested.nested_tensor_from_jagged(unpadded_log_probs, cu_seqlens_cpu)
-                setattr(log_probs, TPU_PADDED_VALUES_ATTR, padded_log_probs)
-                if calculate_entropy:
-                    unpadded_entropy = entropy_rmpad.detach().cpu()[:orig_seq_len]
-                    entropy = torch.nested.nested_tensor_from_jagged(unpadded_entropy, cu_seqlens_cpu)
-                    setattr(entropy, TPU_PADDED_VALUES_ATTR, entropy_rmpad)
-            else:
-                log_probs = torch.nested.nested_tensor_from_jagged(padded_log_probs, cu_seqlens)
-                if calculate_entropy:
-                    entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+            log_probs = _to_jagged(log_probs.squeeze(0) if log_probs.dim() > 1 else log_probs, cu_seqlens, orig_seq_len)
+            if calculate_entropy:
+                entropy = _to_jagged(entropy_rmpad, cu_seqlens, orig_seq_len)
         else:
             if logits.dim() == 2 and "batch_size" in output_args and "max_seq_len" in output_args:
                 logits = logits.view(output_args["batch_size"], output_args["max_seq_len"], -1)
-            logits = logits / temperature
+            logits = (logits / temperature).float()  # fp32 log-softmax and entropy, as above
             if calculate_entropy:
                 if not self.engine_config.entropy_checkpointing:
                     entropy = verl_F.entropy_from_logits(logits)
@@ -1007,10 +882,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
             starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
             logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
             logits_rmpad = torch.cat([t for t in logits.unbind()])
-            if logits_rmpad.device.type == "tpu":
-                log_probs = logprobs_from_logits_naive(logits_rmpad, output_args["labels"])
-            else:
-                log_probs = logprobs_from_logits(logits=logits_rmpad, labels=output_args["labels"])
+            log_probs = logprobs_from_logits_naive(logits_rmpad, output_args["labels"])
             log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
             if calculate_entropy:
                 entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
