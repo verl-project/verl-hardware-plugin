@@ -18,9 +18,10 @@ This module imports vLLM (through the upstream worker extension), so only vLLM w
 """
 
 import logging
+import math
 import os
 import time
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import ray
 import torch
@@ -45,6 +46,20 @@ _REGISTRY_POLL_INTERVAL_S = 0.5
 # Row-parallel layers: vLLM shards their input dimension (dim 1) across TP ranks; every other 2-D weight
 # whose output dimension divides evenly is sharded on dim 0.
 _ROW_PARALLEL_SUFFIXES = (".o_proj.weight", ".down_proj.weight")
+# GQA key/value projections: sharded per KV head when vLLM replicates KV heads (tp_size > num_kv_heads).
+_KV_PROJ_SUFFIXES = (".self_attn.k_proj.weight", ".self_attn.v_proj.weight")
+
+
+class _SamplerSlice(NamedTuple):
+    """How one vLLM TP rank holds a trainer tensor (see ``_sampler_sharding``)."""
+
+    sharding_spec: list[str]
+    local_shape: list[int]
+    mesh_shape: list[int]
+    global_shard_indices: list[int]
+    replicas: int
+
+
 # vLLM fuses these trainer tensors into one parameter: (fused suffix, source suffixes in concat order).
 _FUSED_TARGETS = (
     (
@@ -60,20 +75,41 @@ _FUSED_TARGETS = (
 )
 
 
-def _sampler_sharding(name: str, global_shape: list[int], tp_size: int) -> tuple[list[str], list[int]]:
-    """Returns ``(sharding_spec, local_shape)`` of a trainer tensor on one vLLM TP rank."""
+def _sampler_sharding(
+    name: str, global_shape: list[int], tp_size: int, tp_rank: int = 0, num_kv_heads: Optional[int] = None
+) -> _SamplerSlice:
+    """Returns the slice of a trainer tensor that one vLLM TP rank holds.
+
+    With GQA and ``tp_size > num_kv_heads``, vLLM replicates each KV head on ``tp_size // num_kv_heads`` ranks,
+    so a dim-0 split of k_proj / v_proj over ``tp_size`` would hand every rank a fraction of a head. Those are
+    registered as one slice per KV head instead, and ``global_shard_indices`` names the head this rank holds
+    (ranks sharing a head receive the same slice). E.g. Qwen3-32B (8 KV heads) at TP=32: k_proj [1024, 5120]
+    -> mesh [8, 1], local [128, 5120], rank 13 -> slice 3.
+    """
     spec_axes = [""] * len(global_shape)
     local_shape = list(global_shape)
+    tp_axis_size = tp_size  # number of slices along the "tp" mesh axis
+    global_shard_indices: list[int] = []  # empty: tpu-sync derives this rank's slice from the mesh geometry
     if len(global_shape) == 2:
         if any(name.endswith(s) for s in _ROW_PARALLEL_SUFFIXES):
             # Row parallel: partition input dimension (dim 1) across TP ranks
             spec_axes = ["", "tp"]
             local_shape[1] = global_shape[1] // tp_size
+        elif num_kv_heads is not None and num_kv_heads < tp_size and name.endswith(_KV_PROJ_SUFFIXES):
+            # GQA with replicated KV heads (see above): one slice per KV head.
+            spec_axes = ["tp", ""]
+            tp_axis_size = num_kv_heads
+            local_shape[0] = global_shape[0] // num_kv_heads
+            global_shard_indices = [tp_rank // (tp_size // num_kv_heads)]
         elif global_shape[0] % tp_size == 0:
             # Column parallel or vocab parallel: partition output dimension (dim 0) across TP ranks
             spec_axes = ["tp", ""]
             local_shape[0] = global_shape[0] // tp_size
-    return spec_axes, local_shape
+    mesh_shape = [tp_axis_size if axis == "tp" else 1 for axis in spec_axes]
+    # Number of TP ranks holding this same slice: 1 for a plain split, tp_size // num_kv_heads for GQA k/v,
+    # tp_size for unsharded tensors. The norm parity check divides by it when summing over ranks.
+    replicas = tp_size // math.prod(mesh_shape)
+    return _SamplerSlice(spec_axes, local_shape, mesh_shape, global_shard_indices, replicas)
 
 
 class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
@@ -148,14 +184,19 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
         staging_tensors = {}
         variable_protos = []
         valid_params = []
+        replicas = {}
+        # Total KV heads of the model, to slice k_proj / v_proj per KV head when vLLM replicates them. rank_val is
+        # this worker's TP rank: a single rollout replica without pipeline parallelism, as the registration below
+        # ("sampler/<rank>" on mesh [1, tp_size]) already assumes.
+        num_kv_heads = worker.vllm_config.model_config.get_total_num_kv_heads()
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
-            spec_axes, local_shape = _sampler_sharding(name, g_shape, tp_size)
-            sharding_mesh = [tp_size if axis == "tp" else 1 for axis in spec_axes]
+            shard = _sampler_sharding(name, g_shape, tp_size, tp_rank=rank_val, num_kv_heads=num_kv_heads)
+            replicas[name] = shard.replicas
 
             # Allocate a local staging buffer with matching layout (the trainer sends bf16)
-            t = torch.empty(local_shape, dtype=torch.bfloat16, device=torch.device(raiden.RAIDEN_DEVICE))
+            t = torch.empty(shard.local_shape, dtype=torch.bfloat16, device=torch.device(raiden.RAIDEN_DEVICE))
             staging_tensors[name] = t
             valid_params.append((name, t))
 
@@ -163,16 +204,18 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
                 raiden_service_pb2.VariableMetadataProto(
                     name=name,
                     shape=g_shape,
-                    mesh_shape=sharding_mesh,
-                    layout=list(range(len(local_shape) - 1, -1, -1)),
+                    mesh_shape=shard.mesh_shape,
+                    layout=list(range(len(shard.local_shape) - 1, -1, -1)),
                     item_size=t.element_size(),
                     layer_idx=idx,
-                    sharding_spec=spec_axes,
+                    sharding_spec=shard.sharding_spec,
+                    global_shard_indices=shard.global_shard_indices,
                 )
             )
 
         self._raiden_staging = staging_tensors
         self._sorted_vllm_params = valid_params
+        self._raiden_replicas = replicas
 
         raiden.tpu_synchronize()
 
@@ -321,4 +364,6 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
 
         res = raiden.compute_tensor_stats(self._sorted_vllm_params)
         res["rank"] = getattr(self, "rank", 0)
+        # How many TP ranks hold each tensor's slice, so the parity check counts every slice once.
+        res["replicas"] = dict(getattr(self, "_raiden_replicas", None) or {})
         return res

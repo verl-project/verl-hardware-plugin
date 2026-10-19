@@ -58,8 +58,9 @@ TIMING_KEYS = {
     )
 }
 
-# A one-layer Qwen3-like model in HF naming: hidden size, vocab, MLP intermediate size, q rows, k/v rows.
-HIDDEN, VOCAB, INTERMEDIATE, Q_ROWS, KV_ROWS = 8, 16, 16, 8, 4
+# A one-layer Qwen3-like model in HF naming: hidden size, vocab, MLP intermediate size, q rows, k/v rows, and
+# KV heads (so head_dim = KV_ROWS // KV_HEADS; TP > KV_HEADS replicates KV heads like GQA in vLLM).
+HIDDEN, VOCAB, INTERMEDIATE, Q_ROWS, KV_ROWS, KV_HEADS = 8, 16, 16, 8, 4, 2
 LAYER = "model.layers.0."
 TRAINER_SHAPES = {
     "lm_head.weight": (VOCAB, HIDDEN),
@@ -165,7 +166,10 @@ class _FakeTpuSync:
                 for dim, axis in enumerate(var.sharding_spec):
                     if axis == "tp":
                         size = src.shape[dim] // var.mesh_shape[dim]
-                        src = src.narrow(dim, tp_rank * size, size)
+                        # An explicit global_shard_indices names the slice; else it is the unit's rank in the mesh.
+                        indices = getattr(var, "global_shard_indices", None)
+                        index = indices[0] if indices else tp_rank
+                        src = src.narrow(dim, index * size, size)
                 buffer.copy_(src)
 
     def modules(self) -> dict[str, ModuleType]:
@@ -366,12 +370,15 @@ class _Linear(nn.Module):
 
 
 class _FakeVllmModel(nn.Module):
-    """One TP rank of the vLLM model: fused qkv/gate_up, column and vocab parallel on dim 0, row parallel on dim 1."""
+    """One TP rank of the vLLM model: fused qkv/gate_up, column and vocab parallel on dim 0, row parallel on dim 1.
+
+    With ``tp > KV_HEADS`` every rank holds one whole KV head (replicated on ``tp // KV_HEADS`` ranks).
+    """
 
     def __init__(self, tp, flip_o_proj=False):
         super().__init__()
         attn = nn.Module()
-        attn.qkv_proj = _Linear((Q_ROWS + 2 * KV_ROWS) // tp, HIDDEN)
+        attn.qkv_proj = _Linear(Q_ROWS // tp + 2 * KV_ROWS // min(tp, KV_HEADS), HIDDEN)
         attn.o_proj = _Linear(Q_ROWS // tp, HIDDEN, flipped=True) if flip_o_proj else _Linear(HIDDEN, Q_ROWS // tp)
         mlp = nn.Module()
         mlp.gate_up_proj = _Linear(2 * INTERMEDIATE // tp, HIDDEN)
@@ -394,16 +401,23 @@ def _expected_vllm_state(weights, rank, tp, lm_head_from_embed=False, flip_o_pro
     def rows(name):
         return weights[name].chunk(tp, dim=0)[rank]
 
+    def kv_rows(name):
+        # One whole KV head per rank once KV heads are replicated (tp > KV_HEADS); else a plain dim-0 split.
+        if tp <= KV_HEADS:
+            return rows(name)
+        return weights[name].chunk(KV_HEADS, dim=0)[rank // (tp // KV_HEADS)]
+
     def cols(name):
         return weights[name].chunk(tp, dim=1)[rank]
 
+    q_name, k_name, v_name = QKV
     o_proj = cols(LAYER + "self_attn.o_proj.weight")
     return {
         "model.embed_tokens.weight": rows("model.embed_tokens.weight"),
         "model.norm.weight": weights["model.norm.weight"],
         LAYER + "input_layernorm.weight": weights[LAYER + "input_layernorm.weight"],
         LAYER + "post_attention_layernorm.weight": weights[LAYER + "post_attention_layernorm.weight"],
-        LAYER + "self_attn.qkv_proj.weight": torch.cat([rows(name) for name in QKV]),
+        LAYER + "self_attn.qkv_proj.weight": torch.cat([rows(q_name), kv_rows(k_name), kv_rows(v_name)]),
         LAYER + "self_attn.o_proj.weight": o_proj.T if flip_o_proj else o_proj,
         LAYER + "mlp.gate_up_proj.weight": torch.cat(
             [rows(LAYER + "mlp.gate_proj.weight"), rows(LAYER + "mlp.up_proj.weight")]
@@ -429,7 +443,10 @@ def _make_sampler(module, rank, tp, model):
     sampler = module.vLLMRaidenWorkerExtension()
     sampler.rank = rank
     sampler.model_runner = SimpleNamespace(model=model)
-    sampler.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=tp))
+    sampler.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp),
+        model_config=SimpleNamespace(get_total_num_kv_heads=lambda: KV_HEADS),
+    )
     return sampler
 
 
@@ -948,12 +965,66 @@ def test_manager_hook_routes_tpu_sync_backend(monkeypatch, backend):
 
 
 def test_sampler_sharding(tpu_raiden):
-    shard = tpu_raiden._sampler_sharding
-    assert shard(LAYER + "self_attn.o_proj.weight", [8, 16], 2) == (["", "tp"], [8, 8])
-    assert shard(LAYER + "mlp.down_proj.weight", [8, 16], 4) == (["", "tp"], [8, 4])
-    assert shard(LAYER + "self_attn.q_proj.weight", [16, 8], 2) == (["tp", ""], [8, 8])
-    assert shard("model.embed_tokens.weight", [15, 8], 2) == (["", ""], [15, 8])  # indivisible: replicated
-    assert shard("model.norm.weight", [8], 2) == ([""], [8])
+    def shard(name, shape, tp, **kwargs):
+        s = tpu_raiden._sampler_sharding(name, shape, tp, **kwargs)
+        return s.sharding_spec, s.local_shape, s.mesh_shape, s.global_shard_indices, s.replicas
+
+    assert shard(LAYER + "self_attn.o_proj.weight", [8, 16], 2) == (["", "tp"], [8, 8], [1, 2], [], 1)
+    assert shard(LAYER + "mlp.down_proj.weight", [8, 16], 4) == (["", "tp"], [8, 4], [1, 4], [], 1)
+    assert shard(LAYER + "self_attn.q_proj.weight", [16, 8], 2) == (["tp", ""], [8, 8], [2, 1], [], 1)
+    # indivisible: replicated on every rank
+    assert shard("model.embed_tokens.weight", [15, 8], 2) == (["", ""], [15, 8], [1, 1], [], 2)
+    assert shard("model.norm.weight", [8], 2) == ([""], [8], [1], [], 2)
+
+
+def test_sampler_sharding_gqa_kv_heads(tpu_raiden):
+    """With tp_size > num_kv_heads, k/v are sliced per KV head and every rank names the head it holds."""
+
+    def shard(name, shape, tp, rank, kv_heads):
+        s = tpu_raiden._sampler_sharding(name, shape, tp, tp_rank=rank, num_kv_heads=kv_heads)
+        return s.sharding_spec, s.local_shape, s.mesh_shape, s.global_shard_indices, s.replicas
+
+    k, v, q = (LAYER + f"self_attn.{p}_proj.weight" for p in "kvq")
+    # Qwen3-32B at TP=32: 8 KV heads of 128 rows, each on 4 ranks.
+    assert shard(k, [1024, 5120], 32, 13, 8) == (["tp", ""], [128, 5120], [8, 1], [3], 4)
+    assert shard(v, [1024, 5120], 32, 31, 8) == (["tp", ""], [128, 5120], [8, 1], [7], 4)
+    # q is not replicated, and neither are k/v while tp_size <= num_kv_heads.
+    assert shard(q, [8192, 5120], 32, 13, 8) == (["tp", ""], [256, 5120], [32, 1], [], 1)
+    assert shard(k, [1024, 5120], 8, 3, 8) == (["tp", ""], [128, 5120], [8, 1], [], 1)
+    # Without the KV head count (older callers) k/v fall back to the plain dim-0 split.
+    assert shard(k, [1024, 5120], 32, 13, None) == (["tp", ""], [32, 5120], [32, 1], [], 1)
+
+
+@pytest.mark.parametrize("verify_parity", [False, True])
+def test_update_raiden_weights_gqa_replicated_kv_heads(fake_tpu_sync, tpu_raiden, caplog, verify_parity):
+    """TP=4 with 2 KV heads: each rank receives one whole KV head, and the parity check counts each head once."""
+    tp = 4
+    assert tp > KV_HEADS
+    weights = _trainer_weights()
+    models = [_FakeVllmModel(tp) for _ in range(tp)]
+    samplers = [_make_sampler(tpu_raiden, rank, tp, model) for rank, model in enumerate(models)]
+    manager, _ = _make_manager(
+        [_trainer_engine(rank, verify_parity=verify_parity) for rank in range(2)],
+        lambda rank: iter(weights.items()),
+        samplers,
+        [],
+        verify_parity=verify_parity,
+    )
+    with caplog.at_level(logging.INFO, logger=raiden.__name__):
+        asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
+
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights, rank, tp))
+    for rank in range(tp):
+        variables = {
+            v.name: v for v in fake_tpu_sync.registrations[RaidenId("sampler", str(rank), "weights")].variables
+        }
+        for name in QKV[1:]:
+            assert (variables[name].mesh_shape, variables[name].global_shard_indices) == ([KV_HEADS, 1], [rank // 2])
+        assert (variables[QKV[0]].mesh_shape, variables[QKV[0]].global_shard_indices) == ([tp, 1], [])
+    if verify_parity:
+        assert "RAIDEN PARITY VERIFIED | Step 1" in caplog.text
+        assert "MISMATCH" not in caplog.text
 
 
 def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, tpu_raiden):
@@ -978,11 +1049,18 @@ def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, tpu_raide
     assert (registration.mesh_shape, registration.mesh_axes) == ([1, 2], ["fsdp", "tp"])
     assert registration.data_addresses == [f"10.0.0.1:{ws.local_port}"]
     assert registration.listener_address == "10.0.0.1:12001"
-    assert [(v.name, v.shape, v.mesh_shape, v.sharding_spec) for v in registration.variables] == [
-        (LAYER + "self_attn.k_proj.weight", [16, 64], [2, 1], ["tp", ""]),
-        (LAYER + "self_attn.o_proj.weight", [128, 256], [1, 2], ["", "tp"]),
-        ("model.norm.weight", [128], [1], [""]),
+    assert [
+        (v.name, v.shape, v.mesh_shape, v.sharding_spec, v.global_shard_indices) for v in registration.variables
+    ] == [
+        (LAYER + "self_attn.k_proj.weight", [16, 64], [2, 1], ["tp", ""], []),
+        (LAYER + "self_attn.o_proj.weight", [128, 256], [1, 2], ["", "tp"], []),
+        ("model.norm.weight", [128], [1], [""], []),
     ]
+    assert sampler._raiden_replicas == {
+        LAYER + "self_attn.k_proj.weight": 1,
+        LAYER + "self_attn.o_proj.weight": 1,
+        "model.norm.weight": 2,
+    }
 
     # Later syncs reuse the receive buffers and the registration.
     assert sampler.init_raiden_sync_on_worker(parallelism=4) is True

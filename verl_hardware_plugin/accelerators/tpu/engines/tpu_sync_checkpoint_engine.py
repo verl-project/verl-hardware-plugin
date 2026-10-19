@@ -792,6 +792,9 @@ async def _verify_parity_async(manager: Any, global_steps: Optional[int] = None)
 
         total_sampler_l1, total_sampler_l2_sq, total_sampler_numel = 0.0, 0.0, 0
         mismatches = []
+        # Number of TP ranks holding each tensor's slice (vLLMRaidenWorkerExtension._raiden_replicas): 1 for a
+        # plain split, tp_size // num_kv_heads for GQA k/v with replicated KV heads, tp_size for unsharded tensors.
+        replicas = sampler_workers[0].get("replicas") or {}
 
         for name in all_param_names:
             s_numels = [w.get("per_tensor", {}).get(name, {}).get("numel", 0) for w in sampler_workers]
@@ -803,13 +806,18 @@ async def _verify_parity_async(manager: Any, global_steps: Optional[int] = None)
                 for w in sampler_workers
             ]
 
-            is_replicated = (
+            if name in replicas:
+                # Every slice is held by `r` ranks: summing over ranks counts it r times.
+                r = replicas[name]
+                s_agg_numel = sum(s_numels) // r
+                s_agg_l1 = sum(s_l1s) / r
+                s_agg_l2 = (sum(s_l2_sqs) / r) ** 0.5
+            elif (
                 len(set(s_numels)) == 1
                 and (name.endswith("layernorm.weight") or "norm" in name)
                 and len(s_numels[0:1]) > 0
                 and s_numels[0] < 10000
-            )
-            if is_replicated:
+            ):
                 s_agg_numel = s_numels[0]
                 s_agg_l1 = s_l1s[0]
                 s_agg_l2 = s_l2_sqs[0] ** 0.5
