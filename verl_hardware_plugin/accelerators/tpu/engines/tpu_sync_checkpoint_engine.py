@@ -231,19 +231,6 @@ def setup_raiden_controller() -> tuple[Any, Any, str]:
     return controller, server, address
 
 
-def raiden_is_tile_aligned(local_shape: list) -> bool:
-    """True when a 2D+ shard matches the TPU (8, 128) tile, so it can skip the CPU (de)tiling pass."""
-    return (len(local_shape) >= 2) and (local_shape[-1] % 128 == 0) and (local_shape[-2] % 8 == 0)
-
-
-def apply_raiden_skip_tiling(ws: Any, skip_tiling_plan: list) -> None:
-    """Set the per-tensor skip_tiling plan on a WeightSynchronizer (API name differs across tpu_sync builds)."""
-    if hasattr(ws, "test_only_set_skip_tiling"):
-        ws.test_only_set_skip_tiling(skip_tiling_plan)
-    elif hasattr(ws, "set_skip_tiling"):
-        ws.set_skip_tiling(skip_tiling_plan)
-
-
 def _as_bool(value: Any) -> bool:
     """Parse a bool flag that may arrive as a string (env var, CLI override) as well as a bool."""
     if isinstance(value, str):
@@ -332,17 +319,17 @@ class RaidenCheckpointEngine(CheckpointEngine):
                 logger.debug(f"Trainer Rank {self.rank}: closing the WeightSynchronizer failed: {e}")
 
     async def send_weights(self, weights: Any, global_steps: Optional[int] = None) -> None:
-        """Bind this rank's weights to its WeightSynchronizer, register them with the controller and stage them
-        in host memory.
+        """Bind this rank's weights to its WeightSynchronizer and register them with the controller.
 
         Args:
             weights: Iterable (or dict) of ``(hf_name, tensor)`` pairs: the full weights, which verl gathers on
                 every trainer rank.
             global_steps: Trainer step of these weights.
 
-        The transfer itself is driven by the controller after this returns, so the bound tensors are kept until
-        ``release_sync_buffers``. The synchronizer is created and registered on the first sync and reused (rebound
-        through ``bind_weights``) afterwards as long as the tensor names, shapes and dtypes do not change.
+        The transfer itself, including the device-to-host copy, is driven by the controller after this returns,
+        so the bound tensors are kept until ``release_sync_buffers``. The synchronizer is created and registered
+        on the first sync and reused (rebound through ``bind_weights``) afterwards as long as the tensor names,
+        shapes and dtypes do not change.
         """
         step_key = global_steps if global_steps is not None else 0
         logger.info(f"RaidenCheckpointEngine: [Step {step_key}] Start send_weights...")
@@ -375,13 +362,11 @@ class RaidenCheckpointEngine(CheckpointEngine):
             self._registered_signature = signature
         self._bound_tensors = [t for _, t in valid_weights]
 
-        # Stage weights to host buffer via D2H DMA
-        t_d2h_start = time.perf_counter()
-        self._trainer_raiden_ws.d2h()
-        t_d2h = time.perf_counter() - t_d2h_start
-        logger.info(
-            f"[RAIDEN TELEMETRY | Trainer Worker] Trainer Rank {self.rank}: D2H DMA transfer completed in {t_d2h:.4f}s"
-        )
+        # No explicit d2h() here: the controller-driven push (PushWeightsResharded, started by start_transfer)
+        # performs a pipelined D2H overlapped with the host-to-host transfer, using the per-transfer skip_tiling
+        # plan. An explicit d2h() before the first transfer has no plan yet and stages the wrong (de-tiled)
+        # layout, and on every sync it copies the whole model to host memory a second time; it was only ever
+        # masked by the push's own D2H.
 
         # Compute deterministic stats & norms across all sent tensors on rank 0 only: every rank holds the
         # full model.
@@ -621,9 +606,8 @@ async def update_raiden_weights(manager: Any, global_steps: Optional[int] = None
 
     t_total_start = time.perf_counter()
 
-    # 1. Every trainer rank binds its tensors to a new synchronizer, registers them with the controller, records
-    #    the global shapes and stages the tensors in host memory. ray.get blocks until all ranks finish, so run
-    #    it in a thread to keep the event loop free.
+    # 1. Every trainer rank binds its tensors to its synchronizer, registers them with the controller and records
+    #    the global shapes. ray.get blocks until all ranks finish, so run it in a thread to keep the event loop free.
     t_init_trainer_start = time.perf_counter()
     actor_refs = manager.actor_wg.update_weights(global_steps=global_steps, mode=manager.backend)
     if actor_refs is not None:

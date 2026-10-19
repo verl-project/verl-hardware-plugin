@@ -148,7 +148,6 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
         staging_tensors = {}
         variable_protos = []
         valid_params = []
-        skip_tiling_plan = []
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
@@ -159,8 +158,6 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
             t = torch.empty(local_shape, dtype=torch.bfloat16, device=torch.device(raiden.RAIDEN_DEVICE))
             staging_tensors[name] = t
             valid_params.append((name, t))
-            # Tile-aligned local shards can skip the CPU (de)tiling pass and DMA straight to HBM.
-            skip_tiling_plan.append(raiden.raiden_is_tile_aligned(local_shape))
 
             variable_protos.append(
                 raiden_service_pb2.VariableMetadataProto(
@@ -193,8 +190,13 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
             bind_ip=bind_ip,
         )
 
-        self._skip_tiling_plan = skip_tiling_plan
-        raiden.apply_raiden_skip_tiling(self._raiden_ws, skip_tiling_plan)
+        # Whether a tensor can skip the CPU (de)tiling pass is decided by Raiden's planner per transfer, from the
+        # source and destination slices together, and delivered to this listener with the transfer. Do not set it
+        # here from the local shape alone: both ends must make the same choice, and when they disagree (the
+        # sender de-tiles to row-major, h2d() copies those bytes raw into tiled HBM) the weights come out permuted
+        # while every norm stays unchanged. With full trainer tensors the local guess usually matches the planner,
+        # but not once the trainer sends shards that are not 8-row aligned (e.g. Qwen3's embedding at 32+ FSDP
+        # ranks).
 
         try:
             ctrl_client = raiden_controller.RaidenControllerClientFacade(controller_addr)
@@ -233,9 +235,8 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
 
         t_start = time.perf_counter()
         t_h2d_start = time.perf_counter()
-        # Re-apply the skip_tiling plan right before H2D: the network listener overwrites it with its default.
-        if getattr(self, "_skip_tiling_plan", None):
-            raiden.apply_raiden_skip_tiling(self._raiden_ws, self._skip_tiling_plan)
+        # h2d() applies the skip_tiling plan the listener received with this transfer (see
+        # init_raiden_sync_on_worker); nothing must override it here.
         self._raiden_ws.h2d()
         t_h2d = time.perf_counter() - t_h2d_start
 

@@ -18,7 +18,6 @@ import sys
 import threading
 from collections import namedtuple
 from types import ModuleType, SimpleNamespace
-from unittest import mock
 
 import pytest
 import ray
@@ -589,23 +588,6 @@ def test_as_bool(value, expected):
     assert raiden._as_bool(value) is expected
 
 
-def test_tile_alignment_and_skip_tiling_api():
-    assert raiden.raiden_is_tile_aligned([8, 128])
-    assert raiden.raiden_is_tile_aligned([2, 16, 256])
-    assert not raiden.raiden_is_tile_aligned([4, 128])
-    assert not raiden.raiden_is_tile_aligned([8, 64])
-    assert not raiden.raiden_is_tile_aligned([1024])
-
-    # The setter's name differs across tpu_sync builds; builds with neither are left alone.
-    test_only_api = SimpleNamespace(test_only_set_skip_tiling=mock.Mock())
-    public_api = SimpleNamespace(set_skip_tiling=mock.Mock())
-    raiden.apply_raiden_skip_tiling(test_only_api, [True])
-    raiden.apply_raiden_skip_tiling(public_api, [False])
-    raiden.apply_raiden_skip_tiling(SimpleNamespace(), [True])
-    test_only_api.test_only_set_skip_tiling.assert_called_once_with([True])
-    public_api.set_skip_tiling.assert_called_once_with([False])
-
-
 def test_validate_and_sanitize_tensors():
     weight = torch.arange(6.0).reshape(2, 3)
     named = [
@@ -689,7 +671,7 @@ def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu
     assert [t.data_ptr() for t in ws.tensors] == [weights[n].data_ptr() for n in names]  # bound in place
     assert (ws.parallelism, ws.bind_ip) == (8, "10.0.0.1")
     assert ws.kwargs == {"unsafe_skip_buffer_lock": True, "auto_h2d": False}
-    assert ws.d2h_calls == 1  # staged in host memory before send_weights returns
+    assert ws.d2h_calls == 0  # the controller-driven push does the D2H; send_weights only binds
     registration = fake_tpu_sync.registrations[RaidenId("trainer", "0", "weights")]
     assert registration.address == "10.0.0.1:7777"
     assert (registration.mesh_shape, registration.mesh_axes) == ([1, 1], ["fsdp", "tp"])
@@ -708,14 +690,14 @@ def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu
     assert fake_tpu_sync.registry_state.get_global_shapes() == {n: list(s) for n, s in TRAINER_SHAPES.items()}
 
     # After the transfer, release_sync_buffers unbinds the send tensors but keeps the synchronizer and its
-    # controller registration; the next sync rebinds the new tensors and stages them, without re-registering.
+    # controller registration; the next sync rebinds the new tensors without re-registering.
     engine.release_sync_buffers()
     assert engine._trainer_raiden_ws is ws
     assert (ws.unbind_calls, ws.bound, engine._bound_tensors) == (1, False, None)
     new_weights = _trainer_weights(seed=1)
     asyncio.run(engine.send_weights(iter(new_weights.items()), global_steps=2))
     assert fake_tpu_sync.synchronizers == [ws]
-    assert (ws.bind_calls, ws.bound, ws.d2h_calls) == (1, True, 2)
+    assert (ws.bind_calls, ws.bound, ws.d2h_calls) == (1, True, 0)
     assert [t.data_ptr() for t in ws.tensors] == [new_weights[n].data_ptr() for n in names]
     assert fake_tpu_sync.registrations[RaidenId("trainer", "0", "weights")] is registration
 
@@ -729,7 +711,7 @@ def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu
     asyncio.run(engine.send_weights(iter(fewer.items()), global_steps=4))
     assert len(fake_tpu_sync.synchronizers) == 2
     new_ws = fake_tpu_sync.synchronizers[1]
-    assert engine._trainer_raiden_ws is new_ws and new_ws.d2h_calls == 1
+    assert engine._trainer_raiden_ws is new_ws and new_ws.d2h_calls == 0
     registration = fake_tpu_sync.registrations[RaidenId("trainer", "0", "weights")]
     assert registration.data_addresses == [f"10.0.0.1:{new_ws.local_port}"]
     assert [var.name for var in registration.variables] == sorted(fewer)
@@ -868,7 +850,8 @@ def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie
     assert [sampler._raiden_ws.h2d_calls for sampler in samplers] == [2, 2]
     sampler_synchronizers = [sampler._raiden_ws for sampler in samplers]
     trainer_synchronizers = [ws for ws in fake_tpu_sync.synchronizers if ws not in sampler_synchronizers]
-    assert [ws.d2h_calls for ws in trainer_synchronizers] == [2] * trainer_ranks  # one synchronizer per rank
+    assert len(trainer_synchronizers) == trainer_ranks  # one synchronizer per rank
+    assert [ws.d2h_calls for ws in trainer_synchronizers] == [0] * trainer_ranks  # D2H belongs to the push
     bind_state = [(ws.bind_calls, ws.unbind_calls, ws.bound) for ws in trainer_synchronizers]
     assert bind_state == [(1, 2, False)] * trainer_ranks  # rebound once, unbound after each transfer
     assert "RAIDEN PARITY VERIFIED | Step 1" in caplog.text
@@ -989,7 +972,7 @@ def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, tpu_raide
     assert (ws.listener_port, ws.parallelism, ws.bind_ip) == (12001, 4, "10.0.0.1")
     assert [tuple(t.shape) for t in ws.tensors] == [(8, 64), (128, 128), (128,)]
     assert all(t.dtype == torch.bfloat16 for t in ws.tensors)
-    assert ws.skip_tiling == [False, True, False]  # only (8, 128)-tile aligned 2-D shards skip the tiling pass
+    assert ws.skip_tiling is None  # skip-tiling is left to the planner, which sees both sides of the transfer
     registration = fake_tpu_sync.registrations[RaidenId("sampler", "1", "weights")]
     assert registration.address == "10.0.0.2:7777"
     assert (registration.mesh_shape, registration.mesh_axes) == ([1, 2], ["fsdp", "tp"])
