@@ -23,8 +23,9 @@ for this backend):
    (`engines/weight_export.py` decides how each weight is exported):
    - an FSDP shard (`Shard(0)` on a 1-D mesh, dim 0 divisible by the mesh size) is registered as this rank's
      block of the full tensor; Raiden reshards the blocks of all ranks for the rollout, so no rank gathers it;
-   - a replicated weight (e.g. q/k/v_proj in torchtitan's current Qwen3 layout) is already full on every rank
-     and is registered full, without any communication;
+   - a replicated weight is already full on every rank and is registered full, without further communication.
+     Note that q/k/v_proj are replicated only because torchtitan's `FusedQKVLinear` `state_dict()` hook already
+     all-gathers the FSDP-sharded `wqkv` before splitting it (TODO: split it locally);
    - every other layout (uneven cuts, FSDP x TP or HSDP 2-D meshes, fused expert stacks) is all-gathered and
      registered full. Each such tensor is logged at INFO, with a per-sync summary line.
 

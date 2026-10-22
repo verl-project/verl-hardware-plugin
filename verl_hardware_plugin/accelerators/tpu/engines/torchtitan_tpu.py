@@ -773,9 +773,10 @@ class TorchTitanTPUEngine(BaseEngine):
         dense = self._to_hf_named_params({k: v for k, v in params.items() if k not in stacks})
         params.clear()
 
-        # torchtitan's current Qwen3 layout keeps q/k/v_proj replicated (Replicate() placements) rather than FSDP
-        # sharded, so every rank exports them full, without communication; see weight_export.fsdp_dim0_shard.
-        # TODO(tpu): once they are FSDP sharded, they are exported as local shards like the other weights.
+        # q/k/v_proj arrive here replicated, but not for free: torchtitan's FusedQKVLinear (fuse_qkv=True) keeps
+        # wqkv FSDP sharded, and its state_dict() hook (_split_qkv_on_save) all-gathers it to Replicate() before
+        # splitting it into q/k/v; see weight_export.fsdp_dim0_shard.
+        # TODO(tpu): split wqkv locally on save (or train with fuse_qkv=False) so q/k/v export as local shards.
         return TrainerWeights(dense, expert_stacks, get_device_id()), None
 
 

@@ -34,8 +34,10 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
     * **FSDP + CP**: torchtitan shards parameters over the flattened ``dp_shard`` x ``cp`` mesh dimension (CP splits
       activations, not parameters), so the parameters are again ``Shard(0)`` on a 1-D mesh: exported locally.
     * **Replicated** (``Replicate()`` placements, or a plain tensor): ``None``. Every rank already holds the full
-      tensor, so it is exported full without any communication (e.g. q/k/v_proj in torchtitan's current Qwen3
-      layout).
+      tensor, so it is exported full without further communication here. It may have been gathered upstream,
+      though: torchtitan's ``FusedQKVLinear`` (``fuse_qkv=True``) keeps ``wqkv`` FSDP sharded (``Shard(0)``) in
+      training, but its ``state_dict()`` hook (``_split_qkv_on_save``) redistributes it to ``Replicate()`` (an FSDP
+      all-gather) before splitting it into q/k/v_proj. TODO: split ``wqkv`` locally so q/k/v export as local shards.
     * **Uneven dim-0 cuts**: ``None``, gathered. torch gives the remainder rows to the leading ranks, which is not
       the equal-block layout Raiden assumes.
     * **FSDP x TP, HSDP** (2-D meshes) and ``_StridedShard``: ``None``, gathered. TODO: register these as n-D
@@ -67,7 +69,7 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
 
 
 def _is_replicated(param: Any) -> bool:
-    """True if every rank already holds the whole of ``param``, so exporting it full needs no communication."""
+    """True if every rank already holds the whole of ``param``, so exporting it full needs no further communication."""
     return not isinstance(param, DTensor) or all(p.is_replicate() for p in param.placements)
 
 
@@ -171,6 +173,6 @@ class TrainerWeights:
             del full
         if local:
             logger.info(
-                f"Weight export: {counts['local']} local shards, {counts['replicated']} replicated tensors (no "
-                f"communication), {counts['gathered']} all-gathered"
+                f"Weight export: {counts['local']} local shards, {counts['replicated']} replicated tensors (fused "
+                f"q/k/v are all-gathered inside torchtitan's state_dict()), {counts['gathered']} all-gathered here"
             )
