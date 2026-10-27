@@ -1,11 +1,19 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Optional parity check of the ``tpu-sync`` weight sync (``engine_kwargs.tpu-sync.verify_parity``, off by default).
+"""Optional parity checks of the ``tpu-sync`` weight sync (``engine_kwargs.tpu-sync.verify_parity``, off by default).
 
-After every sync the trainer posts the norms of the weights it sent (``post_trainer_stats``) and the driver compares
-them with the norms of the weights every rollout replica received (``verify_rollout_parity``). It is a bring-up and
-debugging aid; the sync itself does not depend on it.
+``verify_parity`` is one of ``off | norm | exact | all`` (``options.ParityMode``; ``True`` means ``norm``):
+
+* ``norm``: after every sync from step 1 the trainer posts the norms of the weights it sent (``post_trainer_stats``)
+  and the driver compares them with the norms of the weights every rollout replica received
+  (``verify_rollout_parity``). Cheap, but blind to misplaced bytes: a mis-sliced or permuted tensor keeps its norms.
+* ``exact``: on the step-0 sync, when the trainer still holds the checkpoint vLLM loaded, every rollout worker
+  compares each received tensor bit for bit with the vLLM parameter it is about to overwrite (``ExactParityCheck``)
+  and the driver logs one summary for all workers (``report_exact_parity``). Catches any wrong byte (shard slice,
+  tiling, fusion, transpose). Run it after changing the trainer or rollout sharding, or upgrading tpu-sync.
+
+They are bring-up and debugging aids; the sync itself does not depend on them.
 """
 
 import asyncio
@@ -13,10 +21,93 @@ import logging
 import os
 from typing import Any, Optional
 
+import torch
+
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous import get_tpu_sync_rendezvous
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+# Cap on the per-tensor detail lines a worker returns and the driver logs.
+MAX_EXACT_DETAIL_LINES = 60
+
+
+class ExactParityCheck:
+    """Rollout-worker side of the ``exact`` check: compares received tensors with the parameters they overwrite."""
+
+    def __init__(self) -> None:
+        self.checked = 0
+        self.mismatched: list[str] = []
+
+    @torch.no_grad()
+    def check(self, name: str, target: torch.Tensor, received: torch.Tensor) -> None:
+        """Compares ``received`` (already in ``target``'s layout) with ``target``; call before overwriting it."""
+        try:
+            if tuple(target.shape) != tuple(received.shape):
+                self.mismatched.append(f"{name}: shape target={tuple(target.shape)} received={tuple(received.shape)}")
+                return
+            self.checked += 1
+            ref, new = target.detach().float(), received.detach().float()
+            diff = (ref - new).abs().max().item() if ref.numel() else 0.0
+            if diff != 0.0:
+                self.mismatched.append(
+                    f"{name}: max|diff|={diff:.4g} ref_absmean={ref.abs().mean().item():.4g} "
+                    f"recv_absmean={new.abs().mean().item():.4g}"
+                )
+        except Exception as e:  # The check must never break the sync.
+            self.mismatched.append(f"{name}: parity check failed: {e}")
+
+    def result(self, rank: int, unresolved: list[str]) -> dict:
+        """This worker's result, returned to the driver under ``install_tpu_sync_weights(...)["exact_parity"]``."""
+        return {
+            "rank": rank,
+            "checked": self.checked,
+            "num_mismatched": len(self.mismatched),
+            "mismatched": self.mismatched[:MAX_EXACT_DETAIL_LINES],
+            "unresolved": list(unresolved),
+        }
+
+
+def report_exact_parity(global_steps: Optional[int], install_results: list, replica_labels: list[str]) -> bool:
+    """Logs one summary of the ``exact`` check per rollout replica; returns True if every replica matched.
+
+    ``install_results`` holds each replica's ``collective_rpc("install_tpu_sync_weights")`` result (one dict per
+    worker); ``replica_labels`` names each replica in the log lines (empty strings with one replica).
+    """
+    step = global_steps or 0
+    all_ok = True
+    for label, per_replica in zip(replica_labels, install_results, strict=True):
+        workers = per_replica if isinstance(per_replica, list | tuple) else [per_replica]
+        results = [
+            w["exact_parity"] for w in workers if isinstance(w, dict) and isinstance(w.get("exact_parity"), dict)
+        ]
+        prefix = f"[TPU-SYNC PARITY EXACT | Step {step}{label}]"
+        if not results:
+            logger.warning(f"{prefix} no rollout worker returned a result")
+            all_ok = False
+            continue
+        skipped = [r for r in results if r.get("skipped")]
+        if skipped:
+            logger.warning(f"{prefix} not run: {skipped[0]['skipped']}")
+            all_ok = False
+            continue
+        results.sort(key=lambda r: r["rank"])
+        num_mismatched = sum(r["num_mismatched"] for r in results)
+        num_unresolved = sum(len(r["unresolved"]) for r in results)
+        checked_per_rank = sorted({r["checked"] for r in results})
+        summary = (
+            f"{prefix} {len(results)} rollout ranks, {checked_per_rank} tensors checked per rank, "
+            f"{num_mismatched} mismatched, {num_unresolved} unresolved"
+        )
+        if num_mismatched == 0 and num_unresolved == 0:
+            logger.info(f"{summary}: every received tensor matches the checkpoint bit for bit")
+            continue
+        all_ok = False
+        details = [f"  * rank {r['rank']}: {line}" for r in results for line in r["mismatched"]]
+        details += [f"  * rank {r['rank']}: unresolved {r['unresolved'][:5]}" for r in results if r["unresolved"]]
+        detail_text = "\n".join(details[:MAX_EXACT_DETAIL_LINES])
+        logger.error(f"{summary}\n{detail_text}")
+    return all_ok
 
 
 def compute_tensor_stats(items: list) -> dict:

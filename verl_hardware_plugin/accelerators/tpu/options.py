@@ -66,6 +66,8 @@ def _parse(name: str, kind: type, value: Any, source: str, label: str = "TPU") -
         if value == "":
             return None
     try:
+        if kind is ParityMode:
+            return ParityMode.parse(value)
         if kind is bool:
             if isinstance(value, bool):
                 return value
@@ -216,13 +218,40 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
 # ---------------------------------------------------------------------------------------------------------------
 
 
+class ParityMode:
+    """Values of ``engine_kwargs.tpu-sync.verify_parity`` (see ``weight_sync/tpu_sync_parity.py``).
+
+    * ``off`` (default): no check.
+    * ``norm``: on every sync from step 1, compare per-tensor L1/L2 norms between trainer and rollout.
+    * ``exact``: on the step-0 sync, compare every received tensor bit for bit with the parameter vLLM loaded.
+    * ``all``: both.
+
+    A bool is accepted for compatibility: ``True`` means ``norm``, ``False`` means ``off``.
+    """
+
+    MODES = ("off", "norm", "exact", "all")
+    _ALIASES = {"false": "off", "0": "off", "no": "off", "none": "off", "true": "norm", "1": "norm", "yes": "norm"}
+
+    @classmethod
+    def parse(cls, value: Any) -> str:
+        if isinstance(value, bool):
+            return "norm" if value else "off"
+        mode = str(value).strip().lower()
+        mode = cls._ALIASES.get(mode, mode)
+        if mode not in cls.MODES:
+            raise ValueError(value)
+        return mode
+
+
 @dataclasses.dataclass(frozen=True)
 class TPUSyncOptions:
     """Options of the ``tpu-sync`` checkpoint engine.
 
     Attributes:
         parallelism: Parallel transfer streams per worker.
-        verify_parity: After every sync, compare weight norms between trainer and rollout and log the result.
+        verify_parity: Weight-sync check, one of ``ParityMode.MODES`` (``off`` by default): ``norm`` compares
+            trainer and rollout weight norms after every sync, ``exact`` compares every tensor the rollout
+            received on the step-0 sync bit for bit with the checkpoint vLLM loaded, ``all`` runs both.
         release_buffers_after_sync: Unbind the send buffers (a bf16 copy of this rank's weights) after every
             transfer, so training gets that HBM back between syncs.
         tie_word_embeddings: Whether ``lm_head`` is tied to the input embedding, so it need not be sent.
@@ -230,14 +259,24 @@ class TPUSyncOptions:
     """
 
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM
-    verify_parity: bool = False
+    verify_parity: str = "off"
     release_buffers_after_sync: bool = True
     tie_word_embeddings: Optional[bool] = None
+
+    @property
+    def verify_norms(self) -> bool:
+        """Whether the per-step norm check runs (``norm`` or ``all``)."""
+        return self.verify_parity in ("norm", "all")
+
+    @property
+    def verify_exact(self) -> bool:
+        """Whether the step-0 bit-exact check runs (``exact`` or ``all``)."""
+        return self.verify_parity in ("exact", "all")
 
 
 _SYNC_KINDS: dict[str, type] = {
     "parallelism": int,
-    "verify_parity": bool,
+    "verify_parity": ParityMode,
     "release_buffers_after_sync": bool,
     "tie_word_embeddings": bool,
 }

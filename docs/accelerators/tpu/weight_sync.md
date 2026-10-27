@@ -70,15 +70,36 @@ for this backend):
 actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 # Optional, see the table below:
 +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.tpu-sync.parallelism=8
-+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.tpu-sync.verify_parity=True
++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.tpu-sync.verify_parity=all
 +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.tpu-sync.release_buffers_after_sync=True
 ```
 
 | Option (`engine_kwargs.tpu-sync.*`) | Default | Description |
 |-------------------------------------|---------|-------------|
 | `parallelism` | `8` | Parallel transfer streams per worker. |
-| `verify_parity` | `False` | After every sync, compare weight norms between trainer and rollout and log the result. Adds a pass over all weights on both sides, so it is meant for bring-up. |
+| `verify_parity` | `off` | Weight-sync check: `off`, `norm`, `exact` or `all` (`True` means `norm`). See [Parity checks](#parity-checks). Meant for bring-up and after changing sharding or upgrading tpu-sync. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The deprecated environment variable `VERL_TPU_SYNC_RELEASE_BUFFERS` still overrides the option on the trainer workers and logs a deprecation warning. |
+
+## Parity checks
+
+`verify_parity` selects two complementary checks:
+
+| Value | Check | When it runs | What it catches |
+|-------|-------|--------------|-----------------|
+| `norm` (`True`) | Trainer ranks post per-tensor L1/L2 norms; the driver compares them with every rollout replica's | Every sync | Lost or scaled weights (L1 within `1e-3`). Blind to misplaced bytes: a mis-sliced or permuted tensor keeps its norms. |
+| `exact` | Every rollout worker compares each received tensor bit for bit with the vLLM parameter it overwrites | Step-0 sync only, when vLLM still holds the checkpoint the trainer loaded | Any wrong byte: shard slices, tiling, fusion, transposes |
+| `all` | Both | | |
+
+Run `exact` after changing the trainer or rollout sharding, or after upgrading tpu-sync / torch-tpu. It costs one
+extra compare per tensor, once. The driver logs one line per replica:
+
+```text
+[TPU-SYNC PARITY EXACT | Step 0] 8 rollout ranks, [227] tensors checked per rank, 0 mismatched, 0 unresolved: every received tensor matches the checkpoint bit for bit
+```
+
+followed, on a mismatch, by one line per mismatched tensor and rank. It covers every tensor installed directly into
+vLLM's parameters. Qwen3.5's stacked experts are not compared, and models installed through vLLM's weight loaders
+log `not run`. Both checks only report; the sync and the run continue either way.
 
 ## Several rollout replicas
 
@@ -140,7 +161,7 @@ Qwen3-0.6B run with one v6e-8 slice for training and one for rollout:
 ```
 
 The first sync (step 0) is slower, because the rollout workers allocate and register their receive
-buffers then. With `verify_parity=True`, every sync after the first also logs
+buffers then. With `verify_parity=norm` (or `True`), every sync after the first also logs
 
 ```text
 [TPU-SYNC PARITY VERIFIED | Step 1] 100% DISTRIBUTED NORM PARITY CONFIRMED!

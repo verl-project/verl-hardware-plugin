@@ -30,7 +30,7 @@ from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
 from verl_hardware_plugin.accelerators.tpu.rollout import qwen3_5_layout
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_api
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_checkpoint_engine as tpu_sync_engine
-from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import compute_tensor_stats
+from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import ExactParityCheck, compute_tensor_stats
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous import get_tpu_sync_rendezvous
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import (
     get_parent_module,
@@ -338,18 +338,24 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         return True
 
     @torch.no_grad()
-    def install_tpu_sync_weights(self) -> dict[str, float]:
+    def install_tpu_sync_weights(self, exact_parity: bool = False) -> dict:
         """Install received weights from host staging buffer into TPU HBM via zero-copy H2D DMA
         and fuse/transpose them directly into vLLM model parameters.
 
+        Args:
+            exact_parity: Set by the driver on the step-0 sync with ``verify_parity=exact|all``: compare every
+                received tensor bit for bit with the vLLM parameter it overwrites (``ExactParityCheck``).
+
         Returns:
             Per-worker timings in seconds: ``total`` (whole install), ``h2d`` (pure ``_tpu_sync_ws.h2d()``)
-            and ``sync`` (final TPU sync barrier). Empty if the synchronizer is not initialized.
+            and ``sync`` (final TPU sync barrier), plus ``exact_parity`` (this rank's result) when requested.
+            Empty if the synchronizer is not initialized.
         """
         if getattr(self, "_tpu_sync_ws", None) is None:
             logger.warning("tpu-sync Sampler: install_tpu_sync_weights called before _tpu_sync_ws was initialized.")
             return {}
 
+        rank = getattr(self, "rank", 0)
         t_start = time.perf_counter()
         t_h2d_start = time.perf_counter()
         # h2d() applies the skip_tiling plan the listener received with this transfer (see
@@ -364,16 +370,21 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             t_sync = time.perf_counter() - t_sync_start
             t_total = time.perf_counter() - t_start
             logger.info(
-                f"[TPU-SYNC TELEMETRY | Sampler Worker] Sampler Rank {getattr(self, 'rank', 0)}: "
+                f"[TPU-SYNC TELEMETRY | Sampler Worker] Sampler Rank {rank}: "
                 f"install_tpu_sync_weights (load_weights) completed in {t_total:.4f}s "
                 f"(H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
             )
-            return {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+            result: dict[str, Any] = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+            if exact_parity:
+                # vLLM's loaders re-shard and re-layout the tensors themselves; there is no 1:1 target to compare.
+                result["exact_parity"] = {"rank": rank, "skipped": "not supported with the vLLM-loader install"}
+            return result
 
         # Unpack, fuse, and transpose staging tensors into vLLM model parameters
         vllm_model = self._get_vllm_model()
         model_sd = vllm_model.state_dict() if hasattr(vllm_model, "state_dict") else vllm_model.model.state_dict()
         module_dict = dict(vllm_model.named_modules()) if hasattr(vllm_model, "named_modules") else {}
+        parity = ExactParityCheck() if exact_parity else None
 
         def find_model_key(k: str) -> Optional[str]:
             resolved = resolve_model_key(k, model_sd)
@@ -384,7 +395,10 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             target_local = target_param.to_local() if hasattr(target_param, "to_local") else target_param
             parent_mod = get_parent_module(resolved_key, module_dict)
             is_flipped = bool(getattr(parent_mod, "_tpu_weight_flipped", False))
-            target_local.copy_(to_target_layout(src, target_local, is_flipped))
+            adapted = to_target_layout(src, target_local, is_flipped)
+            if parity is not None:
+                parity.check(resolved_key, target_local, adapted)
+            target_local.copy_(adapted)
 
         consumed_staging = set()
         qwen3_5_plan = getattr(self, "_tpu_sync_qwen3_5_plan", None)
@@ -445,11 +459,16 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         t_total = time.perf_counter() - t_start
 
         logger.info(
-            f"[TPU-SYNC TELEMETRY | Sampler Worker] Sampler Rank {getattr(self, 'rank', 0)}: install_tpu_sync_weights "
+            f"[TPU-SYNC TELEMETRY | Sampler Worker] Sampler Rank {rank}: install_tpu_sync_weights "
             f"completed in {t_total:.4f}s (H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
         )
         # Returned through collective_rpc so the orchestrator can log them as step metrics.
-        return {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+        result = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+        if parity is not None:
+            # Covers every tensor written through copy_into; Qwen3.5's stacked experts are written directly
+            # (qwen3_5_layout._write_w13 / _write_w2) and are not compared.
+            result["exact_parity"] = parity.result(rank, unresolved)
+        return result
 
     @torch.no_grad()
     def _install_with_vllm_loaders(self) -> None:

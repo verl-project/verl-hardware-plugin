@@ -581,6 +581,9 @@ def test_engine_kwargs(monkeypatch):
     # Command-line overrides may arrive as strings.
     engine = tpu_sync_engine.TPUSyncCheckpointEngine(parallelism="4", verify_parity="true", tie_word_embeddings="1")
     assert (engine.parallelism, engine.verify_parity, engine.tie_word_embeddings) == (4, True, True)
+    # Trainer ranks only post norm stats; the exact check runs on the rollout workers.
+    assert tpu_sync_engine.TPUSyncCheckpointEngine(verify_parity="exact").verify_parity is False
+    assert tpu_sync_engine.TPUSyncCheckpointEngine(verify_parity="all").verify_parity is True
 
     with pytest.raises(NotImplementedError):
         engine.receive_weights()
@@ -1129,6 +1132,100 @@ def test_parity_check_reports_mismatch(fake_tpu_sync, worker_ext, caplog):
         asyncio.run(tpu_sync_engine._verify_parity(manager, global_steps=1))
     assert "TPU-SYNC PARITY MISMATCH | Step 1" in caplog.text
     assert "model.embed_tokens.weight" in caplog.text
+
+
+def _exact_parity_setup(worker_ext, weights, tp, verify_parity, flip_o_proj=False, loaded=True):
+    """Rollout models that already hold the checkpoint (``loaded``), as vLLM does before the step-0 sync."""
+    models = [_FakeVllmModel(tp, flip_o_proj=flip_o_proj) for _ in range(tp)]
+    if loaded:
+        for rank, model in enumerate(models):
+            model.load_state_dict(_expected_vllm_state(weights, rank, tp, flip_o_proj=flip_o_proj))
+    samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+    events: list = []
+    manager, _ = _make_manager(
+        [_trainer_engine(rank, verify_parity=verify_parity) for rank in range(2)],
+        lambda rank: _LocalShardWeights(weights, rank, 2),
+        samplers,
+        events,
+        verify_parity=verify_parity,
+    )
+    return manager, models, events
+
+
+@pytest.mark.parametrize("verify_parity", ["exact", "all"])
+@pytest.mark.parametrize("tp", [2, 4])
+def test_exact_parity_passes_on_step_0_when_rollout_holds_the_checkpoint(
+    fake_tpu_sync, worker_ext, caplog, verify_parity, tp
+):
+    weights = _trainer_weights()
+    manager, models, _ = _exact_parity_setup(worker_ext, weights, tp, verify_parity, flip_o_proj=True)
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    # Every tensor goes through copy_into: 2 fused (qkv, gate_up) + 7 others, lm_head received (not tied).
+    assert f"TPU-SYNC PARITY EXACT | Step 0] {tp} rollout ranks, [9] tensors checked per rank, 0 mismatched" in (
+        caplog.text
+    )
+    assert "bit for bit" in caplog.text
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights, rank, tp, flip_o_proj=True))
+    # Trainer ranks post norm stats only for norm / all; exact alone needs nothing from them.
+    assert (fake_tpu_sync.registry_state.get_stats(0) is not None) is (verify_parity == "all")
+
+
+def test_exact_parity_reports_every_mismatched_tensor(fake_tpu_sync, worker_ext, caplog):
+    tp = 2
+    weights = _trainer_weights()
+    manager, models, _ = _exact_parity_setup(worker_ext, weights, tp, "exact")
+    # vLLM's copy of one tensor differs from the checkpoint the trainer sends (e.g. a mis-sliced shard).
+    with torch.no_grad():
+        models[1].model.layers[0].mlp.down_proj.weight.add_(1)
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    assert "TPU-SYNC PARITY EXACT | Step 0] 2 rollout ranks, [9] tensors checked per rank, 1 mismatched" in caplog.text
+    assert "rank 1: model.layers.0.mlp.down_proj.weight: max|diff|=1" in caplog.text
+    # The check only reports: the received weights are installed regardless.
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights, rank, tp))
+
+
+def test_exact_parity_runs_only_on_the_step_0_sync(fake_tpu_sync, worker_ext, caplog):
+    weights = _trainer_weights()
+    manager, _, events = _exact_parity_setup(worker_ext, weights, 2, "all", loaded=False)
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    # Trained weights no longer match what vLLM loaded: no exact check, the norm check runs as usual.
+    assert "PARITY EXACT" not in caplog.text
+    assert "TPU-SYNC PARITY VERIFIED | Step 1" in caplog.text
+    assert "get_model_weights_stats" in events
+
+
+def test_report_exact_parity_names_replicas_and_flags_skipped_or_missing_results(caplog):
+    ok = {"rank": 0, "checked": 3, "num_mismatched": 0, "mismatched": [], "unresolved": []}
+    install_results = [
+        [{"h2d": 0.1, "exact_parity": ok}],
+        [{"h2d": 0.1, "exact_parity": {"rank": 0, "skipped": "not supported with the vLLM-loader install"}}],
+        [{"h2d": 0.1}],
+    ]
+    labels = [" | replica 0", " | replica 1", " | replica 2"]
+    with caplog.at_level(logging.INFO, logger=parity.__name__):
+        assert parity.report_exact_parity(0, install_results, labels) is False
+    assert "PARITY EXACT | Step 0 | replica 0] 1 rollout ranks, [3] tensors checked per rank, 0 mismatched" in (
+        caplog.text
+    )
+    assert "PARITY EXACT | Step 0 | replica 1] not run: not supported with the vLLM-loader install" in caplog.text
+    assert "PARITY EXACT | Step 0 | replica 2] no rollout worker returned a result" in caplog.text
+
+
+def test_exact_parity_check_flags_shape_and_value_differences():
+    check = parity.ExactParityCheck()
+    target = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
+    check.check("same", target, target.clone())
+    check.check("shape", target, target.T)
+    check.check("value", target, target + 2)
+    result = check.result(rank=3, unresolved=["extra"])
+    assert (result["rank"], result["checked"], result["num_mismatched"], result["unresolved"]) == (3, 2, 2, ["extra"])
+    assert result["mismatched"][0].startswith("shape: shape target=(2, 3) received=(3, 2)")
+    assert result["mismatched"][1].startswith("value: max|diff|=2")
 
 
 def test_update_tpu_sync_weights_syncs_several_replicas_in_one_transfer(fake_tpu_sync, worker_ext, caplog):

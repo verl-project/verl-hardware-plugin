@@ -44,7 +44,7 @@ verl_hardware_plugin/accelerators/tpu/
 │   ├── ray_checkpoint_engine.py      # `ray-plasma-store` weight sync: through the Ray object store
 │   ├── tpu_sync_checkpoint_engine.py # `tpu-sync` weight sync: peer to peer to the vLLM rollout
 │   ├── tpu_sync_rendezvous.py        # Per-job actor: controller address, tensor shapes, parity stats
-│   └── tpu_sync_parity.py            # Optional `tpu-sync` parity check (trainer vs rollout weight norms)
+│   └── tpu_sync_parity.py            # Optional `tpu-sync` parity checks (norms every sync, bit-exact at step 0)
 ├── profilers/                        # verl core: verl/utils/profiler/
 │   ├── timeline.py                   # Opt-in `VERL_TPU_TIMELINE` span prints, 1 Hz HBM sampling, and CSV sidecar CLI
 │   ├── tpu_vllm_timeline.py          # vLLM rollout server timeline mixin (requests, drain, pause, RPCs)

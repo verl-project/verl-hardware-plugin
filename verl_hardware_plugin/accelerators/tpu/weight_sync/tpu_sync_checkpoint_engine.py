@@ -47,7 +47,11 @@ from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerW
 from verl_hardware_plugin.accelerators.tpu.options import TPU_SYNC_DEFAULT_PARALLELISM, get_tpu_sync_options
 from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_api
-from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import post_trainer_stats, verify_rollout_parity
+from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import (
+    post_trainer_stats,
+    report_exact_parity,
+    verify_rollout_parity,
+)
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous import (
     create_tpu_sync_rendezvous,
     get_tpu_sync_rendezvous,
@@ -205,8 +209,9 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
     Engine kwargs (``actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.tpu-sync``):
 
     * ``parallelism`` (default 8): parallel transfer streams per worker.
-    * ``verify_parity`` (default False): post weight norms after every sync so the driver can check
-      that the rollout received the trainer's weights.
+    * ``verify_parity`` (default ``off``): ``norm`` posts weight norms after every sync so the driver can check
+      that the rollout received the trainer's weights; ``exact`` has the rollout workers compare the step-0 sync
+      bit for bit with the checkpoint vLLM loaded (trainer ranks do nothing for it); ``all`` runs both.
     * ``tie_word_embeddings`` (default unset): whether ``lm_head`` is tied to the input embedding, so it
       need not be sent. Unset sends ``lm_head``, which is correct for tied and untied models alike.
     * ``release_buffers_after_sync`` (default True): free the bound send tensors after every transfer
@@ -223,7 +228,8 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         # verl passes checkpoint_engine.engine_kwargs.<backend> here; parsed (and validated) in one place.
         options = get_tpu_sync_options(kwargs)
         self.parallelism = options.parallelism
-        self.verify_parity = options.verify_parity
+        # Trainer ranks only post norm stats; the exact check runs on the rollout workers.
+        self.verify_parity = options.verify_norms
         self.tie_word_embeddings = options.tie_word_embeddings
         # The synchronizer pins the device buffers of every bound tensor (a bf16 copy of this rank's weights), so
         # dropping the Python references alone frees nothing. On by default so the trainer keeps that HBM headroom
@@ -613,7 +619,10 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     """
     backend = manager.backend or TPU_SYNC_BACKEND
     options = get_tpu_sync_options(_tpu_sync_engine_kwargs(manager.config, backend), backend)
-    verify_parity = options.verify_parity
+    verify_parity = options.verify_norms
+    # The exact check needs the rollout to still hold the checkpoint vLLM loaded, which is only true for the step-0
+    # sync of a fresh run: later syncs (and the first one after resuming from a checkpoint) carry trained weights.
+    exact_install_kwargs = {"exact_parity": True} if options.verify_exact and not global_steps else {}
     parallelism = options.parallelism
     controller = _get_or_start_controller(manager)
 
@@ -699,7 +708,7 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     t_install_start = time.perf_counter()
     install_results = await asyncio.gather(
         *[
-            replica.server_handle.collective_rpc.remote(method="install_tpu_sync_weights")
+            replica.server_handle.collective_rpc.remote(method="install_tpu_sync_weights", kwargs=exact_install_kwargs)
             for replica in manager.replicas
         ]
     )
@@ -727,6 +736,8 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
 
     # 6. Parity verification (optional, default off).
     t_parity_start = time.perf_counter()
+    if exact_install_kwargs:
+        report_exact_parity(global_steps, install_results, _replica_labels(manager))
     if verify_parity:
         try:
             await _verify_parity(manager, global_steps)
@@ -760,7 +771,7 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
             ("sync.p2p_transfer", t_transfer),
             ("sync.sampler_install", t_install),
             ("sync.finalize", t_finalize),
-            ("sync.parity_check", t_parity if verify_parity else 0.0),
+            ("sync.parity_check", t_parity if verify_parity or exact_install_kwargs else 0.0),
             ("sync.resume", t_resume),
         ]
         timeline.emit(
@@ -798,14 +809,16 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     return metrics
 
 
+def _replica_labels(manager: Any) -> list[str]:
+    """Names each of ``manager.replicas`` in the parity log lines (empty strings with one replica)."""
+    if len(manager.replicas) == 1:
+        return [""]
+    return [f" | replica {_replica_rank(replica, index)}" for index, replica in enumerate(manager.replicas)]
+
+
 async def _verify_parity(manager: Any, global_steps: Optional[int]) -> None:
-    """Runs the optional parity check (``tpu_sync_parity``), naming the replicas when there are several."""
-    several = len(manager.replicas) > 1
-    labels = [
-        f" | replica {_replica_rank(replica, index)}" if several else ""
-        for index, replica in enumerate(manager.replicas)
-    ]
-    await verify_rollout_parity(manager, global_steps, labels)
+    """Runs the optional norm parity check (``tpu_sync_parity``), naming the replicas when there are several."""
+    await verify_rollout_parity(manager, global_steps, _replica_labels(manager))
 
 
 apply_checkpoint_engine_manager_hooks()

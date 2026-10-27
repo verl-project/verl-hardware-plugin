@@ -124,15 +124,33 @@ def test_engine_kwargs_survive_verl_config_conversion():
 def test_tpu_sync_options_are_parsed_and_typed():
     assert get_tpu_sync_options(None) == TPUSyncOptions()
     assert get_tpu_sync_options({}) == TPUSyncOptions(
-        parallelism=8, verify_parity=False, release_buffers_after_sync=True, tie_word_embeddings=None
+        parallelism=8, verify_parity="off", release_buffers_after_sync=True, tie_word_embeddings=None
     )
     # Command-line overrides may arrive as strings.
     options = get_tpu_sync_options(
         {"parallelism": "4", "verify_parity": "true", "release_buffers_after_sync": "0", "tie_word_embeddings": 1}
     )
     assert options == TPUSyncOptions(
-        parallelism=4, verify_parity=True, release_buffers_after_sync=False, tie_word_embeddings=True
+        parallelism=4, verify_parity="norm", release_buffers_after_sync=False, tie_word_embeddings=True
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "mode", "norms", "exact"),
+    [
+        (None, "off", False, False),
+        (False, "off", False, False),
+        ("false", "off", False, False),
+        (True, "norm", True, False),
+        ("True", "norm", True, False),
+        ("norm", "norm", True, False),
+        ("exact", "exact", False, True),
+        (" ALL ", "all", True, True),
+    ],
+)
+def test_tpu_sync_verify_parity_modes(value, mode, norms, exact):
+    options = get_tpu_sync_options({} if value is None else {"verify_parity": value})
+    assert (options.verify_parity, options.verify_norms, options.verify_exact) == (mode, norms, exact)
 
 
 @pytest.mark.parametrize("kwargs", [{"paralelism": 4}, {"parallelism": 0}, {"verify_parity": "maybe"}])
