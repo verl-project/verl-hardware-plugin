@@ -58,6 +58,8 @@ TIMING_KEYS = {
         "barrier",
         "p2p_transfer",
         "sampler_h2d",
+        "sampler_resume",
+        "trainer_release",
         "total_sync",
         "sampler_h2d_pure",
     )
@@ -979,9 +981,10 @@ def test_update_tpu_sync_weights_end_to_end(fake_tpu_sync, worker_ext, caplog, t
     events.clear()
     with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
         metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    # The pause runs concurrently with the trainer send, which is requested first.
     assert events == [
-        "abort",
         "update_weights",
+        "abort",
         "init_tpu_sync_on_worker",
         "release_sync_buffers",
         "install_tpu_sync_weights",
@@ -1230,6 +1233,35 @@ def test_update_tpu_sync_weights_returns_phase_timings_and_slowest_worker_h2d(fa
         _rpc_without_results(replica.server_handle._obj, monkeypatch, {"install_tpu_sync_weights"})
     metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=2))
     assert set(metrics) == TIMING_KEYS - {"timing_s/tpu-sync/sampler_h2d_pure"}
+
+
+def test_update_tpu_sync_weights_pauses_concurrently_and_resumes_before_the_release(
+    fake_tpu_sync, worker_ext, monkeypatch
+):
+    """The pause overlaps the trainer send, and generation resumes before the trainer frees its send buffers."""
+    tp = 2
+    weights = _trainer_weights()
+    samplers = [_make_sampler(worker_ext, rank, tp, _FakeVllmModel(tp)) for rank in range(tp)]
+    events: list = []
+    manager, _ = _make_manager(
+        [_trainer_engine(rank) for rank in range(2)], lambda rank: iter(weights.items()), samplers, events
+    )
+    # Record when the trainer's buffer release completes (ray.get on its refs), not only when it is requested.
+    real_get = tpu_sync_engine.ray.get
+
+    def get(refs, timeout=None):
+        fns = [getattr(ref, "_fn", None) for ref in refs] if isinstance(refs, list) else []
+        names = {getattr(fn, "__name__", "") for fn in fns}
+        result = real_get(refs, timeout=timeout)
+        if "release_sync_buffers" in names:
+            events.append("release_done")
+        return result
+
+    monkeypatch.setattr(tpu_sync_engine.ray, "get", get)
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    # update_weights is requested before the pause task first runs: the two overlap.
+    assert events.index("update_weights") < events.index("abort") < events.index("init_tpu_sync_on_worker")
+    assert events.index("resume") < events.index("release_done")
 
 
 def _exact_parity_setup(worker_ext, weights, tp, verify_parity, flip_o_proj=False, loaded=True):

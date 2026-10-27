@@ -119,7 +119,7 @@ compares each replica with the trainer on its own, naming the replica in its res
 
 ```text
 [TPU-SYNC PARITY VERIFIED | Step 3 | replica 0] 100% DISTRIBUTED NORM PARITY CONFIRMED!
-[TPU-SYNC PARITY MISMATCH | Step 3 | replica 1] Norms do NOT match!
+TPUSyncParityError: [TPU-SYNC PARITY MISMATCH | Step 3 | replica 1] Norms do NOT match!
 ```
 
 Every replica tested so far sits on one host; replicas that span several hosts are not covered.
@@ -131,18 +131,23 @@ trainer, log them with the step metrics:
 
 | Metric | Phase |
 |--------|-------|
-| `timing_s/tpu-sync/quiesce` | Pausing generation |
+| `timing_s/tpu-sync/quiesce` | Pausing generation; runs concurrently with `trainer_init` |
 | `timing_s/tpu-sync/trainer_init` | Trainer ranks gathering their weights, and creating and registering a synchronizer (first sync) or rebinding the existing one |
 | `timing_s/tpu-sync/sampler_init` | Rollout workers allocating and registering their receive buffers |
 | `timing_s/tpu-sync/barrier` | Waiting until every worker has registered |
 | `timing_s/tpu-sync/p2p_transfer` | The transfer |
 | `timing_s/tpu-sync/sampler_h2d` | Rollout workers copying the weights to HBM and into vLLM's parameters |
 | `timing_s/tpu-sync/sampler_h2d_pure` | The host-to-device copy alone, on the slowest rollout worker |
-| `timing_s/tpu-sync/total_sync` | The whole sync after pausing generation |
+| `timing_s/tpu-sync/sampler_resume` | Resuming generation, after the parity checks (if enabled) |
+| `timing_s/tpu-sync/trainer_release` | Waiting for the trainer to free its send buffers; generation has already resumed |
+| `timing_s/tpu-sync/total_sync` | The whole sync, including the pause that overlaps `trainer_init` |
 
 `sampler_h2d_pure` and the `verify_parity` checks read the rollout workers' return values, which verl's vLLM server
 passes back from `collective_rpc` (since verl-project/verl#8155). With an older verl, the sync still works, but
 `sampler_h2d_pure` is not reported and an enabled parity check fails for lack of results.
+
+Generation resumes as soon as the rollout holds the new weights and has passed the parity checks; it does not wait
+for the trainer to free its send buffers, which only gives trainer HBM back before the next training step.
 
 ## Verify
 
@@ -154,17 +159,20 @@ pytest tests/accelerators/tpu/test_tpu_sync_checkpoint_engine.py -v
 
 On TPU, set `VERL_LOGGING_LEVEL=INFO` and `SAGEMAKER_CONTAINER_LOG_LEVEL=INFO` in the job's `env_vars` (see
 [vLLM Rollout](./rollout.md#run)). Every sync then logs its phase times. For example, from a
-Qwen3-0.6B run with one v6e-8 slice for training and one for rollout:
+Qwen3-0.6B run with one v6e-8 slice for training and one for rollout (two TP=4 replicas, `verify_parity=all`):
 
 ```text
-[TPU-SYNC TELEMETRY | Orchestrator] Step 1 Completed in 1.9739s:
-  * Sampler Quiesce/Pause  : 0.0338s
-  * Trainer Init           : 1.0341s
-  * Sampler Init           : 0.0063s
+[TPU-SYNC TELEMETRY | Orchestrator] Step 2 Completed in 0.9981s:
+  * Sampler Quiesce/Pause  : 0.0338s (overlaps Trainer Init)
+  * Trainer Init           : 0.3757s
+  * Sampler Init           : 0.0053s
   * Barrier Check          : 0.0002s
-  * Controller P2P         : 0.1317s
-  * Sampler H2D DMA        : 0.0318s
-  * Total End-to-End Sync  : 1.9739s
+  * Controller P2P         : 0.2022s
+  * Sampler H2D DMA        : 0.0325s
+  * Parity Check           : 0.3745s
+  * Sampler Resume         : 0.0046s
+  * Trainer Buffer Release : 0.0003s (rollout already generating)
+  * Total End-to-End Sync  : 0.9981s
 ```
 
 The first sync (step 0) is slower, because the rollout workers allocate and register their receive
