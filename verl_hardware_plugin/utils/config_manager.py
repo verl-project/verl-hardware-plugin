@@ -114,9 +114,6 @@ class FLEnvManager:
         return {k: os.getenv(k, "") for k in keys if os.getenv(k)}
 
 
-_flag_gems_enabled_phases: set[str] = set()
-
-
 def may_enable_flag_gems(phase: str = "training") -> None:
     """Conditionally enable FlagGems based on environment configuration.
 
@@ -125,10 +122,6 @@ def may_enable_flag_gems(phase: str = "training") -> None:
     """
     if not FLEnvManager.is_flaggems_enabled():
         logger.debug("FlagGems is not enabled (TRAINING_FL_FLAGGEMS_ENABLE not set)")
-        return
-
-    if phase in _flag_gems_enabled_phases:
-        logger.debug("flag_gems already enabled for %s phase; skip re-enabling", phase)
         return
 
     try:
@@ -156,7 +149,6 @@ def may_enable_flag_gems(phase: str = "training") -> None:
             logger.info("[FlagGems][%s] Enable all ops", phase)
             flag_gems.enable(record=True, once=True, path=record_path)
 
-        _flag_gems_enabled_phases.add(phase)
         logger.info("FlagGems version: %s", flag_gems.__version__)
 
     except ImportError:
