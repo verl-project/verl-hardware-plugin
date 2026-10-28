@@ -86,6 +86,8 @@ def _patch_get_torch_profiler():
         schedule=None,
         name_mini_batch_window=False,
     ):
+        os.makedirs(save_path, exist_ok=True)
+
         if hasattr(tp, "build_trace_basename"):
             base_file_name = tp.build_trace_basename(
                 rank=rank, role=role, save_file_prefix=save_file_prefix, profile_step=profile_step
