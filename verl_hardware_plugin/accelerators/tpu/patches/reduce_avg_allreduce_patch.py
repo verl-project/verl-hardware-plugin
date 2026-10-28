@@ -1,12 +1,21 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Monkeypatch of ``torch.distributed.all_reduce`` for TPU tensors sent to Gloo-only process groups.
+"""Monkeypatch of ``torch.distributed.all_reduce`` for TPU tensors that ``tpu_dist`` cannot reduce.
 
-Why this is needed: with model parallelism (``dp_size < world_size``) the TorchTitan TPU engine returns a
-host-side Gloo data-parallel group, and verl's ``TrainingWorker._postprocess_output`` all-reduces a TPU tensor with
-``ReduceOp.AVG`` on it. Gloo cannot take TPU tensors and has no AVG, so the tensor is staged through CPU and AVG
-becomes SUM + divide. Every other call passes through unchanged (torch-tpu >= 0.2.0 implements AVG on ``tpu_dist``).
+Why this is needed:
+
+* Gloo-only groups: with model parallelism (``dp_size < world_size``) the TorchTitan TPU engine returns a
+  host-side Gloo data-parallel group, and verl's ``TrainingWorker._postprocess_output`` all-reduces a TPU tensor with
+  ``ReduceOp.AVG`` on it. Gloo cannot take TPU tensors and has no AVG, so the tensor is staged through CPU and AVG
+  becomes SUM + divide.
+* ``ReduceOp.MAX`` / ``ReduceOp.MIN`` outside ``torch.compile``: XLA on TPU only lowers Sum all-reduces for such an
+  eager collective ("supported lowering only of Sum all reduce"). verl's ``seqlen_balancing.rearrange_micro_batches``
+  (``use_dynamic_bsz=True``) agrees on the micro-batch count with small MAX / MIN all-reduces of TPU tensors on the
+  data-parallel group, which in an FSDP-only run (``dp_size == world_size``) is the ``cpu:gloo,tpu:tpu_dist`` default
+  group. These are staged through CPU, so the group's Gloo backend reduces them.
+
+Every other call passes through unchanged (torch-tpu >= 0.2.0 implements AVG on ``tpu_dist``).
 
 Applied lazily when ``PlatformTPU()`` is constructed (i.e. only when the ``tpu`` platform is selected).
 """
@@ -48,6 +57,22 @@ def _is_gloo_only_group_with_tpu_tensor(tensor: Any, group: Any) -> bool:
     return "gloo" in backend and "tpu_dist" not in backend
 
 
+def _is_tpu_max_min_all_reduce(tensor: Any, op: Any, group: Any) -> bool:
+    """A MAX / MIN all-reduce of a TPU tensor outside torch.compile, on a group with a Gloo (CPU) backend."""
+    if op is None or torch.compiler.is_compiling():
+        return False
+    if op != dist.ReduceOp.MAX and op != dist.ReduceOp.MIN:
+        return False
+    device = getattr(tensor, "device", None)
+    if getattr(device, "type", None) != "tpu":
+        return False
+    try:
+        backend = str(dist.get_backend(group))
+    except Exception:
+        return False
+    return "gloo" in backend
+
+
 def apply() -> None:
     global _applied
     if _applied:
@@ -64,7 +89,9 @@ def apply() -> None:
         # the traced function is the current `dist.all_reduce` attribute (i.e. this wrapper). A forwarded
         # `ReduceOp.SUM` default would reach `_functional_collectives.all_reduce` unconverted and fail with
         # "'RedOpType' object has no attribute 'lower'" (e.g. vLLM's compiled tensor-parallel all-reduce).
-        if not async_op and _is_gloo_only_group_with_tpu_tensor(tensor, group):
+        if not async_op and (
+            _is_gloo_only_group_with_tpu_tensor(tensor, group) or _is_tpu_max_min_all_reduce(tensor, op, group)
+        ):
             cpu_tensor = tensor.detach().cpu()
             if op is None:
                 result = original_all_reduce(cpu_tensor, group=group, async_op=False)
@@ -99,4 +126,7 @@ def apply() -> None:
         dist.all_gather_into_tensor = _patched_all_gather_into_tensor
 
     _applied = True
-    logger.info("[verl_hardware_plugin] Patched torch.distributed.all_reduce for TPU tensors on Gloo-only groups")
+    logger.info(
+        "[verl_hardware_plugin] Patched torch.distributed.all_reduce for TPU tensors on Gloo-only groups and "
+        "MAX/MIN reductions"
+    )
