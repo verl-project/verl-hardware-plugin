@@ -38,6 +38,10 @@ verl_hardware_plugin/accelerators/tpu/
 ├── rollout/                          # verl core: verl/workers/rollout/
 │   ├── tpu_vllm.py                   # vLLM rollout replica and server for TPU
 │   ├── tpu_vllm_patches.py           # vLLM / vllm-torchtpu patches for multi-host TPU
+│   ├── direct_install.py             # Table of the model-specific direct `tpu-sync` installs below
+│   ├── moe_weights.py                # vLLM fused-MoE expert weight layouts and writers (shared)
+│   ├── qwen3_5_layout.py             # Direct `tpu-sync` install of Qwen3.5 (GatedDeltaNet, TP-sliced experts)
+│   ├── qwen3_moe_layout.py           # Direct `tpu-sync` install of Qwen3 MoE experts (expert parallel)
 │   └── tpu_sync_worker_extension.py  # vLLM worker extension that receives `tpu-sync` weight syncs
 ├── weight_sync/                      # verl core: verl/checkpoint_engine/
 │   ├── weight_sync_backends.py       # Weight sync backend names, shared helpers and manager dispatch hook
@@ -63,6 +67,10 @@ tests/accelerators/tpu/
 ├── test_tpu_loss_inputs.py           # losses/loss_inputs.py
 ├── test_tpu_vllm_rollout.py          # rollout/tpu_vllm.py
 ├── test_tpu_vllm_patches.py          # rollout/tpu_vllm_patches.py
+├── test_direct_install.py            # rollout/direct_install.py
+├── test_moe_weights.py               # rollout/moe_weights.py
+├── test_qwen3_5_layout.py            # rollout/qwen3_5_layout.py
+├── test_qwen3_moe_layout.py          # rollout/qwen3_moe_layout.py
 ├── test_tpu_timeline.py              # profilers/ (timeline, tpu_vllm_timeline, make_report, index.html)
 ├── test_weight_sync_backends.py      # weight_sync/weight_sync_backends.py
 ├── test_ray_checkpoint_engine.py     # weight_sync/ray_checkpoint_engine.py

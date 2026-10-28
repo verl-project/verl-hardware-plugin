@@ -27,7 +27,7 @@ import ray
 import torch
 
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
-from verl_hardware_plugin.accelerators.tpu.rollout import qwen3_5_layout
+from verl_hardware_plugin.accelerators.tpu.rollout import direct_install
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_api
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_checkpoint_engine as tpu_sync_engine
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import ExactParityCheck, compute_tensor_stats
@@ -214,22 +214,31 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                 f"from worker.vllm_config.parallel_config!"
             )
 
-        # Qwen3.5 installs each rank's slices straight into vLLM's parameters (qwen3_5_layout); other hybrid or
-        # MoE models go through vLLM's loaders, which needs every tensor whole on every rank.
+        # Models with a direct-install layout (``direct_install``: e.g. Qwen3.5, Qwen3 MoE with vLLM expert
+        # parallelism) install each rank's slices straight into vLLM's parameters; other hybrid or MoE models go
+        # through vLLM's loaders, which needs every tensor whole on every rank.
         hf_text_config = getattr(worker.vllm_config.model_config, "hf_text_config", None)
-        qwen3_5_plan, no_plan_reason = qwen3_5_layout.plan_direct_install(
+        layout, plan, no_plan_reasons = direct_install.select_layout(
             vllm_model, global_shapes_map, hf_text_config, tp_size, rank_val
         )
-        use_vllm_loaders = qwen3_5_plan is None and _uses_vllm_weight_loader(vllm_model, global_shapes_map)
-        self._tpu_sync_qwen3_5_plan = qwen3_5_plan
+        use_vllm_loaders = layout is None and _uses_vllm_weight_loader(vllm_model, global_shapes_map)
+        self._tpu_sync_layout = layout
+        self._tpu_sync_plan = plan
         self._tpu_sync_use_vllm_loaders = use_vllm_loaders
-        install_mode = "qwen3_5 direct" if qwen3_5_plan else "vllm loaders" if use_vllm_loaders else "direct"
+        # The loaders need the trainer's tensors back in HF's layout (``DirectInstallLayout.loader_weights``).
+        self._tpu_sync_hf_text_config = hf_text_config
+        loader_error = direct_install.loader_error(global_shapes_map, hf_text_config) if layout is None else ""
+        if loader_error:
+            raise RuntimeError(f"tpu-sync Sampler Rank {rank_val}: {loader_error}")
+        install_mode = (
+            f"{layout.name} direct" if layout is not None else "vllm loaders" if use_vllm_loaders else "direct"
+        )
         logger.info(f"tpu-sync Sampler Rank {rank_val}: install mode {install_mode}")
         if use_vllm_loaders:
             # Every sync then all-gathers the whole model on every rank and re-runs vLLM's loaders (slow).
             logger.warning(
                 f"tpu-sync Sampler Rank {rank_val}: installing through vLLM's checkpoint loaders (TP all-gather of "
-                f"every tensor); no direct install: {no_plan_reason}"
+                f"every tensor); no direct install: {'; '.join(no_plan_reasons)}"
             )
 
         # 3. Allocate local TPU staging buffers matching Trainer un-fused layout and sharding specs
@@ -251,7 +260,7 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
-            rule = qwen3_5_layout.sampler_sharding_rule(name, g_shape, tp_size) if qwen3_5_plan else None
+            rule = layout.sharding_rule(name, g_shape, tp_size) if layout is not None else None
             if rule is not None:
                 shard = _slice_from_spec(*rule, tp_size)
             else:
@@ -401,14 +410,15 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             target_local.copy_(adapted)
 
         consumed_staging = set()
-        qwen3_5_plan = getattr(self, "_tpu_sync_qwen3_5_plan", None)
+        parity_check = parity.check if parity is not None else None
+        layout: Optional[direct_install.DirectInstallLayout] = getattr(self, "_tpu_sync_layout", None)
         fused_targets: tuple[tuple[str, tuple[str, ...]], ...] = _FUSED_TARGETS
-        if qwen3_5_plan is not None:
-            # GatedDeltaNet projections, conv, A_log / dt_bias and the stacked experts (see qwen3_5_layout).
-            consumed_staging |= qwen3_5_layout.install(
-                self._tpu_sync_staging, model_sd, find_model_key, copy_into, qwen3_5_plan
+        if layout is not None:
+            # The model-specific tensors (e.g. GatedDeltaNet projections, expert stacks); see ``direct_install``.
+            consumed_staging |= layout.install(
+                self._tpu_sync_staging, model_sd, find_model_key, copy_into, self._tpu_sync_plan, parity_check
             )
-            fused_targets = _FUSED_TARGETS + qwen3_5_layout.FUSED_TARGETS
+            fused_targets = _FUSED_TARGETS + layout.fused_targets
 
         # 1. Handle fused projections (QKV and Gate-Up)
         for target_suffix, src_suffixes in fused_targets:
@@ -434,7 +444,7 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                 copy_into(resolved_key, src_t)
             else:
                 unresolved.append(name)
-        if qwen3_5_plan is not None and unresolved:
+        if layout is not None and unresolved:
             raise RuntimeError(f"tpu-sync direct install: no vLLM parameter for {len(unresolved)}: {unresolved[:8]}")
 
         # 3. Handle tied word embeddings. Only when the trainer did not send lm_head itself: for untied
@@ -453,6 +463,10 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             if vllm_model.lm_head.weight.data_ptr() != vllm_model.embed_tokens.weight.data_ptr():
                 vllm_model.lm_head.weight.copy_(vllm_model.embed_tokens.weight)
 
+        # TODO(tpu): fail the first sync if some vLLM parameter received no weights (it would keep the checkpoint's
+        #   value for the whole run), for every direct install; Qwen3.5 first needs to confirm which vLLM parameters
+        #   the text-only trainer never sends (e.g. a vision tower).
+
         t_sync_start = time.perf_counter()
         tpu_sync_engine.tpu_synchronize()
         t_sync = time.perf_counter() - t_sync_start
@@ -465,8 +479,8 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         # Returned through collective_rpc so the orchestrator can log them as step metrics.
         result = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
         if parity is not None:
-            # Covers every tensor written through copy_into; Qwen3.5's stacked experts are written directly
-            # (qwen3_5_layout._write_w13 / _write_w2) and are not compared.
+            # Covers every tensor written through copy_into, and the regions that a direct-install layout writes
+            # itself (e.g. the experts' w13 / w2), through the ``check`` passed to its install.
             result["exact_parity"] = parity.result(rank, unresolved)
         return result
 
@@ -510,6 +524,10 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                     t_gather += time.perf_counter() - t0
                 yield name, t
 
+        def _checkpoint_weights():
+            # Back to HF's layout (e.g. Qwen3.5's split tensors re-fused, Qwen3 MoE's folded expert stacks unfolded).
+            return direct_install.loader_weights(_weights(), getattr(self, "_tpu_sync_hf_text_config", None))
+
         worker: Any = getattr(self, "worker", self)
         model_runner = worker.model_runner
         if hasattr(model_runner, "reload_weights"):
@@ -519,11 +537,9 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             for module in self._get_vllm_model().modules():
                 if getattr(module, "_tpu_weight_flipped", False):
                     module._tpu_weight_flipped = False
-            model_runner.reload_weights(
-                weights_iterator=qwen3_5_layout.refuse_split_tensors(_weights()), is_checkpoint_format=True
-            )
+            model_runner.reload_weights(weights_iterator=_checkpoint_weights(), is_checkpoint_format=True)
         else:
-            self._get_vllm_model().load_weights(qwen3_5_layout.refuse_split_tensors(_weights()))
+            self._get_vllm_model().load_weights(_checkpoint_weights())
         logger.info(f"Sampler Rank {getattr(self, 'rank', 0)}: TP all-gathers of the received tensors: {t_gather:.2f}s")
 
     def get_model_weights_stats(self) -> dict:

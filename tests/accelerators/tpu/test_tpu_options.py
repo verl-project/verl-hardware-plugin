@@ -124,14 +124,25 @@ def test_engine_kwargs_survive_verl_config_conversion():
 def test_tpu_sync_options_are_parsed_and_typed():
     assert get_tpu_sync_options(None) == TPUSyncOptions()
     assert get_tpu_sync_options({}) == TPUSyncOptions(
-        parallelism=8, verify_parity="off", release_buffers_after_sync=True, tie_word_embeddings=None
+        parallelism=8,
+        verify_parity="off",
+        release_buffers_after_sync=True,
+        tie_word_embeddings=None,
     )
     # Command-line overrides may arrive as strings.
     options = get_tpu_sync_options(
-        {"parallelism": "4", "verify_parity": "true", "release_buffers_after_sync": "0", "tie_word_embeddings": 1}
+        {
+            "parallelism": "4",
+            "verify_parity": "true",
+            "release_buffers_after_sync": "0",
+            "tie_word_embeddings": 1,
+        }
     )
     assert options == TPUSyncOptions(
-        parallelism=4, verify_parity="norm", release_buffers_after_sync=False, tie_word_embeddings=True
+        parallelism=4,
+        verify_parity="norm",
+        release_buffers_after_sync=False,
+        tie_word_embeddings=True,
     )
 
 
