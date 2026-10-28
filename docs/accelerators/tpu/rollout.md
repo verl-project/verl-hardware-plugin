@@ -49,6 +49,13 @@ per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
 deprecated and log a warning.
 
+Qwen3 MoE models (HF `qwen3_moe`, e.g. Qwen3-30B-A3B) need no extra option. The engine turns off torchtitan's
+expert-bias load balancing (and any aux loss), so the trainer routes tokens like the HF checkpoint that vLLM serves,
+and runs the routed experts with torchtitan's TPU token dispatcher and Pallas grouped matmul (the native
+`torch._grouped_mm` backward is wrong on TPU). This needs `expert_parallel_size=1` and a `seq_bucket_size` that times
+`num_experts_per_tok` is a multiple of 256 (the default 256 is); otherwise the engine raises. `use_dynamic_bsz=True`
+works on TPU: the plugin stages its MAX / MIN micro-batch-count all-reduces through CPU.
+
 The rollout settings that matter on TPU (the recipes already set them):
 
 | Setting | Value on TPU |

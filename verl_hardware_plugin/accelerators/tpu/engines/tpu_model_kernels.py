@@ -21,18 +21,33 @@ The Pallas gated RMSNorm (https://github.com/google-pytorch/torchtitan/pull/80) 
 ``model_kernels``: ``auto`` (default) enables what the installed torchtitan exposes, so the same plugin runs both
 torchtitan ``main`` (nothing is enabled) and an optimized build (everything is enabled) with only the container
 image changed; ``none`` disables all; ``all`` enables every kernel of the model; or a comma-separated subset.
+
+Some models also need a mandatory TPU setup, independent of ``model_kernels``: ``model_setup`` looks it up in
+``_MODEL_SETUPS`` (today Qwen3 MoE). Add a ``ModelSetup`` entry there for a new model; the engine stays unchanged.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
+import logging
+import os
 from types import SimpleNamespace
-from typing import Any, Optional, TypedDict
+from typing import Any, Callable, Optional, TypedDict
 
 import torch
 
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
 # The optional kernels each torchtitan model supports.
 _SUPPORTED_KERNELS = {"qwen3_5": frozenset({"moe", "kda", "lce"})}
+
+# Not ``qwen2_moe``: torchtitan's qwen3 model has no Qwen2-MoE shared expert.
+_QWEN3_MOE_HF_MODEL_TYPES = frozenset({"qwen3_moe"})
+# Pallas grouped-matmul row tile and dWeight tiling; tokens * top_k must be a multiple of the row tile.
+_QWEN3_MOE_GROUPED_MM_TILE_M = 256
+_QWEN3_MOE_GROUPED_MM_TGMM_TILING = (256, 0, 0)
 
 
 class LceBlockSizes(TypedDict, total=False):
@@ -117,6 +132,116 @@ def configure_model_spec(model_spec: Any, kernels: frozenset[str]) -> None:
     for _, experts, _, _ in model_spec.model.traverse(TpuGroupedExperts.Config):
         experts.pallas_grouped_mm_tile_m = _MOE_GROUPED_MM_TILE_M
         experts.pallas_grouped_mm_tgmm_tiling = _MOE_GROUPED_MM_TGMM_TILING
+
+
+def is_qwen3_moe(torchtitan_name: str, hf_config: Any) -> bool:
+    """Whether ``configure_qwen3_moe`` applies (Qwen3 MoE, not dense Qwen3/Qwen2 or Qwen3.5)."""
+    return torchtitan_name == "qwen3" and getattr(hf_config, "model_type", None) in _QWEN3_MOE_HF_MODEL_TYPES
+
+
+def qwen3_moe_model_registry_kwargs() -> dict[str, Any]:
+    """``model_registry`` kwargs for Qwen3 MoE: torchtitan's TPU token dispatcher and grouped-experts converters.
+
+    Same order as torchtitan's Qwen3-30B-A3B TPU recipe. The default dispatcher's backward is ~5x slower on TPU.
+    """
+    from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
+    from torchtitan.experiments.tpu.token_dispatcher import TpuTokenDispatcherConverter
+
+    return {"converters": [TpuTokenDispatcherConverter.Config(), TpuGroupedExpertsConverter.Config()]}
+
+
+def configure_qwen3_moe(model_spec: Any, *, expert_parallel_size: int, seq_bucket_size: int) -> None:
+    """Sets up a Qwen3 MoE ``model_spec.model`` for RL on TPU, in place.
+
+    - Turns off expert-bias load balancing and the aux loss: the HF checkpoint the rollout serves has no expert bias,
+      so the trainer must route like it.
+    - Runs the routed experts with the Pallas grouped matmul in the canonical layout: the native
+      ``torch._grouped_mm`` backward is wrong on TPU (torch_tpu#2668).
+
+    Raises:
+        ValueError: if ``expert_parallel_size > 1``, or if ``seq_bucket_size * top_k`` is not a multiple of the
+            256-row tile.
+    """
+    from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+    from torchtitan.models.common.moe import MoE
+
+    if expert_parallel_size > 1:
+        raise ValueError(
+            f"expert_parallel_size={expert_parallel_size} is not supported for Qwen3 MoE on TPU: the Pallas grouped "
+            "matmul needs EP=1 (exact, tile-aligned routed rows), and the native torch._grouped_mm fallback computes "
+            "a wrong expert dWeight on TPU (torch_tpu#2668). Use expert_parallel_size=1 with FSDP "
+            "(data_parallel_shard_size) instead."
+        )
+    model_config = model_spec.model
+    moe_configs = [moe for _, moe, _, _ in model_config.traverse(MoE.Config)]
+    if not moe_configs:
+        raise ValueError("Qwen3 MoE: the torchtitan model config has no MoE layer")
+    tile_m = _QWEN3_MOE_GROUPED_MM_TILE_M
+    token_multiple = max(int(seq_bucket_size), 1)  # bucket sizes <= 1 disable bucketing
+    for moe in moe_configs:
+        top_k = moe.router.top_k
+        if (token_multiple * top_k) % tile_m:
+            raise ValueError(
+                f"Qwen3 MoE on TPU: the Pallas grouped matmul needs tokens * top_k to be a multiple of {tile_m}, but "
+                f"token counts are only guaranteed to be multiples of the sequence bucket {token_multiple} "
+                f"(top_k={top_k}). Set engine_kwargs.tpu.seq_bucket_size so that it times top_k is a multiple of "
+                f"{tile_m} (the default 256 is)."
+            )
+        moe.load_balance_coeff = None
+        moe.router.aux_loss = None
+    experts_configs = [experts for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config)]
+    if len(experts_configs) != len(moe_configs):
+        raise ValueError(
+            f"Qwen3 MoE: {len(experts_configs)} of {len(moe_configs)} MoE layers use TpuGroupedExperts; build the "
+            "model with qwen3_moe_model_registry_kwargs()"
+        )
+    for experts in experts_configs:
+        experts.use_pallas_grouped_mm = True
+        experts.use_pallas_paired_grouped_mm = False
+        experts.use_kernel_native_weight_layout = False  # keep the canonical parameter names and layout
+        experts.pallas_grouped_mm_tile_m = tile_m
+        experts.pallas_grouped_mm_tgmm_tiling = _QWEN3_MOE_GROUPED_MM_TGMM_TILING
+    logger.info(
+        "Qwen3 MoE: %d layers route without expert bias or aux loss; TPU token dispatcher and Pallas grouped "
+        "matmul experts (tile_m=%d)",
+        len(moe_configs),
+        tile_m,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelSetupContext:
+    """Engine settings a ``ModelSetup.configure`` may need."""
+
+    expert_parallel_size: int
+    seq_bucket_size: int
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelSetup:
+    """Mandatory TPU setup of one model family (not an optional ``model_kernels`` entry)."""
+
+    name: str
+    matches: Callable[[str, Any], bool]  # (torchtitan model name, HF config) -> bool
+    registry_kwargs: Callable[[], dict[str, Any]] = dict  # extra ``model_registry`` kwargs
+    configure: Optional[Callable[[Any, ModelSetupContext], None]] = None  # in-place ``model_spec`` fix-ups
+
+
+_MODEL_SETUPS: tuple[ModelSetup, ...] = (
+    ModelSetup(
+        name="qwen3_moe",
+        matches=is_qwen3_moe,
+        registry_kwargs=qwen3_moe_model_registry_kwargs,
+        configure=lambda spec, ctx: configure_qwen3_moe(
+            spec, expert_parallel_size=ctx.expert_parallel_size, seq_bucket_size=ctx.seq_bucket_size
+        ),
+    ),
+)
+
+
+def model_setup(torchtitan_name: str, hf_config: Any) -> Optional[ModelSetup]:
+    """The mandatory TPU setup of the model, or ``None`` if it needs none."""
+    return next((setup for setup in _MODEL_SETUPS if setup.matches(torchtitan_name, hf_config)), None)
 
 
 def override_imports(kernels: frozenset[str]) -> list[str]:

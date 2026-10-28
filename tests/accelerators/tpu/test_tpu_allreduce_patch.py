@@ -136,3 +136,94 @@ def test_gloo_only_group_all_gather_into_tensor_stages_via_cpu():
         tpu_patch_mod.apply()
         assert dist.all_gather_into_tensor(out, inp, group="dp_gloo") == "ok"
     assert out._cpu.tolist() == [1.0, 2.0, 3.0, 6.0]
+
+
+class _FakeTPUScalar:
+    """A TPU tensor stand-in: only ``.cpu()`` / ``.copy_()`` reach real (CPU) data."""
+
+    device = mock.Mock(type="tpu")
+
+    def __init__(self, val: int):
+        self._cpu = torch.tensor([val])
+        self.copied = None
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self._cpu.clone()
+
+    def copy_(self, src):
+        self.copied = src.clone()
+        return self
+
+
+@pytest.mark.parametrize(
+    ("op", "peer", "expected"),
+    [(dist.ReduceOp.MAX, 7, 7), (dist.ReduceOp.MIN, 1, 1)],
+)
+def test_max_min_on_tpu_dist_group_stage_via_cpu(op, peer, expected):
+    """``use_dynamic_bsz``: verl's ``rearrange_micro_batches`` MAX / MIN-reduces TPU tensors on the data-parallel group.
+
+    In an FSDP-only run that is the ``cpu:gloo,tpu:tpu_dist`` group, whose ``tpu_dist`` backend only lowers Sum
+    all-reduces outside torch.compile, so the patch hands a CPU copy to the group (its Gloo backend reduces it).
+    """
+    seen = {}
+
+    def _fake_orig_all_reduce(t, op=None, group=None, async_op=False):
+        seen.update(device=t.device.type, op=op, group=group)
+        reduced = max(t.item(), peer) if op == dist.ReduceOp.MAX else min(t.item(), peer)
+        t.fill_(reduced)
+        return "ok"
+
+    fake_tpu_tensor = _FakeTPUScalar(3)
+    with (
+        mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True),
+        mock.patch.object(dist, "all_reduce", side_effect=_fake_orig_all_reduce),
+        mock.patch.object(dist, "get_backend", return_value="cpu:gloo,tpu:tpu_dist"),
+    ):
+        tpu_patch_mod.apply()
+        assert dist.all_reduce(fake_tpu_tensor, op=op, group="dp_group") == "ok"
+
+    assert seen == {"device": "cpu", "op": op, "group": "dp_group"}
+    assert fake_tpu_tensor.copied.tolist() == [expected]
+
+
+def test_sum_and_compiled_max_on_tpu_dist_group_pass_through():
+    """Sum all-reduces of TPU tensors, and MAX inside torch.compile, still run on ``tpu_dist`` unchanged."""
+    fake_original = mock.MagicMock(return_value="ok")
+    fake_tpu_tensor = _FakeTPUScalar(3)
+    with (
+        mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True),
+        mock.patch.object(dist, "all_reduce", fake_original),
+        mock.patch.object(dist, "get_backend", return_value="cpu:gloo,tpu:tpu_dist"),
+    ):
+        tpu_patch_mod.apply()
+        dist.all_reduce(fake_tpu_tensor, op=dist.ReduceOp.SUM, group="dp_group")
+        fake_original.assert_called_with(fake_tpu_tensor, op=dist.ReduceOp.SUM, group="dp_group", async_op=False)
+        dist.all_reduce(fake_tpu_tensor, group="dp_group")
+        fake_original.assert_called_with(fake_tpu_tensor, group="dp_group", async_op=False)
+        with mock.patch.object(torch.compiler, "is_compiling", return_value=True):
+            dist.all_reduce(fake_tpu_tensor, op=dist.ReduceOp.MAX, group="dp_group")
+        fake_original.assert_called_with(fake_tpu_tensor, op=dist.ReduceOp.MAX, group="dp_group", async_op=False)
+
+    assert fake_tpu_tensor.copied is None
+
+
+def test_max_on_cpu_tensor_or_tpu_only_group_passes_through():
+    """MAX of a CPU tensor needs no staging, and a group without a Gloo backend could not reduce a CPU copy."""
+    fake_original = mock.MagicMock(return_value="ok")
+    cpu_tensor = torch.tensor([3])
+    fake_tpu_tensor = _FakeTPUScalar(3)
+    with (
+        mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True),
+        mock.patch.object(dist, "all_reduce", fake_original),
+        mock.patch.object(dist, "get_backend", return_value="tpu_dist"),
+    ):
+        tpu_patch_mod.apply()
+        dist.all_reduce(cpu_tensor, op=dist.ReduceOp.MAX, group="dp_group")
+        fake_original.assert_called_with(cpu_tensor, op=dist.ReduceOp.MAX, group="dp_group", async_op=False)
+        dist.all_reduce(fake_tpu_tensor, op=dist.ReduceOp.MIN, group="tpu_group")
+        fake_original.assert_called_with(fake_tpu_tensor, op=dist.ReduceOp.MIN, group="tpu_group", async_op=False)
+
+    assert fake_tpu_tensor.copied is None
