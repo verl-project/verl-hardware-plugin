@@ -1093,28 +1093,26 @@ def test_parity_check_with_local_shards_waits_for_every_rank_and_reports_mismatc
     state = fake_tpu_sync.registry_state
     assert sorted(state.get_stats(1)["ranks"]) == list(range(trainer_ranks))
 
-    # A rank whose stats never arrive: the check gives up waiting and reports the stats as incomplete.
+    # A rank whose stats never arrive: the check gives up waiting and fails on the incomplete stats.
     ranks = state.stats[1]["ranks"]
     missing = ranks.pop(1)
     real_sleep = asyncio.sleep
     monkeypatch.setattr(tpu_sync_engine.asyncio, "sleep", lambda _: real_sleep(0))
     caplog.clear()
     with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
-        asyncio.run(tpu_sync_engine._verify_parity(manager, global_steps=1))
-    assert "Incomplete stats data for step 1" in caplog.text
+        with pytest.raises(parity.TPUSyncParityError, match=r"Step 1\] Incomplete trainer stats: 1 of 2 trainer"):
+            asyncio.run(tpu_sync_engine._verify_parity(manager, global_steps=1))
     assert "PARITY VERIFIED" not in caplog.text
     ranks[1] = missing
 
     # A corrupted rollout tensor is reported against the merged trainer stats.
     samplers[1]._tpu_sync_staging["model.embed_tokens.weight"].zero_()
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+    with pytest.raises(parity.TPUSyncParityError, match=r"TPU-SYNC PARITY MISMATCH \| Step 1\]") as excinfo:
         asyncio.run(tpu_sync_engine._verify_parity(manager, global_steps=1))
-    assert "TPU-SYNC PARITY MISMATCH | Step 1" in caplog.text
-    assert "model.embed_tokens.weight" in caplog.text
+    assert "model.embed_tokens.weight" in str(excinfo.value)
 
 
-def test_parity_check_reports_mismatch(fake_tpu_sync, worker_ext, caplog):
+def test_parity_check_reports_mismatch(fake_tpu_sync, worker_ext):
     tp = 2
     weights = _trainer_weights()
     samplers = [_make_sampler(worker_ext, rank, tp, _FakeVllmModel(tp)) for rank in range(tp)]
@@ -1128,10 +1126,110 @@ def test_parity_check_reports_mismatch(fake_tpu_sync, worker_ext, caplog):
     asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
 
     samplers[1]._tpu_sync_staging["model.embed_tokens.weight"].zero_()
-    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+    with pytest.raises(parity.TPUSyncParityError, match=r"TPU-SYNC PARITY MISMATCH \| Step 1\]") as excinfo:
         asyncio.run(tpu_sync_engine._verify_parity(manager, global_steps=1))
-    assert "TPU-SYNC PARITY MISMATCH | Step 1" in caplog.text
-    assert "model.embed_tokens.weight" in caplog.text
+    assert "model.embed_tokens.weight" in str(excinfo.value)
+
+
+def _norm_parity_setup(worker_ext, weights, trainer_verify_parity=True):
+    """TP=2 rollout and 2 trainer ranks with ``verify_parity=norm`` on the driver (and, by default, the trainer)."""
+    samplers = [_make_sampler(worker_ext, rank, 2, _FakeVllmModel(2)) for rank in range(2)]
+    events: list = []
+    manager, server = _make_manager(
+        [_trainer_engine(rank, verify_parity=trainer_verify_parity) for rank in range(2)],
+        lambda rank: iter(weights.items()),
+        samplers,
+        events,
+        verify_parity="norm",
+    )
+    return manager, server, samplers, events
+
+
+def _rpc_without_results(server, monkeypatch, methods):
+    """Makes ``server`` run ``methods`` on its workers but return no results, like a server that drops them."""
+    real_rpc = server.collective_rpc
+
+    def collective_rpc(method, **kwargs):
+        result = real_rpc(method, **kwargs)
+        return None if method in methods else result
+
+    monkeypatch.setattr(server, "collective_rpc", collective_rpc)
+
+
+def test_norm_parity_mismatch_fails_the_sync_without_resuming(fake_tpu_sync, worker_ext):
+    weights = _trainer_weights()
+    manager, _, samplers, events = _norm_parity_setup(worker_ext, weights)
+    # One rollout worker ends up with a wrong tensor after its install.
+    real_install = samplers[1].install_tpu_sync_weights
+
+    def install_and_corrupt(**kwargs):
+        result = real_install(**kwargs)
+        samplers[1]._tpu_sync_staging["model.embed_tokens.weight"].zero_()
+        return result
+
+    samplers[1].install_tpu_sync_weights = install_and_corrupt
+    with pytest.raises(parity.TPUSyncParityError, match=r"TPU-SYNC PARITY MISMATCH \| Step 1\]") as excinfo:
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert "model.embed_tokens.weight" in str(excinfo.value)
+    assert events[-2:] == ["set_global_steps", "get_model_weights_stats"]  # checked, then stopped: no "resume"
+
+
+def test_norm_parity_fails_the_sync_without_trainer_stats(fake_tpu_sync, worker_ext, monkeypatch):
+    # The trainer ranks post no norms (here: norm check off on the trainer side), so there is nothing to compare.
+    manager, _, _, events = _norm_parity_setup(worker_ext, _trainer_weights(), trainer_verify_parity=False)
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(parity.asyncio, "sleep", lambda _: real_sleep(0))
+    with pytest.raises(parity.TPUSyncParityError, match=r"Step 1\] Incomplete trainer stats: 0 of 2 trainer ranks"):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert "install_tpu_sync_weights" in events and "resume" not in events
+
+
+def test_norm_parity_fails_the_sync_without_rollout_stats(fake_tpu_sync, worker_ext, monkeypatch):
+    manager, server, _, events = _norm_parity_setup(worker_ext, _trainer_weights())
+    _rpc_without_results(server, monkeypatch, {"get_model_weights_stats"})
+    with pytest.raises(parity.TPUSyncParityError, match=r"Step 1\] No sampler worker stats"):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert "resume" not in events
+
+
+def test_exact_parity_fails_the_sync_without_rollout_results(fake_tpu_sync, worker_ext, monkeypatch):
+    weights = _trainer_weights()
+    manager, _, events = _exact_parity_setup(worker_ext, weights, 2, "exact")
+    _rpc_without_results(manager.replicas[0].server_handle._obj, monkeypatch, {"install_tpu_sync_weights"})
+    with pytest.raises(parity.TPUSyncParityError, match=r"Step 0\] no rollout worker returned a result"):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    assert "resume" not in events
+
+
+def test_update_tpu_sync_weights_returns_phase_timings_and_slowest_worker_h2d(fake_tpu_sync, worker_ext, monkeypatch):
+    """The ``timing_s/tpu-sync/*`` step metrics: ``sampler_h2d_pure`` is the slowest worker's H2D time over every
+    replica, and is left out when the rollout servers do not pass the worker results back."""
+    tp, num_replicas = 2, 2
+    weights = _trainer_weights()
+    samplers = [
+        [_make_sampler(worker_ext, rank, tp, _FakeVllmModel(tp)) for rank in range(tp)] for _ in range(num_replicas)
+    ]
+
+    def with_h2d(install, h2d):
+        """``install``, reporting ``h2d`` as its host-to-device time."""
+        return lambda **kwargs: {**install(**kwargs), "h2d": h2d}
+
+    h2d_times = [0.25, 0.5, 0.75, 0.125]  # The slowest worker is rank 0 of replica 1.
+    for sampler, h2d in zip(itertools.chain.from_iterable(samplers), h2d_times, strict=True):
+        sampler.install_tpu_sync_weights = with_h2d(sampler.install_tpu_sync_weights, h2d)
+    manager, _ = _make_manager(
+        [_trainer_engine(0)], lambda rank: iter(weights.items()), None, [], replica_samplers=samplers
+    )
+    assert len(manager.replicas) == num_replicas
+
+    metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert set(metrics) == TIMING_KEYS and min(metrics.values()) >= 0
+    assert metrics["timing_s/tpu-sync/sampler_h2d_pure"] == 0.75
+
+    for replica in manager.replicas:
+        _rpc_without_results(replica.server_handle._obj, monkeypatch, {"install_tpu_sync_weights"})
+    metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=2))
+    assert set(metrics) == TIMING_KEYS - {"timing_s/tpu-sync/sampler_h2d_pure"}
 
 
 def _exact_parity_setup(worker_ext, weights, tp, verify_parity, flip_o_proj=False, loaded=True):
@@ -1172,20 +1270,22 @@ def test_exact_parity_passes_on_step_0_when_rollout_holds_the_checkpoint(
     assert (fake_tpu_sync.registry_state.get_stats(0) is not None) is (verify_parity == "all")
 
 
-def test_exact_parity_reports_every_mismatched_tensor(fake_tpu_sync, worker_ext, caplog):
+def test_exact_parity_mismatch_fails_the_sync_without_resuming(fake_tpu_sync, worker_ext):
     tp = 2
     weights = _trainer_weights()
-    manager, models, _ = _exact_parity_setup(worker_ext, weights, tp, "exact")
+    manager, models, events = _exact_parity_setup(worker_ext, weights, tp, "exact")
     # vLLM's copy of one tensor differs from the checkpoint the trainer sends (e.g. a mis-sliced shard).
     with torch.no_grad():
         models[1].model.layers[0].mlp.down_proj.weight.add_(1)
-    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+    with pytest.raises(parity.TPUSyncParityError) as excinfo:
         asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
-    assert "TPU-SYNC PARITY EXACT | Step 0] 2 rollout ranks, [9] tensors checked per rank, 1 mismatched" in caplog.text
-    assert "rank 1: model.layers.0.mlp.down_proj.weight: max|diff|=1" in caplog.text
-    # The check only reports: the received weights are installed regardless.
+    message = str(excinfo.value)
+    assert "TPU-SYNC PARITY EXACT | Step 0] 2 rollout ranks, [9] tensors checked per rank, 1 mismatched" in message
+    assert "rank 1: model.layers.0.mlp.down_proj.weight: max|diff|=1" in message
+    # The check runs after the install (the received weights are in place) and before generation resumes.
     for rank, model in enumerate(models):
         _assert_state(model, _expected_vllm_state(weights, rank, tp))
+    assert "install_tpu_sync_weights" in events and "resume" not in events
 
 
 def test_exact_parity_runs_only_on_the_step_0_sync(fake_tpu_sync, worker_ext, caplog):
@@ -1201,19 +1301,38 @@ def test_exact_parity_runs_only_on_the_step_0_sync(fake_tpu_sync, worker_ext, ca
 
 def test_report_exact_parity_names_replicas_and_flags_skipped_or_missing_results(caplog):
     ok = {"rank": 0, "checked": 3, "num_mismatched": 0, "mismatched": [], "unresolved": []}
+    skipped = {"rank": 0, "skipped": "not supported with the vLLM-loader install"}
     install_results = [
         [{"h2d": 0.1, "exact_parity": ok}],
-        [{"h2d": 0.1, "exact_parity": {"rank": 0, "skipped": "not supported with the vLLM-loader install"}}],
+        [{"h2d": 0.1, "exact_parity": skipped}],
         [{"h2d": 0.1}],
+        None,  # A rollout server that does not pass the worker results back.
     ]
-    labels = [" | replica 0", " | replica 1", " | replica 2"]
+    labels = [" | replica 0", " | replica 1", " | replica 2", " | replica 3"]
     with caplog.at_level(logging.INFO, logger=parity.__name__):
-        assert parity.report_exact_parity(0, install_results, labels) is False
+        # Every replica is checked before the check fails, and the error names each failing one.
+        with pytest.raises(parity.TPUSyncParityError) as excinfo:
+            parity.report_exact_parity(0, install_results, labels)
     assert "PARITY EXACT | Step 0 | replica 0] 1 rollout ranks, [3] tensors checked per rank, 0 mismatched" in (
         caplog.text
     )
-    assert "PARITY EXACT | Step 0 | replica 1] not run: not supported with the vLLM-loader install" in caplog.text
-    assert "PARITY EXACT | Step 0 | replica 2] no rollout worker returned a result" in caplog.text
+    message = str(excinfo.value)
+    assert "PARITY EXACT | Step 0 | replica 1] not run: not supported with the vLLM-loader install" in message
+    assert "PARITY EXACT | Step 0 | replica 2] no rollout worker returned a result" in message
+    assert "PARITY EXACT | Step 0 | replica 3] no rollout worker returned a result" in message
+    assert "replica 0" not in message
+
+    # A replica the check cannot run on (vLLM-loader install) fails the check too: exact was asked for and did not run.
+    with pytest.raises(parity.TPUSyncParityError, match=r"replica 1\] not run: .*use verify_parity=norm"):
+        parity.report_exact_parity(0, install_results[:2], labels[:2])
+    parity.report_exact_parity(0, install_results[:1], labels[:1])  # all checked and matched: no error
+
+
+def test_report_exact_parity_fails_on_unresolved_tensors():
+    unresolved = {"rank": 1, "checked": 3, "num_mismatched": 0, "mismatched": [], "unresolved": ["extra.weight"]}
+    with pytest.raises(parity.TPUSyncParityError, match="0 mismatched, 1 unresolved") as excinfo:
+        parity.report_exact_parity(None, [[{"exact_parity": unresolved}]], [""])
+    assert "rank 1: unresolved ['extra.weight']" in str(excinfo.value)
 
 
 def test_exact_parity_check_flags_shape_and_value_differences():
@@ -1262,13 +1381,22 @@ def test_update_tpu_sync_weights_syncs_several_replicas_in_one_transfer(fake_tpu
     assert "[TPU-SYNC PARITY VERIFIED | Step 1 | replica 1]" in caplog.text
     assert "MISMATCH" not in caplog.text
 
-    # A replica with wrong weights is reported by name, at ERROR level; the other one still verifies.
+    # A replica with wrong weights fails the check by name; the other one still verifies.
     samplers[1][0]._tpu_sync_staging["model.embed_tokens.weight"].zero_()
     caplog.clear()
-    with caplog.at_level(logging.ERROR, logger=tpu_sync_engine.__name__):
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        with pytest.raises(parity.TPUSyncParityError) as excinfo:
+            asyncio.run(tpu_sync_engine._verify_parity(manager, global_steps=1))
+    assert "[TPU-SYNC PARITY MISMATCH | Step 1 | replica 1]" in str(excinfo.value)
+    assert "replica 0" not in str(excinfo.value)
+    assert "[TPU-SYNC PARITY VERIFIED | Step 1 | replica 0]" in caplog.text
+
+    # Both replicas wrong: each one is checked and named in the error.
+    samplers[0][1]._tpu_sync_staging["model.embed_tokens.weight"].zero_()
+    with pytest.raises(parity.TPUSyncParityError) as excinfo:
         asyncio.run(tpu_sync_engine._verify_parity(manager, global_steps=1))
-    assert "[TPU-SYNC PARITY MISMATCH | Step 1 | replica 1]" in caplog.text
-    assert "replica 0" not in caplog.text
+    assert "[TPU-SYNC PARITY MISMATCH | Step 1 | replica 0]" in str(excinfo.value)
+    assert "[TPU-SYNC PARITY MISMATCH | Step 1 | replica 1]" in str(excinfo.value)
 
 
 def test_sampler_job_names_follow_replica_rank():

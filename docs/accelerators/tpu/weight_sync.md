@@ -77,7 +77,7 @@ actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 | Option (`engine_kwargs.tpu-sync.*`) | Default | Description |
 |-------------------------------------|---------|-------------|
 | `parallelism` | `8` | Parallel transfer streams per worker. |
-| `verify_parity` | `off` | Weight-sync check: `off`, `norm`, `exact` or `all` (`True` means `norm`). See [Parity checks](#parity-checks). Meant for bring-up and after changing sharding or upgrading tpu-sync. |
+| `verify_parity` | `off` | Weight-sync check: `off`, `norm`, `exact` or `all` (`True` means `norm`). See [Parity checks](#parity-checks). A failed check stops the run. Meant for bring-up and after changing sharding or upgrading tpu-sync. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The deprecated environment variable `VERL_TPU_SYNC_RELEASE_BUFFERS` still overrides the option on the trainer workers and logs a deprecation warning. |
 
 ## Parity checks
@@ -98,8 +98,15 @@ extra compare per tensor, once. The driver logs one line per replica:
 ```
 
 followed, on a mismatch, by one line per mismatched tensor and rank. It covers every tensor installed directly into
-vLLM's parameters. Qwen3.5's stacked experts are not compared, and models installed through vLLM's weight loaders
-log `not run`. Both checks only report; the sync and the run continue either way.
+vLLM's parameters. Qwen3.5's stacked experts are not compared. Models installed through vLLM's weight loaders cannot
+be checked bit for bit (the loaders re-shard the tensors themselves); the check logs `not run` and fails, so use
+`verify_parity=norm` for them.
+
+An enabled check that fails raises `TPUSyncParityError` on the driver, which stops the run. It fails on a mismatch
+(including `unresolved` tensors in the `exact` check), and also when it cannot collect what it needs: trainer ranks
+that did not post their norms, rollout workers that returned no stats or no `exact` result, or an `exact` check
+that could not run (`not run`). The checks run before generation resumes, so the rollout never generates with
+weights that failed a check.
 
 ## Several rollout replicas
 
@@ -133,9 +140,9 @@ trainer, log them with the step metrics:
 | `timing_s/tpu-sync/sampler_h2d_pure` | The host-to-device copy alone, on the slowest rollout worker |
 | `timing_s/tpu-sync/total_sync` | The whole sync after pausing generation |
 
-`sampler_h2d_pure` and the `verify_parity` check depend on the rollout workers' return values, which
-verl's vLLM server does not yet pass back from `collective_rpc`. Until it does, the sync still works, but
-`sampler_h2d_pure` is not reported and the parity check logs a warning instead of a result.
+`sampler_h2d_pure` and the `verify_parity` checks read the rollout workers' return values, which verl's vLLM server
+passes back from `collective_rpc` (since verl-project/verl#8155). With an older verl, the sync still works, but
+`sampler_h2d_pure` is not reported and an enabled parity check fails for lack of results.
 
 ## Verify
 
@@ -170,7 +177,7 @@ buffers then. With `verify_parity=norm` (or `True`), every sync after the first 
 Both lines come from the driver process. There, vLLM's serving code imports
 `model_hosting_container_standards`, which sets Python's root logger to `SAGEMAKER_CONTAINER_LOG_LEVEL`
 (default `ERROR`). Without the variable, the driver drops the plugin's `INFO` and `WARNING` messages.
-Errors, such as a parity mismatch, are always logged.
+Errors are always logged, and a failed parity check raises `TPUSyncParityError` with its result lines.
 
 ## Related Documentation
 

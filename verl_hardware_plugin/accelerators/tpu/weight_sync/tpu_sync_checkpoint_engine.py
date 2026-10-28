@@ -211,7 +211,8 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
     * ``parallelism`` (default 8): parallel transfer streams per worker.
     * ``verify_parity`` (default ``off``): ``norm`` posts weight norms after every sync so the driver can check
       that the rollout received the trainer's weights; ``exact`` has the rollout workers compare the step-0 sync
-      bit for bit with the checkpoint vLLM loaded (trainer ranks do nothing for it); ``all`` runs both.
+      bit for bit with the checkpoint vLLM loaded (trainer ranks do nothing for it); ``all`` runs both. A failed
+      check raises ``TPUSyncParityError`` on the driver, before generation resumes.
     * ``tie_word_embeddings`` (default unset): whether ``lm_head`` is tied to the input embedding, so it
       need not be sent. Unset sends ``lm_head``, which is correct for tied and untied models alike.
     * ``release_buffers_after_sync`` (default True): free the bound send tensors after every transfer
@@ -616,6 +617,9 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
 
     Returns:
         Per-phase timings in seconds, logged as step metrics by trainers that record sync metrics.
+
+    Raises:
+        TPUSyncParityError: An enabled parity check (``verify_parity``) failed; generation is not resumed.
     """
     backend = manager.backend or TPU_SYNC_BACKEND
     options = get_tpu_sync_options(_tpu_sync_engine_kwargs(manager.config, backend), backend)
@@ -734,15 +738,14 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
 
     t_total = time.perf_counter() - t_total_start
 
-    # 6. Parity verification (optional, default off).
+    # 6. Parity verification (optional, default off). An enabled check raises TPUSyncParityError on a mismatch or on
+    #    missing stats/results; it runs before resume_generation_replicas, so a failed sync stops the run instead
+    #    of resuming generation on wrong weights.
     t_parity_start = time.perf_counter()
     if exact_install_kwargs:
         report_exact_parity(global_steps, install_results, _replica_labels(manager))
     if verify_parity:
-        try:
-            await _verify_parity(manager, global_steps)
-        except Exception as e:
-            logger.warning(f"Failed to execute parity verification: {e}")
+        await _verify_parity(manager, global_steps)
     t_parity = time.perf_counter() - t_parity_start
 
     logger.info(

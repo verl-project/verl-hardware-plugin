@@ -226,7 +226,8 @@ class ParityMode:
     * ``exact``: on the step-0 sync, compare every received tensor bit for bit with the parameter vLLM loaded.
     * ``all``: both.
 
-    A bool is accepted for compatibility: ``True`` means ``norm``, ``False`` means ``off``.
+    A bool is accepted for compatibility: ``True`` means ``norm``, ``False`` means ``off``. An enabled check that
+    finds a mismatch, or cannot collect the stats it needs, raises ``TPUSyncParityError`` and stops the run.
     """
 
     MODES = ("off", "norm", "exact", "all")
@@ -251,7 +252,8 @@ class TPUSyncOptions:
         parallelism: Parallel transfer streams per worker.
         verify_parity: Weight-sync check, one of ``ParityMode.MODES`` (``off`` by default): ``norm`` compares
             trainer and rollout weight norms after every sync, ``exact`` compares every tensor the rollout
-            received on the step-0 sync bit for bit with the checkpoint vLLM loaded, ``all`` runs both.
+            received on the step-0 sync bit for bit with the checkpoint vLLM loaded, ``all`` runs both. A failed
+            check raises ``TPUSyncParityError`` before generation resumes.
         release_buffers_after_sync: Unbind the send buffers (a bf16 copy of this rank's weights) after every
             transfer, so training gets that HBM back between syncs.
         tie_word_embeddings: Whether ``lm_head`` is tied to the input embedding, so it need not be sent.
