@@ -48,6 +48,15 @@ from typing import Any, Callable, Iterator, NamedTuple, Optional
 
 import torch
 
+from verl_hardware_plugin.accelerators.tpu.rollout.direct_install import DirectInstallLayout
+from verl_hardware_plugin.accelerators.tpu.rollout.moe_weights import (
+    MOE_LAYOUTS,
+    ParityCheckFn,
+    expert_param,
+    write_w2,
+    write_w13,
+)
+
 # HF model types of the Qwen3.5 text models this module installs.
 QWEN3_5_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text")
 
@@ -120,13 +129,6 @@ FUSED_TARGETS = (
     ),
     (".linear_attn.in_proj_ba.weight", (".linear_attn.in_proj_b.weight", ".linear_attn.in_proj_a.weight")),
 )
-
-# vLLM MoE methods whose expert weight layout ``_write_w13`` / ``_write_w2`` know: vllm-torchtpu's unquantized method
-# (transposed, each w13 half padded to a multiple of 128) and vLLM's own unquantized method ([E, 2I, H] / [E, H, I]).
-MOE_LAYOUT_TPU = "tpu_transposed_padded"
-MOE_LAYOUT_VLLM = "vllm"
-_MOE_LAYOUTS = {"VllmUnquantizedFusedMoEMethod": MOE_LAYOUT_TPU, "UnquantizedFusedMoEMethod": MOE_LAYOUT_VLLM}
-_MOE_PAD_MULTIPLE = 128  # vllm-torchtpu's VllmUnquantizedFusedMoEMethod.process_weights_after_loading
 
 _ERROR_PREFIX = "tpu-sync direct install"
 _GDN_RE = re.compile(r"^(.*\.linear_attn)\.in_proj_q\.weight$")
@@ -306,9 +308,9 @@ def plan_direct_install(
             if getattr(m, "use_ep", False):
                 return None, "vLLM uses expert parallelism"
             method = type(m.quant_method).__name__
-            if method not in _MOE_LAYOUTS:
+            if method not in MOE_LAYOUTS:
                 return None, f"unsupported vLLM MoE method {method} (quantized?)"
-            layouts.add(_MOE_LAYOUTS[method])
+            layouts.add(MOE_LAYOUTS[method])
         if len(layouts) != 1:
             return None, f"vLLM MoE layouts {sorted(layouts) or 'not found'}"
         moe_layout = layouts.pop()
@@ -342,12 +344,14 @@ def install(
     find_model_key: Callable[[str], Optional[str]],
     copy_into: Callable[[str, torch.Tensor], None],
     plan: DirectInstallPlan,
+    check: Optional[ParityCheckFn] = None,
 ) -> set[str]:
     """Writes the Qwen3.5-specific tensors of ``staging`` into vLLM's parameters; returns the staging names used.
 
     ``copy_into(vllm_key, tensor)`` copies a tensor in vLLM's checkpoint ([n_out, n_in]) layout, transposing it
-    for the weights that vllm-torchtpu keeps as [n_in, n_out]. Updates ``plan.padding_checked`` and
-    ``plan.expert_keys`` (see ``DirectInstallPlan``).
+    for the weights that vllm-torchtpu keeps as [n_in, n_out]. ``check``, if given, is called on every expert
+    weight region before it is overwritten (the exact parity check; ``copy_into`` runs it for the rest). Updates
+    ``plan.padding_checked`` and ``plan.expert_keys`` (see ``DirectInstallPlan``).
     """
     consumed: set[str] = set()
     dims, tp_rank, tp_size = plan.dims, plan.tp_rank, plan.tp_size
@@ -395,102 +399,31 @@ def install(
             raise RuntimeError(f"{_ERROR_PREFIX}: received experts but planned no MoE layout")
         prefix = m.group(1)
         gate, up, down = staging[name], staging[f"{prefix}.up_proj"], staging[f"{prefix}.down_proj"]
-        w13, w2 = (
-            model_sd[_expert_param(model_sd, find_model_key, prefix, leaf, plan.expert_keys)]
+        w13_key, w2_key = (
+            expert_param(model_sd, find_model_key, prefix, leaf, plan.expert_keys)
             for leaf in ("w13_weight", "w2_weight")
         )
-        _write_w13(w13, gate, up, plan.moe_layout, check_padding=not plan.padding_checked)
-        _write_w2(w2, down, plan.moe_layout, check_padding=not plan.padding_checked)
+        check_padding = not plan.padding_checked
+        write_w13(model_sd[w13_key], gate, up, plan.moe_layout, check_padding, check=check, name=w13_key)
+        write_w2(model_sd[w2_key], down, plan.moe_layout, check_padding, check=check, name=w2_key)
         consumed.update({name, f"{prefix}.up_proj", f"{prefix}.down_proj"})
     plan.padding_checked = True
     return consumed
-
-
-def _expert_param(
-    model_sd: dict[str, torch.Tensor],
-    find_model_key: Callable[[str], Optional[str]],
-    prefix: str,
-    leaf: str,
-    cache: dict[tuple[str, str], str],
-) -> str:
-    """vLLM's key of expert weight ``leaf`` (``w13_weight`` / ``w2_weight``) of the MoE block ``prefix``.
-
-    vLLM's MoE layer keeps the expert weights in a submodule of ``mlp.experts`` (e.g. its ``MoERunner``'s
-    ``routed_experts``), so the key is ``<prefix>.<submodule...>.<leaf>``; the submodule path depends on the vLLM
-    version and platform, so it is looked up (once; ``cache`` keeps the result).
-    """
-    cached = cache.get((prefix, leaf))
-    if cached is not None and cached in model_sd:
-        return cached
-    key = find_model_key(f"{prefix}.{leaf}")
-    if key is not None:
-        cache[(prefix, leaf)] = key
-        return key
-    # ``model.layers.3.mlp.experts`` -> any ``...(^|.)layers.3.mlp.experts.<submodules>.<leaf>`` key of vLLM.
-    stem = re.escape(prefix.split("model.", 1)[-1])
-    pattern = re.compile(rf"(?:^|\.){stem}\.(?:.+\.)?{re.escape(leaf)}$")
-    matches = [k for k in model_sd if pattern.search(k)]
-    if len(matches) != 1:
-        raise RuntimeError(f"{_ERROR_PREFIX}: expected one vLLM parameter {prefix}.*.{leaf}, found {matches}")
-    cache[(prefix, leaf)] = matches[0]
-    return matches[0]
 
 
 def _local(param: torch.Tensor) -> torch.Tensor:
     return param.to_local() if hasattr(param, "to_local") else param
 
 
-def _aligned(inter: int) -> int:
-    return (inter + _MOE_PAD_MULTIPLE - 1) // _MOE_PAD_MULTIPLE * _MOE_PAD_MULTIPLE
+def _loader_weights(weights: Iterator[tuple[str, torch.Tensor]], hf_text_config: Any) -> Iterator:
+    return refuse_split_tensors(weights)
 
 
-def _check_zero(region: torch.Tensor, what: str) -> None:
-    if region.numel() and bool(region.ne(0).any()):
-        raise RuntimeError(f"{_ERROR_PREFIX}: vllm-torchtpu's {what} padding is not zero")
-
-
-def _write_w13(param: torch.Tensor, gate: torch.Tensor, up: torch.Tensor, layout: str, check_padding: bool) -> None:
-    """Writes rank-local ``gate`` / ``up`` [E, I_r, H] into vLLM's ``w13_weight``.
-
-    ``MOE_LAYOUT_TPU``: vllm-torchtpu's unquantized MoE keeps it as [E, H, 2A] (transposed, each half padded with
-    zeros to ``A``, the next multiple of 128). ``MOE_LAYOUT_VLLM``: vLLM's own [E, 2 I_r, H].
-    """
-    w13 = _local(param)
-    num_experts, inter, hidden = gate.shape
-    if layout == MOE_LAYOUT_VLLM:
-        expected: tuple[int, ...] = (num_experts, 2 * inter, hidden)
-    elif layout == MOE_LAYOUT_TPU:
-        expected = (num_experts, hidden, 2 * _aligned(inter))
-    else:
-        raise RuntimeError(f"{_ERROR_PREFIX}: unknown MoE layout {layout}")
-    if tuple(w13.shape) != expected:
-        raise RuntimeError(f"{_ERROR_PREFIX}: w13_weight {tuple(w13.shape)}, expected {expected} ({layout})")
-    if layout == MOE_LAYOUT_VLLM:
-        w13.copy_(torch.cat([gate, up], dim=1))
-        return
-    aligned = _aligned(inter)
-    if check_padding:
-        _check_zero(w13[..., inter:aligned], "w13 gate")
-        _check_zero(w13[..., aligned + inter :], "w13 up")
-    w13[..., :inter].copy_(gate.transpose(1, 2))
-    w13[..., aligned : aligned + inter].copy_(up.transpose(1, 2))
-
-
-def _write_w2(param: torch.Tensor, down: torch.Tensor, layout: str, check_padding: bool) -> None:
-    """Writes rank-local ``down`` [E, H, I_r] into ``w2_weight``: [E, A, H] (``MOE_LAYOUT_TPU``) or [E, H, I_r]."""
-    w2 = _local(param)
-    num_experts, hidden, inter = down.shape
-    if layout == MOE_LAYOUT_VLLM:
-        expected: tuple[int, ...] = (num_experts, hidden, inter)
-    elif layout == MOE_LAYOUT_TPU:
-        expected = (num_experts, _aligned(inter), hidden)
-    else:
-        raise RuntimeError(f"{_ERROR_PREFIX}: unknown MoE layout {layout}")
-    if tuple(w2.shape) != expected:
-        raise RuntimeError(f"{_ERROR_PREFIX}: w2_weight {tuple(w2.shape)}, expected {expected} ({layout})")
-    if layout == MOE_LAYOUT_VLLM:
-        w2.copy_(down)
-        return
-    if check_padding:
-        _check_zero(w2[:, inter:, :], "w2")
-    w2[:, :inter, :].copy_(down.transpose(1, 2))
+LAYOUT = DirectInstallLayout(
+    name="qwen3_5",
+    plan=plan_direct_install,
+    sharding_rule=sampler_sharding_rule,
+    install=install,
+    fused_targets=FUSED_TARGETS,
+    loader_weights=_loader_weights,
+)

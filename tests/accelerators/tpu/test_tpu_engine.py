@@ -1065,6 +1065,60 @@ def test_trainer_weights_exports_local_fsdp_shards_or_gathers(tmp_path):
     )
 
 
+def _folded_expert_stacks_worker(rank: int, world: int, init_file: str) -> None:
+    """One trainer rank of ``test_trainer_weights_folds_expert_stacks_locally_or_gathers``."""
+    import torch.distributed as dist
+    from torch.distributed.tensor import Replicate, Shard, distribute_tensor, init_device_mesh
+
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+    from verl_hardware_plugin.accelerators.tpu.rollout.qwen3_moe_layout import expert_stack_wire_name
+
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
+    try:
+        mesh = init_device_mesh("cpu", (world,))
+        generator = torch.Generator().manual_seed(0)  # the same full stacks on every rank
+        # layer -> (experts, placement): whole experts per rank; torchtitan's dim-1 expert sharding (FSDP degree above
+        # the expert count, torchtitan 73ebc5f2); an uneven expert split; replicated.
+        layouts = {0: (4, Shard(0)), 1: (4, Shard(1)), 2: (3, Shard(0)), 3: (4, Replicate())}
+        stacks, full = [], {}
+        for layer, (num_experts, placement) in layouts.items():
+            stack = torch.randn(num_experts, 6, 4, generator=generator)
+            slots = [(f"model.layers.{layer}.mlp.experts.{e}.gate_proj.weight", (6, 4)) for e in range(num_experts)]
+            stacks.append((distribute_tensor(stack, mesh, [placement]), slots))
+            full[layer] = stack
+
+        def weights() -> TrainerWeights:
+            return TrainerWeights({}, list(stacks), "cpu", expert_stack_wire=expert_stack_wire_name)
+
+        exported = list(weights().local_shards())
+        assert [name for name, _, _ in exported] == [
+            f"model.layers.{layer}.mlp.experts.gate_proj.weight" for layer in layouts
+        ]
+        for layer, (name, tensor, shard) in enumerate(exported):
+            folded = full[layer].to(torch.bfloat16).reshape(-1, 4)
+            assert tensor.dtype == torch.bfloat16, name
+            if layer == 0:  # a dim-0 block of whole experts of the folded tensor: no gather
+                assert shard == (world, rank), name
+                assert tensor._base is None, name  # a copy in its own buffer, as tpu-sync needs
+                assert torch.equal(tensor, folded.chunk(world, dim=0)[rank]), name
+            else:  # gathered (or already whole) and sent folded and full
+                assert shard is None, name
+                assert torch.equal(tensor, folded), name
+
+        gathered = dict(weights())  # plain iteration keeps one HF tensor per expert
+        assert len(gathered) == sum(n for n, _ in layouts.values())
+        assert torch.equal(gathered["model.layers.1.mlp.experts.3.gate_proj.weight"], full[1][3].to(torch.bfloat16))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_trainer_weights_folds_expert_stacks_locally_or_gathers(tmp_path):
+    """Expert stacks go out folded to 2-D: whole-expert dim-0 FSDP shards locally, every other layout gathered."""
+    torch.multiprocessing.start_processes(
+        _folded_expert_stacks_worker, args=(2, str(tmp_path / "pg")), nprocs=2, join=True, start_method="fork"
+    )
+
+
 def test_install_tpu_attention_keeps_cp_wrappers():
     """CP inner attentions keep their communication and take the TPU attention as their local attention."""
 

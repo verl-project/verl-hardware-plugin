@@ -1072,12 +1072,31 @@ class TorchTitanTPUEngine(BaseEngine):
         # shards in several pieces (in_proj_qkv, conv1d, the stacked experts' gate_up_proj) as those pieces
         # (rollout/qwen3_5_layout.py); plain iteration keeps the HF layout.
         local_transform = None
+        expert_stack_wire = None
         if getattr(self, "_torchtitan_name", None) == "qwen3_5":
             from verl_hardware_plugin.accelerators.tpu.rollout.qwen3_5_layout import make_tpu_sync_local_layout
 
             hf_config = self.model_config.hf_config
             local_transform = make_tpu_sync_local_layout(getattr(hf_config, "text_config", None) or hf_config)
-        return TrainerWeights(dense, expert_stacks, get_device_id(), local_transform=local_transform), None
+        elif getattr(self, "_torchtitan_name", None) == "qwen3":
+            # Qwen3 MoE: tpu-sync sends each expert stack folded to 2-D, so that FSDP shards of whole experts are sent
+            # without a gather and the rollout installs them straight into vLLM's expert-parallel w13 / w2
+            # (rollout/qwen3_moe_layout.py). Dense Qwen3 has no expert stacks.
+            from verl_hardware_plugin.accelerators.tpu.rollout import qwen3_moe_layout
+
+            expert_stack_wire = qwen3_moe_layout.trainer_expert_stack_wire(
+                getattr(self.model_config.hf_config, "model_type", None), self.engine_config.expert_parallel_size
+            )
+        return (
+            TrainerWeights(
+                dense,
+                expert_stacks,
+                get_device_id(),
+                local_transform=local_transform,
+                expert_stack_wire=expert_stack_wire,
+            ),
+            None,
+        )
 
 
 @EngineRegistry.register(
