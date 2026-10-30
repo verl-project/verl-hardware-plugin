@@ -4,11 +4,13 @@
 """Unit tests for the TPU TorchTitan engine utilities on CPU."""
 
 import ast
+import dataclasses
 import os
 import sys
 import types
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from typing import Any, Optional
 from unittest import mock
 
 import pytest
@@ -1406,6 +1408,169 @@ def test_resolve_tpu_model_kernels(monkeypatch):
     assert kernels_mod.lce_block_sizes(frozenset(), hidden_size=2048, vocab_size=248320) == {}
     with pytest.raises(ValueError, match="not supported"):
         resolve("qwen3_5", "bogus")
+
+
+def _fake_torchtitan_moe_modules() -> dict[str, types.ModuleType]:
+    """Stand-ins for torchtitan's MoE config classes and TPU MoE converters (fields as in torchtitan ``ea7fec0f``)."""
+
+    @dataclasses.dataclass
+    class _ConverterConfig:
+        pass
+
+    class MoE:
+        @dataclasses.dataclass
+        class Config:
+            router: Any
+            routed_experts: Any
+            load_balance_coeff: Optional[float] = 1e-3
+
+    class GroupedExperts:
+        @dataclasses.dataclass
+        class Config:
+            num_experts: int = 128
+
+    class TpuGroupedExperts(GroupedExperts):
+        @dataclasses.dataclass
+        class Config(GroupedExperts.Config):
+            use_pallas_grouped_mm: bool = False
+            use_pallas_paired_grouped_mm: bool = False
+            pallas_grouped_mm_tile_m: int = 1024
+            pallas_grouped_mm_tgmm_tiling: tuple[int, int, int] = (128, 128, 128)
+            use_kernel_native_weight_layout: bool = False
+
+    moe_mod = types.ModuleType("torchtitan.models.common.moe")
+    moe_mod.MoE = MoE  # type: ignore[attr-defined]
+    moe_mod.GroupedExperts = GroupedExperts  # type: ignore[attr-defined]
+    grouped_experts = types.ModuleType("torchtitan.experiments.tpu.grouped_experts")
+    grouped_experts.TpuGroupedExperts = TpuGroupedExperts  # type: ignore[attr-defined]
+    grouped_experts.TpuGroupedExpertsConverter = type(  # type: ignore[attr-defined]
+        "TpuGroupedExpertsConverter", (), {"Config": type("Config", (_ConverterConfig,), {})}
+    )
+    token_dispatcher = types.ModuleType("torchtitan.experiments.tpu.token_dispatcher")
+    token_dispatcher.TpuTokenDispatcherConverter = type(  # type: ignore[attr-defined]
+        "TpuTokenDispatcherConverter", (), {"Config": type("Config", (_ConverterConfig,), {})}
+    )
+    return {m.__name__: m for m in (moe_mod, grouped_experts, token_dispatcher)}
+
+
+def _fake_qwen3_moe_model_spec(modules, *, n_layers=2, top_k=8, tpu_experts=True):
+    """A ``ModelSpec`` stand-in whose model config ``traverse``s like torchtitan (``(fqn, config, parent, field)``)."""
+    MoE = modules["torchtitan.models.common.moe"].MoE
+    experts_cls = (
+        modules["torchtitan.experiments.tpu.grouped_experts"].TpuGroupedExperts
+        if tpu_experts
+        else modules["torchtitan.models.common.moe"].GroupedExperts
+    )
+    nodes = []
+    for _ in range(n_layers):
+        experts = experts_cls.Config()
+        router = SimpleNamespace(top_k=top_k, aux_loss="batch_wise global aux loss")
+        nodes += [MoE.Config(router=router, routed_experts=experts), experts]
+
+    def traverse(cls):
+        return [(f"layers.{i}", node, None, None) for i, node in enumerate(nodes) if isinstance(node, cls)]
+
+    return SimpleNamespace(model=SimpleNamespace(traverse=traverse), nodes=nodes)
+
+
+def test_only_qwen3_moe_gets_the_qwen3_moe_setup():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels as kernels_mod
+
+    def hf(model_type):
+        return SimpleNamespace(model_type=model_type)
+
+    assert kernels_mod.is_qwen3_moe("qwen3", hf("qwen3_moe"))
+    assert not kernels_mod.is_qwen3_moe("qwen3", hf("qwen3"))  # dense Qwen3: same torchtitan model, unchanged
+    assert not kernels_mod.is_qwen3_moe("qwen3", hf("qwen2"))
+    assert not kernels_mod.is_qwen3_moe("qwen3_5", hf("qwen3_5_moe"))
+    assert not kernels_mod.is_qwen3_moe("qwen3_5", hf("qwen3_5_moe_text"))
+    assert not kernels_mod.is_qwen3_moe("llama3", hf("qwen3_moe"))
+    # The optional ``model_kernels`` do not cover it: torchtitan's qwen3 has none.
+    assert kernels_mod.resolve_tpu_model_kernels("qwen3", "auto") == frozenset()
+
+
+def test_qwen3_moe_model_registry_converters_dispatcher_first():
+    """Same converters, in the same order, as torchtitan's Qwen3-30B-A3B TPU recipe."""
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels as kernels_mod
+
+    modules = _fake_torchtitan_moe_modules()
+    with mock.patch.dict(sys.modules, modules):
+        kwargs = kernels_mod.qwen3_moe_model_registry_kwargs()
+    dispatcher = modules["torchtitan.experiments.tpu.token_dispatcher"].TpuTokenDispatcherConverter
+    grouped_experts = modules["torchtitan.experiments.tpu.grouped_experts"].TpuGroupedExpertsConverter
+    assert list(kwargs) == ["converters"]
+    assert [type(c) for c in kwargs["converters"]] == [dispatcher.Config, grouped_experts.Config]
+
+
+def test_model_setup_table_selects_qwen3_moe_only():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels as kernels_mod
+
+    def hf(model_type):
+        return SimpleNamespace(model_type=model_type)
+
+    setup = kernels_mod.model_setup("qwen3", hf("qwen3_moe"))
+    assert setup is not None and setup.name == "qwen3_moe"
+    for name, model_type in [
+        ("qwen3", "qwen3"),
+        ("qwen3", "qwen2_moe"),
+        ("qwen3_5", "qwen3_5_moe"),
+        ("llama3", "llama"),
+    ]:
+        assert kernels_mod.model_setup(name, hf(model_type)) is None
+    # configure forwards the engine settings to configure_qwen3_moe.
+    calls = []
+    with mock.patch.object(kernels_mod, "configure_qwen3_moe", lambda spec, **kw: calls.append((spec, kw))):
+        setup.configure("spec", kernels_mod.ModelSetupContext(expert_parallel_size=1, seq_bucket_size=1024))
+    assert calls == [("spec", {"expert_parallel_size": 1, "seq_bucket_size": 1024})]
+
+
+def test_configure_qwen3_moe_routes_like_hf_with_tpu_grouped_experts():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels as kernels_mod
+
+    modules = _fake_torchtitan_moe_modules()
+    spec = _fake_qwen3_moe_model_spec(modules)
+    with mock.patch.dict(sys.modules, modules):
+        kernels_mod.configure_qwen3_moe(spec, expert_parallel_size=1, seq_bucket_size=1024)
+
+    moes, experts = spec.nodes[0::2], spec.nodes[1::2]
+    # No expert-bias balancer (the HF checkpoint has no expert bias) and no aux loss.
+    assert all(m.load_balance_coeff is None and m.router.aux_loss is None for m in moes)
+    for e in experts:
+        assert e.use_pallas_grouped_mm and not e.use_pallas_paired_grouped_mm
+        assert not e.use_kernel_native_weight_layout  # canonical w1/w2/w3 layout, which the weight export assumes
+        assert e.pallas_grouped_mm_tile_m == 256
+        assert e.pallas_grouped_mm_tgmm_tiling == (256, 0, 0)  # full K/N dWeight tiles
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"expert_parallel_size": 2, "seq_bucket_size": 256}, "expert_parallel_size=2 is not supported"),
+        ({"expert_parallel_size": 1, "seq_bucket_size": 16}, "multiple of 256"),  # 16 * 8 = 128 routed rows
+        ({"expert_parallel_size": 1, "seq_bucket_size": 0}, "multiple of 256"),  # no bucketing: any token count
+    ],
+)
+def test_configure_qwen3_moe_rejects_ep_and_untiled_buckets(kwargs, match):
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels as kernels_mod
+
+    modules = _fake_torchtitan_moe_modules()
+    spec = _fake_qwen3_moe_model_spec(modules)
+    with mock.patch.dict(sys.modules, modules), pytest.raises(ValueError, match=match):
+        kernels_mod.configure_qwen3_moe(spec, **kwargs)
+    # 32 * 8 = 256 routed rows is tile-aligned.
+    with mock.patch.dict(sys.modules, modules):
+        kernels_mod.configure_qwen3_moe(spec, expert_parallel_size=1, seq_bucket_size=32)
+
+
+def test_configure_qwen3_moe_needs_the_tpu_converters():
+    """A model built without ``qwen3_moe_model_registry_kwargs`` would silently keep the native grouped mm."""
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels as kernels_mod
+
+    modules = _fake_torchtitan_moe_modules()
+    with mock.patch.dict(sys.modules, modules), pytest.raises(ValueError, match="0 of 2 MoE layers"):
+        kernels_mod.configure_qwen3_moe(
+            _fake_qwen3_moe_model_spec(modules, tpu_experts=False), expert_parallel_size=1, seq_bucket_size=256
+        )
 
 
 def test_packed_document_budget_keeps_every_rl_sequence_apart():

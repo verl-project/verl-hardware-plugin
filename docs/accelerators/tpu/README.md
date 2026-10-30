@@ -51,7 +51,7 @@ verl_hardware_plugin/accelerators/tpu/
 │   ├── make_report.py                # Builds a self-contained HTML report (Timeline + HBM Memory tabs) from a job log
 │   └── index.html                    # Self-contained report viewer (Timeline + HBM Memory tabs; also opens raw logs)
 └── patches/
-    └── reduce_avg_allreduce_patch.py # all_reduce workaround for TPU tensors on Gloo-only groups
+    └── reduce_avg_allreduce_patch.py # all_reduce workaround for TPU tensors on Gloo-only groups and for MAX/MIN
 ```
 
 ```text
