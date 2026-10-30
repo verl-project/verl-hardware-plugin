@@ -29,14 +29,15 @@ except Exception as exc:
 
 
 def apply_mlu_profiler_patches():
-    """Apply all MLU profiler monkey-patches. Idempotent."""
-    from verl_hardware_plugin.accelerators.mlu.profilers.torch_profile_mlu import (
-        _patch_get_torch_profiler,
-        _patch_tool_config,
-    )
+    """Apply all MLU profiler monkey-patches (torch + cnprec). Idempotent.
 
-    _patch_tool_config()
-    _patch_get_torch_profiler()
+    Delegates to the profilers package so there is a single implementation of
+    the patch list; this module is imported by the plugin's backend loading,
+    so the patches are applied in production without any extra call.
+    """
+    from verl_hardware_plugin.accelerators.mlu.profilers import register_all_profiles
+
+    register_all_profiles()
 
 
 try:

@@ -70,6 +70,11 @@ try:
 except ImportError:
     HAVE_TRITON = False
     SUPPORT_CUDA_TMA = False
+    # Keep the module importable without the MLU triton backend (community triton,
+    # non-MLU environments): the autotune config selectors below read these at
+    # module level, so they must exist even on the degraded path.
+    _devprob = {}
+    TOTAL_CORE_NUM = 0
 
 
 if not HAVE_TRITON:

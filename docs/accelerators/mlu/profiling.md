@@ -13,7 +13,7 @@ env_vars:
   VERL_USE_EXTERNAL_MODULES: "verl_hardware_plugin"
 ```
 
-The plugin registers the torch profiler patch when `verl_hardware_plugin` is imported.
+The plugin registers its profiler patches (torch and cnprec) when `verl_hardware_plugin` is imported: `accelerators/mlu/registration.py` applies them at import time via `register_all_profiles()`, so no extra call is needed in the training script.
 
 ## Community Torch Profile
 
@@ -76,6 +76,48 @@ python -m verl.trainer.sft_trainer_ray \
 ```
 
 With `all_ranks=False` and `ranks=[0]`, only rank 0 emits a trace, so a single file is produced (e.g. `outputs/profile/train_batch/language-model_train-batch_rank0-of-8_*.json.gz`). Set `all_ranks=True` if you need per-rank traces for all cards.
+
+## Cnprec Profile
+
+The plugin patches verl `DistProfiler` so `global_profiler.tool=cnprec` dispatches to cnprec's `VerlTrainingAnalyzer` without modifying upstream verl. It reuses existing `@DistProfiler.annotate` stages (`actor_update`, `actor_compute_log_prob`, `ref_compute_log_prob`, `critic_update`, `compute_values`, `compute_rm_score`) and lazily attaches cnprec's module/optimizer hooks on the first profiled step, so non-profiled steps pay no overhead.
+
+This is the **online dump** path for verl train-side precision collection. The dumped artifacts (`module_level/...`, `data/...`, `weight_snapshots/...`) are later consumed by cnprec's offline comparison `analyze_verl_offline`.
+
+### Setup
+
+Install `cnprec` in the Ray runtime environment, and prepare an `analyze_verl_config.json` (see cnprec's bundled template `cnprec.configs.analyze_verl_config.json`). The plugin also honors the `CNPREC_VERL_ANALYZE=true` and `CNPREC_VERL_CONFIG_PATH=...` environment variables.
+
+### PPO example
+
+```bash
+python -m verl.trainer.main_ppo \
+  ... \
+  global_profiler.tool=cnprec \
+  global_profiler.steps=[2] \
+  global_profiler.save_path=outputs/profile \
+  actor_rollout_ref.actor.profiler.enable=True \
+  actor_rollout_ref.actor.profiler.all_ranks=True \
+  +actor_rollout_ref.actor.profiler.tool_config.cnprec.config_path=/path/to/analyze_verl_config.json \
+  +actor_rollout_ref.actor.profiler.tool_config.cnprec.stages=[actor_update,actor_compute_log_prob] \
+  +actor_rollout_ref.actor.profiler.tool_config.cnprec.strict=False
+```
+
+The upstream profiler yaml does not define a `cnprec` block, so Hydra overrides must use the `+` prefix to append these keys.
+
+Cnprec options:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `config_path` | `null` | Path to cnprec `analyze_verl_config.json`. Required (or set env `CNPREC_VERL_CONFIG_PATH`). |
+| `stages` | `null` | Subset of annotate stages to collect (`actor_update`, `actor_compute_log_prob`, `ref_compute_log_prob`, `critic_update`, `compute_values`, `compute_rm_score`); `null` = all known. |
+| `strict` | `False` | If `True`, fail when cnprec is unavailable or config_path is missing; otherwise run without profiling. |
+
+### Notes
+
+- Rank selection follows verl's native gating: `global_profiler.ranks` / `all_ranks` decide which ranks enter the profiled range (cnprec no longer forces every rank). cnprec's own `analyze_verl_config.json` `ranks` further filters which ranks actually dump data. Hooks may touch process-global state, so prefer `all_ranks=True` when in doubt.
+- One `VerlTrainingAnalyzer` is built lazily per (role, block) and reused across steps; `stop()` advances it one step (writes per-step artifacts under the `output_dir` from `analyze_verl_config.json`, not `global_profiler.save_path`).
+- For rollout generation (`rollout.mode=async`), the inference-side collection uses cnprec's `VllmAnalyzer` separately; keep trainer-side stages on cnprec and drive rollout profiling as needed.
+- `global_profiler.save_path` is currently informational for cnprec (artifacts go to `analyze_verl_config.json`'s `output_dir`); it is kept for config compatibility.
 
 ## Profiling Steps and Scope
 
