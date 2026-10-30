@@ -30,8 +30,8 @@ design smell" rather than "clean":
   import time), so this does take effect regardless of load order.
 - The cost: this still intercepts a public torch API process-wide -- once
   applied, every `dist.all_reduce(op=AVG)` call in the process is routed
-  through this wrapper, XPU-related or not. It is scoped to xccl groups via
-  `dist.get_backend(group) != "xccl"`, so a gloo/nccl group in the same
+  through this wrapper, XPU-related or not. It is scoped to groups whose
+  backend includes xccl (`_is_xccl_group`), so a gloo/nccl group in the same
   process (e.g. a CPU-only Ray actor's coordination group alongside a GPU
   worker's xccl group) is untouched and keeps native `AVG` -- but anyone
   reading verl-core's source still can't see, from that source alone, that
@@ -65,6 +65,17 @@ def _xpu_available() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+def _is_xccl_group(group) -> bool:
+    """True for any group with an xccl backend, including verl's mixed groups.
+
+    verl creates its process groups with backend "cpu:gloo,xpu:xccl", and for such
+    a group `dist.get_backend()` returns that whole string, not "xccl".
+    """
+    import torch.distributed as dist
+
+    return "xccl" in str(dist.get_backend(group))
+
+
 def apply() -> None:
     global _applied
     if _applied:
@@ -77,7 +88,7 @@ def apply() -> None:
     original_all_reduce = dist.all_reduce
 
     def _patched_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
-        if op != dist.ReduceOp.AVG or async_op or dist.get_backend(group) != "xccl":
+        if op != dist.ReduceOp.AVG or async_op or not _is_xccl_group(group):
             return original_all_reduce(tensor, op=op, group=group, async_op=async_op)
 
         world_size = dist.get_world_size(group=group)
