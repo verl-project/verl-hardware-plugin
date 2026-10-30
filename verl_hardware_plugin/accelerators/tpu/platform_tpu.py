@@ -24,6 +24,7 @@ import torch
 
 from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
+from verl.utils.flops_counter import _DEVICE_FLOPS
 from verl_hardware_plugin.accelerators.tpu import device_api as tpu_device_api
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import extend_torchtitan_engine_config
 from verl_hardware_plugin.accelerators.tpu.options import tpu_chips_per_host_override
@@ -61,6 +62,27 @@ TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_",)
 
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471
+
+# Theoretical BF16 peak FLOPS per addressable TPU device (one chip on v5e/v5p/v6e, one TensorCore on TPU 7x),
+# keyed by both libtpu's PjRtDevice::device_kind() strings (returned by torch.tpu.get_device_name()) and GKE /
+# Ray accelerator names. Registered into verl.utils.flops_counter._DEVICE_FLOPS so get_device_flops() computes
+# MFU on upstream verl without modifying verl's source tree.
+TPU_DEVICE_FLOPS = {
+    "TPU v7x": 1153.5e12,
+    "TPU v7": 1153.5e12,
+    "TPU7x": 1153.5e12,
+    "tpu7x": 1153.5e12,
+    "v7x": 1153.5e12,
+    "TPU v6e": 918e12,
+    "TPU v6 lite": 918e12,
+    "v6e": 918e12,
+    "TPU v5p": 459e12,
+    "v5p": 459e12,
+    "TPU v5e": 197e12,
+    "TPU v5 lite": 197e12,
+    "v5e": 197e12,
+}
+_DEVICE_FLOPS.update(TPU_DEVICE_FLOPS)
 
 # TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice. The vLLM
 # rollout (``rollout/tpu_vllm_patches.py``) resolves its mesh here too, so the trainer and the
