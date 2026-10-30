@@ -1050,19 +1050,55 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
             )
 
 
-@triton.autotune(
-    configs=[
+def _entropy_backward_d_hidden_configs():
+    """Per-part autotune list, tuned with tuning/sweep_backward_kernels.py.
+
+    Parts differ in on-chip memory: 512 KB-NRAM parts vs 1 MB-NRAM parts
+    (e.g. MLU692/M9). The two winner sets are mutually incompatible — a config
+    tuned on one part can exhaust NRAM/SRAM on the other, so pick by
+    ``max_nram_size`` instead of merging the lists.
+    """
+    if _devprob.get("max_nram_size", 0) >= 1024 * 1024:
+        # 1 MB-NRAM parts: 1.00x on every shape in results_local.jsonl
+        return [
+            # large tokens / hidden: overall fastest
+            triton.Config(
+                {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 512, "GROUP_SIZE_M": 8},
+                num_stages=1,
+                num_warps=1,
+            ),
+            # hidden_size=8192-class shapes
+            triton.Config(
+                {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 8},
+                num_stages=3,
+                num_warps=1,
+            ),
+            # small / odd shapes (e.g. correctness-guard sizes)
+            triton.Config(
+                {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 8},
+                num_stages=3,
+                num_warps=4,
+            ),
+        ]
+    # 512 KB-NRAM parts: 1.00x on every shape in results.jsonl / results_refine.jsonl
+    return [
+        # best on every training shape scanned
         triton.Config(
-            {"BLOCK_SIZE_M": 512, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 16},
+            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 512, "GROUP_SIZE_M": 8},
+            num_stages=2,
+            num_warps=4,
+        ),
+        # small / odd shapes (e.g. correctness-guard sizes)
+        triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 8},
             num_stages=3,
             num_warps=4,
         ),
-        triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 16},
-            num_stages=3,
-            num_warps=1,
-        ),
-    ],
+    ]
+
+
+@triton.autotune(
+    configs=_entropy_backward_d_hidden_configs(),
     key=["num_tokens", "hidden_size", "vocab_size"],
 )
 @triton.jit
@@ -1214,168 +1250,46 @@ def efficient_entropy_backward_kernel_d_hidden(
         )
 
 
-@triton.autotune(
-    configs=[
+def _entropy_backward_d_weight_configs():
+    """Per-part autotune list, tuned with tuning/sweep_backward_kernels.py.
+
+    Same NRAM-based part split as ``_entropy_backward_d_hidden_configs``; the
+    two winner sets are mutually incompatible (NRAM/SRAM overflow across parts).
+    """
+    if _devprob.get("max_nram_size", 0) >= 1024 * 1024:
+        # 1 MB-NRAM parts, tuned on MLU692/M9 (results_local.jsonl). Pruned:
+        # the dropped (256,64,512,s2,w4) twin only beat (256,64,512,s3,w4) by
+        # ~2% on the small correctness-guard shape (noise-level elsewhere).
+        return [
+            # best on hidden_size>=4096 shapes
+            triton.Config(
+                {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 512, "GROUP_SIZE_M": 8},
+                num_stages=3,
+                num_warps=4,
+            ),
+            # best on hidden_size=2048-class shapes
+            triton.Config(
+                {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 8},
+                num_stages=3,
+                num_warps=1,
+            ),
+        ]
+    # 512 KB-NRAM parts, tuned on m9dk (results.jsonl / results_refine.jsonl).
+    # Pruned to a single config: the dropped (256,64,512,s3,w4) was only ~1%
+    # ahead on training shapes (noise-level) and ~2% ahead on the small
+    # correctness-guard shape.
+    return [
+        # best or within ~1% on every training shape scanned
         triton.Config(
-            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 256},
-            num_stages=2,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256},
-            num_stages=2,
-            num_warps=1,
-        ),
-    ],
-    key=["num_tokens", "hidden_size", "vocab_size"],
-    reset_to_zero=["d_hidden_ptr"],
-)
-@triton.jit
-def efficient_entropy_backward_kernel_d_hidden_mouter(
-    num_tokens: int,
-    hidden_size: int,
-    vocab_size: int,
-    rank: int,
-    hidden_ptr,
-    stride_hidden_m: tl.int64,
-    stride_hidden_k: tl.int64,
-    weight_ptr,
-    stride_weight_n: tl.int64,
-    stride_weight_k: tl.int64,
-    labels_ptr,
-    stride_labels: tl.int64,
-    maximum_ptr,
-    stride_maximum: tl.int64,
-    accu_ptr,
-    stride_accu: tl.int64,
-    d_entropy_ptr,
-    stride_d_entropy: tl.int64,
-    d_logprobs_ptr,
-    stride_d_logprobs: tl.int64,
-    reduction: int,
-    entropy_b_ptr,
-    stride_entropy_b: tl.int64,
-    d_hidden_ptr,
-    stride_d_hidden_m: tl.int64,
-    stride_d_hidden_k: tl.int64,
-    rcp_temperature: tl.float32,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    num_pid_n = tl.cdiv(vocab_size, 2 * BLOCK_SIZE_N)
-
-    offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-    # Per-token vectors: loaded ONCE and shared across all vocab tiles.
-    maximum = tl.load(maximum_ptr + offs_m * stride_maximum, mask=offs_m < num_tokens, other=0.0)
-    accu = tl.load(accu_ptr + offs_m * stride_accu, mask=offs_m < num_tokens, other=1e-6)
-    accu_rcp = tl.fdiv(1.0, accu)
-    d_entropy = tl.load(d_entropy_ptr + offs_m * stride_d_entropy, mask=offs_m < num_tokens, other=0.0)
-    if reduction == 0:
-        d_logprobs = tl.load(d_logprobs_ptr + offs_m * stride_d_logprobs, mask=offs_m < num_tokens, other=0.0)
-    elif reduction == 1:
-        d_logprobs = tl.load(d_logprobs_ptr)
-        d_logprobs = tl.broadcast_to(d_logprobs, (BLOCK_SIZE_M,))
-    else:
-        d_logprobs = tl.fdiv(tl.load(d_logprobs_ptr), num_tokens.to(tl.float32))
-        d_logprobs = tl.broadcast_to(d_logprobs, (BLOCK_SIZE_M,))
-    d_logprobs = -1 * d_logprobs
-
-    entropy_b = tl.load(entropy_b_ptr + offs_m * stride_entropy_b, mask=offs_m < num_tokens, other=0.0)
-    labels = tl.load(labels_ptr + offs_m * stride_labels, mask=offs_m < num_tokens, other=0)
-
-    for pid_n in range(0, num_pid_n):
-        offs_n0 = (2 * pid_n) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        offs_n1 = (2 * pid_n + 1) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-
-        hidden_ptrs = hidden_ptr + (offs_m[:, None] * stride_hidden_m + offs_k[None, :] * stride_hidden_k)
-        weight_ptrs0 = weight_ptr + (offs_n0[:, None] * stride_weight_n + offs_k[None, :] * stride_weight_k)
-        weight_ptrs1 = weight_ptr + (offs_n1[:, None] * stride_weight_n + offs_k[None, :] * stride_weight_k)
-
-        # forward logits GEMM: hidden streamed ONCE per pair, two weight tiles
-        logits0 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        logits1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for k in range(0, tl.cdiv(hidden_size, BLOCK_SIZE_K)):
-            _hidden = tl.load(
-                hidden_ptrs,
-                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_m[:, None] < num_tokens),
-                other=0.0,
-            )
-            _weight0 = tl.load(
-                weight_ptrs0,
-                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_n0[:, None] < vocab_size),
-                other=0.0,
-            )
-            _weight1 = tl.load(
-                weight_ptrs1,
-                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_n1[:, None] < vocab_size),
-                other=0.0,
-            )
-            logits0 = tl.dot(_hidden, _weight0.trans(), logits0)
-            logits1 = tl.dot(_hidden, _weight1.trans(), logits1)
-            hidden_ptrs += BLOCK_SIZE_K * stride_hidden_k
-            weight_ptrs0 += BLOCK_SIZE_K * stride_weight_k
-            weight_ptrs1 += BLOCK_SIZE_K * stride_weight_k
-
-        logits0 *= rcp_temperature
-        logits1 *= rcp_temperature
-
-        exp_logits0 = tl.exp(logits0 - maximum[:, None])
-        exp_logits1 = tl.exp(logits1 - maximum[:, None])
-
-        mask0 = (offs_n0 + rank * vocab_size)[None, :] == labels[:, None]
-        mask1 = (offs_n1 + rank * vocab_size)[None, :] == labels[:, None]
-        d_logits0 = d_logprobs[:, None] * (exp_logits0 * accu_rcp[:, None] - mask0)
-        d_logits0 += d_entropy[:, None] * (-exp_logits0 * accu_rcp[:, None]) * (logits0 - entropy_b[:, None])
-        d_logits1 = d_logprobs[:, None] * (exp_logits1 * accu_rcp[:, None] - mask1)
-        d_logits1 += d_entropy[:, None] * (-exp_logits1 * accu_rcp[:, None]) * (logits1 - entropy_b[:, None])
-
-        d_logits0 *= rcp_temperature
-        d_logits1 *= rcp_temperature
-        d_logits0_b = d_logits0.to(weight_ptr.dtype.element_ty)
-        d_logits1_b = d_logits1.to(weight_ptr.dtype.element_ty)
-
-        for k in range(0, tl.cdiv(hidden_size, BLOCK_SIZE_K)):
-            result_offs_k = k * BLOCK_SIZE_K + offs_k
-            weight_ptrs0 = weight_ptr + (offs_n0[:, None] * stride_weight_n + result_offs_k[None, :] * stride_weight_k)
-            weight_ptrs1 = weight_ptr + (offs_n1[:, None] * stride_weight_n + result_offs_k[None, :] * stride_weight_k)
-            _weight0 = tl.load(
-                weight_ptrs0,
-                mask=(result_offs_k[None, :] < hidden_size) & (offs_n0[:, None] < vocab_size),
-                other=0.0,
-            )
-            _weight1 = tl.load(
-                weight_ptrs1,
-                mask=(result_offs_k[None, :] < hidden_size) & (offs_n1[:, None] < vocab_size),
-                other=0.0,
-            )
-            _d_hidden = tl.dot(d_logits0_b, _weight0) + tl.dot(d_logits1_b, _weight1)
-            d_hidden_ptrs = (
-                d_hidden_ptr + offs_m[:, None] * stride_d_hidden_m + result_offs_k[None, :] * stride_d_hidden_k
-            )
-            tl.atomic_add(
-                d_hidden_ptrs,
-                _d_hidden,
-                mask=(offs_m[:, None] < num_tokens) & (result_offs_k[None, :] < hidden_size),
-            )
-
-
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 512, "GROUP_SIZE_M": 16},
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 512, "GROUP_SIZE_M": 8},
             num_stages=3,
             num_warps=4,
         ),
-        triton.Config(
-            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 512, "GROUP_SIZE_M": 16},
-            num_stages=1,
-            num_warps=4,
-        ),
-    ],
+    ]
+
+
+@triton.autotune(
+    configs=_entropy_backward_d_weight_configs(),
     key=["num_tokens", "hidden_size", "vocab_size"],
 )
 @triton.jit
@@ -1539,172 +1453,6 @@ def efficient_entropy_backward_kernel_d_weight(
         )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 512},
-            num_stages=3,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256},
-            num_stages=1,
-            num_warps=1,
-        ),
-    ],
-    key=["num_tokens", "hidden_size", "vocab_size"],
-    reset_to_zero=["d_weight_ptr"],
-)
-@triton.jit
-def efficient_entropy_backward_kernel_d_weight_mouter(
-    num_tokens: int,
-    hidden_size: int,
-    vocab_size: int,
-    rank: int,
-    hidden_ptr,
-    stride_hidden_m: tl.int64,
-    stride_hidden_k: tl.int64,
-    weight_ptr,
-    stride_weight_n: tl.int64,
-    stride_weight_k: tl.int64,
-    labels_ptr,
-    stride_labels: tl.int64,
-    maximum_ptr,
-    stride_maximum: tl.int64,
-    accu_ptr,
-    stride_accu: tl.int64,
-    d_entropy_ptr,
-    stride_d_entropy: tl.int64,
-    d_logprobs_ptr,
-    stride_d_logprobs: tl.int64,
-    reduction: int,
-    entropy_b_ptr,
-    stride_entropy_b: tl.int64,
-    d_weight_ptr,
-    stride_d_weight_n: tl.int64,
-    stride_d_weight_k: tl.int64,
-    rcp_temperature: tl.float32,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    """backward d_weight — M-outer variant (stream hidden once per token block).
-
-    Each program owns ONE token block and iterates over ALL adjacent vocab-tile
-    pairs, so ``hidden[BM, full_hidden]`` and the per-token reduction vectors are
-    streamed ONCE per program (shared across every vocab pair) instead of once
-    per vocab tile. This is the inverse of ``efficient_entropy_backward_kernel_d_weight``'s
-    nest (which iterates M inside vocab-pair x K). It wins big when there are
-    enough M-blocks to fill the cores and hidden is large enough that the
-    re-stream savings dominate; the host dispatch falls back to the pair kernel
-    otherwise. d_weight is reduced across M-blocks via ``tl.atomic_add``.
-    """
-    pid = tl.program_id(axis=0)
-    num_pid_n = tl.cdiv(vocab_size, 2 * BLOCK_SIZE_N)
-
-    offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-    # Per-token vectors: loaded ONCE and shared across all vocab tiles.
-    maximum = tl.load(maximum_ptr + offs_m * stride_maximum, mask=offs_m < num_tokens, other=0.0)
-    accu = tl.load(accu_ptr + offs_m * stride_accu, mask=offs_m < num_tokens, other=1e-6)
-    accu_rcp = tl.fdiv(1.0, accu)
-    d_entropy = tl.load(d_entropy_ptr + offs_m * stride_d_entropy, mask=offs_m < num_tokens, other=0.0)
-    if reduction == 0:
-        d_logprobs = tl.load(d_logprobs_ptr + offs_m * stride_d_logprobs, mask=offs_m < num_tokens, other=0.0)
-    elif reduction == 1:
-        d_logprobs = tl.load(d_logprobs_ptr)
-        d_logprobs = tl.broadcast_to(d_logprobs, (BLOCK_SIZE_M,))
-    else:
-        d_logprobs = tl.fdiv(tl.load(d_logprobs_ptr), num_tokens.to(tl.float32))
-        d_logprobs = tl.broadcast_to(d_logprobs, (BLOCK_SIZE_M,))
-    d_logprobs = -1 * d_logprobs
-
-    entropy_b = tl.load(entropy_b_ptr + offs_m * stride_entropy_b, mask=offs_m < num_tokens, other=0.0)
-    labels = tl.load(labels_ptr + offs_m * stride_labels, mask=offs_m < num_tokens, other=0)
-
-    for pid_n in range(0, num_pid_n):
-        offs_n0 = (2 * pid_n) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        offs_n1 = (2 * pid_n + 1) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-
-        hidden_ptrs = hidden_ptr + (offs_m[:, None] * stride_hidden_m + offs_k[None, :] * stride_hidden_k)
-        weight_ptrs0 = weight_ptr + (offs_n0[:, None] * stride_weight_n + offs_k[None, :] * stride_weight_k)
-        weight_ptrs1 = weight_ptr + (offs_n1[:, None] * stride_weight_n + offs_k[None, :] * stride_weight_k)
-
-        # forward logits GEMM: hidden streamed ONCE, two weight tiles
-        logits0 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        logits1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for k in range(0, tl.cdiv(hidden_size, BLOCK_SIZE_K)):
-            _hidden = tl.load(
-                hidden_ptrs,
-                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_m[:, None] < num_tokens),
-                other=0.0,
-            )
-            _weight0 = tl.load(
-                weight_ptrs0,
-                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_n0[:, None] < vocab_size),
-                other=0.0,
-            )
-            _weight1 = tl.load(
-                weight_ptrs1,
-                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_n1[:, None] < vocab_size),
-                other=0.0,
-            )
-            logits0 = tl.dot(_hidden, _weight0.trans(), logits0)
-            logits1 = tl.dot(_hidden, _weight1.trans(), logits1)
-            hidden_ptrs += BLOCK_SIZE_K * stride_hidden_k
-            weight_ptrs0 += BLOCK_SIZE_K * stride_weight_k
-            weight_ptrs1 += BLOCK_SIZE_K * stride_weight_k
-
-        logits0 *= rcp_temperature
-        logits1 *= rcp_temperature
-
-        exp_logits0 = tl.exp(logits0 - maximum[:, None])
-        exp_logits1 = tl.exp(logits1 - maximum[:, None])
-
-        mask0 = (offs_n0 + rank * vocab_size)[None, :] == labels[:, None]
-        mask1 = (offs_n1 + rank * vocab_size)[None, :] == labels[:, None]
-        d_logits0 = d_logprobs[:, None] * (exp_logits0 * accu_rcp[:, None] - mask0)
-        d_logits0 += d_entropy[:, None] * (-exp_logits0 * accu_rcp[:, None]) * (logits0 - entropy_b[:, None])
-        d_logits1 = d_logprobs[:, None] * (exp_logits1 * accu_rcp[:, None] - mask1)
-        d_logits1 += d_entropy[:, None] * (-exp_logits1 * accu_rcp[:, None]) * (logits1 - entropy_b[:, None])
-
-        d_logits0 *= rcp_temperature
-        d_logits1 *= rcp_temperature
-        d_logits0_b = d_logits0.to(d_weight_ptr.dtype.element_ty)
-        d_logits1_b = d_logits1.to(d_weight_ptr.dtype.element_ty)
-
-        # d_weight[n,k] = sum_m d_logits[m,n] * hidden[m,k]: reduce across the
-        # M-blocks this and other programs own, so accumulate with atomic_add.
-        for k in range(0, tl.cdiv(hidden_size, BLOCK_SIZE_K)):
-            result_offs_k = k * BLOCK_SIZE_K + offs_k
-            hidden_ptrs = hidden_ptr + (offs_m[:, None] * stride_hidden_m + result_offs_k[None, :] * stride_hidden_k)
-            _hidden = tl.load(
-                hidden_ptrs,
-                mask=(result_offs_k[None, :] < hidden_size) & (offs_m[:, None] < num_tokens),
-                other=0.0,
-            )
-            _d_weight0 = tl.dot(d_logits0_b.trans(), _hidden)
-            _d_weight1 = tl.dot(d_logits1_b.trans(), _hidden)
-            d_weight_ptrs0 = (
-                d_weight_ptr + offs_n0[:, None] * stride_d_weight_n + result_offs_k[None, :] * stride_d_weight_k
-            )
-            d_weight_ptrs1 = (
-                d_weight_ptr + offs_n1[:, None] * stride_d_weight_n + result_offs_k[None, :] * stride_d_weight_k
-            )
-            tl.atomic_add(
-                d_weight_ptrs0,
-                _d_weight0,
-                mask=(offs_n0[:, None] < vocab_size) & (result_offs_k[None, :] < hidden_size),
-            )
-            tl.atomic_add(
-                d_weight_ptrs1,
-                _d_weight1,
-                mask=(offs_n1[:, None] < vocab_size) & (result_offs_k[None, :] < hidden_size),
-            )
-
-
-# NOTE: split tile from d_logits' perspective
 @triton.autotune(
     configs=[
         triton.Config(
@@ -2281,15 +2029,6 @@ def efficient_entropy_backward(
     return d_hidden, d_weight
 
 
-# M-outer d_weight kernel launch grid: one program per token block (M-tile).
-_D_WEIGHT_MOUTER_BM = 256
-
-
-def _d_weight_use_mouter(num_tokens: int, hidden_size: int) -> bool:
-    num_pid_m = (num_tokens + _D_WEIGHT_MOUTER_BM - 1) // _D_WEIGHT_MOUTER_BM
-    return num_pid_m >= 6 and hidden_size >= 1536
-
-
 def launch_efficient_entropy_backward_kernel_d_weight(
     num_tokens: int,
     hidden_size: int,
@@ -2307,81 +2046,36 @@ def launch_efficient_entropy_backward_kernel_d_weight(
     d_weight: torch.Tensor,
     rcp_temperature: float,
 ):
-    if _d_weight_use_mouter(num_tokens, hidden_size):
-
-        def _mouter_grid(meta):
-            bm = meta["BLOCK_SIZE_M"]
-            return ((num_tokens + bm - 1) // bm,)
-
-        d_weight.zero_()
-        efficient_entropy_backward_kernel_d_weight_mouter[_mouter_grid](
-            num_tokens,
-            hidden_size,
-            vocab_size,
-            rank,
-            hidden,
-            hidden.stride(0),
-            hidden.stride(1),
-            weight,
-            weight.stride(0),
-            weight.stride(1),
-            labels,
-            labels.stride(0),
-            maximum,
-            maximum.stride(0),
-            acc,
-            acc.stride(0),
-            dentropy,
-            dentropy.stride(0),
-            dlogprobs,
-            dlogprobs.stride(0) if dlogprobs.dim() > 0 else 0,
-            reduction,
-            entropy_b,
-            entropy_b.stride(0),
-            d_weight,
-            d_weight.stride(0),
-            d_weight.stride(1),
-            rcp_temperature,
-        )
-    else:
-        grid = (TOTAL_CORE_NUM,)
-        efficient_entropy_backward_kernel_d_weight[grid](
-            num_tokens,
-            hidden_size,
-            vocab_size,
-            rank,
-            hidden,
-            hidden.stride(0),
-            hidden.stride(1),
-            weight,
-            weight.stride(0),
-            weight.stride(1),
-            labels,
-            labels.stride(0),
-            maximum,
-            maximum.stride(0),
-            acc,
-            acc.stride(0),
-            dentropy,
-            dentropy.stride(0),
-            dlogprobs,
-            dlogprobs.stride(0) if dlogprobs.dim() > 0 else 0,
-            reduction,
-            entropy_b,
-            entropy_b.stride(0),
-            d_weight,
-            d_weight.stride(0),
-            d_weight.stride(1),
-            rcp_temperature,
-        )
-
-
-_D_HIDDEN_MOUTER_BM = 64
-
-
-def _d_hidden_use_mouter(num_tokens: int, hidden_size: int) -> bool:
-    num_pid_m = (num_tokens + _D_HIDDEN_MOUTER_BM - 1) // _D_HIDDEN_MOUTER_BM
-    return num_pid_m >= 2 and hidden_size >= 128
+    grid = (TOTAL_CORE_NUM,)
+    efficient_entropy_backward_kernel_d_weight[grid](
+        num_tokens,
+        hidden_size,
+        vocab_size,
+        rank,
+        hidden,
+        hidden.stride(0),
+        hidden.stride(1),
+        weight,
+        weight.stride(0),
+        weight.stride(1),
+        labels,
+        labels.stride(0),
+        maximum,
+        maximum.stride(0),
+        acc,
+        acc.stride(0),
+        dentropy,
+        dentropy.stride(0),
+        dlogprobs,
+        dlogprobs.stride(0) if dlogprobs.dim() > 0 else 0,
+        reduction,
+        entropy_b,
+        entropy_b.stride(0),
+        d_weight,
+        d_weight.stride(0),
+        d_weight.stride(1),
+        rcp_temperature,
+    )
 
 
 def launch_efficient_entropy_backward_kernel_d_hidden(
@@ -2401,70 +2095,33 @@ def launch_efficient_entropy_backward_kernel_d_hidden(
     d_hidden: torch.Tensor,
     rcp_temperature: float,
 ):
-    if _d_hidden_use_mouter(num_tokens, hidden_size):
-
-        def _mouter_grid(meta):
-            bm = meta["BLOCK_SIZE_M"]
-            return ((num_tokens + bm - 1) // bm,)
-
-        d_hidden.zero_()
-        efficient_entropy_backward_kernel_d_hidden_mouter[_mouter_grid](
-            num_tokens,
-            hidden_size,
-            vocab_size,
-            rank,
-            hidden,
-            hidden.stride(0),
-            hidden.stride(1),
-            weight,
-            weight.stride(0),
-            weight.stride(1),
-            labels,
-            labels.stride(0),
-            maximum,
-            maximum.stride(0),
-            acc,
-            acc.stride(0),
-            dentropy,
-            dentropy.stride(0),
-            dlogprobs,
-            dlogprobs.stride(0) if dlogprobs.dim() > 0 else 0,
-            reduction,
-            entropy_b,
-            entropy_b.stride(0),
-            d_hidden,
-            d_hidden.stride(0),
-            d_hidden.stride(1),
-            rcp_temperature,
-        )
-    else:
-        grid = (TOTAL_CORE_NUM,)
-        efficient_entropy_backward_kernel_d_hidden[grid](
-            num_tokens,
-            hidden_size,
-            vocab_size,
-            rank,
-            hidden,
-            hidden.stride(0),
-            hidden.stride(1),
-            weight,
-            weight.stride(0),
-            weight.stride(1),
-            labels,
-            labels.stride(0),
-            maximum,
-            maximum.stride(0),
-            acc,
-            acc.stride(0),
-            dentropy,
-            dentropy.stride(0),
-            dlogprobs,
-            dlogprobs.stride(0) if dlogprobs.dim() > 0 else 0,
-            reduction,
-            entropy_b,
-            entropy_b.stride(0),
-            d_hidden,
-            d_hidden.stride(0),
-            d_hidden.stride(1),
-            rcp_temperature,
-        )
+    grid = (TOTAL_CORE_NUM,)
+    efficient_entropy_backward_kernel_d_hidden[grid](
+        num_tokens,
+        hidden_size,
+        vocab_size,
+        rank,
+        hidden,
+        hidden.stride(0),
+        hidden.stride(1),
+        weight,
+        weight.stride(0),
+        weight.stride(1),
+        labels,
+        labels.stride(0),
+        maximum,
+        maximum.stride(0),
+        acc,
+        acc.stride(0),
+        dentropy,
+        dentropy.stride(0),
+        dlogprobs,
+        dlogprobs.stride(0) if dlogprobs.dim() > 0 else 0,
+        reduction,
+        entropy_b,
+        entropy_b.stride(0),
+        d_hidden,
+        d_hidden.stride(0),
+        d_hidden.stride(1),
+        rcp_temperature,
+    )
