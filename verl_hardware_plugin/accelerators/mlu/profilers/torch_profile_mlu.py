@@ -20,6 +20,13 @@ _original_get_torch_profiler = None
 _original_post_init = None
 
 
+def _mlu_present() -> bool:
+    """Whether torch_mlu is loaded, i.e. this host profiles MLU devices."""
+    from verl_hardware_plugin.accelerators.mlu.platform_mlu import _ensure_torch_mlu
+
+    return _ensure_torch_mlu()
+
+
 def _patch_tool_config():
     """Add 'mlu' to allowed contents in TorchProfilerToolConfig."""
     from verl.utils.profiler.config import TorchProfilerToolConfig
@@ -63,7 +70,14 @@ def _patch_get_torch_profiler():
 
     _original_get_torch_profiler = tp.get_torch_profiler
 
-    def _mlu_get_torch_profiler(
+    def _mlu_get_torch_profiler(*args, **kwargs):
+        # The plugin registers every backend on every host; off MLU, verl's own profiler resolves
+        # the platform's device activity, which the MLU-or-CUDA choice below would drop.
+        if not _mlu_present():
+            return _original_get_torch_profiler(*args, **kwargs)
+        return _mlu_torch_profiler(*args, **kwargs)
+
+    def _mlu_torch_profiler(
         contents,
         save_path,
         role=None,

@@ -12,6 +12,7 @@ TypeError'd on this call for every platform, not just MLU, the moment
 """
 
 import inspect
+from unittest import mock
 
 import pytest
 
@@ -55,7 +56,20 @@ def test_get_torch_profiler_accepts_new_kwargs_for_non_mlu_contents(tmp_path):
     assert prof is not None
 
 
-def test_trace_filenames_unique_on_window_boundary_stop(tmp_path):
+def test_non_mlu_host_delegates_to_verl_profiler(monkeypatch):
+    # Every backend registers on every host: off MLU, verl's own profiler picks the device activity.
+    torch_profile_mlu._patch_get_torch_profiler()
+    original = mock.Mock()
+    monkeypatch.setattr(torch_profile_mlu, "_original_get_torch_profiler", original)
+    monkeypatch.setattr(torch_profile_mlu, "_mlu_present", lambda: False)
+
+    prof = tp.get_torch_profiler(contents=[], save_path="/tmp/test", rank=0)
+
+    assert prof is original.return_value
+    original.assert_called_once_with(contents=[], save_path="/tmp/test", rank=0)
+
+
+def test_trace_filenames_unique_on_window_boundary_stop(tmp_path, monkeypatch):
     """
     This test ensures filenames remain unique by verifying that two trace files
     are created with distinct "_c0" and "_c1" callback counter suffixes.
@@ -63,6 +77,7 @@ def test_trace_filenames_unique_on_window_boundary_stop(tmp_path):
     import os
 
     torch_profile_mlu._patch_get_torch_profiler()
+    monkeypatch.setattr(torch_profile_mlu, "_mlu_present", lambda: True)
 
     # Create a real torch profiler instance with schedule
     save_dir = tmp_path
@@ -93,3 +108,35 @@ def test_trace_filenames_unique_on_window_boundary_stop(tmp_path):
     # Verify callback counter suffixes are unique (_c0 and _c1)
     assert "_c0" in trace_files[0], f"Expected _c0 suffix in {trace_files[0]}"
     assert "_c1" in trace_files[1], f"Expected _c1 suffix in {trace_files[1]}"
+
+
+@pytest.fixture
+def off_mlu_platform(monkeypatch):
+    """Run core's real get_torch_profiler on a pinned non-MLU platform, with the MLU patch installed."""
+    original = tp.get_torch_profiler
+    platform = mock.Mock()
+    # Newer core binds get_platform at import time; older releases (the PyPI floor) have no
+    # platform-aware activity at all, where the comparison below reduces to old core == old core.
+    monkeypatch.setattr(tp, "get_platform", lambda: platform, raising=False)
+    monkeypatch.setattr(torch_profile_mlu, "_mlu_present", lambda: False)
+    torch_profile_mlu._patch_get_torch_profiler()
+    yield lambda device_name: setattr(platform, "device_name", device_name)
+    tp.get_torch_profiler = original
+
+
+@pytest.mark.parametrize("device_name", ["xpu", "cuda", "npu", "metax", "tpu"])
+def test_mlu_patch_is_inert_off_mlu(off_mlu_platform, tmp_path, device_name):
+    """The MLU patch is installed on every host, so off MLU it must behave exactly like core.
+
+    Compares activities, not just that the original was called: a re-copy of core's function
+    into the MLU patch (PR #56 did this to #29's delegation) is caught by the result, on XPU
+    as [CPU, CUDA] instead of [CPU, XPU], whatever the patch's internals look like.
+    """
+    off_mlu_platform(device_name)
+    core = torch_profile_mlu._original_get_torch_profiler
+    for contents in ([], ["cpu"], [device_name]):
+        with mock.patch("torch.profiler.profile") as patched:
+            tp.get_torch_profiler(contents=contents, save_path=str(tmp_path), rank=0)
+        with mock.patch("torch.profiler.profile") as expected:
+            core(contents=contents, save_path=str(tmp_path), rank=0)
+        assert patched.call_args.kwargs["activities"] == expected.call_args.kwargs["activities"], contents
