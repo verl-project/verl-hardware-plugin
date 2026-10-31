@@ -20,6 +20,9 @@ from typing import Any, Callable, Iterable, Iterator, Optional
 import torch
 from torch.distributed.tensor import DTensor, Shard
 
+from verl.utils.debug import log_gpu_memory_usage
+from verl.utils.device import get_device_name
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -42,8 +45,9 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
       the equal-block layout tpu-sync assumes.
     * **FSDP x TP, HSDP** (2-D meshes) and ``_StridedShard``: ``None``, gathered. TODO: register these as n-D
       blocks (``mesh_shape`` / ``global_shard_indices`` per dimension) once tpu-sync is confirmed to describe them.
-    * **EP**: fused expert stacks never reach this function; ``TrainerWeights`` gathers them and splits them into
-      one HF tensor per expert. TODO: export expert blocks locally.
+    * **EP**: routed experts sharded on the expert dimension over ``ep`` (mesh dimensions of size 1, e.g. ``efsdp``
+      when EP spans every rank, are ignored) are blocks, exported locally. Fused expert stacks of other models
+      never reach this function; ``TrainerWeights`` gathers them and splits them into one HF tensor per expert.
     * **1-D tensors** (norm weights, biases, Qwen3.5's ``A_log`` / ``dt_bias``): ``None``, gathered. They are tiny,
       and tpu-sync mis-delivers some of their small blocks (e.g. a 128-element norm weight split 8 ways arrived with
       only its first block), so they are always sent whole.
@@ -53,22 +57,28 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
     if not isinstance(param, DTensor) or param.ndim < 2:
         return None
     mesh = param.device_mesh
-    if mesh.ndim != 1 or len(param.placements) != 1:
+    # Mesh dimensions of size 1 do not split anything (e.g. the ``efsdp`` dimension of the routed experts when EP
+    # spans every rank), so only the others have to form a 1-D layout.
+    active = [d for d in range(mesh.ndim) if mesh.size(d) > 1]
+    if len(active) != 1 or len(param.placements) != mesh.ndim:
         return None
-    placement = param.placements[0]
+    dim = active[0]
+    placement = param.placements[dim]
     # type() rather than isinstance(): _StridedShard subclasses Shard but permutes which block a rank holds.
     if type(placement) is not Shard or placement.dim != 0:
         return None
-    num_shards = mesh.size(0)
+    # The other dimensions have size 1, so whatever their placement (torchtitan puts ``_StridedShard`` on the
+    # routed experts' size-1 ``efsdp`` dimension under EP), they leave the local block unchanged.
+    num_shards = mesh.size(dim)
     full_rows = int(param.shape[0])
-    if num_shards <= 1 or full_rows % num_shards:
+    if full_rows % num_shards:
         return None
     if int(param.to_local().shape[0]) != full_rows // num_shards:
         return None
     coordinate = mesh.get_coordinate()
     if coordinate is None:
         return None
-    return num_shards, int(coordinate[0])
+    return num_shards, int(coordinate[dim])
 
 
 def _is_replicated(param: Any) -> bool:
@@ -84,6 +94,17 @@ def _bf16_on(tensor: torch.Tensor, device: Any) -> torch.Tensor:
         # after the export returns, so it must not change under a later optimizer step.
         out = out.clone()
     return out
+
+
+def _owned(tensor: torch.Tensor, aliases_param: bool) -> torch.Tensor:
+    """``tensor``, or a copy of it if it may alias the parameter or is a view into a larger buffer.
+
+    The exported tensors are bound to tpu-sync as whole buffers, read after the export returns. With bf16
+    parameters (``engine_kwargs.tpu.param_dtype``), the bf16 cast is a no-op: a replicated parameter's
+    ``full_tensor()`` is then the parameter itself, or a view of it (e.g. Qwen3.5's q / k / v rows of the fused
+    ``in_proj_qkv``), which tpu-sync rejects and a later optimizer step would change.
+    """
+    return tensor.clone() if aliases_param or tensor._base is not None else tensor
 
 
 class TrainerWeights:
@@ -158,7 +179,11 @@ class TrainerWeights:
             elif isinstance(param, DTensor):
                 shard = fsdp_dim0_shard(param) if local else None
                 if shard is not None:
-                    tensor = _bf16_on(param.to_local(), device)
+                    local_block = param.to_local()
+                    if getattr(param, "_tpu_sync_owned", False) and local_block.dtype == torch.bfloat16:
+                        tensor = local_block.to(device, non_blocking=True)  # already a fresh copy (local_transform)
+                    else:
+                        tensor = _bf16_on(local_block, device)
                     counts["local"] += 1
                 else:
                     if local:
@@ -170,11 +195,13 @@ class TrainerWeights:
                                 f"placements={param.placements}, shape={tuple(param.shape)}, "
                                 f"local={tuple(param.to_local().shape)})"
                             )
-                    tensor = param.to(device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
+                    converted = param.to(device, dtype=torch.bfloat16, non_blocking=True)
+                    tensor = _owned(converted.full_tensor(), aliases_param=converted is param)
                 if num_names > 1:
                     exported[pid] = (tensor, shard, param)
             else:
-                tensor, shard = param.to(torch.bfloat16, non_blocking=True), None
+                converted = param.to(torch.bfloat16, non_blocking=True)
+                tensor, shard = _owned(converted, aliases_param=converted is param), None
                 if local:
                     counts["replicated"] += 1
             yield name, tensor, shard
@@ -196,6 +223,8 @@ class TrainerWeights:
                 yield hf_name, full[e].clone(), None
             del full
         if local:
+            if get_device_name() == "tpu":
+                log_gpu_memory_usage("After the tpu-sync weight export", logger=logger)
             logger.info(
                 f"Weight export: {counts['local']} local shards, {counts['replicated']} replicated tensors (fused "
                 f"q/k/v are all-gathered inside torchtitan's state_dict()), {counts['gathered']} all-gathered here"

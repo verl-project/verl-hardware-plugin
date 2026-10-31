@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import os
 from collections.abc import Mapping
 from typing import Any, Optional
@@ -78,10 +79,19 @@ def _parse(name: str, kind: type, value: Any, source: str, label: str = "TPU") -
                 return False
             raise ValueError(value)
         if kind is int:
+            if isinstance(value, bool):
+                raise ValueError(value)
             parsed = int(value)
             if parsed <= 0:
                 raise ValueError(value)
             return parsed
+        if kind is float:
+            if isinstance(value, bool):
+                raise ValueError(value)
+            parsed_float = float(value)
+            if not math.isfinite(parsed_float) or parsed_float <= 0:
+                raise ValueError(value)
+            return parsed_float
         # Strings are passed through; e.g. tpu_eager_mode="NONE" explicitly disables the eager mode.
         return str(value)
     except (TypeError, ValueError) as e:
@@ -140,6 +150,22 @@ class TPUEngineOptions:
             ``pad_to_length`` is set, else 256).
         model_kernels: Optional torchtitan TPU kernels of the model (``engines.tpu_model_kernels``): ``auto``
             (default: what the installed torchtitan provides), ``none``, ``all``, or a comma-separated subset.
+        param_dtype: Storage dtype of the trained parameters, their gradients and (with the default AdamW) the
+            optimizer states: ``float32`` (default) or ``bfloat16``. ``bfloat16`` halves the parameter and gradient
+            memory (pure bf16 training, no fp32 master), e.g. for models whose fp32 training state does not fit.
+        optimizer_host_offload: Keep the optimizer states in host memory and move them to the device one
+            parameter chunk (4 layers) at a time inside the chunked optimizer step (default: ``False``). Unlike
+            verl's ``optimizer_offload``, the whole state never has to fit on the device.
+        rollout_expert_parallel: The rollout runs the MoE experts with vLLM expert parallelism (default:
+            ``False``). ``tpu-sync`` then sends the experts in vLLM's expert-parallel layout, which the rollout
+            receives straight into its expert weights (``rollout/qwen3_5_layout.py``).
+        fp32_master: With ``param_dtype=bfloat16``, the optimizer steps FP32 master weights with FP32 AdamW states
+            and casts the result into the bf16 parameters (default: ``False``). Without it, bf16 weights absorb no
+            update smaller than half a bf16 ulp (lr 1e-6 updates mostly round to zero). With
+            ``optimizer_host_offload`` the masters live in host memory with the optimizer states.
+        ep_capacity_factor: Per-destination-rank token capacity multiplier of ``TpuQwen35TokenDispatcher`` when
+            ``expert_parallel_size > 1`` (default: ``4.0``). torchtitan's pretraining default (``1.25``) drops
+            skewed RL / math tokens across 32-64 EP ranks while vLLM rollout is dropless.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -151,6 +177,11 @@ class TPUEngineOptions:
     optim_impl: Optional[str] = None
     seq_bucket_size: Optional[int] = None
     model_kernels: Optional[str] = None
+    param_dtype: Optional[str] = None
+    optimizer_host_offload: Optional[bool] = None
+    rollout_expert_parallel: Optional[bool] = None
+    fp32_master: Optional[bool] = None
+    ep_capacity_factor: Optional[float] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -163,6 +194,11 @@ _ENGINE_KINDS: dict[str, type] = {
     "optim_impl": str,
     "seq_bucket_size": int,
     "model_kernels": str,
+    "param_dtype": str,
+    "optimizer_host_offload": bool,
+    "rollout_expert_parallel": bool,
+    "fp32_master": bool,
+    "ep_capacity_factor": float,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
@@ -210,6 +246,13 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
     _apply_legacy_env(
         values, _ENGINE_KINDS, _ENGINE_LEGACY_ENV_VARS, f"torchtitan.engine_kwargs.{TPU_ENGINE_KWARGS_KEY}"
     )
+    if values.get("param_dtype") not in (None, "float32", "bfloat16"):
+        raise ValueError(
+            f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.param_dtype must be float32 or bfloat16, "
+            f"got {values['param_dtype']!r}"
+        )
+    if values.get("fp32_master") and values.get("param_dtype") != "bfloat16":
+        raise ValueError(f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.fp32_master needs param_dtype=bfloat16")
     return TPUEngineOptions(**values)
 
 

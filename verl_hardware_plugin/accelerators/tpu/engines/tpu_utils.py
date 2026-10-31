@@ -316,7 +316,7 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
     Each option comes from ``engine_kwargs.tpu`` (see ``get_tpu_engine_options``), else defaults from
     ``engine_config.use_torch_compile``: with ``use_torch_compile=True`` (splash also when
     ``context_parallel_size > 1``), enables torchtitan's TPU ``SplashAttention``, ``SimpleFSDP``
-    (for FSDP/HSDP with optional TP and CP where PP/EP == 1) and ``DEFER_AND_FUSE``.
+    (for FSDP/HSDP with optional TP, CP and EP where PP == 1) and ``DEFER_AND_FUSE``.
     """
     options = get_tpu_engine_options(engine_config)
     use_torch_compile = bool(getattr(engine_config, "use_torch_compile", False))
@@ -330,12 +330,12 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
             "use_torch_compile=False."
         )
 
-    simple_fsdp_compatible = all(
-        getattr(engine_config, f"{dim}_parallel_size", 1) == 1 for dim in ("pipeline", "expert")
-    )
+    # SimpleFSDP composes with TP, CP and EP (torchtitan's TPU Qwen3.5 wraps the routed experts on the expert-DP mesh
+    # under EP, google-pytorch/torchtitan#6), but not with PP.
+    simple_fsdp_compatible = getattr(engine_config, "pipeline_parallel_size", 1) == 1
     use_simple_fsdp = _or_default(options.use_simple_fsdp, use_torch_compile and simple_fsdp_compatible)
     if use_simple_fsdp and not simple_fsdp_compatible:
-        raise ValueError("use_simple_fsdp supports FSDP/HSDP (+ optional TP/CP) only (pipeline/expert parallel size 1)")
+        raise ValueError("use_simple_fsdp supports FSDP/HSDP (+ optional TP/CP/EP) only (pipeline parallel size 1)")
 
     if options.tpu_eager_mode is None:
         tpu_eager_mode = "DEFER_AND_FUSE" if use_torch_compile else None
@@ -1122,16 +1122,23 @@ def fused_linear_logprobs_tpu(
     return -nll
 
 
+_PAD_VOCAB_STRIDE = 9973  # prime stride: spreads packed-padding token IDs across vocab instead of 1 or math experts
+
+
 def pad_packed_inputs_for_tpu(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     micro_batch: TensorDict,
     device: Any,
     bucket_size: Optional[int] = None,
+    vocab_size: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Bucket-pad packed (nested) 1D sequences on CPU before the H2D copy.
 
     Pad tokens get position 0, so the attention treats each one as its own document (it only attends to itself).
+    Under expert parallelism (``TpuQwen35TokenDispatcher``), repeating token 0 sends every pad slot to the same 8
+    experts, and cycling the micro-batch's own tokens concentrates pad traffic onto the same domain/math experts as
+    real tokens; striding across ``vocab_size`` disperses pad slots across the full vocabulary and expert set.
     Returns ``(input_ids, position_ids, labels, orig_seq_len)``.
     """
     step = bucket_size if bucket_size is not None and bucket_size > 0 else get_tpu_seq_bucket_size()
@@ -1147,9 +1154,16 @@ def pad_packed_inputs_for_tpu(
     )
     pad_len = padded_seq_len - orig_seq_len
     if pad_len > 0:
-        input_ids_cpu, labels_cpu, position_ids_cpu = (
-            F.pad(t, (0, pad_len), value=0) for t in (input_ids_cpu, labels_cpu, position_ids_cpu)
-        )
+        if vocab_size is not None and int(vocab_size) > 1:
+            pad_ids = (torch.arange(pad_len, dtype=torch.int64) * _PAD_VOCAB_STRIDE) % int(vocab_size)
+            input_ids_cpu = torch.cat((input_ids_cpu, pad_ids.to(dtype=input_ids_cpu.dtype)), dim=-1)
+        elif orig_seq_len > 0:
+            pad_ids = input_ids_cpu[torch.arange(pad_len, dtype=torch.int64) % orig_seq_len]
+            input_ids_cpu = torch.cat((input_ids_cpu, pad_ids), dim=-1)
+        else:
+            input_ids_cpu = F.pad(input_ids_cpu, (0, pad_len), value=0)
+        labels_cpu = F.pad(labels_cpu, (0, pad_len), value=0)
+        position_ids_cpu = F.pad(position_ids_cpu, (0, pad_len), value=0)
 
     if "responses" in micro_batch.keys() and getattr(micro_batch["responses"], "is_nested", False):
         raw_max_resp = int(micro_batch["responses"].offsets().diff().max().item())

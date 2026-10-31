@@ -307,3 +307,75 @@ def test_refuse_split_tensors_for_vllm_loaders():
     partial = [(n, t) for n, t in sorted(split.items()) if not n.endswith("up_proj")]
     with pytest.raises(RuntimeError, match="missing pieces"):
         list(qwen3_5_layout.refuse_split_tensors(iter(partial)))
+
+
+def test_trainer_expert_parallel_layout_and_refuse():
+    """EP layout: the expert stacks are sent transposed ([E, H, 2I] / [E, I, H]); the loader fallback undoes it."""
+    full = _hf_tensors(torch.Generator().manual_seed(0))
+    out = qwen3_5_layout.make_tpu_sync_local_layout(CONFIG, expert_parallel=True)(dict(full))
+    assert torch.equal(out[f"{EXPERTS}.w13_ep"], full[f"{EXPERTS}.gate_up_proj"].transpose(1, 2))
+    assert torch.equal(out[f"{EXPERTS}.w2_ep"], full[f"{EXPERTS}.down_proj"].transpose(1, 2))
+    assert out[f"{EXPERTS}.w13_ep"].is_contiguous()
+    assert not any(n.endswith(("gate_up_proj", "down_proj", "gate_proj", "up_proj")) for n in out)
+    back = dict(qwen3_5_layout.refuse_split_tensors(iter(sorted(out.items()))))
+    assert set(back) == set(full)
+    for name, t in full.items():
+        assert torch.equal(back[name], t), name
+    rule = qwen3_5_layout.sampler_sharding_rule
+    assert rule(f"{EXPERTS}.w13_ep", [512, 4096, 2048], 16) == (["tp", "", ""], [32, 4096, 2048])
+    assert rule(f"{EXPERTS}.w2_ep", [512, 1024, 4096], 16) == (["tp", "", ""], [32, 1024, 4096])
+
+
+EP_SHAPES = {
+    name: list(t.shape)
+    for name, t in qwen3_5_layout.make_tpu_sync_local_layout(CONFIG, expert_parallel=True)(
+        _hf_tensors(torch.Generator())
+    ).items()
+}
+
+
+def test_plan_expert_parallel():
+    def ep_model(tp, method=VllmUnquantizedFusedMoEMethod, use_ep=True):
+        return _vllm_model(gdn=_GDN(tp_size=tp), experts=_Experts(method(), use_ep=use_ep))
+
+    plan, reason = qwen3_5_layout.plan_direct_install(ep_model(1), EP_SHAPES, CONFIG, 1, 0)
+    assert reason == "" and plan.moe_layout == qwen3_5_layout.MOE_LAYOUT_TPU_EP
+    # moe_intermediate_size need not split over the ranks under EP (the experts are not sliced).
+    odd = SimpleNamespace(**{**vars(CONFIG), "moe_intermediate_size": 5})
+    assert qwen3_5_layout.plan_direct_install(ep_model(1), EP_SHAPES, odd, 1, 0)[0] is not None
+    assert "rollout_expert_parallel=True" in qwen3_5_layout.plan_direct_install(ep_model(2), SHAPES, CONFIG, 2, 0)[1]
+    no_ep = ep_model(1, use_ep=False)
+    assert "does not use expert parallelism" in qwen3_5_layout.plan_direct_install(no_ep, EP_SHAPES, CONFIG, 1, 0)[1]
+    quant = ep_model(1, method=Fp8MoEMethod)
+    assert "unquantized" in qwen3_5_layout.plan_direct_install(quant, EP_SHAPES, CONFIG, 1, 0)[1]
+    # 3 experts over 2 ranks.
+    assert "do not split over EP" in qwen3_5_layout.plan_direct_install(ep_model(2), EP_SHAPES, CONFIG, 2, 0)[1]
+
+
+@pytest.mark.parametrize("nested", [True, False])
+def test_zero_copy_targets_and_install(nested):
+    """Each rank's expert slice is received straight into its vLLM w13 / w2; install() leaves them alone."""
+    full = _hf_tensors(torch.Generator().manual_seed(0))
+    sent = qwen3_5_layout.make_tpu_sync_local_layout(CONFIG, expert_parallel=True)(dict(full))
+    shapes = {n: list(t.shape) for n, t in sent.items()}
+    plan = qwen3_5_layout.DirectInstallPlan(
+        qwen3_5_layout.Qwen3_5Dims.from_config(CONFIG), 0, 1, qwen3_5_layout.MOE_LAYOUT_TPU_EP
+    )
+    mid = ".routed_experts" if nested else ""
+    model_sd = {
+        f"{EXPERTS}{mid}.w13_weight": torch.zeros(E, HID, 2 * INTER, dtype=torch.bfloat16),
+        f"{EXPERTS}{mid}.w2_weight": torch.zeros(E, INTER, HID, dtype=torch.bfloat16),
+    }
+    targets = qwen3_5_layout.zero_copy_targets(plan, model_sd, lambda k: k if k in model_sd else None, shapes)
+    assert set(targets) == {f"{EXPERTS}.w13_ep", f"{EXPERTS}.w2_ep"}
+    assert targets[f"{EXPERTS}.w13_ep"].data_ptr() == model_sd[f"{EXPERTS}{mid}.w13_weight"].data_ptr()
+    consumed = qwen3_5_layout.install(
+        {n: t for n, t in sent.items() if n.endswith(("w13_ep", "w2_ep"))}, model_sd, lambda k: None, None, plan
+    )
+    assert consumed == {f"{EXPERTS}.w13_ep", f"{EXPERTS}.w2_ep"}
+    bad = {f"{EXPERTS}{mid}.w13_weight": torch.zeros(E, HID, 2 * INTER), **model_sd}
+    bad[f"{EXPERTS}{mid}.w13_weight"] = torch.zeros(E, HID, 2 * INTER)  # float32: not a valid receive buffer
+    with pytest.raises(RuntimeError, match="expert-parallel layout needs"):
+        qwen3_5_layout.zero_copy_targets(plan, bad, lambda k: k if k in bad else None, shapes)
+    tp_plan = qwen3_5_layout.DirectInstallPlan(plan.dims, 0, 1, qwen3_5_layout.MOE_LAYOUT_TPU)
+    assert qwen3_5_layout.zero_copy_targets(tp_plan, model_sd, lambda k: k, shapes) == {}

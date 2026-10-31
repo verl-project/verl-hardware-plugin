@@ -48,6 +48,16 @@ _LCE_BLOCK_SIZES = LceBlockSizes(b_block_size=1024, h_block_size=2048, v_block_s
 # Pallas grouped-matmul tiles of ``moe`` (google-pytorch/torchtitan#79).
 _MOE_GROUPED_MM_TILE_M = 512
 _MOE_GROUPED_MM_TGMM_TILING = (512, 0, 0)
+_MOE_GROUPED_MM_TILES_MAX_DIM = 2048  # the model width those tiles fit (VMEM)
+# dWeight (TGMM) tiles of wider models (Qwen3.5-397B-A17B: hidden 4096, expert hidden 1024). The full-K/N tiles of
+# ``_use_tpu_moe_kernels`` keep (K, N) FP32 accumulators in VMEM: 16 MB for the down projection and 2 x 16 MB for the
+# paired gate/up projection, past the scoped VMEM limit ("CompileTimeScopedVmemOom" in moe_tgmm_wgrad). 1024-wide
+# K/N slabs keep each accumulator at 4 MB. Paired gate/up needs a full N tile, so only K is tiled there.
+_MOE_WIDE_TGMM_TILING = (256, 1024, 0)
+_MOE_WIDE_W2_TGMM_TILING = (256, 1024, 1024)
+# Default ``TpuQwen35TokenDispatcher.capacity_factor`` under EP > 1. torchtitan's pretraining default (1.25) drops
+# skewed RL / math tokens at EP 32-64 while vLLM rollout is dropless, inflating logp_trainer - logp_vllm.
+DEFAULT_EP_CAPACITY_FACTOR = 4.0
 
 
 def _qwen3_5_config_registry() -> Any:
@@ -115,6 +125,12 @@ def configure_model_spec(model_spec: Any, kernels: frozenset[str]) -> None:
 
     _qwen3_5_config_registry()._use_tpu_moe_kernels(SimpleNamespace(model_spec=model_spec))
     for _, experts, _, _ in model_spec.model.traverse(TpuGroupedExperts.Config):
+        # The 512-row tiles were tuned for Qwen3.5-35B-A3B (hidden 2048). At hidden 4096 (Qwen3.5-397B-A17B) the
+        # weight-gradient kernels do not fit in VMEM with full K/N tiles: tile K/N of the dWeight instead.
+        if (getattr(experts, "dim", None) or 0) > _MOE_GROUPED_MM_TILES_MAX_DIM:
+            experts.pallas_grouped_mm_tgmm_tiling = _MOE_WIDE_TGMM_TILING
+            experts.pallas_grouped_mm_w2_tgmm_tiling = _MOE_WIDE_W2_TGMM_TILING
+            continue
         experts.pallas_grouped_mm_tile_m = _MOE_GROUPED_MM_TILE_M
         experts.pallas_grouped_mm_tgmm_tiling = _MOE_GROUPED_MM_TGMM_TILING
 
@@ -161,4 +177,32 @@ def set_packed_document_budget(modules: Any, num_documents: int) -> int:
             if is_kernel and hasattr(module, "max_num_segments") and module.max_num_segments != num_documents:
                 module.max_num_segments = int(num_documents)
                 updated += 1
+    return updated
+
+
+def set_ep_capacity_factor(modules: Any, capacity_factor: float) -> int:
+    """Sets ``capacity_factor`` of every ``TpuQwen35TokenDispatcher`` in ``modules``.
+
+    torchtitan's ``TpuQwen35Model`` switches MoE layers to ``TpuQwen35TokenDispatcher(capacity_factor=1.25)`` when
+    ``expert_parallel_degree > 1``. ``RoutedExperts`` holds ``token_dispatcher`` as a ``Configurable`` object
+    attribute (not an ``nn.Module``), so inspect both each submodule and its ``token_dispatcher`` attribute. On skewed
+    RL / math batches at EP 32-64, a 1.25 per-rank cap drops real tokens while vLLM rollout is dropless, corrupting
+    ``logp_trainer - logp_vllm``. Must be called before the first compiled forward pass traces ``dispatch``.
+    """
+    model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
+    cap = float(capacity_factor)
+    seen: set[int] = set()
+    updated = 0
+    for model in model_list:
+        if not isinstance(model, torch.nn.Module):
+            continue
+        for module in model.modules():
+            for candidate in (module, getattr(module, "token_dispatcher", None)):
+                if candidate is None or id(candidate) in seen:
+                    continue
+                seen.add(id(candidate))
+                is_dispatcher = any(c.__name__ == "TpuQwen35TokenDispatcher" for c in type(candidate).__mro__)
+                if is_dispatcher and hasattr(candidate, "capacity_factor") and candidate.capacity_factor != cap:
+                    candidate.capacity_factor = cap
+                    updated += 1
     return updated

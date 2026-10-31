@@ -50,6 +50,7 @@ def test_engine_kwargs_are_parsed_and_typed():
                 "optim_impl": "for-loop",
                 "seq_bucket_size": "512",
                 "context_parallel_strategy": "ulysses",
+                "ep_capacity_factor": "4.0",
             }
         )
     )
@@ -61,6 +62,7 @@ def test_engine_kwargs_are_parsed_and_typed():
         optim_impl="for-loop",
         seq_bucket_size=512,
         context_parallel_strategy="ulysses",
+        ep_capacity_factor=4.0,
     )
     assert get_tpu_engine_options(_cfg()) == TPUEngineOptions()
     assert get_tpu_engine_options(None) == TPUEngineOptions()
