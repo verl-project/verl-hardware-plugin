@@ -542,10 +542,17 @@ def worker_ext(fake_tpu_sync, monkeypatch):
     utils = ModuleType("verl.workers.rollout.vllm_rollout.utils")
     utils.vLLMColocateWorkerExtension = _WorkerExtensionBase  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "verl.workers.rollout.vllm_rollout.utils", utils)
+    # vLLM's mp workers are not Ray processes: the extension takes its bind address from vLLM.
+    network_utils = ModuleType("vllm.utils.network_utils")
+    network_utils.get_ip = lambda: "10.0.0.1"  # type: ignore[attr-defined]
+    for name, mod in {
+        "vllm": ModuleType("vllm"),
+        "vllm.utils": ModuleType("vllm.utils"),
+        "vllm.utils.network_utils": network_utils,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, mod)
     sys.modules.pop(TPU_SYNC_WORKER_EXTENSION, None)
     module = importlib.import_module(TPU_SYNC_WORKER_EXTENSION)
-    monkeypatch.setattr(module, "get_tpu_sync_rendezvous", fake_tpu_sync.get_rendezvous)
-    monkeypatch.setattr(module, "_REGISTRY_POLL_INTERVAL_S", 0.0)
     yield module
     sys.modules.pop(TPU_SYNC_WORKER_EXTENSION, None)
 
@@ -958,7 +965,8 @@ def test_update_tpu_sync_weights_end_to_end(fake_tpu_sync, worker_ext, caplog, t
     assert server.global_steps == 0
     # The manager holds the rendezvous handle: the actor is not detached, so Ray would destroy it otherwise.
     assert manager._tpu_sync_rendezvous is fake_tpu_sync.registry
-    assert set(fake_tpu_sync.rendezvous_lookups) <= {None, "TpuSyncRendezvous-test"}
+    # The rollout workers get the controller address and the shapes from the driver, not from the rendezvous.
+    assert set(fake_tpu_sync.rendezvous_lookups) <= {None}
     assert set(metrics) == TIMING_KEYS and min(metrics.values()) >= 0
     (transfer,) = fake_tpu_sync.transfers
     assert transfer["src_units"] == [TpuSyncId("trainer", str(r), "weights") for r in range(trainer_ranks)]
@@ -1559,16 +1567,13 @@ def test_update_tpu_sync_weights_gqa_replicated_kv_heads(fake_tpu_sync, worker_e
 
 
 def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, worker_ext):
-    fake_tpu_sync.registry_state.set_controller_address("10.0.0.2:7777")
-    fake_tpu_sync.registry_state.set_global_shapes(
-        {
-            "model.norm.weight": [128],
-            LAYER + "self_attn.o_proj.weight": [128, 256],
-            LAYER + "self_attn.k_proj.weight": [16, 64],
-        }
-    )
+    shapes = {
+        "model.norm.weight": [128],
+        LAYER + "self_attn.o_proj.weight": [128, 256],
+        LAYER + "self_attn.k_proj.weight": [16, 64],
+    }
     sampler = _make_sampler(worker_ext, rank=1, tp=2, model=_FakeVllmModel(2))
-    assert sampler.init_tpu_sync_on_worker(parallelism=4) is True
+    assert sampler.init_tpu_sync_on_worker("10.0.0.2:7777", shapes, parallelism=4) is True
 
     (ws,) = fake_tpu_sync.synchronizers
     assert (ws.parallelism, ws.bind_ip) == (4, "10.0.0.1")
@@ -1595,15 +1600,18 @@ def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, worker_ex
     }
 
     # Later syncs reuse the receive buffers and the registration.
-    assert sampler.init_tpu_sync_on_worker(parallelism=4) is True
+    assert sampler.init_tpu_sync_on_worker("10.0.0.2:7777", shapes, parallelism=4) is True
     assert len(fake_tpu_sync.synchronizers) == 1
 
 
 def test_sampler_init_registers_under_its_replica_job_name(fake_tpu_sync, worker_ext):
-    fake_tpu_sync.registry_state.set_controller_address("10.0.0.2:7777")
-    fake_tpu_sync.registry_state.set_global_shapes({"model.norm.weight": [128]})
     sampler = _make_sampler(worker_ext, rank=1, tp=2, model=_FakeVllmModel(2))
-    assert sampler.init_tpu_sync_on_worker(parallelism=4, job_name="sampler1") is True
+    assert (
+        sampler.init_tpu_sync_on_worker(
+            "10.0.0.2:7777", {"model.norm.weight": [128]}, parallelism=4, job_name="sampler1"
+        )
+        is True
+    )
 
     (ws,) = fake_tpu_sync.synchronizers
     assert TpuSyncId("sampler0", "1", "weights") not in fake_tpu_sync.registrations
@@ -1611,11 +1619,11 @@ def test_sampler_init_registers_under_its_replica_job_name(fake_tpu_sync, worker
     assert registration.listener_address == f"10.0.0.1:{ws.listener_port}"
 
 
-def test_sampler_init_times_out_without_registry(fake_tpu_sync, worker_ext, monkeypatch):
-    monkeypatch.setattr(worker_ext, "_REGISTRY_POLL_ATTEMPTS", 2)
+@pytest.mark.parametrize("address, shapes", [(None, {"model.norm.weight": [128]}), ("10.0.0.2:7777", {})])
+def test_sampler_init_requires_the_controller_address_and_shapes(fake_tpu_sync, worker_ext, address, shapes):
     sampler = _make_sampler(worker_ext, rank=0, tp=2, model=_FakeVllmModel(2))
-    with pytest.raises(RuntimeError, match="No tpu-sync controller address"):
-        sampler.init_tpu_sync_on_worker()
+    with pytest.raises(RuntimeError, match="the driver passed no tpu-sync controller address"):
+        sampler.init_tpu_sync_on_worker(address, shapes)
     assert fake_tpu_sync.synchronizers == []
 
 

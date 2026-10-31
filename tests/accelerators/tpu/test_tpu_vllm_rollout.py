@@ -120,17 +120,14 @@ def test_server_patches_vllm_before_upstream_init(tpu_vllm):
     assert order == ["patch", "upstream init"]
 
 
-def test_server_engine_kwargs_force_tpu_executor(tpu_vllm):
+def test_server_engine_kwargs_disable_sleep_mode_and_keep_mp_executor(tpu_vllm):
     server = tpu_vllm.TPUvLLMHttpServer()
-    engine_kwargs = {"distributed_executor_backend": "mp", "enable_sleep_mode": True}
+    engine_kwargs = {"enable_sleep_mode": True}
     server._preprocess_engine_kwargs(engine_kwargs)
 
     assert server.calls == ["preprocess"]  # upstream validation still runs first
-    assert engine_kwargs == {
-        "distributed_executor_backend": "external_launcher",
-        "enable_sleep_mode": False,
-        "from_upstream": True,
-    }
+    # No distributed_executor_backend: upstream's "mp" stays, and vllm-torchtpu picks its mp multi-host executor.
+    assert engine_kwargs == {"enable_sleep_mode": False, "from_upstream": True}
 
 
 def test_server_worker_extension_defers_to_upstream(tpu_vllm):
@@ -200,17 +197,18 @@ class _FakeServer:
 
 class _FakeServerClass:
     def __init__(self):
-        self.options_kwargs = None
-        self.init_kwargs = None
-        self.server = _FakeServer()
+        self.options_kwargs = []
+        self.init_kwargs = []
+        self.servers = []
 
     def options(self, **kwargs):
-        self.options_kwargs = kwargs
+        self.options_kwargs.append(kwargs)
         return self
 
     def remote(self, **kwargs):
-        self.init_kwargs = kwargs
-        return self.server
+        self.init_kwargs.append(kwargs)
+        self.servers.append(_FakeServer())
+        return self.servers[-1]
 
 
 NODE_A = "a" * 56
@@ -232,19 +230,13 @@ def _fake_replica(data_parallel_size=1):
         is_teacher_model=False,
         gpus_per_replica_node=4,
         nnodes=2,
-        resource_pool=SimpleNamespace(
-            get_placement_groups=lambda device_name=None: [
-                SimpleNamespace(id=SimpleNamespace(hex=lambda: "pg0hex")),
-                SimpleNamespace(id=SimpleNamespace(hex=lambda: "pg1hex")),
-            ]
-        ),
         servers=[],
         server_class=_FakeServerClass(),
         _get_server_name_prefix=lambda: "vllm_",
     )
 
 
-def test_launch_tpu_vllm_servers_single_server_spanning_all_workers(tpu_vllm):
+def test_launch_tpu_vllm_servers_one_server_per_host(tpu_vllm):
     replica = _fake_replica()
     platform = SimpleNamespace(ray_noset_envvars=lambda: ["RAY_NOSET"], rollout_env_vars=lambda: {})
 
@@ -255,27 +247,24 @@ def test_launch_tpu_vllm_servers_single_server_spanning_all_workers(tpu_vllm):
     asyncio.run(run())
 
     server_class = replica.server_class
-    options = server_class.options_kwargs
-    assert options["name"] == "vllm_server_3_0"
-    assert options["max_concurrency"] == 1234
-    assert options["scheduling_strategy"].node_id == NODE_A
-    assert options["runtime_env"] == {
-        "env_vars": {
-            "RAY_NOSET": "1",
-            "TPU_MULTIHOST_BACKEND": "ray",
-            "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": "0",
-            "VERL_TPU_PG_IDS": "pg0hex,pg1hex",
-        }
-    }
+    assert [o["name"] for o in server_class.options_kwargs] == ["vllm_server_3_0", "vllm_server_3_1"]
+    assert [o["scheduling_strategy"].node_id for o in server_class.options_kwargs] == [NODE_A, NODE_B]
+    for options in server_class.options_kwargs:
+        assert options["max_concurrency"] == 1234
+        assert options["runtime_env"] == {"env_vars": {"RAY_NOSET": "1", "TPU_MULTIHOST_BACKEND": "mp"}}
 
-    init = server_class.init_kwargs
-    assert init["workers"] is replica.workers
-    assert init["node_rank"] == 0
-    assert init["nnodes"] == 2
-    assert init["cuda_visible_devices"] == ""
+    for node_rank, init in enumerate(server_class.init_kwargs):
+        assert init["workers"] == replica.workers[node_rank * 4 : (node_rank + 1) * 4]
+        assert init["node_rank"] == node_rank
+        assert init["nnodes"] == 2
+        assert init["gpus_per_node"] == 4
+        assert init["cuda_visible_devices"] == ""
 
-    assert server_class.server.launch_kwargs == {"master_address": "10.0.0.1", "master_port": 1234, "dp_rpc_port": 5678}
-    assert replica.servers == [server_class.server]
+    # Every host joins the engine at the master address of node 0.
+    for server in server_class.servers:
+        assert server.launch_kwargs == {"master_address": "10.0.0.1", "master_port": 1234, "dp_rpc_port": 5678}
+    assert replica.servers == server_class.servers
+    assert replica._server_handle is server_class.servers[0]
     assert replica._server_address == "10.0.0.1:8000"
 
 
@@ -344,75 +333,3 @@ def test_multiprocessing_patch_wraps_keyword_and_positional_targets(isolated_pat
         assert isinstance(process._target, isolated_patches.PickleableProcessWrapper)
         assert process._target.target is len
     assert multiprocessing.Process()._target is None
-
-
-def test_local_ranks_count_workers_per_host_in_rank_order():
-    assert tpu_vllm_patches._local_ranks(["b", "b", "a", "a", "a"]) == [0, 1, 0, 1, 2]
-
-
-def test_tpu_worker_envs_two_hosts_of_four_chips():
-    ips = ["10.0.0.2"] * 4 + ["10.0.0.1"] * 4  # rank order: the driver's host first
-    env = {k: v for k, v in os.environ.items() if k != "TORCH_TPU_TOPOLOGY"}
-    with mock.patch.dict(os.environ, env, clear=True):
-        envs = tpu_vllm_patches._tpu_worker_envs(ips, base_port=8070)
-
-    addresses = ",".join(f"{ip}:{8070 + chip}" for ip in ("10.0.0.2", "10.0.0.1") for chip in range(4))
-    assert envs[5] == {
-        "TPU_VISIBLE_CHIPS": "1",
-        "TPU_PROCESS_PORT": "8071",
-        "TPU_PROCESS_ADDRESSES": addresses,
-        "TORCH_TPU_SLICEBUILDER_ADDRESSES": addresses,
-        "CLOUD_TPU_TASK_ID": "1",
-        "TPU_WORKER_HOSTNAMES": "10.0.0.2,10.0.0.1",
-        # One process per chip: libtpu sees 8 single-chip "hosts" laid out as the 2x4 slice.
-        "TORCH_TPU_TOPOLOGY": "2,4,1",
-        "TPU_HOST_BOUNDS": "2,4,1",
-        "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
-    }
-    assert [e["TPU_VISIBLE_CHIPS"] for e in envs] == ["0", "1", "2", "3"] * 2
-    assert [e["CLOUD_TPU_TASK_ID"] for e in envs] == ["0"] * 4 + ["1"] * 4
-
-
-def test_tpu_worker_envs_v6e_engine_mesh_comes_from_its_worker_count():
-    """Two TP=4 engines on a v6e-8 host: each engine's mesh is its own 4 workers, not the host's 8 chips."""
-    env = {k: v for k, v in os.environ.items() if k not in ("TORCH_TPU_TOPOLOGY", "TPU_ACCELERATOR_TYPE")}
-    with mock.patch.dict(os.environ, env, clear=True):
-        envs = tpu_vllm_patches._tpu_worker_envs(["10.0.0.1"] * 4, base_port=8070, pod_type="v6e-8")
-    assert envs[3]["TORCH_TPU_TOPOLOGY"] == "2,2,1" and envs[3]["TPU_CHIPS_PER_HOST_BOUNDS"] == "2,2,1"
-    assert envs[3]["TPU_HOST_BOUNDS"] == "1,1,1" and envs[3]["CLOUD_TPU_TASK_ID"] == "0"
-    assert "TPU_VISIBLE_DEVICES" not in envs[3]
-
-
-def test_tpu_worker_envs_tpu7x_host_of_eight_cores():
-    ips = ["10.0.0.1"] * 8  # one TP=8 engine on one host: 4 chips, 8 TensorCore devices, one worker each
-    env = {k: v for k, v in os.environ.items() if k not in ("TORCH_TPU_TOPOLOGY", "TPU_ACCELERATOR_TYPE")}
-    with mock.patch.dict(os.environ, env, clear=True):
-        envs = tpu_vllm_patches._tpu_worker_envs(ips, base_port=8070, pod_type="tpu7x-8")
-
-    addresses = ",".join(f"10.0.0.1:{8070 + core}" for core in range(8))
-    assert envs[5] == {
-        "TPU_VISIBLE_CHIPS": "5",
-        "TPU_VISIBLE_DEVICES": "5",
-        "TPU_PROCESS_PORT": "8075",
-        "TPU_PROCESS_ADDRESSES": addresses,
-        "TORCH_TPU_SLICEBUILDER_ADDRESSES": addresses,
-        # Laid out by process: the task id is the worker's rank, not its host's index.
-        "CLOUD_TPU_TASK_ID": "5",
-        "TPU_WORKER_HOSTNAMES": "10.0.0.1",
-        "TORCH_TPU_TOPOLOGY": "2,2,1,2",
-        "TPU_HOST_BOUNDS": "2,2,1,2",
-        "TPU_PROCESS_BOUNDS": "2,2,1,2",
-        "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1,1",
-        "TPU_CHIPS_PER_PROCESS_BOUNDS": "1,1,1,1",
-    }
-    assert [e["CLOUD_TPU_TASK_ID"] for e in envs] == [str(rank) for rank in range(8)]
-
-
-def test_tpu_worker_envs_tpu7x_rejects_an_engine_that_does_not_span_whole_hosts():
-    env = {k: v for k, v in os.environ.items() if k not in ("TORCH_TPU_TOPOLOGY", "TPU_ACCELERATOR_TYPE")}
-    with mock.patch.dict(os.environ, env, clear=True):
-        with pytest.raises(ValueError, match="whole hosts"):
-            tpu_vllm_patches._tpu_worker_envs(["10.0.0.1"] * 4, base_port=8070, pod_type="tpu7x")
-        # Two whole hosts are fine.
-        envs = tpu_vllm_patches._tpu_worker_envs(["10.0.0.1"] * 8 + ["10.0.0.2"] * 8, base_port=8070, pod_type="tpu7x")
-        assert envs[9]["CLOUD_TPU_TASK_ID"] == "9" and envs[9]["TORCH_TPU_TOPOLOGY"] == "2,2,2,2"

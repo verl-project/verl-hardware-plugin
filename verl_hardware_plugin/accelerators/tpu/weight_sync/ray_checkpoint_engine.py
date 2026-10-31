@@ -331,6 +331,9 @@ def load_weights_from_ray_registry(self: Any, step_key: int) -> int:
                     except OSError:
                         pass
 
+            if not ray.is_initialized():
+                # vLLM's mp workers are not Ray processes: join the node's Ray cluster to read the object store.
+                ray.init(address="auto", log_to_driver=False)
             registry = ray.get_actor(RAY_WEIGHT_REGISTRY_ACTOR_NAME, namespace=RAY_WEIGHT_REGISTRY_NAMESPACE)
             state_dict_ref = ray.get(registry.get_weights.remote(step_key))
             if state_dict_ref is None:

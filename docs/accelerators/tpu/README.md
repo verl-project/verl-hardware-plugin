@@ -99,7 +99,7 @@ replacement. verl's `TorchtitanEngineConfig` has no `engine_kwargs` field yet; t
 | Component | Where the options go | Read by | Options |
 |-----------|----------------------|---------|---------|
 | Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `context_parallel_strategy`; see [vLLM Rollout](./rollout.md) |
-| Rollout (vLLM on TPU) | `actor_rollout_ref.rollout.engine_kwargs.vllm.*` | verl core, passed to vLLM as is | vLLM engine arguments. The TPU replica forces `distributed_executor_backend=external_launcher` and `enable_sleep_mode=False`; there are no TPU-only rollout options. |
+| Rollout (vLLM on TPU) | `actor_rollout_ref.rollout.engine_kwargs.vllm.*` | verl core, passed to vLLM as is | vLLM engine arguments. The TPU replica forces `enable_sleep_mode=False` and keeps upstream's `distributed_executor_backend=mp`; there are no TPU-only rollout options. |
 | Weight sync | `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.*` | verl core passes them to the checkpoint engine's constructor; `options.py`: `TPUSyncOptions` | `tpu-sync`: `parallelism`, `verify_parity`, `release_buffers_after_sync`, `tie_word_embeddings`; `ray-plasma-store`: none. See [Weight Sync](./weight_sync.md#configuration) |
 
 Process-wide settings that are not part of any verl config stay environment variables, set in the shell that

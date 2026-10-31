@@ -179,7 +179,7 @@ def setup_tpu_sync_controller() -> tuple[Any, Any, str, Any, str]:
     Returns:
         ``(controller, server, "host:port", rendezvous, rendezvous_name)``. The caller must keep ``server`` and
         ``rendezvous`` referenced while syncing (the rendezvous actor is not detached: Ray destroys it once no
-        handle to it is left), and passes ``rendezvous_name`` to the rollout workers.
+        handle to it is left), and passes the address to the rollout workers.
     """
     # TODO(security): the controller (like the WeightSynchronizer endpoints) accepts unauthenticated
     # connections. Add authentication once tpu_sync supports it; until then it must only be reachable
@@ -666,16 +666,17 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     # 2. Every rollout worker allocates its receive buffers and registers them with the controller under
     #    its replica's job name (a no-op after the first sync).
     t_init_sampler_start = time.perf_counter()
+    # vLLM's workers are not Ray processes, so the driver hands them what the trainer published in step 1.
+    global_shapes = await manager._tpu_sync_rendezvous.get_global_shapes.remote()
     await asyncio.gather(
         *[
             replica.server_handle.collective_rpc.remote(
                 method="init_tpu_sync_on_worker",
                 kwargs={
+                    "controller_address": manager._tpu_sync_address,
+                    "global_shapes": global_shapes,
                     "parallelism": parallelism,
                     "job_name": _sampler_job_name(replica, replica_idx),
-                    # vLLM's workers run under their own Ray driver (the engine process), so they are told the
-                    # rendezvous name instead of deriving it from their job id.
-                    "rendezvous_name": manager._tpu_sync_rendezvous_name,
                 },
             )
             for replica_idx, replica in enumerate(manager.replicas)

@@ -8,6 +8,11 @@ Training and rollout run on separate TPU slices (a slice is a group of TPU hosts
 chip interconnect). One vLLM engine spans all chips of the rollout slice and receives the trainer's
 updated weights through the `ray-plasma-store` or `tpu-sync` checkpoint engine (see [Weight Sync](./weight_sync.md)).
 
+A rollout replica is laid out as upstream verl lays it out on GPU: one server actor per host, the first
+running the engine and the HTTP API, the others running vLLM headless. vLLM's `mp` executor starts one
+worker per chip (per TensorCore on TPU 7x) on each host, and vllm-torchtpu's `mp` multi-host backend
+(`TPU_MULTIHOST_BACKEND=mp`) joins the replica's hosts into one TPU mesh.
+
 ## Requirements
 
 - The prerequisites from the [Installation Guide](./install_guidance.md), plus vLLM `v0.32.0` and
@@ -71,11 +76,12 @@ On TPU, the job log contains
 
 ```text
 Registered rollout replica loader: vllm (TPU-aware)
-Reusing 2 verl placement group(s) for TPU rollout
+[TPU-SYNC CONTROLLER] All 8 Trainer and 16 Sampler units verified and registered.
 ```
 
-where the number is the number of rollout hosts, and the job ends with status `SUCCEEDED`. The rollout is
-tested with Qwen3-0.6B and Qwen3-4B on two v6e-4 slices and on two v6e-8 slices.
+where the sampler count is the number of rollout chips (with `tpu-sync`), and the job ends with status
+`SUCCEEDED`. The rollout is tested with Qwen3-4B on a v6e-8 trainer slice and two 2-host v6e-8 rollout
+slices (two replicas, each spanning two hosts).
 
 ## Related Documentation
 
