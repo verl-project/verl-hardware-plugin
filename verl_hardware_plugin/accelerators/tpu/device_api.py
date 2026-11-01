@@ -11,6 +11,10 @@ public replacements are the device-generic ``torch.accelerator`` APIs.
 
 Each helper uses ``torch.accelerator`` when the current accelerator is the TPU, and otherwise falls
 back to the ``torch.tpu`` function, which older ``torch_tpu`` builds still expose publicly.
+
+The memory statistics (``memory_allocated`` and the others below) exist only in ``torch.accelerator``:
+``torch_tpu`` registers its PJRT allocator as the TPU's ``c10::DeviceAllocator``, and ``torch.tpu`` has
+no memory functions.
 """
 
 import logging
@@ -130,3 +134,71 @@ def initial_seed() -> int:
     if accelerator_is_tpu():
         return _default_generator().initial_seed()
     return torch.tpu.initial_seed()
+
+
+def _tpu_runtime_initialized() -> bool:
+    """Whether this process has started its TPU runtime (the PJRT client)."""
+    is_initialized = getattr(getattr(torch, "tpu", None), "is_initialized", None)
+    if is_initialized is None:
+        return False
+    try:
+        # Experimental in torch_tpu 0.2.0; its one-time warning is noise in every worker's log.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return bool(is_initialized())
+    except Exception as e:
+        logger.debug("torch.tpu.is_initialized() failed: %s", e)
+        return False
+
+
+def _memory_fn(name: str):
+    """``torch.accelerator.<name>`` if this process's TPU runtime is up, else ``None`` (the caller reports zero).
+
+    Reading the allocator statistics before the runtime is up would start it (``PjrtBackend::EnsureInitialized``),
+    and in a multi-process slice that waits for every other process: a metrics query must not do that. Processes
+    without a TPU, such as the Ray driver or the rollout server actor, report zero as well.
+    """
+    if not accelerator_is_tpu() or not _tpu_runtime_initialized():
+        return None
+    return getattr(torch.accelerator, name, None)
+
+
+def memory_allocated(device: Any = None) -> int:
+    fn = _memory_fn("memory_allocated")
+    return int(fn(device)) if fn is not None else 0
+
+
+def max_memory_allocated(device: Any = None) -> int:
+    fn = _memory_fn("max_memory_allocated")
+    return int(fn(device)) if fn is not None else 0
+
+
+def memory_reserved(device: Any = None) -> int:
+    # PJRT's bytes_reserved: unlike CUDA's caching allocator this is not a superset of memory_allocated().
+    fn = _memory_fn("memory_reserved")
+    return int(fn(device)) if fn is not None else 0
+
+
+def max_memory_reserved(device: Any = None) -> int:
+    fn = _memory_fn("max_memory_reserved")
+    return int(fn(device)) if fn is not None else 0
+
+
+def memory_stats(device: Any = None) -> dict[str, Any]:
+    fn = _memory_fn("memory_stats")
+    return fn(device) if fn is not None else {}
+
+
+def reset_peak_memory_stats(device: Any = None) -> None:
+    fn = _memory_fn("reset_peak_memory_stats")
+    if fn is not None:
+        fn(device)
+
+
+def mem_get_info(device: Any = None) -> tuple[int, int]:
+    """``(free, total)`` bytes of this process's TPU device: ``torch.accelerator.get_memory_info``."""
+    fn = _memory_fn("get_memory_info")
+    if fn is None:
+        return 0, 0
+    free, total = fn(device)
+    return int(free), int(total)

@@ -266,7 +266,7 @@ const COLORS = {
   // weight sync phases
   "sync.quiesce": "#fb8c00", "sync.trainer_send": "#7e57c2", "sync.sampler_init": "#9575cd", "sync.barrier": "#b39ddb",
   "sync.p2p_transfer": "#4527a0", "sync.sampler_install": "#d81b60", "sync.finalize": "#f06292",
-  "sync.parity_check": "#8d6e63", "sync.resume": "#26a69a", "sync.transfer": "#4527a0",
+  "sync.parity_check": "#8d6e63", "sync.resume": "#26a69a", "sync.trainer_release": "#90a4ae", "sync.transfer": "#4527a0",
   "sync.release_kv_cache": "#b39ddb", "sync.build_process_group": "#9575cd", "sync.resume_kv_cache": "#80cbc4",
   // rollout server
   "paused": "#fb8c00", "abort": "#e65100", "resume_engine": "#26a69a",
@@ -540,11 +540,21 @@ function buildTimelineModel(evs, metrics, sourceName) {
   // weight-sync phases: tpu-sync logs them as timing_s/tpu-sync/* step metrics; lay them out inside update_weights
   const loop0 = groups.has("trainer") ? groups.get("trainer").lanes.get("loop") : null;
   if (loop0 && !loop0.spans.some(s => s.name.startsWith("sync."))) {
-    const order = [["quiesce", "sync.quiesce"], ["trainer_init", "sync.trainer_send"], ["sampler_init", "sync.sampler_init"],
-                   ["barrier", "sync.barrier"], ["p2p_transfer", "sync.p2p_transfer"], ["sampler_h2d", "sync.sampler_install"]];
+    // The quiesce runs concurrently with the trainer send; the other phases follow the longer of the two.
+    const concurrent = [["quiesce", "sync.quiesce"], ["trainer_init", "sync.trainer_send"]];
+    const order = [["sampler_init", "sync.sampler_init"], ["barrier", "sync.barrier"], ["p2p_transfer", "sync.p2p_transfer"],
+                   ["sampler_h2d", "sync.sampler_install"], ["sampler_resume", "sync.resume"],
+                   ["trainer_release", "sync.trainer_release"]];
     for (const uw of loop0.spans.filter(s => s.name === "update_weights" && s.step != null)) {
       const m = metrics[uw.step] || {};
       let t = uw.t0;
+      for (const [key, name] of concurrent) {
+        const d = m["timing_s/tpu-sync/" + key];
+        if (!(d > 0)) continue;
+        loop0.spans.push({t0: uw.t0, t1: Math.min(uw.t1, uw.t0 + d), name, cat: "sync", step: uw.step,
+                          args: {from: "timing_s/tpu-sync/" + key}, group: "trainer", lane: "loop"});
+        t = Math.max(t, Math.min(uw.t1, uw.t0 + d));
+      }
       for (const [key, name] of order) {
         const d = m["timing_s/tpu-sync/" + key];
         if (!(d > 0)) continue;

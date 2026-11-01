@@ -62,22 +62,6 @@ TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_",)
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471
 
-# HBM capacity in bytes of one addressable device (a chip, or a TensorCore on TPU 7x)
-HBM_BYTES_TPU_V5P = 95 * 1024 * 1024 * 1024  # 95 GB
-HBM_BYTES_TPU_V6E = 32 * 1024 * 1024 * 1024  # 32 GB
-# A TPU 7x chip has 192 GB and two TensorCores; a process drives one core, so this is what a process sees.
-HBM_BYTES_TPU_V7X = 96 * 1024 * 1024 * 1024  # 96 GB per TensorCore device
-
-# Keyed by the generation ``tpu_generation`` extracts from a pod type, accelerator type or Ray label.
-TPU_HBM_BYTES_MAP = {
-    "v5p": HBM_BYTES_TPU_V5P,
-    "v6e": HBM_BYTES_TPU_V6E,
-    "v7x": HBM_BYTES_TPU_V7X,
-}
-
-# Fallback HBM capacity when the chip generation cannot be determined.
-HBM_BYTES_TPU_DEFAULT = HBM_BYTES_TPU_V6E
-
 # TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice. The vLLM
 # rollout (``rollout/tpu_vllm_patches.py``) resolves its mesh here too, so the trainer and the
 # rollout agree on the physical layout of a given slice size.
@@ -260,11 +244,15 @@ def ray_tpu_accelerator_name(node_ips: Optional[list[str]] = None) -> str:
 
 
 def tpu_mesh_env(total_chips: int, num_nodes: int, rank: int, local_rank: int, pod_type: str = "") -> dict[str, str]:
-    """The complete mesh environment of one process of a slice.
+    """The complete mesh environment of one process of a slice, for the rollout's vLLM workers.
 
     The topology and bounds of ``resolve_tpu_topology_bounds`` and, on TPU 7x, the per-process variables of
     ``tpu_v7x_process_env``. Callers apply it after their generic defaults, so that on TPU 7x the task id is
     the process's global rank rather than its host's index.
+
+    The trainer does not use it: its processes start torch_tpu in multi-process mode, which derives these
+    variables itself (see ``PlatformTPU.get_tpu_env_vars``). A TP=1 rollout worker starts torch_tpu in
+    single-device mode (vllm-torchtpu unsets ``WORLD_SIZE``), which derives only the visible device.
     """
     topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(
         total_chips=total_chips, num_nodes=num_nodes, pod_type=pod_type
@@ -330,16 +318,6 @@ def resolve_tpu_topology_bounds(
     return topology, host_bounds, chips_per_host_bounds, chips_per_host
 
 
-def get_tpu_chip_hbm_bytes() -> int:
-    """Detect the TPU chip generation from Ray node labels or env vars and return its HBM capacity."""
-    tpu_type = ray_tpu_accelerator_name() or os.environ.get("TPU_ACCELERATOR_TYPE", "")
-    hbm_bytes = TPU_HBM_BYTES_MAP.get(tpu_generation(tpu_type))
-    if hbm_bytes is None:
-        logger.warning(f"Unable to determine TPU chip HBM bytes for tpu_type='{tpu_type}'. Returning -1.")
-        return -1
-    return hbm_bytes
-
-
 class DummyTpuDeviceModule:
     """Fallback device module for CPU-only nodes and driver processes.
 
@@ -370,55 +348,31 @@ class DummyTpuDeviceModule:
 
 
 class TPUDeviceModuleProxy:
-    """Proxy wrapper for torch.tpu to emulate the PyTorch NVIDIA memory management APIs.
+    """The device module verl uses on TPU (``get_torch_device()``): ``torch.tpu`` plus what verl needs from it.
 
-    Provides default fallback implementations for memory tracking methods
-    (e.g. memory_reserved, memory_allocated, get_device_properties) that are called throughout verl's
-    codebase but not natively provided by torch_tpu.
+    verl calls every accelerator through a CUDA-style device module. ``torch.tpu`` (torch_tpu >= 0.2.0) provides
+    part of that surface itself, e.g. ``get_device_properties``, ``get_device_name``, ``manual_seed_all`` and
+    ``set_rng_state``, and those are forwarded unchanged. This class serves the rest:
+
+    * Device queries that torch_tpu made internal (they raise when called from outside torch / torch_tpu) go
+      through ``torch.accelerator`` (see ``device_api``).
+    * The memory statistics (``memory_allocated``, ``max_memory_allocated``, ``memory_reserved``,
+      ``max_memory_reserved``, ``memory_stats``, ``reset_peak_memory_stats``, ``mem_get_info``) come from the
+      PJRT allocator, which torch_tpu exposes through ``torch.accelerator`` only (see ``device_api``).
+    * ``empty_cache`` does nothing. PJRT manages TPU HBM itself and torch_tpu has nothing to release
+      (``torch.accelerator.empty_cache`` is a no-op on TPU, as vllm-torchtpu's ``torch.cuda.empty_cache`` shim
+      is); ``torch.tpu._clear_cache()`` evicts every compiled executable, so calling it would make each
+      ``empty_cache()`` force recompilations.
+
+    The proxy never modifies ``torch.tpu``: torchtitan's TPU support patches the same module with its own memory
+    shims (``torchtitan.tools.utils``), and two patches of one module depend on import order.
     """
 
     def __init__(self, original_module):
         self.__dict__["_original_module"] = original_module
 
     def __getattr__(self, name):
-        if name == "set_device":
-            return self.set_device
-
-        if hasattr(self._original_module, name):
-            return getattr(self._original_module, name)
-
-        if name == "memory_reserved":
-            return lambda *args, **kwargs: 0
-        elif name == "memory_allocated":
-            return lambda *args, **kwargs: 0
-        elif name == "max_memory_reserved":
-            return lambda *args, **kwargs: 0
-        elif name == "max_memory_allocated":
-            return lambda *args, **kwargs: 0
-        elif name == "reset_peak_memory_stats":
-            return lambda *args, **kwargs: None
-        elif name == "memory_stats":
-            return lambda *args, **kwargs: {}
-        elif name == "get_device_name":
-            return lambda *args, **kwargs: "Google TPU"
-        elif name == "get_device_properties":
-
-            class DummyDeviceProperties:
-                def __init__(self, total_memory=HBM_BYTES_TPU_DEFAULT):
-                    self.total_memory = total_memory
-                    self.name = "Google TPU"
-                    self.major = 1
-                    self.minor = 0
-
-            hbm_bytes = get_tpu_chip_hbm_bytes()
-            total_mem = hbm_bytes if hbm_bytes > 0 else HBM_BYTES_TPU_DEFAULT
-            return lambda *args, **kwargs: DummyDeviceProperties(total_memory=total_mem)
-        elif name == "mem_get_info":
-            hbm_bytes = get_tpu_chip_hbm_bytes()
-            total_mem = hbm_bytes if hbm_bytes > 0 else HBM_BYTES_TPU_DEFAULT
-            return lambda *args, **kwargs: (total_mem, total_mem)
-
-        raise AttributeError(f"'TPUDeviceModuleProxy' object has no attribute '{name}'")
+        return getattr(self._original_module, name)
 
     def __setattr__(self, name, value):
         if name.startswith("_"):
@@ -470,21 +424,30 @@ class TPUDeviceModuleProxy:
     def initial_seed(self) -> int:
         return tpu_device_api.initial_seed()
 
-    def manual_seed_all(self, seed: int) -> None:
-        # torch_tpu does not always expose manual_seed_all; the global torch seed is the
-        # right fallback because a TPU process owns exactly one chip.
-        fn = getattr(self._original_module, "manual_seed_all", None)
-        if fn is not None:
-            fn(seed)
-        else:
-            torch.manual_seed(seed)
+    # Memory statistics: torch.tpu has none, torch.accelerator reports the PJRT allocator's (see device_api).
+    def memory_allocated(self, device: Any = None) -> int:
+        return tpu_device_api.memory_allocated(device)
+
+    def max_memory_allocated(self, device: Any = None) -> int:
+        return tpu_device_api.max_memory_allocated(device)
+
+    def memory_reserved(self, device: Any = None) -> int:
+        return tpu_device_api.memory_reserved(device)
+
+    def max_memory_reserved(self, device: Any = None) -> int:
+        return tpu_device_api.max_memory_reserved(device)
+
+    def memory_stats(self, device: Any = None) -> dict[str, Any]:
+        return tpu_device_api.memory_stats(device)
+
+    def reset_peak_memory_stats(self, device: Any = None) -> None:
+        tpu_device_api.reset_peak_memory_stats(device)
+
+    def mem_get_info(self, device: Any = None) -> tuple[int, int]:
+        return tpu_device_api.mem_get_info(device)
 
     def empty_cache(self) -> None:
-        if hasattr(self._original_module, "_clear_cache"):
-            try:
-                self._original_module._clear_cache()
-            except Exception as e:
-                logger.warning(f"Failed to clear TPU cache: {e}")
+        """Nothing to release; see the class docstring (never ``torch.tpu._clear_cache()``)."""
 
 
 def driver_tpu_env_for_workers() -> dict[str, str]:
@@ -497,15 +460,16 @@ def driver_tpu_env_for_workers() -> dict[str, str]:
 
 
 def configure_torchrun_tpu_env() -> None:
-    """Populate PJRT multi-process environment variables when launched via ``torchrun``.
+    """Populate the torch_tpu multi-process environment when launched via ``torchrun``.
 
     In Ray single-controller runs (``sft_trainer_ray`` / ``main_ppo``), ``get_worker_env_vars``
-    populates ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` and the topology bounds on each worker actor.
+    populates ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` and ``TORCH_TPU_TOPOLOGY`` on each worker actor.
     In ``torchrun`` multi-controller runs (``verl.trainer.sft_trainer``), ``PlatformTPU()`` is
     instantiated inside ``auto_set_device`` / ``initialize_global_process_group`` before
-    ``torch.distributed.init_process_group(backend="cpu:gloo,tpu:tpu_dist")`` runs. Setting
-    missing PJRT variables from ``LOCAL_RANK`` / ``RANK`` / ``WORLD_SIZE`` lets ``torchrun``
-    work out of the box without a wrapper script.
+    ``torch.distributed.init_process_group(backend="cpu:gloo,tpu:tpu_dist")`` runs. Setting the
+    two from ``LOCAL_WORLD_SIZE`` / ``WORLD_SIZE`` lets ``torchrun`` work out of the box without a
+    wrapper script; torch_tpu derives libtpu's per-process variables from them and from torchrun's
+    ``RANK`` / ``LOCAL_RANK`` (see ``PlatformTPU.get_tpu_env_vars``).
     """
     if "LOCAL_RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         return
@@ -518,9 +482,7 @@ def configure_torchrun_tpu_env() -> None:
         pass
 
     try:
-        local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        rank = int(os.environ.get("RANK", local_rank))
         local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
     except ValueError:
         return
@@ -547,52 +509,23 @@ def configure_torchrun_tpu_env() -> None:
 
     os.environ.setdefault("PJRT_DEVICE", "TPU")
     os.environ.setdefault("TORCH_TPU_SLICEBUILDER_ADDRESSES", ",".join(sb_addresses))
-    os.environ.setdefault("TPU_PROCESS_ADDRESSES", ",".join(sb_addresses))
-    os.environ.setdefault("TPU_PROCESS_PORT", str(TPU_PROCESS_BASE_PORT + local_rank))
-    os.environ.setdefault("CLOUD_TPU_TASK_ID", str(rank // local_world_size))
     os.environ.setdefault("TPU_WORKER_HOSTNAMES", ",".join(hostnames))
-    os.environ.setdefault("TPU_VISIBLE_CHIPS", str(local_rank))
 
     pod_type = os.environ.get("TPU_ACCELERATOR_TYPE", "")
     try:
-        mesh_env = tpu_mesh_env(
-            total_chips=world_size, num_nodes=num_nodes, rank=rank, local_rank=local_rank, pod_type=pod_type
+        topology, _, _, chips_per_host = resolve_tpu_topology_bounds(
+            total_chips=world_size, num_nodes=num_nodes, pod_type=pod_type
         )
     except ValueError:
         return
+    mesh_env = {"TORCH_TPU_TOPOLOGY": topology, "CHIPS_PER_HOST": chips_per_host}
     if is_tpu_v7x(pod_type):
-        # The GKE TPU webhook pre-sets 3-D host bounds and a per-host task id on TPU 7x pods; the mesh is
-        # laid out by process here, so those are replaced rather than kept.
+        # The 4-D mesh of TensorCore processes replaces any other preset value (resolve_tpu_v7x_topology already
+        # returned a TORCH_TPU_TOPOLOGY that fits the world size).
         os.environ.update(mesh_env)
     else:
         for name, value in mesh_env.items():
             os.environ.setdefault(name, value)
-
-
-def configure_ray_worker_tpu7x_env() -> None:
-    """On a TPU 7x Ray worker, lay the mesh out from the slice shape the GKE webhook put in the pod.
-
-    ``get_tpu_env_vars`` runs in the process that creates the workers, usually the Ray head, which has no
-    TPU webhook variables and so takes the pool's mesh from ``TPU_V7X_TOPOLOGY_MAP``. The worker itself has
-    them, so it recomputes the mesh the way torchtitan's launcher does (``resolve_tpu_v7x_topology``) and
-    replaces the head's shape when the two differ. Only the shape changes; the process addresses, ports,
-    ranks and visible device the head assigned stay.
-    """
-    addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
-    hostnames = os.environ.get("TPU_WORKER_HOSTNAMES")
-    if not addresses or not hostnames or "TPU_PROCESS_BOUNDS" not in os.environ or not is_tpu_v7x():
-        return
-    num_devices, num_nodes = len(addresses.split(",")), len(hostnames.split(","))
-    try:
-        topology = resolve_tpu_v7x_topology(num_devices, num_nodes)
-    except ValueError as e:
-        logger.warning("Keeping the mesh the head assigned: %s", e)
-        return
-    if topology != os.environ["TPU_PROCESS_BOUNDS"]:
-        logger.info(
-            "TPU 7x mesh %s from this pod's slice (head assigned %s)", topology, os.environ["TPU_PROCESS_BOUNDS"]
-        )
-        os.environ.update({"TORCH_TPU_TOPOLOGY": topology, "TPU_HOST_BOUNDS": topology, "TPU_PROCESS_BOUNDS": topology})
 
 
 @PlatformRegistry.register(platform="tpu")
@@ -608,19 +541,9 @@ class PlatformTPU(PlatformBase):
         super().__init__()
         reduce_avg_allreduce_patch.apply()
         configure_torchrun_tpu_env()
-        configure_ray_worker_tpu7x_env()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
+        # torch.tpu itself is left untouched; the proxy adds what verl needs (see TPUDeviceModuleProxy).
         self._device_module = TPUDeviceModuleProxy(original_tpu)
-        if hasattr(torch, "tpu"):
-            for attr in (
-                "reset_peak_memory_stats",
-                "empty_cache",
-                "memory_stats",
-                "get_device_name",
-                "get_device_properties",
-            ):
-                if not hasattr(torch.tpu, attr):
-                    setattr(torch.tpu, attr, getattr(self._device_module, attr))
         self._claimed_slices: set[str] = set()
 
     @property
@@ -654,11 +577,9 @@ class PlatformTPU(PlatformBase):
         self.device_module.manual_seed_all(seed)
 
     def empty_cache(self) -> None:
-        # Delegate when torch.tpu provides it. A TPU runtime that manages HBM itself has no
-        # CUDA-style caching allocator to drain, in which case there is nothing to do.
-        empty = getattr(self.device_module, "empty_cache", None)
-        if empty is not None:
-            empty()
+        # PJRT manages TPU HBM itself: there is no CUDA-style caching allocator to drain, so this does nothing
+        # (TPUDeviceModuleProxy.empty_cache explains why it must not call torch.tpu._clear_cache()).
+        self.device_module.empty_cache()
 
     def set_allocator_settings(self, settings: str) -> None:
         # TPU exposes no configurable caching allocator equivalent to CUDA's.
@@ -821,6 +742,13 @@ class PlatformTPU(PlatformBase):
         bundle order, are exactly the processes of the PJRT mesh. This runs in the process that
         creates the workers (the trainer's TaskRunner), so nothing here may depend on the IP of
         the calling process -- it can be the head node or any TPU host.
+
+        Only the slice's process addresses and topology are set. verl sets ``WORLD_SIZE`` on every worker, so
+        torch_tpu (>= 0.2.0) starts its runtime in multi-process mode: from ``RANK``, ``LOCAL_RANK``,
+        ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` and ``TORCH_TPU_TOPOLOGY`` it derives libtpu's per-process variables
+        (``CLOUD_TPU_TASK_ID``, ``TPU_VISIBLE_DEVICES`` / ``TPU_VISIBLE_CHIPS``, ``TPU_PROCESS_ADDRESSES``,
+        ``TPU_PROCESS_PORT``, and the host, process and chip bounds) and overwrites any value set before, on TPU 7x
+        as on v6e.
         """
         node_ip_map = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes() if node.get("Alive", False)}
         bundle_ips = []
@@ -841,29 +769,20 @@ class PlatformTPU(PlatformBase):
         # Extract unique worker hostnames preserving rank order
         unique_hostnames = list(dict.fromkeys(bundle_ips))
 
-        env_vars = {
+        # Derive the mesh from the pod type Ray reports for this pool's hosts, falling back to the chip count.
+        tpu_type = ray_tpu_accelerator_name(node_ips=unique_hostnames)
+        topology, _, _, chips_per_host = resolve_tpu_topology_bounds(
+            total_chips=world_size, num_nodes=len(unique_hostnames), pod_type=tpu_type
+        )
+
+        return {
             "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(sb_addresses),
-            "TPU_PROCESS_ADDRESSES": ",".join(sb_addresses),
-            "TPU_PROCESS_PORT": str(base_port + local_rank),
-            "CLOUD_TPU_TASK_ID": str(rank // local_world_size),
+            "TORCH_TPU_TOPOLOGY": topology,
             "TPU_WORKER_HOSTNAMES": ",".join(unique_hostnames),
             "LOCAL_RANK": str(local_rank),
             "LOCAL_WORLD_SIZE": str(local_world_size),
+            "CHIPS_PER_HOST": chips_per_host,
         }
-
-        # Derive the mesh from the pod type Ray reports for this pool's hosts, falling back to the chip count.
-        tpu_type = ray_tpu_accelerator_name(node_ips=unique_hostnames)
-        env_vars.update(
-            tpu_mesh_env(
-                total_chips=world_size,
-                num_nodes=len(unique_hostnames),
-                rank=rank,
-                local_rank=local_rank,
-                pod_type=tpu_type,
-            )
-        )
-
-        return env_vars
 
     def get_worker_env_vars(
         self,

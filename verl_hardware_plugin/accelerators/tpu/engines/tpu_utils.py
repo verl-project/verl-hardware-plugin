@@ -735,15 +735,18 @@ def tpu_eager_mode_context(mode: Optional[str]):
     recipes set to ``DEFER_AND_FUSE``: ops outside the compiled blocks are deferred and compiled into
     fused XLA programs at the next materialization point instead of being launched one XLA program per op
     (the ``torch_tpu`` default, ``DEFER_NEVER``).
+
+    Uses torch_tpu's public ``torch.tpu.set_eager_mode`` / ``torch.tpu.EagerMode`` (torch_tpu >= 0.2.0), the same
+    context manager as the private ``torch_tpu._internal.execution_mode.set_eager_mode``.
     """
     if mode is None:
         return nullcontext()
-    try:
-        from torch_tpu._internal import execution_mode
-
-        return execution_mode.set_eager_mode(getattr(execution_mode.EagerMode, mode))
-    except ImportError:
+    tpu = getattr(torch, "tpu", None)
+    set_eager_mode = getattr(tpu, "set_eager_mode", None)
+    eager_mode = getattr(tpu, "EagerMode", None)
+    if set_eager_mode is None or eager_mode is None:  # no torch_tpu, e.g. the CPU tests
         return nullcontext()
+    return set_eager_mode(getattr(eager_mode, mode))
 
 
 @torch.no_grad()

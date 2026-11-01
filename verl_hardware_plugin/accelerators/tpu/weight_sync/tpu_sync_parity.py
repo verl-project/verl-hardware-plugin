@@ -13,7 +13,10 @@
   and the driver logs one summary for all workers (``report_exact_parity``). Catches any wrong byte (shard slice,
   tiling, fusion, transpose). Run it after changing the trainer or rollout sharding, or upgrading tpu-sync.
 
-They are bring-up and debugging aids; the sync itself does not depend on them.
+They are bring-up and debugging aids; the sync itself does not depend on them. An enabled check that fails raises
+``TPUSyncParityError``: on a mismatch, and also when it cannot get the stats or results it needs, so a broken
+verification path never passes silently. The driver runs the checks before it resumes generation, so the run stops
+instead of generating with wrong weights.
 """
 
 import asyncio
@@ -30,6 +33,10 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # Cap on the per-tensor detail lines a worker returns and the driver logs.
 MAX_EXACT_DETAIL_LINES = 60
+
+
+class TPUSyncParityError(RuntimeError):
+    """An enabled parity check found wrong weights, or could not collect what it needs to verify them."""
 
 
 class ExactParityCheck:
@@ -68,14 +75,18 @@ class ExactParityCheck:
         }
 
 
-def report_exact_parity(global_steps: Optional[int], install_results: list, replica_labels: list[str]) -> bool:
-    """Logs one summary of the ``exact`` check per rollout replica; returns True if every replica matched.
+def report_exact_parity(global_steps: Optional[int], install_results: list, replica_labels: list[str]) -> None:
+    """Logs one summary of the ``exact`` check per rollout replica.
 
     ``install_results`` holds each replica's ``collective_rpc("install_tpu_sync_weights")`` result (one dict per
     worker); ``replica_labels`` names each replica in the log lines (empty strings with one replica).
+
+    Raises ``TPUSyncParityError`` after checking every replica if any of them had a mismatched or unresolved
+    tensor, returned no result, or could not run the check (installs through vLLM's loaders re-shard the tensors
+    themselves, so there is nothing to compare bit for bit; use ``verify_parity=norm`` for those models).
     """
     step = global_steps or 0
-    all_ok = True
+    failures = []
     for label, per_replica in zip(replica_labels, install_results, strict=True):
         workers = per_replica if isinstance(per_replica, list | tuple) else [per_replica]
         results = [
@@ -83,13 +94,14 @@ def report_exact_parity(global_steps: Optional[int], install_results: list, repl
         ]
         prefix = f"[TPU-SYNC PARITY EXACT | Step {step}{label}]"
         if not results:
-            logger.warning(f"{prefix} no rollout worker returned a result")
-            all_ok = False
+            failures.append(f"{prefix} no rollout worker returned a result")
             continue
         skipped = [r for r in results if r.get("skipped")]
         if skipped:
-            logger.warning(f"{prefix} not run: {skipped[0]['skipped']}")
-            all_ok = False
+            failures.append(
+                f"{prefix} not run: {skipped[0]['skipped']} (the exact check needs a direct install; "
+                "use verify_parity=norm for this model)"
+            )
             continue
         results.sort(key=lambda r: r["rank"])
         num_mismatched = sum(r["num_mismatched"] for r in results)
@@ -102,12 +114,12 @@ def report_exact_parity(global_steps: Optional[int], install_results: list, repl
         if num_mismatched == 0 and num_unresolved == 0:
             logger.info(f"{summary}: every received tensor matches the checkpoint bit for bit")
             continue
-        all_ok = False
         details = [f"  * rank {r['rank']}: {line}" for r in results for line in r["mismatched"]]
         details += [f"  * rank {r['rank']}: unresolved {r['unresolved'][:5]}" for r in results if r["unresolved"]]
         detail_text = "\n".join(details[:MAX_EXACT_DETAIL_LINES])
-        logger.error(f"{summary}\n{detail_text}")
-    return all_ok
+        failures.append(f"{summary}\n{detail_text}")
+    if failures:
+        raise TPUSyncParityError("\n".join(failures))
 
 
 def compute_tensor_stats(items: list) -> dict:
@@ -233,58 +245,67 @@ async def verify_rollout_parity(manager: Any, global_steps: Optional[int], repli
       - Ranks 1..N-1 accumulate only sharded tensors.
     The orchestrator can then perform verification in O(ranks) pure scalar arithmetic
     rather than O(tensors * ranks) loop aggregation.
+
+    Raises ``TPUSyncParityError`` after checking every replica if any of them mismatched or returned no worker
+    stats, and right away if the trainer ranks did not post complete stats for this step.
     """
     step_key = global_steps if global_steps is not None else 0
     if step_key <= 0:
         return
 
-    try:
-        rendezvous = get_tpu_sync_rendezvous()
-        # With local shards every trainer rank posts its own stats ("ranks"); wait until all of them have.
-        num_trainer_ranks = manager.actor_wg.world_size
-        trainer_entry = None
-        for _ in range(25):
-            entry = await rendezvous.get_stats.remote(step_key)
-            if entry is not None and ("ranks" not in entry or len(entry["ranks"]) >= num_trainer_ranks):
-                trainer_entry = entry
-                break
-            await asyncio.sleep(0.5)
-
-        sampler_entries = await asyncio.gather(
-            *[
-                replica.server_handle.collective_rpc.remote(method="get_model_weights_stats")
-                for replica in manager.replicas
-            ]
+    rendezvous = get_tpu_sync_rendezvous()
+    # With local shards every trainer rank posts its own stats ("ranks"); wait until all of them have.
+    num_trainer_ranks = manager.actor_wg.world_size
+    trainer_entry = posted = None
+    for _ in range(25):
+        posted = await rendezvous.get_stats.remote(step_key)
+        if posted is not None and ("ranks" not in posted or len(posted["ranks"]) >= num_trainer_ranks):
+            trainer_entry = posted
+            break
+        await asyncio.sleep(0.5)
+    if not trainer_entry:
+        got = len(posted.get("ranks", ())) if posted else 0
+        raise TPUSyncParityError(
+            f"[TPU-SYNC PARITY | Step {step_key}] Incomplete trainer stats: {got} of {num_trainer_ranks} trainer "
+            "ranks posted them"
         )
 
-        if not trainer_entry or not sampler_entries:
-            logger.warning(f"[TPU-SYNC PARITY] Incomplete stats data for step {step_key}")
-            return
+    sampler_entries = await asyncio.gather(
+        *[replica.server_handle.collective_rpc.remote(method="get_model_weights_stats") for replica in manager.replicas]
+    )
+    if not sampler_entries:
+        raise TPUSyncParityError(f"[TPU-SYNC PARITY | Step {step_key}] No rollout replica returned stats")
 
-        if "ranks" in trainer_entry:
-            # Local shards: every trainer rank posted the stats of its own shards; their sum describes the model.
-            trainer_entry = {"master": merge_rank_stats(trainer_entry["ranks"])}
-        # The norms of a replica's workers are summed before the comparison with the trainer, which describes
-        # one copy of the model. Every replica is a full copy, so each one is compared on its own, and the
-        # result lines name the replica when there are several.
-        for label, entry in zip(replica_labels, sampler_entries, strict=True):
+    if "ranks" in trainer_entry:
+        # Local shards: every trainer rank posted the stats of its own shards; their sum describes the model.
+        trainer_entry = {"master": merge_rank_stats(trainer_entry["ranks"])}
+    # The norms of a replica's workers are summed before the comparison with the trainer, which describes
+    # one copy of the model. Every replica is a full copy, so each one is compared on its own, and the
+    # result lines name the replica when there are several.
+    failures = []
+    for label, entry in zip(replica_labels, sampler_entries, strict=True):
+        try:
             _check_parity_norms(trainer_entry, entry, step_key, label)
-    except Exception as e:
-        logger.warning(f"Error during parity verification for step {step_key}: {e}")
+        except TPUSyncParityError as e:
+            failures.append(str(e))
+    if failures:
+        raise TPUSyncParityError("\n".join(failures))
 
 
 def _check_parity_norms(trainer_entry: Any, sampler_entry: Any, step_key: int, label: str = "") -> None:
     """Compares the trainer's norms with the summed norms of one replica's workers (``sampler_entry``, the
-    rollout server's ``collective_rpc`` result); ``label`` is appended to the step in the log lines."""
+    rollout server's ``collective_rpc`` result); ``label`` is appended to the step in the log lines.
+
+    Logs the result on parity; raises ``TPUSyncParityError`` on a mismatch or when no worker returned stats.
+    """
     # The server returns one result per TP worker (a list), or a single dict.
     results = sampler_entry if isinstance(sampler_entry, list | tuple) else [sampler_entry]
     sampler_workers = [w for w in results if isinstance(w, dict)]
     if not sampler_workers:
-        logger.warning(
-            f"[TPU-SYNC PARITY] No sampler worker stats for step {step_key}{label}: the rollout server's "
+        raise TPUSyncParityError(
+            f"[TPU-SYNC PARITY | Step {step_key}{label}] No sampler worker stats: the rollout server's "
             "collective_rpc must return the worker results for the parity check."
         )
-        return
 
     trainer_master = trainer_entry.get("master", trainer_entry)
     trainer_per_tensor = trainer_master.get("per_tensor", {})
@@ -363,7 +384,7 @@ def _check_parity_norms(trainer_entry: Any, sampler_entry: Any, step_key: int, l
         )
     else:
         mismatches_summary = "\n".join(mismatches[:10])
-        logger.error(
+        raise TPUSyncParityError(
             f"[TPU-SYNC PARITY MISMATCH | Step {step_key}{label}] Norms do NOT match!\n"
             f"  * Trainer: numel={total_trainer_numel}, L1={total_trainer_l1:.6f}, L2={global_trainer_l2:.6f}\n"
             f"  * Sampler: numel={total_sampler_numel}, L1={total_sampler_l1:.6f}, L2={global_sampler_l2:.6f}\n"

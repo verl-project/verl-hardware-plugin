@@ -77,7 +77,7 @@ actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 | Option (`engine_kwargs.tpu-sync.*`) | Default | Description |
 |-------------------------------------|---------|-------------|
 | `parallelism` | `8` | Parallel transfer streams per worker. |
-| `verify_parity` | `off` | Weight-sync check: `off`, `norm`, `exact` or `all` (`True` means `norm`). See [Parity checks](#parity-checks). Meant for bring-up and after changing sharding or upgrading tpu-sync. |
+| `verify_parity` | `off` | Weight-sync check: `off`, `norm`, `exact` or `all` (`True` means `norm`). See [Parity checks](#parity-checks). A failed check stops the run. Meant for bring-up and after changing sharding or upgrading tpu-sync. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The deprecated environment variable `VERL_TPU_SYNC_RELEASE_BUFFERS` still overrides the option on the trainer workers and logs a deprecation warning. |
 
 ## Parity checks
@@ -98,8 +98,15 @@ extra compare per tensor, once. The driver logs one line per replica:
 ```
 
 followed, on a mismatch, by one line per mismatched tensor and rank. It covers every tensor installed directly into
-vLLM's parameters. Qwen3.5's stacked experts are not compared, and models installed through vLLM's weight loaders
-log `not run`. Both checks only report; the sync and the run continue either way.
+vLLM's parameters. Qwen3.5's stacked experts are not compared. Models installed through vLLM's weight loaders cannot
+be checked bit for bit (the loaders re-shard the tensors themselves); the check logs `not run` and fails, so use
+`verify_parity=norm` for them.
+
+An enabled check that fails raises `TPUSyncParityError` on the driver, which stops the run. It fails on a mismatch
+(including `unresolved` tensors in the `exact` check), and also when it cannot collect what it needs: trainer ranks
+that did not post their norms, rollout workers that returned no stats or no `exact` result, or an `exact` check
+that could not run (`not run`). The checks run before generation resumes, so the rollout never generates with
+weights that failed a check.
 
 ## Several rollout replicas
 
@@ -112,7 +119,7 @@ compares each replica with the trainer on its own, naming the replica in its res
 
 ```text
 [TPU-SYNC PARITY VERIFIED | Step 3 | replica 0] 100% DISTRIBUTED NORM PARITY CONFIRMED!
-[TPU-SYNC PARITY MISMATCH | Step 3 | replica 1] Norms do NOT match!
+TPUSyncParityError: [TPU-SYNC PARITY MISMATCH | Step 3 | replica 1] Norms do NOT match!
 ```
 
 Every replica tested so far sits on one host; replicas that span several hosts are not covered.
@@ -124,18 +131,23 @@ trainer, log them with the step metrics:
 
 | Metric | Phase |
 |--------|-------|
-| `timing_s/tpu-sync/quiesce` | Pausing generation |
+| `timing_s/tpu-sync/quiesce` | Pausing generation; runs concurrently with `trainer_init` |
 | `timing_s/tpu-sync/trainer_init` | Trainer ranks gathering their weights, and creating and registering a synchronizer (first sync) or rebinding the existing one |
 | `timing_s/tpu-sync/sampler_init` | Rollout workers allocating and registering their receive buffers |
 | `timing_s/tpu-sync/barrier` | Waiting until every worker has registered |
 | `timing_s/tpu-sync/p2p_transfer` | The transfer |
 | `timing_s/tpu-sync/sampler_h2d` | Rollout workers copying the weights to HBM and into vLLM's parameters |
 | `timing_s/tpu-sync/sampler_h2d_pure` | The host-to-device copy alone, on the slowest rollout worker |
-| `timing_s/tpu-sync/total_sync` | The whole sync after pausing generation |
+| `timing_s/tpu-sync/sampler_resume` | Resuming generation, after the parity checks (if enabled) |
+| `timing_s/tpu-sync/trainer_release` | Waiting for the trainer to free its send buffers; generation has already resumed |
+| `timing_s/tpu-sync/total_sync` | The whole sync, including the pause that overlaps `trainer_init` |
 
-`sampler_h2d_pure` and the `verify_parity` check depend on the rollout workers' return values, which
-verl's vLLM server does not yet pass back from `collective_rpc`. Until it does, the sync still works, but
-`sampler_h2d_pure` is not reported and the parity check logs a warning instead of a result.
+`sampler_h2d_pure` and the `verify_parity` checks read the rollout workers' return values, which verl's vLLM server
+passes back from `collective_rpc` (since verl-project/verl#8155). With an older verl, the sync still works, but
+`sampler_h2d_pure` is not reported and an enabled parity check fails for lack of results.
+
+Generation resumes as soon as the rollout holds the new weights and has passed the parity checks; it does not wait
+for the trainer to free its send buffers, which only gives trainer HBM back before the next training step.
 
 ## Verify
 
@@ -147,17 +159,20 @@ pytest tests/accelerators/tpu/test_tpu_sync_checkpoint_engine.py -v
 
 On TPU, set `VERL_LOGGING_LEVEL=INFO` and `SAGEMAKER_CONTAINER_LOG_LEVEL=INFO` in the job's `env_vars` (see
 [vLLM Rollout](./rollout.md#run)). Every sync then logs its phase times. For example, from a
-Qwen3-0.6B run with one v6e-8 slice for training and one for rollout:
+Qwen3-0.6B run with one v6e-8 slice for training and one for rollout (two TP=4 replicas, `verify_parity=all`):
 
 ```text
-[TPU-SYNC TELEMETRY | Orchestrator] Step 1 Completed in 1.9739s:
-  * Sampler Quiesce/Pause  : 0.0338s
-  * Trainer Init           : 1.0341s
-  * Sampler Init           : 0.0063s
+[TPU-SYNC TELEMETRY | Orchestrator] Step 2 Completed in 0.9981s:
+  * Sampler Quiesce/Pause  : 0.0338s (overlaps Trainer Init)
+  * Trainer Init           : 0.3757s
+  * Sampler Init           : 0.0053s
   * Barrier Check          : 0.0002s
-  * Controller P2P         : 0.1317s
-  * Sampler H2D DMA        : 0.0318s
-  * Total End-to-End Sync  : 1.9739s
+  * Controller P2P         : 0.2022s
+  * Sampler H2D DMA        : 0.0325s
+  * Parity Check           : 0.3745s
+  * Sampler Resume         : 0.0046s
+  * Trainer Buffer Release : 0.0003s (rollout already generating)
+  * Total End-to-End Sync  : 0.9981s
 ```
 
 The first sync (step 0) is slower, because the rollout workers allocate and register their receive
@@ -170,7 +185,7 @@ buffers then. With `verify_parity=norm` (or `True`), every sync after the first 
 Both lines come from the driver process. There, vLLM's serving code imports
 `model_hosting_container_standards`, which sets Python's root logger to `SAGEMAKER_CONTAINER_LOG_LEVEL`
 (default `ERROR`). Without the variable, the driver drops the plugin's `INFO` and `WARNING` messages.
-Errors, such as a parity mismatch, are always logged.
+Errors are always logged, and a failed parity check raises `TPUSyncParityError` with its result lines.
 
 ## Related Documentation
 

@@ -211,7 +211,8 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
     * ``parallelism`` (default 8): parallel transfer streams per worker.
     * ``verify_parity`` (default ``off``): ``norm`` posts weight norms after every sync so the driver can check
       that the rollout received the trainer's weights; ``exact`` has the rollout workers compare the step-0 sync
-      bit for bit with the checkpoint vLLM loaded (trainer ranks do nothing for it); ``all`` runs both.
+      bit for bit with the checkpoint vLLM loaded (trainer ranks do nothing for it); ``all`` runs both. A failed
+      check raises ``TPUSyncParityError`` on the driver, before generation resumes.
     * ``tie_word_embeddings`` (default unset): whether ``lm_head`` is tied to the input embedding, so it
       need not be sent. Unset sends ``lm_head``, which is correct for tied and untied models alike.
     * ``release_buffers_after_sync`` (default True): free the bound send tensors after every transfer
@@ -516,8 +517,8 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
                 # device tensors and the host staging memory) is destroyed when the last Python reference goes.
                 self._close_synchronizer()
                 gc.collect()
-            # No empty_cache(): on TPU it clears the eager-op compilation cache (forcing recompiles) and the
-            # TPU runtime reuses freed HBM without it.
+            # No empty_cache(): the TPU runtime reuses freed HBM by itself (the platform's empty_cache() does
+            # nothing, and torch.tpu._clear_cache() would evict the compiled executables, forcing recompiles).
             tpu_synchronize()
         return {}
 
@@ -616,6 +617,9 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
 
     Returns:
         Per-phase timings in seconds, logged as step metrics by trainers that record sync metrics.
+
+    Raises:
+        TPUSyncParityError: An enabled parity check (``verify_parity``) failed; generation is not resumed.
     """
     backend = manager.backend or TPU_SYNC_BACKEND
     options = get_tpu_sync_options(_tpu_sync_engine_kwargs(manager.config, backend), backend)
@@ -627,13 +631,20 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     controller = _get_or_start_controller(manager)
 
     t_sync_wall = time.time()
-    t_abort_start = time.perf_counter()
-    if global_steps and global_steps > 0:
-        try:
-            await manager.abort_replicas()
-        except Exception as e:
-            logger.warning(f"Failed to abort replicas at step {global_steps}: {e}")
-    t_abort = time.perf_counter() - t_abort_start
+
+    # 0. Pause the rollout concurrently with the trainer-side export below. The trainer only exports and binds its
+    #    own tensors and registers with the controller; nothing reads or writes rollout memory before step 2
+    #    (rollout init), so the pause need not run in front of it.
+    async def _quiesce_rollout() -> float:
+        t0 = time.perf_counter()
+        if global_steps and global_steps > 0:
+            try:
+                await manager.abort_replicas()
+            except Exception as e:
+                logger.warning(f"Failed to abort replicas at step {global_steps}: {e}")
+        return time.perf_counter() - t0
+
+    quiesce_task = asyncio.create_task(_quiesce_rollout())
 
     t_total_start = time.perf_counter()
 
@@ -641,9 +652,16 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     #    the global shapes. ray.get blocks until all ranks finish, so run it in a thread to keep the event loop free.
     t_init_trainer_start = time.perf_counter()
     actor_refs = manager.actor_wg.update_weights(global_steps=global_steps, mode=manager.backend)
-    if actor_refs is not None:
-        await asyncio.to_thread(ray.get, actor_refs)
+    try:
+        if actor_refs is not None:
+            await asyncio.to_thread(ray.get, actor_refs)
+    except BaseException:
+        quiesce_task.cancel()
+        raise
     t_init_trainer = time.perf_counter() - t_init_trainer_start
+
+    # The rollout must be paused before anything below touches it.
+    t_abort = await quiesce_task
 
     # 2. Every rollout worker allocates its receive buffers and registers them with the controller under
     #    its replica's job name (a no-op after the first sync).
@@ -728,44 +746,51 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
         await asyncio.gather(
             *[replica.server_handle.set_global_steps.remote(global_steps) for replica in manager.replicas]
         )
-    if release_refs is not None:
-        await asyncio.to_thread(ray.get, release_refs)
     t_finalize = time.perf_counter() - t_finalize_start
 
-    t_total = time.perf_counter() - t_total_start
-
-    # 6. Parity verification (optional, default off).
+    # 6. Parity verification (optional, default off). An enabled check raises TPUSyncParityError on a mismatch or on
+    #    missing stats/results; it runs before resume_generation_replicas, so a failed sync stops the run instead
+    #    of resuming generation on wrong weights.
     t_parity_start = time.perf_counter()
     if exact_install_kwargs:
         report_exact_parity(global_steps, install_results, _replica_labels(manager))
     if verify_parity:
-        try:
-            await _verify_parity(manager, global_steps)
-        except Exception as e:
-            logger.warning(f"Failed to execute parity verification: {e}")
+        await _verify_parity(manager, global_steps)
     t_parity = time.perf_counter() - t_parity_start
+
+    # 7. Resume generation as soon as the rollout holds the new weights and their global_steps tag, without waiting
+    #    for the trainer to free its send buffers below: that only gives trainer HBM back and must not keep the
+    #    rollout idle.
+    t_resume_start = time.perf_counter()
+    await manager.resume_generation_replicas()
+    t_resume = time.perf_counter() - t_resume_start
+
+    # 8. Wait for the trainer to free its send buffers before the next training step.
+    t_release_start = time.perf_counter()
+    if release_refs is not None:
+        await asyncio.to_thread(ray.get, release_refs)
+    t_release = time.perf_counter() - t_release_start
+
+    t_total = time.perf_counter() - t_total_start
 
     logger.info(
         f"[TPU-SYNC TELEMETRY | Orchestrator] Step {global_steps} Completed in {t_total:.4f}s:\n"
-        f"  * Sampler Quiesce/Pause  : {t_abort:.4f}s\n"
+        f"  * Sampler Quiesce/Pause  : {t_abort:.4f}s (overlaps Trainer Init)\n"
         f"  * Trainer Init           : {t_init_trainer:.4f}s\n"
         f"  * Sampler Init           : {t_init_sampler:.4f}s\n"
         f"  * Barrier Check          : {t_barrier:.4f}s\n"
         f"  * Controller P2P         : {t_transfer:.4f}s\n"
         f"  * Sampler H2D DMA        : {t_install:.4f}s\n"
+        f"  * Parity Check           : {t_parity:.4f}s\n"
+        f"  * Sampler Resume         : {t_resume:.4f}s\n"
+        f"  * Trainer Buffer Release : {t_release:.4f}s (rollout already generating)\n"
         f"  * Total End-to-End Sync  : {t_total:.4f}s"
     )
 
-    # 7. Resume generation immediately
-    t_resume_start = time.perf_counter()
-    await manager.resume_generation_replicas()
-    t_resume = time.perf_counter() - t_resume_start
-
     if timeline.enabled():
         step = global_steps or 0
+        # The quiesce runs concurrently with the trainer send; every later phase follows the longer of the two.
         sync_phases = [
-            ("sync.quiesce", t_abort),
-            ("sync.trainer_send", t_init_trainer),
             ("sync.sampler_init", t_init_sampler),
             ("sync.barrier", t_barrier),
             ("sync.p2p_transfer", t_transfer),
@@ -773,18 +798,23 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
             ("sync.finalize", t_finalize),
             ("sync.parity_check", t_parity if verify_parity or exact_install_kwargs else 0.0),
             ("sync.resume", t_resume),
+            ("sync.trainer_release", t_release),
         ]
+        t_concurrent = max(t_abort, t_init_trainer)
         timeline.emit(
             "update_weights" if step > 0 else "initial_weight_sync",
             t_sync_wall,
-            sum(d for _, d in sync_phases),
+            t_concurrent + sum(d for _, d in sync_phases),
             step=step,
             quiesce=round(t_abort, 3),
             trainer_send=round(t_init_trainer, 3),
             p2p=round(t_transfer, 3),
             install=round(t_install, 3),
         )
-        t_cursor = t_sync_wall
+        for phase_name, phase_dur in (("sync.quiesce", t_abort), ("sync.trainer_send", t_init_trainer)):
+            if phase_dur >= 1e-4:
+                timeline.emit(phase_name, t_sync_wall, phase_dur, step=step)
+        t_cursor = t_sync_wall + t_concurrent
         for phase_name, phase_dur in sync_phases:
             if phase_dur >= 1e-4:
                 timeline.emit(phase_name, t_cursor, phase_dur, step=step)
@@ -792,7 +822,7 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
 
     # Surface the phase timers as step metrics. Trainers that record sync metrics (e.g. the separate-async
     # trainer's _pending_sync_metrics) log them next to timing_s/update_weights with every configured
-    # backend (console / tensorboard / wandb). timing_s/update_weights ~= quiesce + total_sync.
+    # backend (console / tensorboard / wandb). total_sync spans the whole sync: the quiesce overlaps its trainer_init.
     metrics = {
         "timing_s/tpu-sync/quiesce": t_abort,
         "timing_s/tpu-sync/trainer_init": t_init_trainer,
@@ -800,6 +830,8 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
         "timing_s/tpu-sync/barrier": t_barrier,
         "timing_s/tpu-sync/p2p_transfer": t_transfer,
         "timing_s/tpu-sync/sampler_h2d": t_install,
+        "timing_s/tpu-sync/sampler_resume": t_resume,
+        "timing_s/tpu-sync/trainer_release": t_release,
         "timing_s/tpu-sync/total_sync": t_total,
     }
     if t_h2d_pure is not None:

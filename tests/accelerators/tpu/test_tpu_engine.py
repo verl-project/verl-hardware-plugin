@@ -7,7 +7,7 @@ import ast
 import os
 import sys
 import types
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -30,13 +30,12 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     install_tpu_attention,
     pad_packed_inputs_for_tpu,
     resolve_tpu_torchtitan_options,
+    tpu_eager_mode_context,
     unwrap_metadata,
 )
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
     PlatformTPU,
-    configure_ray_worker_tpu7x_env,
     configure_torchrun_tpu_env,
-    get_tpu_chip_hbm_bytes,
     gke_tpu_slice_topology,
     is_tpu_v7x,
     ray_tpu_accelerator_name,
@@ -214,6 +213,28 @@ def test_configure_torch_compile_for_tpu():
     assert torch._dynamo.config.assume_static_by_default is True
     assert torch._dynamo.config.capture_scalar_outputs is True
     assert torch._dynamo.config.recompile_limit >= 64
+
+
+def test_tpu_eager_mode_context_uses_the_public_torch_tpu_api():
+    """torch.tpu.set_eager_mode / torch.tpu.EagerMode (torch_tpu >= 0.2.0), not torch_tpu._internal."""
+    entered = []
+
+    @contextmanager
+    def set_eager_mode(mode):
+        entered.append(mode)
+        yield
+
+    tpu = SimpleNamespace(
+        set_eager_mode=set_eager_mode, EagerMode=SimpleNamespace(DEFER_AND_FUSE="fuse", DEFER_NEVER="never")
+    )
+    with mock.patch.object(torch, "tpu", tpu, create=True):
+        with tpu_eager_mode_context("DEFER_AND_FUSE"):
+            assert entered == ["fuse"]
+        assert isinstance(tpu_eager_mode_context(None), nullcontext)
+    # Without torch_tpu (e.g. these CPU tests) the context does nothing.
+    with mock.patch.object(torch, "tpu", SimpleNamespace(), create=True):
+        assert isinstance(tpu_eager_mode_context("DEFER_AND_FUSE"), nullcontext)
+    assert entered == ["fuse"]
 
 
 def test_resolve_tpu_torchtitan_options_and_config_extension():
@@ -411,9 +432,10 @@ def test_tpu_mesh_env_applies_the_process_layout_on_tpu7x_only():
         }
 
 
-def test_configure_torchrun_tpu_env_tpu7x_replaces_the_webhook_bounds():
-    """GKE pre-sets 3-D bounds and a per-host task id on TPU 7x pods; torchrun on TPU 7x lays the mesh out by
-    process from them (the slice's shape plus the core axis) and replaces them."""
+def test_configure_torchrun_tpu_env_tpu7x_takes_the_mesh_from_the_webhook_slice():
+    """torchrun on TPU 7x lays the mesh out by process: the slice the GKE webhook describes, plus the core axis.
+    The webhook's own 3-D variables are left as they are; torch_tpu replaces them, the task id, the visible
+    device and the process port with the per-process layout when it starts."""
     keep = {k: v for k, v in os.environ.items() if not k.startswith(("TPU_", "TORCH_TPU_", "CLOUD_TPU_", "CHIPS_"))}
     keep.pop("PJRT_DEVICE", None)
     torchrun = {
@@ -428,23 +450,18 @@ def test_configure_torchrun_tpu_env_tpu7x_replaces_the_webhook_bounds():
     }
     with mock.patch.dict(os.environ, {**keep, **torchrun}, clear=True):
         configure_torchrun_tpu_env()
-        assert os.environ["CLOUD_TPU_TASK_ID"] == "13"
-        assert (
-            os.environ["TORCH_TPU_TOPOLOGY"]
-            == os.environ["TPU_HOST_BOUNDS"]
-            == os.environ["TPU_PROCESS_BOUNDS"]
-            == "2,2,2,2"
-        )
-        assert os.environ["TPU_CHIPS_PER_HOST_BOUNDS"] == os.environ["TPU_CHIPS_PER_PROCESS_BOUNDS"] == "1,1,1,1"
-        assert os.environ["TPU_VISIBLE_CHIPS"] == os.environ["TPU_VISIBLE_DEVICES"] == "5"
-        assert os.environ["TPU_PROCESS_PORT"] == "8476"
-    # v6e keeps a pre-set value, as before.
-    with mock.patch.dict(
-        os.environ, {**keep, **torchrun, "TPU_ACCELERATOR_TYPE": "v6e-16", "WORLD_SIZE": "16"}, clear=True
-    ):
+        assert os.environ["TORCH_TPU_TOPOLOGY"] == "2,2,2,2"
+        assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")[13] == "10.0.0.2:8476"
+        assert os.environ["TPU_HOST_BOUNDS"] == "1,1,2" and os.environ["TPU_CHIPS_PER_HOST_BOUNDS"] == "2,2,1"
+        derived = {"CLOUD_TPU_TASK_ID", "TPU_PROCESS_BOUNDS", "TPU_VISIBLE_DEVICES", "TPU_PROCESS_PORT"}
+        assert not derived & set(os.environ)
+    # A preset 3-D topology is replaced on TPU 7x.
+    with mock.patch.dict(os.environ, {**keep, **torchrun, "TORCH_TPU_TOPOLOGY": "2,2,2"}, clear=True):
         configure_torchrun_tpu_env()
-        assert os.environ["TPU_HOST_BOUNDS"] == "1,1,2"
-        assert os.environ["CLOUD_TPU_TASK_ID"] == "1"
+        assert os.environ["TORCH_TPU_TOPOLOGY"] == "2,2,2,2"
+    with mock.patch.dict(os.environ, {**keep, **torchrun, "TPU_ACCELERATOR_TYPE": "v6e-16"}, clear=True):
+        configure_torchrun_tpu_env()
+        assert os.environ["TORCH_TPU_TOPOLOGY"] == "4,4,1"
 
 
 def test_ray_tpu_accelerator_name_prefers_the_pools_own_nodes(caplog):
@@ -477,42 +494,43 @@ def test_ray_tpu_accelerator_name_prefers_the_pools_own_nodes(caplog):
         assert ray_tpu_accelerator_name() == ""
 
 
-def test_tpu7x_hbm_is_per_tensorcore_device(monkeypatch):
-    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "tpu7x")
-    assert get_tpu_chip_hbm_bytes() == 96 * 1024**3
-    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v6e-8")
-    assert get_tpu_chip_hbm_bytes() == 32 * 1024**3
-    nodes = [{"Alive": True, "Resources": {"TPU": 8.0}, "Labels": {"ray.io/tpu-pod-type": "v7x-16"}}]
-    with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
-        assert get_tpu_chip_hbm_bytes() == 96 * 1024**3  # Ray's spelling of the pod type
-    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v9z-8")
-    assert get_tpu_chip_hbm_bytes() == -1
-
-
-def test_ray_worker_relays_the_webhook_slice_shape_on_tpu7x():
-    """The head assigned the table's shape for a 2-host pool; the worker, which sees the webhook's chip bounds
-    and the slice's host bounds, replaces it with the slice's own shape when the pool spans the slice, and
-    leaves everything else alone."""
-    head = {
-        "TPU_ACCELERATOR_TYPE": "tpu7x",
+def test_tpu7x_trainer_env_is_the_slice_addresses_and_mesh():
+    """A trainer worker on a 2-host TPU 7x pool gets the processes' addresses and the 4-D mesh. torch_tpu derives
+    the per-process layout (task id = rank, visible device = local rank, process bounds = the mesh) itself."""
+    nodes = [
+        {
+            "NodeID": f"n{h}",
+            "NodeManagerAddress": f"10.0.0.{h}",
+            "Alive": True,
+            "Resources": {"TPU": 8.0},
+            "Labels": {"ray.io/tpu-pod-type": "v7x-16"},
+        }
+        for h in (1, 2)
+    ]
+    tables = {f"pg{h}": {"state": "CREATED", "bundles_to_node_id": {i: f"n{h}" for i in range(8)}} for h in (1, 2)}
+    platform = PlatformTPU()
+    with (
+        mock.patch.dict(os.environ, _env_without_webhook(), clear=True),
+        mock.patch("ray.is_initialized", return_value=True),
+        mock.patch("ray.nodes", return_value=nodes),
+        mock.patch("ray._private.state.state.placement_group_table", side_effect=tables.__getitem__),
+    ):
+        env = platform.get_tpu_env_vars(
+            rank=13,
+            world_size=16,
+            local_rank=5,
+            local_world_size=8,
+            name_prefix="actor_rollout",
+            pgs=[mock.Mock(id="pg1"), mock.Mock(id="pg2")],
+        )
+    assert env == {
         "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(f"10.0.0.{h}:{8471 + c}" for h in (1, 2) for c in range(8)),
+        "TORCH_TPU_TOPOLOGY": "2,2,2,2",
         "TPU_WORKER_HOSTNAMES": "10.0.0.1,10.0.0.2",
-        "TPU_PROCESS_BOUNDS": "2,2,2,2",
-        "CLOUD_TPU_TASK_ID": "13",
-        "TPU_VISIBLE_DEVICES": "5",
+        "LOCAL_RANK": "5",
+        "LOCAL_WORLD_SIZE": "8",
+        "CHIPS_PER_HOST": "8",
     }
-    # The webhook's variables as the pod has them: a 1x2x1-host slice (2 hosts of 2,2,1 chips = 2,4,1 chips).
-    webhook = {"TPU_HOST_BOUNDS": "1,2,1", "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1"}
-    base = _env_without_webhook()
-    with mock.patch.dict(os.environ, {**base, **head, **webhook}, clear=True):
-        configure_ray_worker_tpu7x_env()
-        assert os.environ["TPU_PROCESS_BOUNDS"] == os.environ["TPU_HOST_BOUNDS"] == os.environ["TORCH_TPU_TOPOLOGY"]
-        assert os.environ["TPU_PROCESS_BOUNDS"] == "2,4,1,2"
-        assert os.environ["CLOUD_TPU_TASK_ID"] == "13" and os.environ["TPU_VISIBLE_DEVICES"] == "5"
-    # Not a TPU 7x worker: nothing happens.
-    with mock.patch.dict(os.environ, {**base, **head, **webhook, "TPU_ACCELERATOR_TYPE": "v6e-8"}, clear=True):
-        configure_ray_worker_tpu7x_env()
-        assert os.environ["TPU_PROCESS_BOUNDS"] == "2,2,2,2"
 
 
 def test_resolve_tpu_topology_bounds_raises_on_unknown_slice():

@@ -144,15 +144,34 @@ The two variables serve different purposes and must not be merged.
 | TPU 7x (`tpu7x`) | 96 GB per TensorCore (192 GB per dual-core chip) | by device count: 8 (one `2x2x1` host), 16, 32, 64, 128 (`4x4x4`) |
 
 On TPU 7x a chip has two TensorCores that `torch_tpu` drives as two devices, one process each: a host is
-8 devices, a slice is a 4-D mesh `x,y,z,cores`, and libtpu lays the mesh out by process (`CLOUD_TPU_TASK_ID`
-is the process's global rank, `TPU_VISIBLE_DEVICES` the process's core). A pool that spans its GKE slice
-takes the mesh from the slice shape the TPU webhook puts in the pod (`TPU_HOST_BOUNDS` times
-`TPU_CHIPS_PER_HOST_BOUNDS`, plus the core axis, as torchtitan's launcher computes it); a pool that uses
-part of a slice takes the whole-host shape for its device count from `TPU_V7X_TOPOLOGY_MAP` in
-`platform_tpu.py`. The generation comes from the `ray.io/tpu-pod-type` node label of the pool's hosts or
+8 devices, a slice is a 4-D mesh `x,y,z,cores` (`TORCH_TPU_TOPOLOGY`), and libtpu lays the mesh out by process:
+when it starts, `torch_tpu` sets `CLOUD_TPU_TASK_ID` to the process's global rank and `TPU_VISIBLE_DEVICES` to
+its local rank, i.e. its core. Under `torchrun` and in the rollout, which resolve the mesh inside a TPU pod, a
+pool that spans its GKE slice takes the mesh from the slice shape the TPU webhook puts in the pod
+(`TPU_HOST_BOUNDS` times `TPU_CHIPS_PER_HOST_BOUNDS`, plus the core axis, as torchtitan's launcher computes it).
+A pool that uses part of a slice, and a Ray trainer pool, whose mesh is resolved where its workers are created
+(usually on the Ray head, which has no webhook variables), take the whole-host shape for their device count from
+`TPU_V7X_TOPOLOGY_MAP` in `platform_tpu.py`.
+The generation comes from the `ray.io/tpu-pod-type` node label of the pool's hosts or
 from `TPU_ACCELERATOR_TYPE`; set `TORCH_TPU_TOPOLOGY='x,y,z,cores'` to override. Rollout engines on TPU 7x
 use one worker per TensorCore, e.g. a TP=8 engine per host; on every generation an engine's mesh is its
-own worker count. When the generation cannot be determined, the platform falls back to the v6e HBM figure.
+own worker count.
+
+### Device memory
+
+`get_torch_device()` (`TPUDeviceModuleProxy`) forwards to `torch.tpu`, except for the calls `torch.tpu`
+does not provide:
+
+- The memory statistics (`memory_allocated`, `max_memory_allocated`, `memory_reserved`,
+  `max_memory_reserved`, `memory_stats`, `reset_peak_memory_stats`, `mem_get_info`) come from
+  `torch.accelerator`. That is where `torch_tpu` reports its PJRT allocator. They read zero until the
+  process has started its TPU runtime, and in processes without a TPU. On TPU, `memory_reserved` is
+  PJRT's reserved bytes, so unlike on CUDA it is not a superset of `memory_allocated`.
+- `empty_cache()` does nothing, because PJRT manages HBM itself. It must not call
+  `torch.tpu._clear_cache()`, which evicts every compiled executable.
+- HBM capacity: `torch.tpu.get_device_properties().total_memory`.
+
+The plugin never modifies the `torch.tpu` module.
 
 ## Related Documentation
 

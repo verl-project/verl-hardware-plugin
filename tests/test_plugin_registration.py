@@ -383,7 +383,16 @@ class TestPlatformRegistration:
         assert head == on_slice_host
         assert head["TPU_WORKER_HOSTNAMES"] == "10.0.0.1,10.0.0.2"
         assert len(head["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 8
-        assert head["CLOUD_TPU_TASK_ID"] == "1" and head["LOCAL_RANK"] == "1" and "TPU_VISIBLE_CHIPS" not in head
+        assert head["TORCH_TPU_TOPOLOGY"] == "2,4,1" and head["LOCAL_RANK"] == "1"
+        # torch_tpu derives libtpu's per-process variables from RANK, LOCAL_RANK, the addresses and the topology.
+        derived = {
+            "CLOUD_TPU_TASK_ID",
+            "TPU_VISIBLE_CHIPS",
+            "TPU_PROCESS_ADDRESSES",
+            "TPU_PROCESS_PORT",
+            "TPU_HOST_BOUNDS",
+        }
+        assert not derived & head.keys()
 
     def test_tpu_cudart_returns_none(self):
         """There is no CUDA runtime on a TPU host; PlatformBase documents None as the answer."""
@@ -1227,12 +1236,11 @@ class TestReduceAvgAllReducePatchTPU:
         with mock.patch.dict(os.environ, env, clear=True), mock.patch("ray.is_initialized", return_value=False):
             configure_torchrun_tpu_env()
             assert os.environ["PJRT_DEVICE"] == "TPU"
-            assert os.environ["TPU_VISIBLE_CHIPS"] == "2"
-            assert os.environ["CLOUD_TPU_TASK_ID"] == "0"
-            assert os.environ["TPU_PROCESS_PORT"] == "8473"
             assert os.environ["TORCH_TPU_TOPOLOGY"] == "2,2,1"
-            assert os.environ["TPU_CHIPS_PER_HOST_BOUNDS"] == "2,2,1"
-            assert len(os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 4
+            assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == ",".join(f"10.0.0.5:{8471 + r}" for r in range(4))
+            # Derived by torch_tpu from torchrun's RANK / LOCAL_RANK, the addresses and the topology when it starts.
+            for name in ("TPU_VISIBLE_CHIPS", "CLOUD_TPU_TASK_ID", "TPU_PROCESS_PORT", "TPU_CHIPS_PER_HOST_BOUNDS"):
+                assert name not in os.environ
 
     def test_training_worker_postprocess_output_uses_tpu_patches(self):
         def _fake_tpu_dist_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
