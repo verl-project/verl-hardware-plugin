@@ -29,10 +29,12 @@ import functools
 import gc
 import importlib
 import inspect
+import io
 import logging
 import math
 import os
 import re
+import shutil
 from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Any, Callable, Iterator, Optional
@@ -549,6 +551,133 @@ def _fp32_masters_of(engine: Any) -> Optional[_Fp32Masters]:
         masters = _Fp32Masters(host=bool(tpu_options.optimizer_host_offload))
         engine._fp32_master_store = masters
     return masters
+
+
+class _NonSeekableWriter(io.RawIOBase):
+    """Append-only binary stream wrapper so ``torch.save`` never seeks backwards on GCSFuse streaming mounts."""
+
+    def __init__(self, raw: Any):
+        self._raw = raw
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def write(self, b: Any) -> int:
+        return self._raw.write(b)
+
+    def flush(self) -> None:
+        self._raw.flush()
+
+
+def _fp32_master_ckpt_filename(rank: int, world_size: int) -> str:
+    return f"fp32_master_rank_{rank:05d}_of_{world_size:05d}.pt"
+
+
+def _pack_ckpt_tensor(value: Any) -> Any:
+    if isinstance(value, DTensor):
+        return {"__dtensor_local__": value._local_tensor.detach().cpu()}
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    return value
+
+
+def _unpack_ckpt_tensor_like(saved: Any, like_param: torch.Tensor, target_device: torch.device) -> Any:
+    if isinstance(saved, dict) and "__dtensor_local__" in saved:
+        local = saved["__dtensor_local__"].to(device=target_device)
+        return _wrap_local_like_param(local, like_param)
+    if isinstance(saved, torch.Tensor):
+        return saved.to(device=target_device)
+    return saved
+
+
+@torch.no_grad()
+def _copy_local_into_(dst: torch.Tensor, saved: Any) -> None:
+    src = saved["__dtensor_local__"] if isinstance(saved, dict) and "__dtensor_local__" in saved else saved
+    target = dst._local_tensor if isinstance(dst, DTensor) else dst.data
+    target.copy_(src.to(device=target.device, dtype=target.dtype))
+
+
+def _gcs_ckpt_blob_target(path: str) -> Optional[tuple[str, str]]:
+    """Resolve a direct ``gs://`` URI or a ``VERL_GCS_CKPT_BUCKET``-backed mount path to ``(bucket, blob)``.
+
+    Streaming multi-terabyte checkpoints directly via ``google.cloud.storage`` avoids staging 35-70 GiB/rank shards
+    onto node-local root disks through GCSFuse's ``/gcsfuse-tmp`` cache.
+    """
+    if path.startswith("gs://"):
+        without_scheme = path[len("gs://") :].strip("/")
+        bucket_name, _, blob_name = without_scheme.partition("/")
+        if bucket_name:
+            return bucket_name, blob_name
+        return None
+    bucket_name = os.environ.get("VERL_GCS_CKPT_BUCKET", "").strip()
+    if not bucket_name:
+        return None
+    mount_root = os.path.normpath(os.environ.get("VERL_GCS_CKPT_MOUNT", "/gcs_ckpt"))
+    norm = os.path.normpath(path)
+    mount_prefix = f"{mount_root.rstrip('/')}/"
+    if norm == mount_root or norm.startswith(mount_prefix):
+        rel = norm[len(mount_prefix) :].lstrip("/") if norm != mount_root else ""
+        prefix = os.environ.get("VERL_GCS_CKPT_PREFIX", "").strip("/")
+        blob_name = f"{prefix}/{rel}".strip("/") if prefix and rel else (prefix or rel)
+        return bucket_name, blob_name
+    return None
+
+
+def _prune_old_fp32_master_checkpoints(local_path: str, max_ckpt_to_keep: Optional[int]) -> None:
+    if max_ckpt_to_keep is None or max_ckpt_to_keep <= 0:
+        return
+    norm_path = os.path.normpath(local_path)
+    step_dir = os.path.dirname(norm_path)
+    if os.path.basename(norm_path) != "actor" or not os.path.basename(step_dir).startswith("global_step_"):
+        return
+    ckpt_root = os.path.dirname(step_dir)
+    gcs_root = _gcs_ckpt_blob_target(ckpt_root)
+    if gcs_root is not None:
+        from google.cloud import storage
+
+        bucket_name, root_prefix = gcs_root
+        prefix_with_slash = f"{root_prefix.rstrip('/')}/"
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        it = bucket.list_blobs(prefix=prefix_with_slash, delimiter="/")
+        list(it)  # populate it.prefixes
+        found_gcs: list[tuple[int, str]] = []
+        for sub_prefix in it.prefixes:
+            rel_name = sub_prefix[len(prefix_with_slash) :].rstrip("/")
+            m = re.fullmatch(r"global_step_(\d+)", rel_name)
+            if m:
+                found_gcs.append((int(m.group(1)), sub_prefix))
+        found_gcs.sort(key=lambda item: item[0])
+        if len(found_gcs) > max_ckpt_to_keep:
+            for _, old_prefix in found_gcs[:-max_ckpt_to_keep]:
+                logger.info(
+                    "Removing old GCS checkpoint prefix gs://%s/%s (max_ckpt_to_keep=%d)",
+                    bucket_name,
+                    old_prefix,
+                    max_ckpt_to_keep,
+                )
+                blobs = list(bucket.list_blobs(prefix=old_prefix))
+                for i in range(0, len(blobs), 100):
+                    bucket.delete_blobs(blobs[i : i + 100])
+        return
+
+    if not os.path.isdir(ckpt_root):
+        return
+    found: list[tuple[int, str]] = []
+    for entry in os.listdir(ckpt_root):
+        m = re.fullmatch(r"global_step_(\d+)", entry)
+        if m:
+            full = os.path.join(ckpt_root, entry)
+            if os.path.isdir(full):
+                found.append((int(m.group(1)), full))
+    found.sort(key=lambda item: item[0])
+    if len(found) > max_ckpt_to_keep:
+        for _, old_dir in found[:-max_ckpt_to_keep]:
+            logger.info("Removing old checkpoint directory %s (max_ckpt_to_keep=%d)", old_dir, max_ckpt_to_keep)
+            shutil.rmtree(old_dir, ignore_errors=True)
 
 
 def _partition_params_into_chunks(
@@ -1460,6 +1589,165 @@ class TorchTitanTPUEngine(BaseEngine):
             else:
                 raise ValueError(f"Invalid device type: {device}")
 
+    def _save_fp32_master_checkpoint(
+        self,
+        masters: _Fp32Masters,
+        local_path: str,
+        global_step: int,
+        max_ckpt_to_keep: Optional[int],
+    ) -> None:
+        is_dist = torch.distributed.is_initialized()
+        rank = torch.distributed.get_rank() if is_dist else 0
+        world_size = torch.distributed.get_world_size() if is_dist else 1
+        if rank == 0 and _gcs_ckpt_blob_target(local_path) is None:
+            os.makedirs(local_path, exist_ok=True)
+        if is_dist:
+            torch.distributed.barrier()
+
+        saved_masters: dict[str, dict[str, Any]] = {}
+        saved_params: dict[str, Any] = {}
+        for idx, module in enumerate(self.module):
+            for name, p in module.named_parameters():
+                fqn = f"{idx}.{name}"
+                entry = masters._entries.get(id(p))
+                if entry is not None:
+                    master, state = entry
+                    saved_masters[fqn] = {
+                        "master": _pack_ckpt_tensor(master),
+                        "state": {k: _pack_ckpt_tensor(v) for k, v in state.items()},
+                    }
+                else:
+                    saved_params[fqn] = _pack_ckpt_tensor(p)
+
+        saved_buffers = {
+            f"{idx}.{bname}": _pack_ckpt_tensor(b)
+            for idx, module in enumerate(self.module)
+            for bname, b in module.named_buffers()
+        }
+        optimizer_param_groups = (
+            [
+                [{k: v for k, v in g.items() if k not in ("params", "param_names")} for g in opt.param_groups]
+                for opt in getattr(self.optimizer, "optimizers", ())
+            ]
+            if getattr(self, "optimizer", None) is not None
+            else None
+        )
+        payload = {
+            "format_version": 1,
+            "global_step": int(global_step),
+            "rank": rank,
+            "world_size": world_size,
+            "masters": saved_masters,
+            "params": saved_params,
+            "buffers": saved_buffers,
+            "optimizer_param_groups": optimizer_param_groups,
+            "lr_scheduler": self.lr_scheduler.state_dict() if getattr(self, "lr_scheduler", None) is not None else None,
+        }
+        final_file = os.path.join(local_path, _fp32_master_ckpt_filename(rank, world_size))
+        gcs_target = _gcs_ckpt_blob_target(final_file)
+        if gcs_target is not None:
+            import time as _time
+
+            from google.cloud import storage
+
+            bucket_name, blob_name = gcs_target
+            for attempt_idx in range(3):
+                try:
+                    client = storage.Client()
+                    blob = client.bucket(bucket_name).blob(blob_name)
+                    with blob.open("wb", chunk_size=64 * 1024 * 1024, ignore_flush=True) as raw_f:
+                        with io.BufferedWriter(_NonSeekableWriter(raw_f), buffer_size=16 * 1024 * 1024) as stream:
+                            torch.save(payload, stream)
+                    break
+                except Exception as exc:
+                    if attempt_idx == 2:
+                        raise
+                    logger.warning(
+                        "Rank %d/%d retrying direct GCS checkpoint upload to gs://%s/%s after error: %s",
+                        rank,
+                        world_size,
+                        bucket_name,
+                        blob_name,
+                        exc,
+                    )
+                    _time.sleep(2.0 * (attempt_idx + 1))
+        else:
+            tmp_file = f"{final_file}.tmp"
+            with open(tmp_file, "wb") as raw_f:
+                with io.BufferedWriter(_NonSeekableWriter(raw_f), buffer_size=16 * 1024 * 1024) as stream:
+                    torch.save(payload, stream)
+            os.replace(tmp_file, final_file)
+        if is_dist:
+            torch.distributed.barrier()
+
+        if rank == 0:
+            _prune_old_fp32_master_checkpoints(local_path, max_ckpt_to_keep)
+        if is_dist:
+            torch.distributed.barrier()
+
+    def _load_fp32_master_checkpoint(self, masters: _Fp32Masters, local_path: str) -> None:
+        is_dist = torch.distributed.is_initialized()
+        rank = torch.distributed.get_rank() if is_dist else 0
+        world_size = torch.distributed.get_world_size() if is_dist else 1
+        ckpt_file = os.path.join(local_path, _fp32_master_ckpt_filename(rank, world_size))
+        if not os.path.exists(ckpt_file):
+            raise FileNotFoundError(f"FP32 master checkpoint shard not found for rank {rank}/{world_size}: {ckpt_file}")
+
+        masters.clear()
+        if getattr(self, "optimizer", None) is not None:
+            for opt in getattr(self.optimizer, "optimizers", ()):
+                opt.state.clear()
+        gc.collect()
+
+        payload: dict[str, Any] = {}
+        num_slots = min(2, max(1, (world_size + 3) // 4)) if is_dist else 1
+        for slot in range(num_slots):
+            if not is_dist or ((rank % 8) // 4) % num_slots == slot:
+                payload = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+            if is_dist:
+                torch.distributed.barrier()
+
+        if payload.get("world_size") != world_size:
+            raise ValueError(
+                f"Checkpoint world_size={payload.get('world_size')} does not match current world_size={world_size}"
+            )
+
+        saved_masters: dict[str, dict[str, Any]] = payload.get("masters", {})
+        saved_params: dict[str, Any] = payload.get("params", {})
+        saved_buffers: dict[str, Any] = payload.get("buffers", {})
+
+        for idx, module in enumerate(self.module):
+            for name, p in module.named_parameters():
+                fqn = f"{idx}.{name}"
+                if fqn in saved_masters:
+                    entry_data = saved_masters.pop(fqn)
+                    master_saved = entry_data["master"]
+                    _copy_local_into_(p, master_saved)
+                    param_dev = p._local_tensor.device if isinstance(p, DTensor) else p.device
+                    home_dev = torch.device(masters.home) if masters.home is not None else param_dev
+                    master = _unpack_ckpt_tensor_like(master_saved, p, home_dev)
+                    state = {k: _unpack_ckpt_tensor_like(v, p, home_dev) for k, v in entry_data["state"].items()}
+                    masters._entries[id(p)] = (master, state)
+                elif fqn in saved_params:
+                    _copy_local_into_(p, saved_params.pop(fqn))
+                else:
+                    raise KeyError(f"Parameter {fqn!r} missing from FP32 master checkpoint {ckpt_file}")
+
+            for bname, b in module.named_buffers():
+                bfqn = f"{idx}.{bname}"
+                if bfqn in saved_buffers:
+                    _copy_local_into_(b, saved_buffers.pop(bfqn))
+
+        saved_opt_groups = payload.get("optimizer_param_groups")
+        if saved_opt_groups is not None and getattr(self, "optimizer", None) is not None:
+            for opt, groups in zip(self.optimizer.optimizers, saved_opt_groups, strict=True):
+                for g, sg in zip(opt.param_groups, groups, strict=True):
+                    g.update(sg)
+
+        lr_sched_state = payload.get("lr_scheduler")
+        if lr_sched_state is not None and getattr(self, "lr_scheduler", None) is not None:
+            self.lr_scheduler.load_state_dict(lr_sched_state)
+
     def save_checkpoint(
         self,
         local_path: str,
@@ -1469,57 +1757,78 @@ class TorchTitanTPUEngine(BaseEngine):
         **kwargs,
     ) -> None:
         """Save checkpoint."""
-        if _fp32_masters_of(self) is not None:
-            raise NotImplementedError("save_checkpoint with engine_kwargs.tpu.fp32_master=True is not yet enabled")
-        if self._is_offload_param:
-            self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
+        with timeline.span(
+            "save_checkpoint", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane(), step=global_step
+        ):
+            masters = _fp32_masters_of(self)
+            if masters is not None:
+                self._save_fp32_master_checkpoint(masters, local_path, global_step, max_ckpt_to_keep)
+                return
 
-        # Override TorchTitan's folder to use verl's path
-        parent_dir = os.path.dirname(local_path)
-        self.checkpointer.folder = parent_dir
+            if self._is_offload_param:
+                self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
 
-        if max_ckpt_to_keep is not None:
-            self.checkpointer.keep_latest_k = max_ckpt_to_keep
+            # Override TorchTitan's folder to use verl's path
+            parent_dir = os.path.dirname(local_path)
+            self.checkpointer.folder = parent_dir
 
-        self.checkpointer.save(curr_step=global_step)
+            if max_ckpt_to_keep is not None:
+                self.checkpointer.keep_latest_k = max_ckpt_to_keep
 
-        torch.distributed.barrier()
-        if self._is_offload_param:
-            self.to(device="cpu", model=True, optimizer=False, grad=False)
+            self.checkpointer.save(curr_step=global_step)
+
+            torch.distributed.barrier()
+            if self._is_offload_param:
+                self.to(device="cpu", model=True, optimizer=False, grad=False)
 
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
     ) -> None:
         """Load checkpoint."""
-        if _fp32_masters_of(self) is not None:
-            raise NotImplementedError("load_checkpoint with engine_kwargs.tpu.fp32_master=True is not yet enabled")
-        if self._is_offload_param:
-            self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
+        with timeline.span("load_checkpoint", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()):
+            masters = _fp32_masters_of(self)
+            if masters is not None:
+                if self._is_offload_param:
+                    self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
+                self._load_fp32_master_checkpoint(masters, local_path)
+                for module in self.module:
+                    for p in module.parameters():
+                        if hasattr(p, "_tpu_cpu_offload_tensor"):
+                            delattr(p, "_tpu_cpu_offload_tensor")
+                tpu_synchronize(wait=True)
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                if self._is_offload_param:
+                    self.to(device="cpu", model=True, optimizer=False, grad=False)
+                return
 
-        # Override TorchTitan's folder to use verl's path
-        parent_dir = os.path.dirname(local_path)
-        self.checkpointer.folder = parent_dir
+            if self._is_offload_param:
+                self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
 
-        # Extract step number from path (verl uses global_step_N format)
-        match = re.search(r"global_step_(\d+)", local_path)
-        if match:
-            step = int(match.group(1))
-            self.checkpointer.load(step=step)
-        else:
-            # Fallback to latest
-            self.checkpointer.load(step=-1)
-        for module in self.module:
-            for p in module.parameters():
-                if hasattr(p, "_tpu_cpu_offload_tensor"):
-                    delattr(p, "_tpu_cpu_offload_tensor")
-        tpu_synchronize(wait=True)
+            # Override TorchTitan's folder to use verl's path
+            parent_dir = os.path.dirname(local_path)
+            self.checkpointer.folder = parent_dir
 
-        torch.distributed.barrier()
-        if self._is_offload_param:
-            self.to(device="cpu", model=True, optimizer=False, grad=False)
+            # Extract step number from path (verl uses global_step_N format)
+            match = re.search(r"global_step_(\d+)", local_path)
+            if match:
+                step = int(match.group(1))
+                self.checkpointer.load(step=step)
+            else:
+                # Fallback to latest
+                self.checkpointer.load(step=-1)
+            for module in self.module:
+                for p in module.parameters():
+                    if hasattr(p, "_tpu_cpu_offload_tensor"):
+                        delattr(p, "_tpu_cpu_offload_tensor")
+            tpu_synchronize(wait=True)
 
-        if self._is_offload_optimizer and self.optimizer is not None:
-            offload_fsdp_optimizer(self.optimizer)
+            torch.distributed.barrier()
+            if self._is_offload_param:
+                self.to(device="cpu", model=True, optimizer=False, grad=False)
+
+            if self._is_offload_optimizer and self.optimizer is not None:
+                offload_fsdp_optimizer(self.optimizer)
 
     def _to_hf_named_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Re-key a torchtitan state dict to HuggingFace names, values untouched."""
