@@ -1,12 +1,14 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Unit tests for TPUCheckpointEngine, TPUWeightRegistry, and worker weight sharding/fusion."""
+"""Unit tests for RayPlasmaCheckpointEngine, RayWeightRegistry, and worker weight sharding/fusion."""
 
 import logging
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
+import pytest
+import ray
 import torch
 import torch.nn as nn
 
@@ -21,8 +23,10 @@ for _mod_name in ("uvicorn", "fastapi"):
             _stub.Config = object  # type: ignore[attr-defined]
             sys.modules[_mod_name] = _stub
 
-from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import RayWeightRegistryState  # noqa: E402
-from verl_hardware_plugin.accelerators.tpu.engines.tpu_checkpoint_engine import (  # noqa: E402
+from verl_hardware_plugin.accelerators.tpu.weight_sync import ray_checkpoint_engine  # noqa: E402
+from verl_hardware_plugin.accelerators.tpu.weight_sync.ray_checkpoint_engine import (  # noqa: E402
+    RayPlasmaCheckpointEngine,
+    RayWeightRegistryState,
     TPUCheckpointEngine,
     apply_tpu_checkpoint_engine_hooks,
     get_clean_name,
@@ -31,14 +35,36 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_checkpoint_engine import 
 )
 
 
-def test_tpu_checkpoint_engine_registered():
+def test_ray_checkpoint_engine_registered():
     from verl.checkpoint_engine.base import CheckpointEngineRegistry
 
-    assert CheckpointEngineRegistry.get("tpu") is TPUCheckpointEngine
+    assert CheckpointEngineRegistry.get("ray-plasma-store") is RayPlasmaCheckpointEngine
+    # Former name of the backend, still accepted.
+    assert CheckpointEngineRegistry.get("tpu") is RayPlasmaCheckpointEngine
+    assert TPUCheckpointEngine is RayPlasmaCheckpointEngine
+
+
+@pytest.mark.parametrize("backend", ["ray-plasma-store", "tpu"])
+def test_manager_hook_routes_ray_plasma_store_backend(monkeypatch, backend):
+    import verl.checkpoint_engine.base as ckpt_base
+
+    calls = []
+
+    async def fake_update_ray_weights(manager, global_steps=None):
+        calls.append((manager.backend, global_steps))
+        return {"timing_s/update_weights": 1.0}
+
+    monkeypatch.setattr(ray_checkpoint_engine, "update_ray_weights", fake_update_ray_weights)
+    assert getattr(ckpt_base, "_verl_tpu_ckpt_patched", False)
+    result = ckpt_base.CheckpointEngineManager.update_weights(SimpleNamespace(backend=backend), global_steps=2)
+    assert result == {"timing_s/update_weights": 1.0}
+    assert calls == [(backend, 2)]
 
 
 def test_apply_tpu_checkpoint_engine_hooks_logs_importerror(caplog):
-    with caplog.at_level(logging.DEBUG, logger="verl_hardware_plugin.accelerators.tpu.engines.tpu_checkpoint_engine"):
+    with caplog.at_level(
+        logging.DEBUG, logger="verl_hardware_plugin.accelerators.tpu.weight_sync.ray_checkpoint_engine"
+    ):
         apply_tpu_checkpoint_engine_hooks()
     assert any("caused ImportError" in rec.message for rec in caplog.records)
 
@@ -56,6 +82,46 @@ def test_ray_weight_registry_write_eviction():
 
     reg.clear()
     assert reg.get_weights(0) is None
+
+
+def test_get_ray_weight_registry_finds_creates_or_loses_race(monkeypatch):
+    existing, created = object(), object()
+    lookups: list = []
+    create_error: list = []
+    options_calls = []
+
+    def get_actor(name, namespace=None):
+        assert (name, namespace) == ("RayWeightRegistry", "verl")
+        result = lookups.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def options(**kwargs):
+        options_calls.append(kwargs)
+
+        def remote():
+            if create_error:
+                raise create_error[0]
+            return created
+
+        return SimpleNamespace(remote=remote)
+
+    monkeypatch.setattr(ray, "get_actor", get_actor)
+    monkeypatch.setattr(ray_checkpoint_engine, "RayWeightRegistry", SimpleNamespace(options=options))
+
+    lookups[:] = [existing]
+    assert ray_checkpoint_engine.get_ray_weight_registry() is existing
+    assert options_calls == []
+
+    lookups[:] = [ValueError("Failed to look up actor")]
+    assert ray_checkpoint_engine.get_ray_weight_registry() is created
+    assert options_calls == [{"name": "RayWeightRegistry", "namespace": "verl", "lifetime": "detached"}]
+
+    # Another process creates the actor between the lookup and the creation.
+    lookups[:] = [ValueError("Failed to look up actor"), existing]
+    create_error[:] = [ValueError("Actor name is already taken")]
+    assert ray_checkpoint_engine.get_ray_weight_registry() is existing
 
 
 def test_clean_name_and_layer_group():
@@ -95,7 +161,7 @@ def test_pack_and_load_weights_with_qkv_fusion_and_tp_sharding():
         yield ("_fsdp_wrapped_module.layers.0.self_attn.v_proj.weight", v_w)
         yield ("_fsdp_wrapped_module.tok_embeddings.weight", emb_w)
 
-    state_dict = TPUCheckpointEngine.pack_weights_to_grouped_dict(weight_gen())
+    state_dict = RayPlasmaCheckpointEngine.pack_weights_to_grouped_dict(weight_gen())
     assert set(state_dict["grouped"].keys()) == {"layers.0", "embeddings"}
 
     model_r0 = _DummyRolloutModel(tp_size=2, flipped=False)
@@ -119,7 +185,7 @@ def test_pack_and_load_weights_with_qkv_fusion_and_tp_sharding():
     assert torch.equal(model_flipped.layers[0]["self_attn"].qkv_proj.weight.data, expected_r0_qkv.T)
 
 
-def test_update_tpu_weights_clears_kv_cache_and_sets_global_steps(monkeypatch):
+def test_update_ray_weights_clears_kv_cache_and_sets_global_steps(monkeypatch):
     """After loading new weights every replica must drop its KV cache and learn the weight version.
 
     upstream verl stamps each trajectory with the server's ``global_steps`` and converts it with
@@ -127,12 +193,7 @@ def test_update_tpu_weights_clears_kv_cache_and_sets_global_steps(monkeypatch):
     there and the first training step dies.
     """
     import asyncio
-    from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock
-
-    import ray
-
-    from verl_hardware_plugin.accelerators.tpu.engines import tpu_checkpoint_engine as engine_mod
 
     fake_registry = SimpleNamespace(
         get_weights=SimpleNamespace(remote=MagicMock(return_value="published")),
@@ -147,14 +208,14 @@ def test_update_tpu_weights_clears_kv_cache_and_sets_global_steps(monkeypatch):
         set_global_steps=SimpleNamespace(remote=MagicMock(side_effect=lambda s: AsyncMock()())),
     )
     fake_manager = SimpleNamespace(
-        backend="tpu",
+        backend="ray-plasma-store",
         actor_wg=SimpleNamespace(update_weights=MagicMock(return_value=None)),
         replicas=[SimpleNamespace(server_handle=fake_server_handle)],
         abort_replicas=AsyncMock(),
         resume_generation_replicas=AsyncMock(),
     )
 
-    asyncio.run(engine_mod.update_tpu_weights(fake_manager, global_steps=5))
+    asyncio.run(ray_checkpoint_engine.update_ray_weights(fake_manager, global_steps=5))
 
     fake_manager.abort_replicas.assert_awaited_once()
     fake_server_handle.collective_rpc.remote.assert_called_once_with(method="load_weights_from_ray_registry", args=(5,))

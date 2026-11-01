@@ -1,0 +1,2318 @@
+<!DOCTYPE html>
+<!--
+  Copyright (c) 2026 Google LLC. All rights reserved.
+  Licensed under the Apache License, Version 2.0.
+
+  verl TPU RL timeline.
+
+  Reads the Ray job log of a verl run on TPU started with VERL_TPU_TIMELINE=1 (verl-hardware-plugin, see
+  verl_hardware_plugin/accelerators/tpu/profilers/timeline.py) and draws what every actor was doing over wall-clock time: the
+  trainer loop (waiting for rollout, old/ref log-prob, update, weight sync, validation), what trainer rank 0 executes
+  on its TPU chips (actor update, reference forward, weight-sync gather / host staging), and every rollout replica
+  (generating with N requests in flight, draining / paused for a weight sync, idle, which weight version it serves).
+  The trainer-loop phases are rebuilt from the per-step timing_s/* metrics, anchored at each step's weight sync.
+  Logs without timeline lines fall back to an approximate trainer-only view rebuilt from the timing_s/* metrics.
+
+  Single self-contained file, no network access: open it from disk and drop a log on it, pass ?src=<url> when it is
+  served next to the log, or let make_report.py (next to this file) embed the events into a copy of this file.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>verl TPU RL timeline</title>
+<style>
+  :root {
+    --bg: #f6f8fa; --panel: #ffffff; --text: #1f2328; --muted: #656d76; --border: #d0d7de; --accent: #0969da;
+    --label-w: 210px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { position: sticky; top: 0; z-index: 20; background: var(--panel); border-bottom: 1px solid var(--border);
+           padding: 8px 14px; display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; }
+  header h1 { font-size: 16px; margin: 0 6px 0 0; white-space: nowrap; }
+  header .src { color: var(--muted); max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .btn, button, select { font: inherit; border: 1px solid var(--border); background: #f6f8fa; color: var(--text);
+                          border-radius: 6px; padding: 3px 9px; cursor: pointer; }
+  .btn:hover, button:hover { background: #eef1f4; }
+  .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .ctl { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .ctl label { color: var(--muted); user-select: none; }
+  main { padding: 10px 14px 40px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px; }
+  .panel h2 { font-size: 13px; margin: 0; padding: 8px 12px; border-bottom: 1px solid var(--border);
+              display: flex; align-items: center; gap: 10px; }
+  .panel h2 .hint { font-weight: normal; color: var(--muted); }
+  #drop { border: 2px dashed var(--border); border-radius: 8px; padding: 34px; text-align: center; color: var(--muted);
+          background: var(--panel); margin-bottom: 12px; }
+  #drop.over { border-color: var(--accent); color: var(--accent); background: #f0f6ff; }
+  #drop code { background: #f0f2f4; padding: 1px 5px; border-radius: 4px; }
+  #status { color: var(--muted); padding: 0 2px 8px; min-height: 18px; }
+  #status.warn { color: #9a6700; }
+  #status.err { color: #cf222e; }
+  .cards { display: flex; flex-wrap: wrap; gap: 10px; padding: 10px 12px; }
+  .card { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; min-width: 150px; background: #fbfcfd; }
+  .card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; }
+  .card .v { font-size: 18px; font-weight: 600; margin-top: 2px; }
+  .card .s { color: var(--muted); font-size: 11px; }
+  .util { padding: 4px 12px 12px; }
+  .util-row { display: grid; grid-template-columns: 210px 1fr 260px; gap: 10px; align-items: center; margin: 4px 0; }
+  .util-row .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar { display: flex; height: 16px; border-radius: 4px; overflow: hidden; background: #eaeef2; }
+  .bar > div { height: 100%; }
+  .util-row .nums { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #tl-wrap { position: relative; overflow: hidden; }
+  #tl { display: block; width: 100%; cursor: grab; }
+  #tl.dragging { cursor: grabbing; }
+  #tooltip { position: fixed; z-index: 50; pointer-events: none; background: rgba(31, 35, 40, .95); color: #fff;
+             padding: 7px 9px; border-radius: 6px; font-size: 12px; max-width: 460px; display: none;
+             box-shadow: 0 4px 14px rgba(0,0,0,.25); white-space: nowrap; }
+  #tooltip b { color: #ffd479; }
+  #tooltip .row { display: flex; justify-content: space-between; gap: 18px; }
+  #tooltip .row span:first-child { color: #c9d1d9; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 8px 12px; }
+  .legend .it { display: flex; align-items: center; gap: 5px; color: var(--muted); }
+  .legend .sw { width: 14px; height: 10px; border-radius: 2px; border: 1px solid rgba(0,0,0,.15); }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { padding: 4px 8px; text-align: right; border-bottom: 1px solid #eaeef2; white-space: nowrap; }
+  th { position: sticky; top: 0; background: #f6f8fa; color: var(--muted); font-weight: 600; cursor: pointer; }
+  th:first-child, td:first-child { text-align: left; }
+  tbody tr:hover { background: #f0f6ff; cursor: pointer; }
+  td.hot { color: #cf222e; font-weight: 600; }
+  .tbl-wrap { max-height: 460px; overflow: auto; }
+  .help { padding: 10px 14px; color: var(--muted); }
+  .help code, .help pre { background: #f0f2f4; border-radius: 4px; }
+  .help code { padding: 1px 5px; }
+  .help pre { padding: 8px 10px; overflow: auto; color: var(--text); }
+  .pill { display: inline-block; padding: 0 7px; border-radius: 10px; font-size: 11px; background: #fff8c5;
+          color: #7d4e00; border: 1px solid #eac54f; }
+  .tab-group { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: #f0f2f4; }
+  .tab-btn { border: none; border-right: 1px solid var(--border); border-radius: 0; background: transparent;
+             padding: 4px 12px; font-weight: 600; color: var(--muted); cursor: pointer; }
+  .tab-btn:last-child { border-right: none; }
+  .tab-btn:hover { background: #e6eaef; color: var(--text); }
+  .tab-btn.active { background: var(--accent); color: #fff; }
+  .hbm-charts { padding: 12px; display: flex; flex-direction: column; gap: 14px; }
+  .hbm-svg { display: block; width: 100%; height: auto; background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>verl TPU RL timeline</h1>
+  <div class="tab-group" id="tab-bar" role="tablist">
+    <button class="tab-btn active" id="tab-btn-timeline" data-tab="timeline" role="tab" aria-selected="true">Timeline</button>
+    <button class="tab-btn" id="tab-btn-memory" data-tab="memory" role="tab" aria-selected="false">HBM Memory</button>
+  </div>
+  <a class="btn hidden" id="home-link" href="#" title="list of published runs">&#8592; all runs</a>
+  <span class="src" id="src-name">no log loaded</span>
+  <label class="btn primary">Open log&hellip;<input type="file" id="file" hidden></label>
+  <label class="btn" title="Load a second log (or report) and compare steady-state step times">Compare&hellip;<input type="file" id="file-cmp" hidden></label>
+  <div class="ctl" id="view-ctl">
+    <button id="btn-fit" title="Show the whole run (double-click the timeline)">Fit</button>
+    <button id="btn-steady" title="From the start of step 2 to the end: skips compile/warm-up">Steady state</button>
+    <select id="step-select" title="Zoom to one step"><option value="">step&hellip;</option></select>
+    <button id="btn-prev" title="Previous step">&#9664;</button><button id="btn-next" title="Next step">&#9654;</button>
+    <span class="ctl" id="tl-only-opts">
+      <label><input type="checkbox" id="opt-requests" checked> requests</label>
+      <label title="Color the request bars by the weight version that generated them instead of by finish reason"><input type="checkbox" id="opt-wv"> color by weights</label>
+      <label><input type="checkbox" id="opt-ranks" checked> trainer ranks</label>
+      <label><input type="checkbox" id="opt-depth" checked> sync detail</label>
+    </span>
+    <button id="btn-export" title="Chrome trace JSON for ui.perfetto.dev">Export Perfetto</button>
+    <button id="btn-csv" title="Per-step table as CSV">Export CSV</button>
+  </div>
+</header>
+<main>
+  <section class="panel hidden" id="runs-panel">
+    <h2>Published runs <span class="hint">self-contained reports (events embedded); open one, or drop your own log below</span></h2>
+    <div class="help" id="runs-list"></div>
+  </section>
+  <div id="drop">
+    <div style="font-size:15px;margin-bottom:6px"><b>Drop a Ray job log here</b> or use <b>Open log&hellip;</b></div>
+    e.g. <code>ray job logs --address http://localhost:8265 &lt;submission-id&gt; &gt; job.log</code> of a TPU run with
+    <code>VERL_TPU_TIMELINE=1</code>. Older logs work too (approximate trainer-only view from <code>timing_s/*</code>).
+  </div>
+  <div id="status"></div>
+
+  <div id="tab-timeline">
+  <section class="panel hidden" id="sum-panel">
+    <h2>Run summary <span class="hint" id="sum-window"></span></h2>
+    <div class="cards" id="cards"></div>
+    <div class="util" id="util"></div>
+    <div class="help" id="insights"></div>
+  </section>
+
+  <section class="panel hidden" id="cmp-panel">
+    <h2>Comparison <span class="hint" id="cmp-hint"></span></h2>
+    <div class="tbl-wrap"><table id="cmp-table"></table></div>
+  </section>
+
+  <section class="panel hidden" id="tl-panel">
+    <h2>Timeline <span class="hint">wheel: zoom &middot; drag: pan &middot; drag on the time axis: zoom to range
+      &middot; double-click: fit &middot; click a group name to fold it &middot; click a step label to zoom</span></h2>
+    <div id="tl-wrap"><canvas id="tl" height="200"></canvas></div>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <section class="panel hidden" id="steps-panel">
+    <h2>Per step <span class="hint">steps aligned at their start: top = trainer loop (thin strip: weight-sync phases),
+      then what trainer rank 0 runs on its chips, then the rollout replica state; click a step to zoom the timeline to it</span></h2>
+    <div id="sc-wrap" style="position:relative"><canvas id="steps-canvas" style="display:block;width:100%;cursor:pointer"></canvas></div>
+    <div class="hint" style="padding:6px 12px;color:var(--muted)">Table: seconds per phase; red = largest phase of the step.</div>
+    <div class="tbl-wrap"><table id="steps-table"></table></div>
+  </section>
+
+  <section class="panel" id="help-panel">
+    <h2>How to produce a timeline log</h2>
+    <div class="help">
+      <p>Set <code>VERL_TPU_TIMELINE=1</code> in the job's runtime env of a TPU run with verl-hardware-plugin. The plugin's
+      TPU trainer engine, its <code>tpu-sync</code> weight sync and its vLLM rollout server then print one
+      <code>VERL_TIMELINE{...}</code> line per finished span, which Ray forwards into the job log, so the plain job log
+      is all this page needs (no verl change; the trainer-loop phases are rebuilt from the <code>timing_s/*</code> step
+      metrics, anchored at each step's weight sync):</p>
+<pre>ray job submit ... --runtime-env-json '{"env_vars": {"VERL_TPU_TIMELINE": "1", ...}}' -- bash examples/tpu/grpo/run_qwen3_4b_torchtitan.sh
+ray job logs --address http://localhost:8265 &lt;submission-id&gt; &gt; job.log      # then drop job.log here
+python3 -m verl_hardware_plugin.accelerators.tpu.profilers.make_report job.log -o report.html --summary   # sharable copy</pre>
+      <p><b>Lanes.</b> <i>trainer loop</i> (driver): <code>step</code>, then <code>gen</code> = waiting for the replay
+      buffer (i.e. for rollout), old/ref log-prob, advantage, update, <code>update_weights</code> with its
+      <code>sync.*</code> phases (exact, printed by the weight sync) and <code>testing</code> = validation; the other
+      phases are laid out from <code>timing_s/*</code>. <i>trainer ranks</i>: what trainer rank 0 executes on its chips
+      (<code>update_actor</code> = forward/backward + optimizer step, <code>compute_ref_log_prob</code> = reference
+      forward, <code>update_weights</code> = weight-sync gather / bind / device-to-host staging); gaps are idle chips.
+      <i>rollout replica N</i> (one per vLLM replica / sampler slice): <i>state</i>
+      (green = generating, light green = still generating while the submission gate is closed for a weight sync, i.e.
+      the sync waits for the rollout to drain, orange = engine paused for the weight transfer/install, red = idle with
+      nothing to generate), <i>weights</i> = the weight version the replica serves (v<i>k</i> = the weights after
+      step <i>k</i>), <i>decoding</i> = requests the engine is running, <i>waiting</i> = requests queued inside the
+      engine (dotted: parked at the closed gate), <i>server</i> = drain / paused and the weight-sync RPCs, and one bar
+      per request while it decodes (teal = ended with EOS, orange = hit the length limit, red = aborted by a weight sync
+      and resumed later; or colored by weight version).</p>
+    </div>
+  </section>
+  </div>
+
+  <div id="tab-memory" class="hidden">
+    <section class="panel" id="hbm-sum-panel">
+      <h2>TPU HBM Memory Summary &amp; RL Phase Correlation <span class="hint" id="hbm-sum-hint"></span></h2>
+      <div class="cards" id="hbm-cards"></div>
+      <div class="legend" id="hbm-legend"></div>
+    </section>
+
+    <section class="panel" id="hbm-charts-panel">
+      <h2>Per-Chip TPU HBM Traces (1 Hz <code>tpu-info</code>) <span class="hint">Chart 2 follows the active step / zoom selection in the top bar (Fit / Steady state / step&hellip;)</span></h2>
+      <div class="hbm-charts" id="hbm-charts"></div>
+    </section>
+
+    <section class="panel" id="hbm-table-panel">
+      <h2>Per-Step TPU HBM Memory Breakdown (Max Across Chips, GiB / GB) <span class="hint">click a step row to zoom Chart 2 &amp; the timeline to that step</span></h2>
+      <div class="tbl-wrap"><table id="hbm-steps-table"></table></div>
+    </section>
+  </div>
+</main>
+<div id="tooltip"></div>
+
+<!-- make_report.py replaces the contents of this tag with {"source": ..., "events": [...], "metrics": {...}}. -->
+<script id="tl-embedded" type="application/json"></script>
+<!-- Optional list of published reports for a landing page: [{"name": ..., "href": ..., "desc": ...}]. -->
+<script id="tl-runs" type="application/json"></script>
+
+<script>
+"use strict";
+
+// --------------------------------------------------------------------------------------------------------------------
+// Formatting and colors
+// --------------------------------------------------------------------------------------------------------------------
+const MARKER = "VERL_TIMELINE";
+
+function fmtDur(s) {
+  if (s == null || !isFinite(s)) return "–";
+  if (s === 0) return "0 s";
+  const a = Math.abs(s);
+  if (a < 1e-3) return (s * 1e6).toFixed(0) + " µs";
+  if (a < 1) return (s * 1e3).toFixed(a < 0.01 ? 2 : a < 0.1 ? 1 : 0) + " ms";
+  if (a < 60) return s.toFixed(a < 10 ? 2 : 1) + " s";
+  const m = Math.floor(a / 60), sec = a - 60 * m;
+  if (m < 60) return (s < 0 ? "-" : "") + m + "m " + sec.toFixed(0).padStart(2, "0") + "s";
+  return (s < 0 ? "-" : "") + Math.floor(m / 60) + "h " + String(m % 60).padStart(2, "0") + "m";
+}
+function fmtClock(rel) {  // relative seconds -> "m:ss.s" / "h:mm:ss"
+  const neg = rel < 0; let a = Math.abs(rel);
+  const h = Math.floor(a / 3600); a -= 3600 * h;
+  const m = Math.floor(a / 60); const s = a - 60 * m;
+  let out = h ? h + ":" + String(m).padStart(2, "0") + ":" + s.toFixed(0).padStart(2, "0")
+              : m + ":" + (s < 10 ? "0" : "") + s.toFixed(1);
+  return (neg ? "-" : "") + out;
+}
+function fmtWall(epoch) {
+  const d = new Date(epoch * 1000);
+  return d.toISOString().replace("T", " ").replace("Z", " UTC").slice(0, 23) + " UTC";
+}
+function pct(x) { return isFinite(x) ? (100 * x).toFixed(1) + "%" : "–"; }
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c])); }
+
+const COLORS = {
+  // trainer loop
+  "step": "#e9edf1", "gen": "#c3ccd5", "switch_wait": "#c3ccd5", "reward": "#ffd54f", "old_log_prob": "#42a5f5",
+  "ref": "#9ccc65", "values": "#4dd0e1", "adv": "#a1887f", "update_critic": "#f48fb1", "update_actor": "#e53935",
+  "update_weights": "#8e24aa", "testing": "#43a047", "save_checkpoint": "#00acc1", "metrics": "#b0bec5",
+  "dump_rollout_generations": "#90a4ae", "setup": "#78909c", "initial_weight_sync": "#ab47bc",
+  "init_agent_loop": "#90a4ae", "switch_to_trainer": "#ff8a65", "switch_to_rollout": "#ffb74d",
+  "submit_batch": "#ffcc80", "other": "#e3e8ed",
+  // trainer ranks (what a trainer process executes on its chips)
+  "compute_ref_log_prob": "#9ccc65", "compute_log_prob": "#42a5f5", "fwd_bwd": "#ef9a9a", "optimizer_step": "#b71c1c",
+  "gather": "#7e57c2", "bind": "#b39ddb", "d2h": "#5e35b1", "release_tpu_sync": "#f06292",
+  // weight sync phases
+  "sync.quiesce": "#fb8c00", "sync.trainer_send": "#7e57c2", "sync.sampler_init": "#9575cd", "sync.barrier": "#b39ddb",
+  "sync.p2p_transfer": "#4527a0", "sync.sampler_install": "#d81b60", "sync.finalize": "#f06292",
+  "sync.parity_check": "#8d6e63", "sync.resume": "#26a69a", "sync.transfer": "#4527a0",
+  "sync.release_kv_cache": "#b39ddb", "sync.build_process_group": "#9575cd", "sync.resume_kv_cache": "#80cbc4",
+  // rollout server
+  "paused": "#fb8c00", "abort": "#e65100", "resume_engine": "#26a69a",
+  "rpc.install_tpu_sync_weights": "#d81b60", "rpc.init_tpu_sync_on_worker": "#9575cd",
+  "rpc.load_weights_from_ray_registry": "#d81b60",
+  // states
+  "state.busy": "#2e9d4f", "state.drain": "#9ccc65", "state.paused": "#fb8c00", "state.idle": "#f28b82", "state.unknown": "#e0e0e0",
+  "drain": "#9ccc65",
+  // requests
+  "req.queue": "#b2dfdb", "req.decode": "#00897b", "req.abort": "#e57373", "req.length": "#ffb74d",
+};
+const WORKER_COLORS = [
+  [/compute_ref_log_prob/, "#9ccc65"], [/compute_log_prob/, "#42a5f5"], [/update_actor|train_batch|train_mini_batch/, "#e53935"],
+  [/update_weights/, "#8e24aa"], [/release_tpu_sync/, "#f06292"], [/save_model_to_cpu|restore_model_from_cpu|clear_cpu/, "#00acc1"],
+  [/init_model|load_checkpoint|reset/, "#78909c"], [/execute_checkpoint_engine/, "#b39ddb"], [/update_critic|compute_values/, "#f48fb1"],
+];
+function hashColor(s) {
+  let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return "hsl(" + (((h % 360) + 360) % 360) + ",55%,62%)";
+}
+// Labels drawn inside the bars (the tooltip shows the full span name)
+const SHORT_LABEL = {compute_ref_log_prob: "ref forward", compute_log_prob: "log-prob forward", release_tpu_sync: "release",
+                     initial_weight_sync: "initial sync"};
+// weight versions (v0 = initial weights, vk = weights after step k): one light hue per version
+const VERSION_COLORS = ["#a8c6e8", "#f9c38f", "#a6d49d", "#d4b5cc", "#f5e18f", "#b1dad7", "#ffc9cf", "#c9b29f"];
+function versionColor(wv) {
+  if (wv == null || !isFinite(wv)) return "#bdbdbd";
+  const n = VERSION_COLORS.length;
+  return VERSION_COLORS[((Math.round(wv) % n) + n) % n];
+}
+function colorFor(name, cat) {
+  if (COLORS[name]) return COLORS[name];
+  if (cat === "worker") { for (const [re, c] of WORKER_COLORS) if (re.test(name)) return c; }
+  if (name && name.startsWith("rpc.")) return "#ba68c8";
+  return hashColor(name || "?");
+}
+
+// --------------------------------------------------------------------------------------------------------------------
+// Log parsing (streamed: works for multi-hundred-MB job logs)
+// --------------------------------------------------------------------------------------------------------------------
+function createParser() {
+  const st = {events: [], metrics: {}, lines: 0, bad: 0, rest: ""};
+  const stepRe = /(?:^|\s)step:(\d+)\s+-\s+(.*)$/;
+  let pending = [];  // trainer-loop spans printed since the last "step:N" metrics line
+  function onLine(l) {
+    st.lines++;
+    let i = l.indexOf(MARKER + "{");
+    if (i >= 0) {
+      const j = l.lastIndexOf("}");
+      if (j > i) {
+        try {
+          const e = JSON.parse(l.slice(i + MARKER.length, j + 1));
+          st.events.push(e);
+          if ((e.group || "trainer") === "trainer" && e.step == null) pending.push(e);
+        } catch (e) { st.bad++; }
+      } else st.bad++;
+      return;
+    }
+    i = l.indexOf("step:");
+    if (i < 0) return;
+    const m = stepRe.exec(l.slice(Math.max(0, i - 1)));
+    if (!m) return;
+    const step = +m[1];
+    for (const e of pending) e.step = step;  // the trainer logs a step's metrics right after its spans
+    pending = [];
+    if (l.indexOf("timing_s/") < 0) return;  // e.g. the step-0 validation line
+    const rec = st.metrics[step] || (st.metrics[step] = {});
+    for (const part of m[2].split(" - ")) {
+      const k = part.indexOf(":");
+      if (k <= 0) continue;
+      let txt = part.slice(k + 1).trim();
+      const np = /^np\.\w+\((.*)\)$/.exec(txt);  // numpy scalars print as np.float64(1.0)
+      if (np) txt = np[1];
+      const v = parseFloat(txt);
+      if (isFinite(v)) rec[part.slice(0, k).trim()] = v;
+    }
+  }
+  return {
+    st,
+    push(text) {
+      text = st.rest + text;
+      let start = 0;
+      for (;;) {
+        const nl = text.indexOf("\n", start);
+        if (nl < 0) break;
+        onLine(text.charCodeAt(nl - 1) === 13 ? text.slice(start, nl - 1) : text.slice(start, nl));
+        start = nl + 1;
+      }
+      st.rest = text.slice(start);
+    },
+    end() { if (st.rest) onLine(st.rest); st.rest = ""; return st; },
+  };
+}
+
+async function parseFile(file, onProgress) {
+  const parser = createParser();
+  if (file.stream && typeof TextDecoderStream !== "undefined") {
+    const reader = file.stream().pipeThrough(new TextDecoderStream()).getReader();
+    let done = 0;
+    for (;;) {
+      const r = await reader.read();
+      if (r.done) break;
+      parser.push(r.value);
+      done += r.value.length;
+      onProgress && onProgress(done / Math.max(1, file.size));
+    }
+  } else {
+    parser.push(await file.text());
+  }
+  return parser.end();
+}
+
+// --------------------------------------------------------------------------------------------------------------------
+// Model: groups/lanes/spans, steps, rollout replica states, statistics
+// --------------------------------------------------------------------------------------------------------------------
+function groupOrder(id) {
+  if (id === "trainer") return [0, 0, id];
+  if (id === "trainer_workers") return [1, 0, id];
+  const m = /^rollout_replica_(\d+)/.exec(id);
+  if (m) return [2, +m[1], id];
+  if (id === "rollout_workers") return [3, 0, id];
+  return [4, 0, id];
+}
+function cmpKey(a, b) { for (let i = 0; i < a.length; i++) { if (a[i] < b[i]) return -1; if (a[i] > b[i]) return 1; } return 0; }
+function laneOrder(id) { const m = /(\d+)$/.exec(id); return m ? [id.replace(/\d+$/, ""), +m[1]] : [id, -1]; }
+
+function assignDepth(spans) {  // spans sorted by (t0 asc, t1 desc); nesting by time containment
+  const stack = [];
+  const EPS = 2e-3;
+  for (const s of spans) {
+    while (stack.length && stack[stack.length - 1].t1 <= s.t0 + EPS) stack.pop();
+    while (stack.length && s.t1 > stack[stack.length - 1].t1 + EPS) stack.pop();  // not contained: sibling
+    s.depth = stack.length;
+    s.parent = stack.length ? stack[stack.length - 1] : null;
+    stack.push(s);
+  }
+  return spans.reduce((m, s) => Math.max(m, s.depth), -1) + 1;
+}
+
+function unionIntervals(iv) {  // [[a,b],...] -> merged, sorted
+  const xs = iv.filter(x => x[1] > x[0]).sort((p, q) => p[0] - q[0]);
+  const out = [];
+  for (const [a, b] of xs) {
+    if (out.length && a <= out[out.length - 1][1]) out[out.length - 1][1] = Math.max(out[out.length - 1][1], b);
+    else out.push([a, b]);
+  }
+  return out;
+}
+function overlap(iv, a, b) {  // total length of merged intervals iv inside [a,b]
+  let s = 0;
+  for (const [x, y] of iv) { const lo = Math.max(x, a), hi = Math.min(y, b); if (hi > lo) s += hi - lo; }
+  return s;
+}
+function lowerBound(arr, t, key) {  // first index with arr[i][key] >= t
+  let lo = 0, hi = arr.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid][key] < t) lo = mid + 1; else hi = mid; }
+  return lo;
+}
+
+// Trainer-loop phases in the order the trainer runs them within a step (verl/trainer/ppo/v1/trainer_base.py:
+// _step_once, then save_checkpoint, then update_weights in on_step_end).
+const LOOP_PHASES = ["switch_wait", "switch_to_trainer", "gen", "reward", "old_log_prob", "ref", "values", "adv",
+                     "update_critic", "update_actor", "save_checkpoint"];
+function synthesizeLoop(loop, metrics) {
+  const mk = (name, t0, t1, step, args) => ({t0, t1, name, cat: "loop", step, args, group: "trainer", lane: "loop"});
+  // step -> update_weights span printed by the weight sync: the exact wall-clock position of the step's end
+  const anchors = new Map();
+  for (const s of loop.spans) if (s.name === "update_weights" && s.step != null) anchors.set(s.step, s);
+  const steps = Object.keys(metrics).map(Number).filter(k => metrics[k]["timing_s/step"] > 0).sort((a, b) => a - b);
+  let n = 0, prevEnd = null;
+  for (const k of steps) {
+    const m = metrics[k], uw = anchors.get(k), stepDur = m["timing_s/step"];
+    let end, tPhaseEnd;
+    if (uw) {
+      end = uw.t1;  // the step timer stops right after update_weights (on_step_end)
+      tPhaseEnd = uw.t0;
+    } else if (prevEnd != null) {  // no anchor for this step: lay it out right after the previous one (approximate)
+      end = prevEnd + stepDur;
+      const d = m["timing_s/update_weights"] || 0;
+      tPhaseEnd = end - d;
+      if (d > 0) loop.spans.push(mk("update_weights", end - d, end, k, {approx: true}));
+    } else continue;
+    const t0 = end - stepDur;
+    loop.spans.push(mk("step", t0, end, k, {from: "timing_s/step"}));
+    let t = tPhaseEnd;  // walk back from update_weights through the step's phases
+    for (let i = LOOP_PHASES.length - 1; i >= 0; i--) {
+      const ph = LOOP_PHASES[i], d = m["timing_s/" + ph];
+      if (!(d > 0)) continue;
+      const a = Math.max(t0, t - d);
+      loop.spans.push(mk(ph, a, t, k, {from: "timing_s/" + ph}));
+      t = a;
+    }
+    if (t - t0 > 0.02) loop.spans.push(mk("other", t0, t, k, {note: "untimed: prepare_step, batch balancing, ..."}));
+    const dt = m["timing_s/testing"];
+    if (dt > 0) loop.spans.push(mk("testing", end, end + dt, k, {from: "timing_s/testing"}));
+    prevEnd = end + (dt > 0 ? dt : 0);
+    n++;
+  }
+  return n;
+}
+
+function buildModel(parsed, sourceName) {
+  const evs = parsed.events || [];
+  for (const e of evs) {  // compact format: every line is a finished span; infer what the full format spelled out
+    if (!e || typeof e !== "object") continue;
+    if (!e.ph) e.ph = "X";
+    if (!e.cat) e.cat = e.name === "request" ? "req" : e.name && e.name.startsWith("sync.") ? "sync"
+                     : (e.group || "").startsWith("rollout") ? "rollout" : "loop";
+  }
+  const hasTimeline = evs.some(e => e && e.ph === "X");
+  return hasTimeline ? buildTimelineModel(evs, parsed.metrics || {}, sourceName)
+                     : buildLegacyModel(parsed.metrics || {}, sourceName);
+}
+
+function buildTimelineModel(evs, metrics, sourceName) {
+  let T0 = Infinity, T1 = -Infinity;
+  for (const e of evs) {
+    if (typeof e.ts !== "number") continue;
+    if (e.ph === "M") continue;
+    T0 = Math.min(T0, e.ts); T1 = Math.max(T1, e.ts + (e.dur || 0));
+  }
+  const model = {kind: "timeline", source: sourceName, T0, duration: T1 - T0, groups: [], steps: [], meta: {},
+                 replicas: [], hbm: new Map(), metrics, nEvents: evs.length};
+  const groups = new Map();
+  const getLane = (g, l) => {
+    if (!groups.has(g)) groups.set(g, {id: g, lanes: new Map()});
+    const G = groups.get(g);
+    if (!G.lanes.has(l)) G.lanes.set(l, {id: l, spans: [], instants: [], requests: []});
+    return G.lanes.get(l);
+  };
+  for (const e of evs) {
+    if (!e || typeof e !== "object") continue;
+    const g = e.group || "trainer", l = e.lane || "loop";
+    if (e.ph === "M") { (model.meta[e.name] = model.meta[e.name] || []).push(Object.assign({group: g, lane: l, ts: e.ts}, e.args || {})); continue; }
+    if (typeof e.ts !== "number") continue;
+    const t0 = e.ts - T0;
+    if (e.ph === "C" && e.name === "hbm") {
+      if (!groups.has(g)) groups.set(g, {id: g, lanes: new Map()});
+      const a = e.args || {}, used = Array.isArray(a.used) ? a.used : (typeof a.used === "number" ? [a.used] : []);
+      if (!used.length) continue;
+      let H = model.hbm.get(g);
+      if (!H) { H = {group: g, samples: [], cap: a.cap || 31.25, maxUsed: 0, minUsed: Infinity, nChips: 0}; model.hbm.set(g, H); }
+      if (a.cap) H.cap = Math.max(H.cap, a.cap);
+      H.nChips = Math.max(H.nChips, used.length);
+      const hi = Math.max(...used), lo = Math.min(...used);
+      H.maxUsed = Math.max(H.maxUsed, hi); H.minUsed = Math.min(H.minUsed, lo);
+      H.samples.push({t: t0, used, max: hi, min: lo, duty: Array.isArray(a.duty) ? a.duty : []});
+      continue;
+    }
+    if (e.ph === "i") { getLane(g, l).instants.push({t: t0, name: e.name, cat: e.cat, args: e.args || {}, step: e.step}); continue; }
+    if (e.ph !== "X") continue;
+    const t1 = t0 + (e.dur || 0);
+    if (e.cat === "req" && e.name === "request") {
+      const a = e.args || {};
+      const tAdmit = t0 + Math.min(a.admit != null ? a.admit : 0, e.dur || 0);
+      const tFirst = t0 + Math.min(Math.max(a.first != null ? a.first : 0, a.admit || 0), e.dur || 0);
+      getLane(g, l).requests.push({t0, tAdmit, tFirst, t1, nIn: a.in, nOut: a.out, stop: a.stop, wv: a.wv, ip: e.ip});
+      continue;
+    }
+    getLane(g, l).spans.push({t0, t1, name: e.name, cat: e.cat, step: e.step, args: e.args || {}, ip: e.ip, pid: e.pid,
+                               group: g, lane: l});
+  }
+
+  // The TPU plugin prints no trainer-loop spans (verl's marked_timer prints nothing): rebuild them from the per-step
+  // timing_s/* metrics, anchored at the step's update_weights span that the plugin's weight sync prints.
+  if (groups.has("trainer") && groups.get("trainer").lanes.has("loop")) {
+    const loopL = groups.get("trainer").lanes.get("loop");
+    if (!loopL.spans.some(s => s.name === "step")) model.synthesized = synthesizeLoop(loopL, metrics);
+  }
+
+  // weight-sync phases: tpu-sync logs them as timing_s/tpu-sync/* step metrics; lay them out inside update_weights
+  const loop0 = groups.has("trainer") ? groups.get("trainer").lanes.get("loop") : null;
+  if (loop0 && !loop0.spans.some(s => s.name.startsWith("sync."))) {
+    const order = [["quiesce", "sync.quiesce"], ["trainer_init", "sync.trainer_send"], ["sampler_init", "sync.sampler_init"],
+                   ["barrier", "sync.barrier"], ["p2p_transfer", "sync.p2p_transfer"], ["sampler_h2d", "sync.sampler_install"]];
+    for (const uw of loop0.spans.filter(s => s.name === "update_weights" && s.step != null)) {
+      const m = metrics[uw.step] || {};
+      let t = uw.t0;
+      for (const [key, name] of order) {
+        const d = m["timing_s/tpu-sync/" + key];
+        if (!(d > 0)) continue;
+        const t1 = Math.min(uw.t1, t + d);
+        loop0.spans.push({t0: t, t1, name, cat: "sync", step: uw.step, args: {from: "timing_s/tpu-sync/" + key}, group: "trainer", lane: "loop"});
+        t = t1;
+      }
+    }
+  }
+
+  // groups -> sorted arrays, depths
+  const gl = [...groups.values()].sort((a, b) => cmpKey(groupOrder(a.id), groupOrder(b.id)));
+  for (const G of gl) {
+    G.lanes = [...G.lanes.values()].sort((a, b) => cmpKey(laneOrder(a.id), laneOrder(b.id)));
+    const srv = G.id.startsWith("rollout_replica") ? G.lanes.find(l => l.id === "server") : null;
+    if (srv && srv.spans.some(x => x.name === "drain")) {
+      // "abort" = drain + engine pause: keep one server row (drain, paused, RPCs) and move its counts onto the drain.
+      for (const ab of srv.spans.filter(x => x.name === "abort")) {
+        const d = srv.spans.find(x => x.name === "drain" && Math.abs(x.t0 - ab.t0) < 0.5);
+        if (d) Object.assign(d.args, ab.args, {abort_call_s: +(ab.t1 - ab.t0).toFixed(3)});
+      }
+      srv.spans = srv.spans.filter(x => x.name !== "abort");
+    }
+    for (const L of G.lanes) {
+      L.spans.sort((a, b) => a.t0 - b.t0 || b.t1 - a.t1);
+      L.depth = assignDepth(L.spans);
+      L.byDepth = [];
+      for (let d = 0; d < L.depth; d++) L.byDepth.push(L.spans.filter(s => s.depth === d));
+      L.instants.sort((a, b) => a.t - b.t);
+      L.requests.sort((a, b) => a.t0 - b.t0);
+    }
+    model.groups.push(G);
+  }
+
+  // steps from the trainer loop
+  const loop = (groups.get("trainer") || {lanes: []}).lanes.find(l => l.id === "loop");
+  if (loop) {
+    const stepSpans = loop.spans.filter(s => s.name === "step" && s.depth === 0);
+    stepSpans.forEach((s, i) => {
+      const next = stepSpans[i + 1];
+      model.steps.push({step: s.step != null ? s.step : i + 1, t0: s.t0, t1: s.t1,
+                        tNext: next ? next.t0 : Math.max(s.t1, ...loop.spans.filter(x => x.step === s.step).map(x => x.t1)),
+                        span: s});
+    });
+    model.loop = loop;
+  }
+
+  // rollout replicas: requests -> occupancy/state
+  for (const G of model.groups) {
+    if (!G.id.startsWith("rollout_replica")) continue;
+    const reqLane = G.lanes.find(l => l.id === "requests");
+    const srvLane = G.lanes.find(l => l.id === "server");
+    const metaList = (model.meta.rollout_replica || []).filter(m => m.group === G.id);
+    const rep = {id: G.id, group: G, requests: reqLane ? reqLane.requests : [], server: srvLane,
+                 meta: metaList[metaList.length - 1] || {}};
+    buildReplica(rep, model);
+    model.replicas.push(rep);
+  }
+  model.run = (model.meta.run || [])[0] || {};
+  for (const H of model.hbm.values()) H.samples.sort((a, b) => a.t - b.t);
+  computeStepStats(model);
+  return model;
+}
+
+function buildReplica(rep, model) {
+  const pts = [];
+  for (const r of rep.requests) {
+    pts.push([r.t0, 0, 1, 0]); pts.push([r.tAdmit, 1, -1, 0]);   // parked
+    pts.push([r.tAdmit, 2, 0, 1]); pts.push([r.t1, -1, 0, -1]);  // in engine
+    pts.push([r.tFirst, 3, 0, 0, 1]); pts.push([r.t1, -2, 0, 0, -1]);  // decoding
+  }
+  // Sort by time; at equal time apply decrements before increments so counts never spike spuriously.
+  pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const occ = [];  // {t, parked, engine, decode}
+  let parked = 0, engine = 0, decode = 0;
+  for (const p of pts) {
+    parked += p[2] || 0; engine += p[3] || 0; decode += p[4] || 0;
+    const waiting = engine - decode + parked;
+    if (occ.length && Math.abs(occ[occ.length - 1].t - p[0]) < 1e-9) {
+      Object.assign(occ[occ.length - 1], {parked, engine, decode, waiting});
+    } else occ.push({t: p[0], parked, engine, decode, waiting});
+  }
+  rep.occ = occ;
+  rep.maxEngine = occ.reduce((m, o) => Math.max(m, o.engine), 0);
+  rep.maxDecode = occ.reduce((m, o) => Math.max(m, o.decode), 0);
+  rep.maxParked = occ.reduce((m, o) => Math.max(m, o.parked), 0);
+  rep.maxQueued = occ.reduce((m, o) => Math.max(m, o.engine - o.decode + o.parked), 0);
+  rep.cap = Math.max(rep.meta.max_num_seqs || 0, rep.maxDecode, 1);
+  // busy = engine > 0
+  const busy = [];
+  let start = null;
+  for (const o of occ) {
+    if (o.engine > 0 && start == null) start = o.t;
+    else if (o.engine === 0 && start != null) { busy.push([start, o.t]); start = null; }
+  }
+  if (start != null) busy.push([start, model.duration]);
+  rep.busy = unionIntervals(busy);
+  const srv = rep.server ? rep.server.spans : [];
+  let paused = unionIntervals(srv.filter(s => s.name === "paused").map(s => [s.t0, s.t1]));
+  let drain = unionIntervals(srv.filter(s => s.name === "drain").map(s => [s.t0, s.t1]));
+  if (!drain.length && paused.length) {
+    // Older logs open "paused" when the submission gate closes, but the engine keeps decoding until every admitted
+    // request produced its first token: call the part of the window that still decodes "drain" (gate closed).
+    const np = [];
+    for (const [p0, p1] of paused) {
+      let tz = p0;
+      const i0 = Math.max(0, lowerBound(occ, p0, "t") - 1);
+      for (let i = i0; i < occ.length && occ[i].t < p1; i++) {
+        if (occ[i].t >= p0 && occ[i].decode === 0) { tz = occ[i].t; break; }
+        tz = Math.min(p1, i + 1 < occ.length ? occ[i + 1].t : p1);
+      }
+      if (tz > p0 + 1e-3) drain.push([p0, Math.min(tz, p1)]);
+      if (p1 > tz) np.push([Math.max(p0, tz), p1]);
+    }
+    paused = np; drain = unionIntervals(drain); rep.drainInferred = true;
+  }
+  rep.paused = paused;
+  rep.drain = drain;
+  // first time the replica could serve: its meta (server up) or first request
+  const metaT = rep.meta && rep.meta.ts ? rep.meta.ts - model.T0 : null;
+  rep.tReady = Math.min(rep.requests.length ? rep.requests[0].t0 : Infinity, metaT != null ? metaT : Infinity);
+  if (!isFinite(rep.tReady)) rep.tReady = 0;
+  // state segments: paused > busy > idle, from tReady to end
+  const cuts = new Set([rep.tReady, model.duration]);
+  for (const [a, b] of rep.busy.concat(rep.paused, rep.drain)) { cuts.add(a); cuts.add(b); }
+  const ts = [...cuts].filter(t => t >= rep.tReady && t <= model.duration).sort((a, b) => a - b);
+  const states = [];
+  let bi = 0, pi = 0, di = 0;
+  for (let i = 0; i + 1 < ts.length; i++) {
+    const a = ts[i], b = ts[i + 1], mid = (a + b) / 2;
+    if (b - a <= 0) continue;
+    while (pi < rep.paused.length && rep.paused[pi][1] <= mid) pi++;
+    while (bi < rep.busy.length && rep.busy[bi][1] <= mid) bi++;
+    while (di < rep.drain.length && rep.drain[di][1] <= mid) di++;
+    const isP = pi < rep.paused.length && rep.paused[pi][0] <= mid;
+    const isB = bi < rep.busy.length && rep.busy[bi][0] <= mid;
+    const isD = di < rep.drain.length && rep.drain[di][0] <= mid;
+    const s = isP ? "paused" : isB ? (isD ? "drain" : "busy") : isD ? "paused" : "idle";
+    if (states.length && states[states.length - 1].state === s && Math.abs(states[states.length - 1].t1 - a) < 1e-9) states[states.length - 1].t1 = b;
+    else states.push({t0: a, t1: b, state: s});
+  }
+  rep.states = states;
+  // waterfall rows: one row per decode slot (packed by [first token, end]); queue time is in the tooltip
+  const rows = [];  // last end per row
+  const sorted = rep.requests.slice().sort((a, b) => a.tFirst - b.tFirst || a.t1 - b.t1);
+  for (const r of sorted) {
+    let k = rows.findIndex(end => end <= r.tFirst + 1e-6);
+    if (k < 0) { k = rows.length; rows.push(0); }
+    rows[k] = r.t1; r.row = k;
+  }
+  rep.nRows = rows.length;
+  rep.rowSpans = Array.from({length: rows.length}, () => []);
+  for (const r of sorted) rep.rowSpans[r.row].push(r);
+  // weight versions the replica serves: a "weights" instant marks every install (set_global_steps)
+  const marks = (rep.server ? rep.server.instants : []).filter(i => i.name === "weights" && i.args && i.args.wv != null)
+    .sort((p, q) => p.t - q.t);
+  rep.versions = marks.map((mk, i) => ({t0: mk.t, t1: i + 1 < marks.length ? marks[i + 1].t : model.duration, wv: mk.args.wv}));
+}
+
+function stateTime(rep, a, b) {  // drain (gate closed but still decoding) is included in busy and reported apart
+  const out = {busy: 0, paused: 0, idle: 0, before: 0, drain: 0};
+  for (const s of rep.states) {
+    const lo = Math.max(a, s.t0), hi = Math.min(b, s.t1);
+    if (hi > lo) { if (s.state === "drain") { out.drain += hi - lo; out.busy += hi - lo; } else out[s.state] += hi - lo; }
+  }
+  out.before = Math.max(0, Math.min(b, rep.tReady) - a);
+  return out;
+}
+function engineAvg(rep, a, b) {  // time-weighted mean of requests in engine while busy, and overall
+  let area = 0;
+  for (let i = 0; i < rep.occ.length; i++) {
+    const o = rep.occ[i], tEnd = i + 1 < rep.occ.length ? rep.occ[i + 1].t : b;
+    const lo = Math.max(a, o.t), hi = Math.min(b, tEnd);
+    if (hi > lo) area += o.engine * (hi - lo);
+  }
+  return area;
+}
+
+const STATE_LABEL = {busy: "generating", drain: "generating, gate closed (sync waits)", paused: "paused (weight sync)",
+                     idle: "idle", unknown: "not up"};
+const TRAINER_CLASS = {
+  gen: "wait", switch_wait: "wait",
+  old_log_prob: "compute", ref: "compute", values: "compute", adv: "compute", update_critic: "compute",
+  update_actor: "compute", reward: "compute",
+  update_weights: "sync", initial_weight_sync: "sync", switch_to_trainer: "sync", switch_to_rollout: "sync",
+  testing: "val", save_checkpoint: "ckpt",
+};
+const CLASS_COLORS = {compute: "#e53935", sync: "#8e24aa", wait: "#9aa7b3", val: "#43a047", ckpt: "#00acc1", other: "#d6dce2"};
+const CLASS_NAMES = {compute: "compute (old/ref log-prob, adv, update)", sync: "weight sync", wait: "waiting for rollout",
+                     val: "validation", ckpt: "checkpoint", other: "other / untracked"};
+// What a trainer rank executes on its chips (trainer_workers lanes, depth 0).
+const RANK_CLASS = {update_actor: "actor", compute_ref_log_prob: "ref", compute_log_prob: "logp", update_weights: "sync",
+                    release_tpu_sync: "sync"};
+const RANK_COLORS = {actor: "#e53935", ref: "#9ccc65", logp: "#42a5f5", sync: "#8e24aa", other: "#90a4ae", idle: "#eaeef2"};
+const RANK_NAMES = {actor: "actor update (fwd/bwd + optimizer)", ref: "reference forward", logp: "actor forward (log-prob)",
+                    sync: "weight sync (gather, host staging, release)", other: "other", idle: "idle"};
+function rankBreakdown(wg, a, b) {  // seconds per class in [a, b], averaged over the printed ranks
+  const out = {actor: 0, ref: 0, logp: 0, sync: 0, other: 0, idle: 0};
+  if (!wg || !wg.lanes.length || b <= a) return out;
+  for (const L of wg.lanes) {
+    const by = {actor: [], ref: [], logp: [], sync: [], other: []};
+    for (const s of (L.byDepth[0] || [])) by[RANK_CLASS[s.name] || "other"].push([s.t0, s.t1]);
+    const busy = overlap(unionIntervals([].concat(...Object.values(by))), a, b);
+    for (const k in by) out[k] += overlap(unionIntervals(by[k]), a, b);
+    out.idle += Math.max(0, (b - a) - busy);
+  }
+  for (const k in out) out[k] /= wg.lanes.length;
+  return out;
+}
+
+function trainerPhaseSpans(model) {  // the trainer's activity at the finest non-overlapping level used for accounting
+  if (!model.loop) return [];
+  return model.loop.spans.filter(s => (s.depth === 0 && s.name !== "step") ||
+                                      (s.depth === 1 && s.parent && s.parent.name === "step"));
+}
+
+function trainerBreakdown(model, a, b) {
+  const by = {compute: [], sync: [], wait: [], val: [], ckpt: [], other: []};
+  for (const s of trainerPhaseSpans(model)) by[TRAINER_CLASS[s.name] || "other"].push([s.t0, s.t1]);
+  const out = {};
+  let tracked = 0;
+  for (const k in by) { out[k] = overlap(unionIntervals(by[k]), a, b); tracked += out[k]; }
+  out.other += Math.max(0, (b - a) - tracked);
+  return out;
+}
+
+function hbmMaxIn(H, a, b) {
+  if (!H || !H.samples.length || b <= a) return null;
+  let m = null;
+  const i0 = Math.max(0, lowerBound(H.samples, a, "t") - 1);
+  for (let i = i0; i < H.samples.length; i++) {
+    const s = H.samples[i];
+    if (s.t > b) break;
+    if (s.t >= a && (m == null || s.max > m)) m = s.max;
+  }
+  return m;
+}
+function hbmMinIn(H, a, b) {
+  if (!H || !H.samples.length || b <= a) return null;
+  let m = null;
+  const i0 = Math.max(0, lowerBound(H.samples, a, "t") - 1);
+  for (let i = i0; i < H.samples.length; i++) {
+    const s = H.samples[i];
+    if (s.t > b) break;
+    if (s.t >= a && (m == null || s.min < m)) m = s.min;
+  }
+  return m;
+}
+
+function computeStepStats(model) {
+  const phases = new Set();
+  const trHbm = model.hbm ? model.hbm.get("trainer_workers") : null;
+  for (const st of model.steps) {
+    const a = st.t0, b = st.tNext;
+    st.phase = {};
+    for (const s of model.loop.spans) {
+      if (s === st.span) continue;
+      const inStep = s.step === st.step || (s.t0 >= a - 1e-3 && s.t1 <= b + 1e-3);
+      if (!inStep) continue;
+      const isPhase = (s.depth === 1 && s.parent === st.span) || (s.depth === 0 && s.name !== "step");
+      const isSync = s.name.startsWith("sync.");
+      if (!isPhase && !isSync) continue;
+      st.phase[s.name] = (st.phase[s.name] || 0) + (s.t1 - s.t0);
+      phases.add(s.name);
+    }
+    st.total = b - a;
+    st.stepDur = st.t1 - st.t0;
+    st.trainer = trainerBreakdown(model, a, b);
+    st.hbmPeak = hbmMaxIn(trHbm, a, b);
+    st.hbmFloor = hbmMinIn(trHbm, a, b);
+    let busy = 0, paused = 0, idle = 0, area = 0, nDone = 0, nAbort = 0, outTok = 0;
+    for (const rep of model.replicas) {
+      const t = stateTime(rep, a, b);
+      busy += t.busy; paused += t.paused; idle += t.idle;
+      area += engineAvg(rep, a, b);
+      for (const r of rep.requests) {
+        if (r.t1 < a || r.t1 >= b) continue;
+        if (r.stop === "abort") nAbort++; else nDone++;
+        outTok += r.nOut || 0;
+      }
+    }
+    const nr = Math.max(1, model.replicas.length);
+    st.sampler = {busy: busy / nr, paused: paused / nr, idle: idle / nr, meanEngine: area / nr / Math.max(1e-9, b - a),
+                  nDone, nAbort, outTok, tokPerS: outTok / Math.max(1e-9, b - a)};
+    const wg = model.groups.find(g => g.id === "trainer_workers");
+    st.rank = wg ? rankBreakdown(wg, a, b) : null;
+  }
+  model.phaseNames = [...phases];
+}
+
+// Legacy logs (no VERL_TIMELINE lines): lay steps end to end from timing_s/* (approximate, trainer only).
+const LEGACY_ORDER = ["gen", "reward", "old_log_prob", "ref", "values", "adv", "update_critic", "update_actor",
+                      "save_checkpoint", "update_weights"];
+const LEGACY_SYNC = ["quiesce", "trainer_init", "sampler_init", "barrier", "p2p_transfer", "sampler_h2d"];
+function buildLegacyModel(metrics, sourceName) {
+  const steps = Object.keys(metrics).map(Number).sort((a, b) => a - b);
+  const model = {kind: "legacy", source: sourceName, T0: 0, duration: 0, groups: [], steps: [], meta: {}, replicas: [],
+                 metrics, nEvents: 0};
+  if (!steps.length) return model;
+  const loop = {id: "loop", spans: [], instants: [], requests: []};
+  let t = 0;
+  for (const k of steps) {
+    const m = metrics[k];
+    const stepDur = m["timing_s/step"] || 0;
+    const stepSpan = {t0: t, t1: t + stepDur, name: "step", cat: "loop", step: k, args: {approx: true}};
+    loop.spans.push(stepSpan);
+    let c = t;
+    for (const ph of LEGACY_ORDER) {
+      const d = m["timing_s/" + ph];
+      if (!d) continue;
+      const s = {t0: c, t1: c + d, name: ph, cat: "loop", step: k, args: {approx: true}};
+      loop.spans.push(s);
+      if (ph === "update_weights") {
+        let cs = c;
+        for (const sp of LEGACY_SYNC) {
+          const ds = m["timing_s/tpu-sync/" + sp];
+          if (!ds) continue;
+          const nm = "sync." + ({trainer_init: "trainer_send", sampler_h2d: "sampler_install"}[sp] || sp);
+          loop.spans.push({t0: cs, t1: cs + ds, name: nm, cat: "sync", step: k, args: {approx: true}});
+          cs += ds;
+        }
+      }
+      c += d;
+    }
+    stepSpan.t1 = Math.max(stepSpan.t1, c);
+    t = stepSpan.t1;
+    const dt = m["timing_s/testing"];
+    if (dt) { loop.spans.push({t0: t, t1: t + dt, name: "testing", cat: "loop", step: k, args: {approx: true}}); t += dt; }
+  }
+  loop.spans.sort((a, b) => a.t0 - b.t0 || b.t1 - a.t1);
+  loop.depth = assignDepth(loop.spans);
+  loop.byDepth = [];
+  for (let d = 0; d < loop.depth; d++) loop.byDepth.push(loop.spans.filter(s => s.depth === d));
+  model.groups.push({id: "trainer", lanes: [loop]});
+  model.loop = loop;
+  model.duration = t;
+  const stepSpans = loop.spans.filter(s => s.name === "step");
+  stepSpans.forEach((s, i) => model.steps.push({step: s.step, t0: s.t0, t1: s.t1,
+                                                 tNext: stepSpans[i + 1] ? stepSpans[i + 1].t0 : t, span: s}));
+  computeStepStats(model);
+  return model;
+}
+
+// --------------------------------------------------------------------------------------------------------------------
+// Timeline canvas
+// --------------------------------------------------------------------------------------------------------------------
+const AXIS_H = 30, GROUP_H = 22, LABEL_PAD = 8;
+const view = {model: null, t0: 0, t1: 1, rows: [], width: 800, height: 200, collapsed: new Set(), hover: null,
+              brush: null, drag: null, cursorT: null};
+const canvas = document.getElementById("tl");
+const ctx = canvas.getContext("2d");
+const tooltip = document.getElementById("tooltip");
+const labelW = () => parseInt(getComputedStyle(document.documentElement).getPropertyValue("--label-w")) || 210;
+
+function opt(id) { return document.getElementById(id).checked; }
+
+function buildRows() {
+  const m = view.model, rows = [];
+  if (!m) return rows;
+  // Overview: the trainer's step, what the trainer chips run, what the sampler chips do and which weights they serve.
+  const wg0 = m.groups.find(g => g.id === "trainer_workers");
+  const rankLane = wg0 && wg0.lanes.length ? wg0.lanes[0] : null, rep0 = m.replicas[0];
+  const trHbm = m.hbm ? m.hbm.get("trainer_workers") : null;
+  if (m.loop && (rankLane || rep0 || trHbm)) {
+    rows.push({kind: "group", id: "overview", label: "overview: trainer chips vs sampler chips", h: GROUP_H});
+    if (!view.collapsed.has("overview")) {
+      rows.push({kind: "spans", lane: m.loop, depth: 0, label: "trainer step", h: 18});
+      if (rankLane) rows.push({kind: "spans", lane: rankLane, depth: 0, label: "trainer chips (" + rankLane.id + ")", h: 20, idle: true});
+      if (trHbm && trHbm.samples.length) rows.push({kind: "hbm", hbm: trHbm, label: "trainer HBM (peak " + trHbm.maxUsed.toFixed(1) + "/" + trHbm.cap.toFixed(1) + " GiB)", h: 42});
+      if (rep0) {
+        rows.push({kind: "state", rep: rep0, label: "sampler chips (" + rep0.id.replace("rollout_replica_", "replica ") + ")", h: 20});
+        if (rep0.versions && rep0.versions.length) rows.push({kind: "versions", rep: rep0, label: "sampler weights", h: 14});
+      }
+    }
+  }
+  for (const G of m.groups) {
+    const isRep = G.id.startsWith("rollout_replica");
+    const rep = isRep ? m.replicas.find(r => r.id === G.id) : null;
+    const hbm = m.hbm ? m.hbm.get(G.id) : null;
+    let title = G.id;
+    if (G.id === "trainer") title = "trainer loop";
+    else if (G.id === "trainer_workers") title = "trainer ranks (what runs on the trainer chips)";
+    else if (rep) {
+      const md = rep.meta || {};
+      title = G.id.replace("rollout_replica_", "rollout replica ") + (md.tp ? "  (TP " + md.tp + (md.host ? ", " + md.host : "") + ")" : "");
+    }
+    rows.push({kind: "group", id: G.id, label: title, h: GROUP_H});
+    if (view.collapsed.has(G.id)) continue;
+    if (rep) {
+      rows.push({kind: "state", rep, label: "state", h: 16});
+      if (rep.versions && rep.versions.length) rows.push({kind: "versions", rep, label: "weights (vK = after step K)", h: 14});
+      if (hbm && hbm.samples.length) rows.push({kind: "hbm", hbm, label: "HBM (peak " + hbm.maxUsed.toFixed(1) + "/" + hbm.cap.toFixed(1) + " GiB)", h: 38});
+      const cap = rep.meta.max_num_seqs ? "max_num_seqs " + rep.meta.max_num_seqs : "peak " + rep.maxDecode;
+      rows.push({kind: "occ", rep, label: "decoding (" + cap + ")", h: 40});
+      if (rep.maxQueued > 0) rows.push({kind: "queue", rep, label: "waiting (peak " + rep.maxQueued + ")", h: 26});
+      if (rep.server && rep.server.spans.length) {
+        rows.push({kind: "spans", lane: rep.server, depth: 0, label: "server", h: 16});
+        if (rep.server.depth > 1) rows.push({kind: "spans", lane: rep.server, depth: 1, label: "server: sync RPCs", h: 14});
+      }
+      if (opt("opt-requests") && rep.nRows) {
+        const rh = Math.max(2, Math.min(6, Math.floor(260 / rep.nRows)));
+        rows.push({kind: "reqs", rep, label: rep.requests.length + " requests", h: rep.nRows * rh + 2, rh});
+      }
+      continue;
+    }
+    if (G.id === "trainer_workers" && !opt("opt-ranks")) {
+      rows.push({kind: "note", label: G.lanes.length + " ranks hidden", h: 14});
+      continue;
+    }
+    for (const L of G.lanes) {
+      let maxD = L.depth;
+      if (G.id === "trainer" && !opt("opt-depth")) maxD = Math.min(L.depth, 2);
+      if (G.id === "trainer_workers") maxD = Math.min(L.depth, opt("opt-depth") ? 2 : 1);  // deeper calls: tooltip
+      for (let d = 0; d < maxD; d++) {
+        const label = G.id === "trainer" ? ["step · validation · init", "phases", "weight-sync phases", "detail"][d] || "depth " + d
+                                         : (d === 0 ? L.id + " (chips)" : L.id + " detail");
+        rows.push({kind: "spans", lane: L, depth: d, label, h: G.id === "trainer" ? 20 : (d === 0 ? 18 : 13)});
+      }
+    }
+    if (hbm && hbm.samples.length) {
+      rows.push({kind: "hbm", hbm, label: "HBM (" + hbm.nChips + " chips, peak " + hbm.maxUsed.toFixed(1) + "/" + hbm.cap.toFixed(1) + " GiB)", h: 48});
+    }
+  }
+  let y = AXIS_H;
+  for (const r of rows) { r.y = y; y += r.h + 1; }
+  view.height = y + 6;
+  return rows;
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.parentElement.clientWidth;
+  view.width = w;
+  view.rows = buildRows();
+  canvas.style.height = view.height + "px";
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(view.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+
+function tx(t) { const L = labelW(); return L + (t - view.t0) / (view.t1 - view.t0) * (view.width - L); }
+function xt(x) { const L = labelW(); return view.t0 + (x - L) / (view.width - L) * (view.t1 - view.t0); }
+
+function niceStep(span, target) {
+  const raw = span / target, p = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const k of [1, 2, 5, 10]) if (k * p >= raw) return k * p;
+  return 10 * p;
+}
+
+function draw() {
+  const m = view.model, W = view.width, H = view.height, L = labelW();
+  ctx.clearRect(0, 0, W, H);
+  if (!m) return;
+  // background stripes per step
+  ctx.save();
+  ctx.beginPath(); ctx.rect(L, 0, W - L, H); ctx.clip();
+  m.steps.forEach((st, i) => {
+    if (i % 2) { ctx.fillStyle = "rgba(9,105,218,0.035)"; ctx.fillRect(tx(st.t0), AXIS_H, tx(st.tNext) - tx(st.t0), H - AXIS_H); }
+  });
+  ctx.restore();
+
+  for (const r of view.rows) drawRow(r);
+
+  // axis
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W, AXIS_H);
+  ctx.strokeStyle = "#d0d7de"; ctx.beginPath(); ctx.moveTo(0, AXIS_H - 0.5); ctx.lineTo(W, AXIS_H - 0.5); ctx.stroke();
+  const span = view.t1 - view.t0, step = niceStep(span, Math.max(3, (W - L) / 110));
+  ctx.fillStyle = "#656d76"; ctx.font = "11px sans-serif"; ctx.textBaseline = "top";
+  for (let t = Math.ceil(view.t0 / step) * step; t <= view.t1; t += step) {
+    const x = tx(t);
+    ctx.strokeStyle = "rgba(0,0,0,0.06)"; ctx.beginPath(); ctx.moveTo(x + 0.5, AXIS_H); ctx.lineTo(x + 0.5, H); ctx.stroke();
+    ctx.strokeStyle = "#8c959f"; ctx.beginPath(); ctx.moveTo(x + 0.5, AXIS_H - 6); ctx.lineTo(x + 0.5, AXIS_H); ctx.stroke();
+    ctx.fillText(step < 1 ? fmtClock(t) : fmtClock(t).replace(/\.\d$/, ""), x + 3, 3);
+  }
+  // step markers
+  ctx.save(); ctx.beginPath(); ctx.rect(L, 0, W - L, H); ctx.clip();
+  view.stepHits = [];
+  let lastX = -1e9;
+  for (const st of m.steps) {
+    const x = tx(st.t0);
+    if (x < L - 40 || x > W + 5) continue;
+    ctx.strokeStyle = "rgba(9,105,218,0.35)"; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(x + 0.5, AXIS_H - 12); ctx.lineTo(x + 0.5, H); ctx.stroke(); ctx.setLineDash([]);
+    if (x - lastX > 26) {
+      ctx.fillStyle = "#0969da"; ctx.font = "bold 10px sans-serif"; ctx.fillText("S" + st.step, x + 3, 16);
+      view.stepHits.push({x0: x, x1: x + 26, st}); lastX = x;
+    }
+  }
+  if (view.cursorT != null) {
+    const x = tx(view.cursorT);
+    ctx.strokeStyle = "rgba(207,34,46,0.55)"; ctx.beginPath(); ctx.moveTo(x + 0.5, AXIS_H); ctx.lineTo(x + 0.5, H); ctx.stroke();
+  }
+  if (view.brush) {
+    const a = tx(view.brush[0]), b = tx(view.brush[1]);
+    ctx.fillStyle = "rgba(9,105,218,0.15)"; ctx.fillRect(Math.min(a, b), 0, Math.abs(b - a), H);
+  }
+  ctx.restore();
+  // label column
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, AXIS_H, L, H - AXIS_H);
+  ctx.strokeStyle = "#d0d7de"; ctx.beginPath(); ctx.moveTo(L - 0.5, 0); ctx.lineTo(L - 0.5, H); ctx.stroke();
+  ctx.textBaseline = "middle";
+  for (const r of view.rows) {
+    if (r.kind === "group") {
+      ctx.fillStyle = "#f6f8fa"; ctx.fillRect(0, r.y, W, r.h);
+      ctx.fillStyle = "#1f2328"; ctx.font = "bold 12px sans-serif";
+      ctx.fillText((view.collapsed.has(r.id) ? "▸ " : "▾ ") + r.label, 6, r.y + r.h / 2);
+    } else {
+      ctx.fillStyle = "#656d76"; ctx.font = "11px sans-serif";
+      ctx.fillText(clipText(r.label, L - 2 * LABEL_PAD - 4), LABEL_PAD + 10, r.y + Math.min(r.h, 18) / 2);
+    }
+  }
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, L, AXIS_H);
+  ctx.fillStyle = "#656d76"; ctx.font = "11px sans-serif"; ctx.textBaseline = "top";
+  ctx.fillText(m.kind === "legacy" ? "approx. from timing_s/*" : "t = 0: " + fmtWall(m.T0).slice(5, 19), 6, 4);
+  ctx.fillText(fmtDur(view.t1 - view.t0) + " shown", 6, 16);
+}
+
+const _clipCache = new Map();
+function clipText(s, w) {
+  if (ctx.measureText(s).width <= w) return s;
+  let lo = 0, hi = s.length;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (ctx.measureText(s.slice(0, mid) + "…").width <= w) lo = mid; else hi = mid - 1; }
+  return lo ? s.slice(0, lo) + "…" : "";
+}
+
+function drawSpanBar(s, y, h, color, text) {
+  const W = view.width, L = labelW();
+  let x0 = tx(s.t0), x1 = tx(s.t1);
+  if (x1 < L || x0 > W) return;
+  x0 = Math.max(x0, L - 1); x1 = Math.min(x1, W + 1);
+  const w = Math.max(1, x1 - x0);
+  ctx.fillStyle = color; ctx.fillRect(x0, y, w, h);
+  if (text && w > 34 && h >= 12) {
+    ctx.fillStyle = "rgba(0,0,0,0.78)"; ctx.font = "11px sans-serif"; ctx.textBaseline = "middle";
+    const t = clipText(text, w - 6);
+    if (t) ctx.fillText(t, x0 + 3, y + h / 2 + 0.5);
+  }
+}
+
+function visibleRange(arr, k0, k1) {  // arr sorted by k0 asc and (mostly) non-overlapping
+  let i = lowerBound(arr, view.t0, k1);
+  return [Math.max(0, i - 1), arr.length];
+}
+
+function drawRow(r) {
+  const y = r.y, h = r.h, W = view.width;
+  if (r.kind === "spans") {
+    if (r.idle) {  // gaps between the spans are idle chips
+      ctx.fillStyle = RANK_COLORS.idle; ctx.fillRect(labelW(), y + 1, W - labelW(), h - 2);
+      ctx.fillStyle = "#8c959f"; ctx.font = "italic 10px sans-serif"; ctx.textBaseline = "middle";
+      ctx.fillText("idle where blank", labelW() + 4, y + h / 2);
+    }
+    const arr = r.lane.byDepth[r.depth] || [];
+    let i = Math.max(0, lowerBound(arr, view.t0 - 3600 * 24, "t0"));
+    // spans in one depth row may overlap slightly; scan from the first whose end is in view
+    i = 0;
+    const lo = lowerBound(arr, view.t0, "t1");
+    for (i = Math.max(0, lo - 64); i < arr.length; i++) {
+      const s = arr[i];
+      if (s.t0 > view.t1) break;
+      if (s.t1 < view.t0) continue;
+      const light = s.name === "step";
+      drawSpanBar(s, y + 1, h - 2, colorFor(s.name, s.cat), light ? "step " + s.step : SHORT_LABEL[s.name] || s.name);
+      if (light) { ctx.strokeStyle = "#c8d1da"; ctx.strokeRect(Math.max(tx(s.t0), labelW()) + 0.5, y + 1.5, Math.max(1, tx(s.t1) - Math.max(tx(s.t0), labelW())) - 1, h - 3); }
+    }
+    for (const ins of r.lane.instants || []) {
+      if (r.depth !== 0 || ins.t < view.t0 || ins.t > view.t1) continue;
+      const x = tx(ins.t);
+      ctx.fillStyle = ins.name === "rejected" ? "#cf222e" : "#57606a";
+      ctx.beginPath(); ctx.moveTo(x, y + 1); ctx.lineTo(x + 3, y + 5); ctx.lineTo(x - 3, y + 5); ctx.fill();
+    }
+  } else if (r.kind === "state") {
+    for (const s of r.rep.states) {
+      if (s.t1 < view.t0 || s.t0 > view.t1) continue;
+      drawSpanBar(s, y + 1, h - 2, COLORS["state." + s.state], STATE_LABEL[s.state] || s.state);
+    }
+  } else if (r.kind === "versions") {
+    for (const v of r.rep.versions) {
+      if (v.t1 < view.t0 || v.t0 > view.t1) continue;
+      drawSpanBar(v, y + 1, h - 2, versionColor(v.wv), "weights v" + v.wv);
+    }
+  } else if (r.kind === "occ" || r.kind === "queue") {
+    const rep = r.rep, occ = rep.occ, cap = r.kind === "occ" ? rep.cap : Math.max(1, rep.maxQueued);
+    ctx.strokeStyle = "rgba(0,0,0,0.12)";
+    ctx.strokeRect(labelW() + 0.5, y + 0.5, W - labelW() - 1, h - 1);
+    if (!occ.length) return;
+    const yOf = v => y + h - 1 - (h - 3) * Math.min(1, v / cap);
+    const drawArea = (key, color, mode) => {
+      ctx.beginPath();
+      let started = false, prevY = y + h - 1;
+      const i0 = Math.max(0, lowerBound(occ, view.t0, "t") - 1);
+      for (let i = i0; i < occ.length; i++) {
+        const o = occ[i];
+        const x = Math.max(labelW(), Math.min(W, tx(o.t)));
+        const yy = yOf(o[key]);
+        if (!started) { ctx.moveTo(x, y + h - 1); started = true; }
+        ctx.lineTo(x, prevY); ctx.lineTo(x, yy); prevY = yy;
+        if (o.t > view.t1) break;
+      }
+      ctx.lineTo(W, prevY); ctx.lineTo(W, y + h - 1); ctx.closePath();
+      if (mode === "line") { ctx.setLineDash([2, 2]); ctx.strokeStyle = color; ctx.stroke(); ctx.setLineDash([]); }
+      else { ctx.fillStyle = color; ctx.fill(); }
+    };
+    ctx.save(); ctx.beginPath(); ctx.rect(labelW(), y, W - labelW(), h); ctx.clip();
+    if (r.kind === "queue") {
+      drawArea("waiting", "rgba(0,137,123,0.30)");
+      if (rep.maxParked) drawArea("parked", "#bf8700", "line");
+      ctx.restore();
+      return;
+    }
+    drawArea("decode", "rgba(0,105,92,0.85)");
+    // capacity line
+    if (rep.meta.max_num_seqs) {
+      const yc = yOf(rep.meta.max_num_seqs);
+      ctx.strokeStyle = "rgba(207,34,46,0.5)"; ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.moveTo(labelW(), yc + 0.5); ctx.lineTo(W, yc + 0.5); ctx.stroke(); ctx.setLineDash([]);
+    }
+    ctx.restore();
+  } else if (r.kind === "hbm") {
+    const H = r.hbm, samples = H.samples, cap = Math.max(H.cap || 31.25, H.maxUsed, 1);
+    ctx.strokeStyle = "rgba(0,0,0,0.12)";
+    ctx.strokeRect(labelW() + 0.5, y + 0.5, W - labelW() - 1, h - 1);
+    if (!samples.length) return;
+    const yOf = v => y + h - 1 - (h - 3) * Math.min(1, Math.max(0, v) / cap);
+    ctx.save(); ctx.beginPath(); ctx.rect(labelW(), y, W - labelW(), h); ctx.clip();
+    // Shaded area under max chip HBM
+    const i0 = Math.max(0, lowerBound(samples, view.t0, "t") - 1);
+    ctx.beginPath();
+    let started = false, prevY = y + h - 1, lastX = labelW();
+    for (let i = i0; i < samples.length; i++) {
+      const s = samples[i], x = Math.max(labelW(), Math.min(W, tx(s.t))), yy = yOf(s.max);
+      if (!started) { ctx.moveTo(x, y + h - 1); started = true; }
+      ctx.lineTo(x, prevY); ctx.lineTo(x, yy); prevY = yy; lastX = x;
+      if (s.t > view.t1) break;
+    }
+    if (started) {
+      ctx.lineTo(lastX, y + h - 1); ctx.closePath();
+      ctx.fillStyle = H.group === "trainer_workers" ? "rgba(21,101,192,0.22)" : "rgba(0,137,123,0.20)";
+      ctx.fill();
+    }
+    // Per-chip lines
+    const chipColors = ["#1565c0", "#ef6c00", "#2e7d32", "#c62828", "#6a1b9a", "#00838f", "#ad1457", "#4e342e"];
+    for (let c = 0; c < H.nChips; c++) {
+      ctx.beginPath();
+      let stChip = false;
+      for (let i = i0; i < samples.length; i++) {
+        const s = samples[i];
+        if (c >= s.used.length) continue;
+        const x = Math.max(labelW(), Math.min(W, tx(s.t))), yy = yOf(s.used[c]);
+        if (!stChip) { ctx.moveTo(x, yy); stChip = true; } else ctx.lineTo(x, yy);
+        if (s.t > view.t1) break;
+      }
+      if (stChip) {
+        ctx.strokeStyle = chipColors[c % chipColors.length];
+        ctx.lineWidth = 1.25;
+        ctx.stroke();
+      }
+    }
+    ctx.lineWidth = 1;
+    // Capacity dashed line
+    const yc = yOf(H.cap || 31.25);
+    ctx.strokeStyle = "rgba(183,28,28,0.55)"; ctx.setLineDash([4, 3]);
+    ctx.beginPath(); ctx.moveTo(labelW(), yc + 0.5); ctx.lineTo(W, yc + 0.5); ctx.stroke(); ctx.setLineDash([]);
+    ctx.restore();
+  } else if (r.kind === "reqs") {
+    const rep = r.rep;
+    for (let k = 0; k < rep.nRows; k++) {
+      const arr = rep.rowSpans[k], yy = y + 1 + k * r.rh, hh = Math.max(1, r.rh - 1);
+      const lo = Math.max(0, lowerBound(arr, view.t0, "t1") - 1);
+      for (let i = lo; i < arr.length; i++) {
+        const q = arr[i];
+        if (q.tFirst > view.t1) break;
+        if (q.t1 < view.t0) continue;
+        const c = opt("opt-wv") ? versionColor(q.wv)
+                : q.stop === "abort" ? COLORS["req.abort"] : q.stop === "length" ? COLORS["req.length"] : COLORS["req.decode"];
+        drawSpanBar({t0: q.tFirst, t1: q.t1}, yy, hh, c);
+      }
+    }
+  } else if (r.kind === "note") {
+    ctx.fillStyle = "#8c959f"; ctx.font = "italic 11px sans-serif"; ctx.textBaseline = "middle";
+    ctx.fillText("(hidden; enable \u201ctrainer ranks\u201d)", labelW() + 8, y + h / 2);
+  }
+}
+
+// --- hit testing / tooltip ---
+function hitTest(x, y) {
+  if (!view.model) return null;
+  const t = xt(x);
+  const row = view.rows.find(r => y >= r.y && y < r.y + r.h + 1);
+  if (!row) return null;
+  const tol = (view.t1 - view.t0) / Math.max(1, view.width - labelW()) * 2;
+  const pick = arr => {
+    let best = null;
+    const lo = Math.max(0, lowerBound(arr, t - tol, "t1") - 64);
+    for (let i = lo; i < arr.length; i++) {
+      const s = arr[i];
+      if (s.t0 > t + tol) break;
+      if (s.t0 - tol <= t && t <= s.t1 + tol && (!best || (s.t1 - s.t0) < (best.t1 - best.t0))) best = s;
+    }
+    return best;
+  };
+  if (row.kind === "group") return {row, kind: "group"};
+  if (row.kind === "spans") { const s = pick(row.lane.byDepth[row.depth] || []); return s ? {row, kind: "span", s, t} : {row, t}; }
+  if (row.kind === "state") { const s = row.rep.states.find(s => s.t0 <= t && t <= s.t1); return s ? {row, kind: "state", s, t} : {row, t}; }
+  if (row.kind === "versions") { const v = row.rep.versions.find(v => v.t0 <= t && t <= v.t1); return v ? {row, kind: "version", v, t} : {row, t}; }
+  if (row.kind === "occ" || row.kind === "queue") {
+    const occ = row.rep.occ, i = Math.max(0, lowerBound(occ, t, "t") - (occ.length && lowerBound(occ, t, "t") < occ.length && occ[lowerBound(occ, t, "t")].t === t ? 0 : 1));
+    return {row, kind: "occ", o: occ[Math.min(i, occ.length - 1)], t};
+  }
+  if (row.kind === "hbm") {
+    const arr = row.hbm.samples;
+    if (!arr.length) return {row, t};
+    const idx = Math.max(0, Math.min(arr.length - 1, lowerBound(arr, t, "t") - (lowerBound(arr, t, "t") < arr.length && arr[lowerBound(arr, t, "t")].t === t ? 0 : 1)));
+    return {row, kind: "hbm", sample: arr[idx], t};
+  }
+  if (row.kind === "reqs") {
+    const k = Math.floor((y - row.y - 1) / row.rh);
+    const arr = row.rep.rowSpans[k] || [];
+    const q = arr.find(q => q.tFirst - tol <= t && t <= q.t1 + tol);
+    return q ? {row, kind: "req", q, t} : {row, t};
+  }
+  return {row, t};
+}
+
+function kv(k, v) { return '<div class="row"><span>' + esc(k) + "</span><span>" + v + "</span></div>"; }
+function tooltipHtml(h) {
+  const m = view.model;
+  if (!h) return "";
+  if (h.kind === "span") {
+    const s = h.s;
+    let html = "<b>" + esc(s.name) + "</b>" + (s.step != null ? " &middot; step " + s.step : "") + "<br>";
+    html += kv("duration", fmtDur(s.t1 - s.t0)) + kv("start", fmtClock(s.t0)) + kv("end", fmtClock(s.t1));
+    if (m.kind !== "legacy") html += kv("wall", fmtWall(m.T0 + s.t0).slice(11));
+    if (s.lane && s.group === "trainer_workers") html += kv("rank", esc(s.lane));
+    if (s.ip) html += kv("host", esc(s.ip) + (s.pid ? " pid " + s.pid : ""));
+    for (const k in s.args || {}) html += kv(k, esc(JSON.stringify(s.args[k])));
+    if (s.parent && s.parent.name !== "step") html += kv("in", esc(s.parent.name) + " (" + pct((s.t1 - s.t0) / Math.max(1e-9, s.parent.t1 - s.parent.t0)) + ")");
+    if (s.group === "trainer_workers" && s.depth === 0) {
+      const L = view.model.groups.find(g => g.id === s.group).lanes.find(l => l.id === s.lane);
+      const kids = (L.byDepth[1] || []).filter(c => c.parent === s);
+      for (const c of kids.slice(0, 6)) html += kv("  ↳ " + c.name, fmtDur(c.t1 - c.t0));
+    }
+    return html;
+  }
+  if (h.kind === "state") {
+    const s = h.s;
+    const note = {drain: "submission gate closed for a weight sync; the engine still decodes until every admitted request has its first token",
+                  paused: "engine paused: weight transfer/install, then resume", idle: "no request in the engine (nothing to generate)"}[s.state];
+    return "<b>" + esc(STATE_LABEL[s.state] || s.state) + "</b><br>" + kv("duration", fmtDur(s.t1 - s.t0)) +
+           kv("from", fmtClock(s.t0)) + kv("to", fmtClock(s.t1)) + (note ? '<div style="max-width:380px;white-space:normal;color:#c9d1d9;margin-top:4px">' + esc(note) + "</div>" : "");
+  }
+  if (h.kind === "version") {
+    const v = h.v;
+    const note = v.wv === 0 ? "the initial weights" : "the weights after step " + v.wv + "'s actor update; what the replica " +
+      "generates now is trained on in step " + (v.wv + 1) + " or later";
+    return "<b>weights v" + esc(v.wv) + "</b><br>" + kv("installed", fmtClock(v.t0)) + kv("served until", fmtClock(v.t1)) +
+           kv("duration", fmtDur(v.t1 - v.t0)) + '<div style="max-width:380px;white-space:normal;color:#c9d1d9;margin-top:4px">' +
+           esc(note) + "</div>";
+  }
+  if (h.kind === "occ" && h.o) {
+    const o = h.o;
+    return "<b>" + esc(h.row.rep.id) + "</b> @ " + fmtClock(h.t) + "<br>" + kv("decoding (running)", o.decode) +
+           kv("queued in engine / prefill", o.engine - o.decode) + kv("parked at closed gate", o.parked) +
+           (h.row.rep.meta.max_num_seqs ? kv("max_num_seqs", h.row.rep.meta.max_num_seqs) : kv("peak decoding", h.row.rep.maxDecode));
+  }
+  if (h.kind === "hbm" && h.sample) {
+    const s = h.sample, H = h.row.hbm, cap = H.cap || 31.25;
+    let html = "<b>" + esc(H.group) + " HBM</b> @ " + fmtClock(s.t) + "<br>" +
+               kv("max across chips", s.max.toFixed(2) + " / " + cap.toFixed(2) + " GiB (" + pct(s.max / cap) + ")") +
+               kv("window peak / floor", H.maxUsed.toFixed(2) + " / " + H.minUsed.toFixed(2) + " GiB");
+    s.used.forEach((u, i) => {
+      const d = s.duty && s.duty[i] != null ? " · duty " + s.duty[i].toFixed(0) + "%" : "";
+      html += kv("  chip " + i, u.toFixed(2) + " GiB (" + (u * 1.073741824).toFixed(2) + " GB)" + d);
+    });
+    return html;
+  }
+  if (h.kind === "req") {
+    const q = h.q;
+    const dec = q.t1 - q.tFirst;
+    return "<b>request</b> &middot; " + esc(q.stop || "?") + "<br>" + kv("submitted", fmtClock(q.t0)) +
+           kv("parked at gate", fmtDur(q.tAdmit - q.t0)) + kv("queue + prefill", fmtDur(q.tFirst - q.tAdmit)) +
+           kv("decode", fmtDur(dec)) + kv("total", fmtDur(q.t1 - q.t0)) + kv("tokens in / out", (q.nIn ?? "?") + " / " + (q.nOut ?? "?")) +
+           kv("decode tok/s", q.nOut && dec > 0 ? (q.nOut / dec).toFixed(1) : "–") + kv("weights version", q.wv ?? "?");
+  }
+  return "";
+}
+
+canvas.addEventListener("mousemove", ev => {
+  const rect = canvas.getBoundingClientRect(), x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+  if (view.drag) {
+    const dt = (x - view.drag.x) / (view.width - labelW()) * (view.drag.t1 - view.drag.t0);
+    view.t0 = view.drag.t0 - dt; view.t1 = view.drag.t1 - dt; draw(); return;
+  }
+  if (view.brush) { view.brush[1] = xt(x); draw(); return; }
+  view.cursorT = x > labelW() ? xt(x) : null;
+  const h = x > labelW() ? hitTest(x, y) : null;
+  const html = tooltipHtml(h);
+  if (html) {
+    tooltip.innerHTML = html; tooltip.style.display = "block";
+    const tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
+    tooltip.style.left = Math.min(ev.clientX + 14, window.innerWidth - tw - 8) + "px";
+    tooltip.style.top = (ev.clientY + 16 + th > window.innerHeight ? ev.clientY - th - 10 : ev.clientY + 16) + "px";
+  } else tooltip.style.display = "none";
+  draw();
+});
+canvas.addEventListener("mouseleave", () => { tooltip.style.display = "none"; view.cursorT = null; draw(); });
+canvas.addEventListener("mousedown", ev => {
+  const rect = canvas.getBoundingClientRect(), x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+  if (y < AXIS_H && x > labelW()) {
+    const hit = (view.stepHits || []).find(h => x >= h.x0 && x <= h.x1 && y >= 12);
+    if (hit) { zoomStep(hit.st); return; }
+    view.brush = [xt(x), xt(x)]; return;
+  }
+  const row = view.rows.find(r => y >= r.y && y < r.y + r.h + 1);
+  if (row && row.kind === "group" && x < labelW() + 300) {
+    if (view.collapsed.has(row.id)) view.collapsed.delete(row.id); else view.collapsed.add(row.id);
+    resize(); return;
+  }
+  view.drag = {x, t0: view.t0, t1: view.t1}; canvas.classList.add("dragging");
+});
+window.addEventListener("mouseup", () => {
+  if (view.brush) {
+    const [a, b] = view.brush; view.brush = null;
+    if (Math.abs(b - a) > (view.t1 - view.t0) * 0.003) setView(Math.min(a, b), Math.max(a, b)); else draw();
+  }
+  if (view.drag) { view.drag = null; canvas.classList.remove("dragging"); updateSummary(); }
+});
+canvas.addEventListener("wheel", ev => {
+  if (!view.model) return;
+  ev.preventDefault();
+  const rect = canvas.getBoundingClientRect(), x = ev.clientX - rect.left;
+  const span = view.t1 - view.t0;
+  if (ev.shiftKey || Math.abs(ev.deltaX) > Math.abs(ev.deltaY)) {
+    const d = (ev.shiftKey ? ev.deltaY : ev.deltaX) / (view.width - labelW()) * span;
+    view.t0 += d; view.t1 += d;
+  } else {
+    const t = x > labelW() ? xt(x) : (view.t0 + view.t1) / 2;
+    const f = Math.pow(1.0015, ev.deltaY);
+    const ns = Math.max(1e-3, Math.min(span * f, Math.max(10, view.model.duration * 1.5)));
+    view.t0 = t - (t - view.t0) * ns / span; view.t1 = view.t0 + ns;
+  }
+  draw();
+  clearTimeout(view._sumTimer); view._sumTimer = setTimeout(updateSummary, 250);
+}, {passive: false});
+canvas.addEventListener("dblclick", () => fitAll());
+window.addEventListener("resize", () => {
+  if (!view.model) return;
+  if (view.activeTab === "memory") renderMemoryTab();
+  else { resize(); drawStepsChart(); }
+});
+
+function setView(a, b) {
+  view.t0 = a; view.t1 = Math.max(b, a + 1e-3);
+  draw(); updateSummary();
+  if (view.activeTab === "memory") renderMemoryTab();
+}
+function fitAll() { const m = view.model; if (!m) return; const pad = m.duration * 0.01 + 0.1; setView(-pad, m.duration + pad); }
+function steadyWindow() {
+  const m = view.model;
+  if (!m || !m.steps.length) return [0, m ? m.duration : 1];
+  const st = m.steps.find(s => s.step >= 2) || m.steps[0];
+  return [st.t0, m.steps[m.steps.length - 1].tNext];
+}
+function zoomStep(st) {
+  const pad = (st.tNext - st.t0) * 0.03;
+  setView(st.t0 - pad, st.tNext + pad);
+  document.getElementById("step-select").value = String(st.step);
+}
+function setActiveTab(tab, updateHash) {
+  const isMem = tab === "memory" || tab === "hbm";
+  view.activeTab = isMem ? "memory" : "timeline";
+  const btnTl = document.getElementById("tab-btn-timeline");
+  const btnMem = document.getElementById("tab-btn-memory");
+  btnTl.classList.toggle("active", !isMem);
+  btnMem.classList.toggle("active", isMem);
+  btnTl.setAttribute("aria-selected", String(!isMem));
+  btnMem.setAttribute("aria-selected", String(isMem));
+  document.getElementById("tab-timeline").classList.toggle("hidden", isMem);
+  document.getElementById("tab-memory").classList.toggle("hidden", !isMem);
+  document.getElementById("tl-only-opts").classList.toggle("hidden", isMem);
+  if (updateHash) {
+    const stepPart = (location.hash || "").replace(/^#/, "").split("&").filter(p => p && !p.startsWith("tab="));
+    const parts = ["tab=" + view.activeTab].concat(stepPart);
+    history.replaceState(null, "", "#" + parts.join("&"));
+  }
+  if (!view.model) return;
+  if (isMem) renderMemoryTab();
+  else { resize(); drawStepsChart(); }
+}
+for (const btn of document.querySelectorAll("#tab-bar .tab-btn")) {
+  btn.addEventListener("click", () => setActiveTab(btn.dataset.tab, true));
+}
+// #tab=memory / #tab=timeline and #step=5 or #steps=3-5 in the URL
+function applyHash() {
+  const hash = location.hash || "";
+  const tm = /tab=(timeline|memory|hbm)/i.exec(hash);
+  if (tm) setActiveTab(tm[1].toLowerCase(), false);
+  const m = view.model, h = /steps?=(\d+)(?:-(\d+))?/.exec(hash);
+  if (!m || !h) return;
+  const a = m.steps.find(s => s.step === +h[1]), b = m.steps.find(s => s.step === +(h[2] || h[1]));
+  if (a && b) { const pad = (b.tNext - a.t0) * 0.02; setView(a.t0 - pad, b.tNext + pad); }
+}
+window.addEventListener("hashchange", applyHash);
+
+// --------------------------------------------------------------------------------------------------------------------
+// Summary panel and per-step table
+// --------------------------------------------------------------------------------------------------------------------
+function utilBar(parts) {  // [{v, color, label}]
+  const tot = parts.reduce((s, p) => s + p.v, 0) || 1;
+  return '<div class="bar">' + parts.map(p => p.v > 0 ? '<div title="' + esc(p.label + ": " + fmtDur(p.v) + " (" + pct(p.v / tot) + ")") +
+         '" style="width:' + (100 * p.v / tot) + "%;background:" + p.color + '"></div>' : "").join("") + "</div>";
+}
+
+function updateSummary() {
+  const m = view.model;
+  if (!m) return;
+  const a = Math.max(0, view.t0), b = Math.min(m.duration, view.t1);
+  if (b <= a) return;
+  document.getElementById("sum-window").textContent = "for the visible window " + fmtClock(a) + " – " + fmtClock(b) +
+    " (" + fmtDur(b - a) + ")" + (m.kind === "legacy" ? " · approximate (no VERL_TIMELINE lines)" : "");
+  const stepsIn = m.steps.filter(s => s.t0 >= a - 1e-6 && s.tNext <= b + 1e-6);
+  const cards = [];
+  const run = m.run || {};
+  if (run.experiment) cards.push(["experiment", esc(run.experiment), esc((run.model || "").split("/").pop())]);
+  cards.push(["steps in window", stepsIn.length, m.steps.length + " total"]);
+  if (stepsIn.length) {
+    const tot = stepsIn.reduce((s, x) => s + x.total, 0) / stepsIn.length;
+    cards.push(["mean step (start→next)", fmtDur(tot), "timing_s/step mean " + fmtDur(stepsIn.reduce((s, x) => s + x.stepDur, 0) / stepsIn.length)]);
+    const tok = stepsIn.reduce((s, x) => s + x.sampler.outTok, 0);
+    if (tok) cards.push(["generated tokens/s", (tok / stepsIn.reduce((s, x) => s + x.total, 0)).toFixed(0), "all replicas, finished requests"]);
+  }
+  const tb = trainerBreakdown(m, a, b);
+  cards.push(["trainer compute", pct(tb.compute / (b - a)), "sync " + pct(tb.sync / (b - a)) + " · waiting " + pct(tb.wait / (b - a))]);
+  if (m.replicas.length) {
+    let busy = 0, paused = 0, idle = 0;
+    let before = 0;
+    for (const rep of m.replicas) { const t = stateTime(rep, a, b); busy += t.busy; paused += t.paused; idle += t.idle; before += t.before; }
+    const n = m.replicas.length;
+    cards.push(["rollout generating", pct(busy / n / (b - a)), "paused " + pct(paused / n / (b - a)) + " · idle " + pct(idle / n / (b - a)) +
+                (before > 0 ? " · not up " + pct(before / n / (b - a)) : "")]);
+  }
+  if (run.train_batch_size) cards.push(["batch", run.train_batch_size + " × n=" + run.rollout_n, "resp ≤ " + run.max_response_length + " · " + (run.checkpoint_engine || "") + " sync"]);
+  const trHbm = m.hbm ? m.hbm.get("trainer_workers") : null;
+  if (trHbm && trHbm.samples.length) {
+    const pk = hbmMaxIn(trHbm, a, b), fl = hbmMinIn(trHbm, a, b), cap = trHbm.cap || 31.25;
+    if (pk != null) cards.push(["trainer HBM peak", pk.toFixed(2) + " GiB (" + pct(pk / cap) + ")", "floor " + (fl != null ? fl.toFixed(2) : "–") + " / " + cap.toFixed(2) + " GiB"]);
+  }
+  const repHbm = m.replicas.map(r => m.hbm ? m.hbm.get(r.id) : null).find(h => h && h.samples.length);
+  if (repHbm) {
+    const pk = hbmMaxIn(repHbm, a, b), cap = repHbm.cap || 31.25;
+    if (pk != null) cards.push(["rollout HBM peak", pk.toFixed(2) + " GiB (" + pct(pk / cap) + ")", repHbm.nChips + " chips · cap " + cap.toFixed(2) + " GiB"]);
+  }
+  document.getElementById("cards").innerHTML = cards.map(c => '<div class="card"><div class="k">' + c[0] + '</div><div class="v">' + c[1] +
+    '</div><div class="s">' + (c[2] || "") + "</div></div>").join("");
+
+  // utilization rows
+  const rows = [];
+  rows.push(["trainer loop", utilBar(Object.keys(CLASS_COLORS).map(k => ({v: tb[k], color: CLASS_COLORS[k], label: CLASS_NAMES[k]}))),
+             Object.keys(CLASS_COLORS).filter(k => tb[k] > 0).map(k => k + " " + pct(tb[k] / (b - a))).join(" · ")]);
+  const wg = m.groups.find(g => g.id === "trainer_workers");
+  if (wg) {
+    const rb = rankBreakdown(wg, a, b);
+    const keys = Object.keys(RANK_COLORS);
+    rows.push(["trainer chips (" + wg.lanes.map(L => L.id).join(", ") + ")",
+               utilBar(keys.map(k => ({v: rb[k], color: RANK_COLORS[k], label: RANK_NAMES[k]}))),
+               keys.filter(k => rb[k] > 0).map(k => RANK_NAMES[k].split(" (")[0] + " " + pct(rb[k] / (b - a))).join(" · ")]);
+  }
+  for (const rep of m.replicas) {
+    const t = stateTime(rep, a, b);
+    const meanEng = engineAvg(rep, a, b) / Math.max(1e-9, t.busy);
+    rows.push([rep.id.replace("rollout_replica_", "rollout replica "), utilBar([
+      {v: t.busy - t.drain, color: COLORS["state.busy"], label: "generating"},
+      {v: t.drain, color: COLORS["state.drain"], label: "generating with the gate closed (weight sync waits)"},
+      {v: t.paused, color: COLORS["state.paused"], label: "paused (weight sync)"},
+      {v: t.idle, color: COLORS["state.idle"], label: "idle (nothing to generate)"}, {v: t.before, color: COLORS["state.unknown"], label: "not up yet"}]),
+      "gen " + pct(t.busy / (b - a)) + (t.drain ? " (gate closed " + pct(t.drain / (b - a)) + ")" : "") + " · paused " + pct(t.paused / (b - a)) +
+      " · idle " + pct(t.idle / (b - a)) +
+      " · " + meanEng.toFixed(1) + " req avg while generating"]);
+  }
+  document.getElementById("util").innerHTML = rows.map(r => '<div class="util-row"><div class="name">' + r[0] + "</div>" + r[1] +
+    '<div class="nums" title="' + esc(r[2]) + '">' + esc(r[2]) + "</div></div>").join("");
+  const ins = insights(m, a, b);
+  document.getElementById("insights").innerHTML = ins.length ? "<b>Where the time goes</b><ul>" + ins.map(x => "<li>" + x + "</li>").join("") + "</ul>" : "";
+}
+
+function intersectLen(A, B, a, b) {  // total length of (union A) ∩ (union B) ∩ [a,b]; A, B merged & sorted
+  let i = 0, j = 0, s = 0;
+  while (i < A.length && j < B.length) {
+    const lo = Math.max(A[i][0], B[j][0], a), hi = Math.min(A[i][1], B[j][1], b);
+    if (hi > lo) s += hi - lo;
+    if (A[i][1] < B[j][1]) i++; else j++;
+  }
+  return s;
+}
+function complement(iv, a, b) {
+  const out = []; let c = a;
+  for (const [x, y] of iv) { if (y <= a || x >= b) continue; if (x > c) out.push([c, x]); c = Math.max(c, y); }
+  if (c < b) out.push([c, b]);
+  return out;
+}
+
+function insights(m, a, b) {
+  const out = [], W = b - a;
+  if (!m.loop || W <= 0) return out;
+  const spans = trainerPhaseSpans(m);
+  const cls = k => unionIntervals(spans.filter(s => (TRAINER_CLASS[s.name] || "other") === k).map(s => [s.t0, s.t1]));
+  const compute = cls("compute"), sync = cls("sync"), wait = cls("wait"), val = cls("val");
+  const nSteps = m.steps.filter(s => s.t0 >= a - 1e-6 && s.tNext <= b + 1e-6).length;
+  const perStep = x => nSteps ? " (" + fmtDur(x / nSteps) + " per step)" : "";
+  const tW = overlap(wait, a, b), tC = overlap(compute, a, b), tS = overlap(sync, a, b), tV = overlap(val, a, b);
+  out.push("Trainer: computing <b>" + pct(tC / W) + "</b>" + perStep(tC) + ", weight sync <b>" + pct(tS / W) + "</b>" + perStep(tS) +
+           ", waiting for rollout <b>" + pct(tW / W) + "</b>" + perStep(tW) + (tV ? ", validation " + pct(tV / W) : "") + ".");
+  const wg = m.groups.find(g => g.id === "trainer_workers");
+  if (wg) {
+    const rb = rankBreakdown(wg, a, b);
+    out.push("Trainer chips (" + esc(wg.lanes.map(L => L.id).join(", ")) + "): actor update <b>" + pct(rb.actor / W) + "</b>" +
+             perStep(rb.actor) + ", reference forward <b>" + pct(rb.ref / W) + "</b>" + perStep(rb.ref) +
+             (rb.logp ? ", actor log-prob " + pct(rb.logp / W) + perStep(rb.logp) : "") + ", weight sync <b>" + pct(rb.sync / W) +
+             "</b>" + perStep(rb.sync) + ", idle <b>" + pct(rb.idle / W) + "</b>" + perStep(rb.idle) + ".");
+  }
+  // weight-sync phases
+  const syncNames = {};
+  for (const s of m.loop.spans) if (s.name.startsWith("sync.") && s.t0 >= a && s.t1 <= b) syncNames[s.name] = (syncNames[s.name] || 0) + (s.t1 - s.t0);
+  const syncTot = Object.values(syncNames).reduce((x, y) => x + y, 0);
+  if (syncTot > 0) {
+    const parts = Object.entries(syncNames).sort((p, q) => q[1] - p[1]).filter(p => p[1] / syncTot > 0.02)
+      .map(p => esc(p[0].slice(5)) + " " + pct(p[1] / syncTot));
+    out.push("Weight sync time splits into " + parts.join(", ") + ".");
+  }
+  if (!m.replicas.length) return out;
+  let busyAll = [], pausedSum = 0, idleSum = 0, busySum = 0, beforeSum = 0, decArea = 0, capTime = 0, tail = 0, nAbort = 0, abortTok = 0, nPaused = 0;
+  for (const rep of m.replicas) {
+    const t = stateTime(rep, a, b);
+    busySum += t.busy; pausedSum += t.paused; idleSum += t.idle; beforeSum += t.before;
+    busyAll = busyAll.concat(rep.busy);
+    nPaused += rep.paused.filter(p => p[0] >= a && p[1] <= b).length;
+    for (let i = 0; i < rep.occ.length; i++) {
+      const o = rep.occ[i], tEnd = i + 1 < rep.occ.length ? rep.occ[i + 1].t : b;
+      const lo = Math.max(a, o.t), hi = Math.min(b, tEnd);
+      if (hi <= lo) continue;
+      decArea += o.decode * (hi - lo);
+      if (o.engine > 0) { capTime += rep.cap * (hi - lo); if (o.decode > 0 && o.decode < rep.cap / 2 && o.waiting === 0) tail += hi - lo; }
+    }
+    for (const r of rep.requests) if (r.stop === "abort" && r.t1 >= a && r.t1 <= b) { nAbort++; abortTok += r.nOut || 0; }
+  }
+  const n = m.replicas.length;
+  out.push("Rollout (" + n + " replica" + (n > 1 ? "s" : "") + "): generating <b>" + pct(busySum / n / W) + "</b>, paused for weight sync <b>" +
+           pct(pausedSum / n / W) + "</b>" + (nPaused ? " (" + fmtDur(pausedSum / Math.max(1, nPaused)) + " per pause)" : "") +
+           ", idle <b>" + pct(idleSum / n / W) + "</b> with nothing to generate" +
+           (beforeSum > 0 ? " (plus " + pct(beforeSum / n / W) + " before the server was up)" : "") + ".");
+  if (capTime > 0) out.push("While generating, decode slots are <b>" + pct(decArea / capTime) + "</b> full on average (max_num_seqs); " +
+           "the long tail (fewer than half the slots busy and nothing queued) takes <b>" + pct(tail / Math.max(1e-9, busySum)) + "</b> of the generating time.");
+  const busyU = unionIntervals(busyAll);
+  const both = intersectLen(compute, busyU, a, b);
+  const trainerIdle = unionIntervals(complement(unionIntervals(compute.concat(sync, val)), a, b));
+  const samplerIdle = complement(busyU, a, b);
+  const bothIdle = intersectLen(trainerIdle, unionIntervals(samplerIdle), a, b);
+  out.push("Overlap: trainer computes while rollout generates <b>" + pct(both / Math.max(1e-9, tC)) + "</b> of its compute time; " +
+           "both trainer and rollout are idle/waiting <b>" + pct(bothIdle / W) + "</b> of the wall time.");
+  if (nAbort) out.push(nAbort + " requests were aborted by weight syncs (" + abortTok + " tokens generated before the abort, resumed as partial rollouts).");
+  // quiesce: how long the trainer waits for the rollout to stop, and how much was still queued when it started
+  const qs = m.loop.spans.filter(s => s.name === "sync.quiesce" && s.t0 >= a && s.t1 <= b && s.t1 - s.t0 > 0.5);
+  if (qs.length) {
+    const occAt = (rep, t) => { const i = lowerBound(rep.occ, t, "t") - 1; return i >= 0 ? rep.occ[i] : null; };
+    let qd = 0, waiting = 0, decoding = 0;
+    for (const q of qs) {
+      qd += q.t1 - q.t0;
+      for (const rep of m.replicas) { const o = occAt(rep, q.t0); if (o) { waiting += o.waiting; decoding += o.decode; } }
+    }
+    out.push("<code>sync.quiesce</code> averages <b>" + fmtDur(qd / qs.length) + "</b> over " + qs.length + " syncs. When it starts, the rollout still holds " +
+             (decoding / qs.length).toFixed(0) + " decoding + " + (waiting / qs.length).toFixed(0) + " queued requests per sync; the abort closes the " +
+             "submission gate and then waits until every request already admitted to vLLM has produced its first token " +
+             "(<code>vLLMHttpServer.abort_all_requests</code>, <code>_admitting</code> barrier), so queued requests behind <code>max_num_seqs</code> " +
+             "keep the trainer blocked while the rollout drains (light-green \u201cgate closed\u201d state).");
+  }
+  return out;
+}
+
+const STEP_COLS = [
+  ["step", s => s.step, 0],
+  ["start", s => fmtClock(s.t0), 0],
+  ["step→next", s => s.total, 1],
+  ["timing_s/step", s => s.stepDur, 1],
+  ["wait rollout (gen)", s => (s.phase.gen || 0) + (s.phase.switch_wait || 0), 2],
+  ["old_log_prob", s => s.phase.old_log_prob, 2],
+  ["ref", s => s.phase.ref, 2],
+  ["adv", s => s.phase.adv, 2],
+  ["update_actor", s => s.phase.update_actor, 2],
+  ["update_weights", s => s.phase.update_weights, 2],
+  ["↳ quiesce", s => s.phase["sync.quiesce"], 3],
+  ["↳ trainer send", s => s.phase["sync.trainer_send"], 3],
+  ["↳ p2p", s => (s.phase["sync.p2p_transfer"] || 0) + (s.phase["sync.transfer"] || 0) || undefined, 3],
+  ["↳ install", s => s.phase["sync.sampler_install"], 3],
+  ["↳ parity", s => s.phase["sync.parity_check"], 3],
+  ["testing", s => s.phase.testing, 2],
+  ["metrics", s => s.phase.metrics, 2],
+  ["rollout gen %", s => s.sampler && isFinite(s.sampler.busy) ? s.sampler.busy / s.total : undefined, 4],
+  ["paused %", s => s.sampler ? s.sampler.paused / s.total : undefined, 4],
+  ["idle %", s => s.sampler ? s.sampler.idle / s.total : undefined, 4],
+  ["rollout paused (s)", s => s.sampler ? s.sampler.paused : undefined, 8],
+  ["rollout idle (s)", s => s.sampler ? s.sampler.idle : undefined, 8],
+  ["chips: actor update (s)", s => s.rank ? s.rank.actor : undefined, 7],
+  ["chips: ref fwd (s)", s => s.rank ? s.rank.ref : undefined, 7],
+  ["chips: log-prob (s)", s => s.rank ? s.rank.logp : undefined, 7],
+  ["chips: weight sync (s)", s => s.rank ? s.rank.sync : undefined, 7],
+  ["trainer chips idle (s)", s => s.rank ? s.rank.idle : undefined, 7],
+  ["trainer HBM peak (GiB)", s => s.hbmPeak, 7],
+  ["trainer HBM floor (GiB)", s => s.hbmFloor, 7],
+  ["req done", s => s.sampler ? s.sampler.nDone : undefined, 5],
+  ["aborted", s => s.sampler ? s.sampler.nAbort : undefined, 5],
+  ["mean in engine", s => s.sampler ? s.sampler.meanEngine : undefined, 6],
+  ["tok/s", s => s.sampler ? s.sampler.tokPerS : undefined, 6],
+];
+
+function renderSteps() {
+  const m = view.model, tbl = document.getElementById("steps-table");
+  if (!m || !m.steps.length) { tbl.innerHTML = "<tr><td>no steps found</td></tr>"; return; }
+  const hasRep = m.replicas.length > 0;
+  const cols = STEP_COLS.filter(c => (hasRep || c[2] < 4 || c[2] === 7) && m.steps.some(s => { const v = c[1](s); return v !== undefined && v !== null && v !== 0; }));
+  let html = "<thead><tr>" + cols.map(c => "<th>" + esc(c[0]) + "</th>").join("") + "</tr></thead><tbody>";
+  for (const s of m.steps) {
+    const phaseCols = cols.filter(c => c[2] === 2);
+    let hot = null, hv = -1;
+    for (const c of phaseCols) { const v = c[1](s) || 0; if (v > hv) { hv = v; hot = c; } }
+    html += '<tr data-step="' + s.step + '">' + cols.map(c => {
+      const v = c[1](s);
+      let txt;
+      if (v === undefined || v === null) txt = "";
+      else if (c[2] === 4) txt = pct(v);
+      else if (c[2] === 5 || c[2] === 0) txt = String(v);
+      else if (c[2] === 6) txt = v.toFixed(1);
+      else txt = v.toFixed(2);
+      return "<td" + (c === hot ? ' class="hot"' : "") + ">" + txt + "</td>";
+    }).join("") + "</tr>";
+  }
+  tbl.innerHTML = html + "</tbody>";
+  tbl.querySelectorAll("tbody tr").forEach(tr => tr.addEventListener("click", () => {
+    const st = m.steps.find(s => String(s.step) === tr.dataset.step);
+    if (st) { zoomStep(st); document.getElementById("tl-panel").scrollIntoView({behavior: "smooth"}); }
+  }));
+  view.stepCols = cols;
+}
+
+// Steps aligned at their start (small multiples): compare where each step's time goes.
+const sc = {canvas: null, ctx: null, rows: [], maxDur: 1, labelW: 70, rowH: 26, axisH: 22};
+function drawStepsChart() {
+  const m = view.model;
+  sc.canvas = sc.canvas || document.getElementById("steps-canvas");
+  sc.ctx = sc.ctx || sc.canvas.getContext("2d");
+  const ctx2 = sc.ctx, cv = sc.canvas;
+  if (!m || !m.steps.length) { cv.style.height = "0px"; return; }
+  const dpr = window.devicePixelRatio || 1, W = cv.parentElement.clientWidth;
+  const nRep = Math.min(m.replicas.length, 4), compact = m.steps.length > 30;
+  const wg = m.groups.find(g => g.id === "trainer_workers"), rankLane = wg && wg.lanes.length ? wg.lanes[0] : null;
+  const nStrips = nRep + (rankLane ? 1 : 0);
+  const barH = compact ? 7 : 10, stripH = compact ? 2 : 3, repH = compact ? 3 : 6;
+  sc.rowH = 2 + barH + stripH + nStrips * (repH + 1) + (compact ? 2 : 4) + (nStrips ? 0 : (compact ? 0 : 8));
+  const H = sc.axisH + m.steps.length * sc.rowH + 6;
+  cv.style.height = H + "px"; cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  ctx2.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx2.clearRect(0, 0, W, H);
+  sc.maxDur = Math.max(...m.steps.map(st => st.tNext - st.t0), 1e-3);
+  const L = sc.labelW, X = d => L + d / sc.maxDur * (W - L - 10);
+  // axis
+  const stepT = niceStep(sc.maxDur, Math.max(3, (W - L) / 90));
+  ctx2.font = "11px sans-serif"; ctx2.textBaseline = "top"; ctx2.fillStyle = "#656d76";
+  for (let t = 0; t <= sc.maxDur + 1e-9; t += stepT) {
+    const x = X(t);
+    ctx2.strokeStyle = "rgba(0,0,0,0.07)"; ctx2.beginPath(); ctx2.moveTo(x + 0.5, sc.axisH - 4); ctx2.lineTo(x + 0.5, H); ctx2.stroke();
+    ctx2.fillText(fmtDur(t).replace(".00 s", " s"), x + 2, 4);
+  }
+  const phases = trainerPhaseSpans(m);
+  const syncSpans = m.loop ? m.loop.spans.filter(s => s.name.startsWith("sync.")) : [];
+  sc.rows = [];
+  m.steps.forEach((st, i) => {
+    const y = sc.axisH + i * sc.rowH, a = st.t0, b = st.tNext;
+    if (i % 2) { ctx2.fillStyle = "rgba(9,105,218,0.035)"; ctx2.fillRect(0, y, W, sc.rowH); }
+    ctx2.fillStyle = "#1f2328"; ctx2.font = (compact ? "" : "bold ") + (compact ? 10 : 11) + "px sans-serif"; ctx2.textBaseline = "middle";
+    ctx2.fillText("step " + st.step, 6, y + (compact ? sc.rowH / 2 : 7));
+    if (!compact) { ctx2.fillStyle = "#656d76"; ctx2.font = "10px sans-serif"; ctx2.fillText(fmtDur(b - a), 6, y + 18); }
+    const segs = [];
+    for (const s of phases) {
+      const lo = Math.max(a, s.t0), hi = Math.min(b, s.t1);
+      if (hi <= lo) continue;
+      ctx2.fillStyle = colorFor(s.name, s.cat); ctx2.fillRect(X(lo - a), y + 2, Math.max(1, X(hi - a) - X(lo - a)), barH);
+      segs.push({lo, hi, name: s.name, y0: y + 2, y1: y + 2 + barH});
+    }
+    for (const s of syncSpans) {  // thin strip under update_weights
+      const lo = Math.max(a, s.t0), hi = Math.min(b, s.t1);
+      if (hi <= lo) continue;
+      ctx2.fillStyle = colorFor(s.name, s.cat); ctx2.fillRect(X(lo - a), y + 2 + barH, Math.max(1, X(hi - a) - X(lo - a)), stripH);
+      segs.push({lo, hi, name: s.name, y0: y + 2 + barH, y1: y + 2 + barH + stripH});
+    }
+    if (rankLane) {  // what trainer rank 0 executes on its chips (gaps = idle chips)
+      const yy = y + 3 + barH + stripH;
+      for (const s of (rankLane.byDepth[0] || [])) {
+        const lo = Math.max(a, s.t0), hi = Math.min(b, s.t1);
+        if (hi <= lo) continue;
+        ctx2.fillStyle = colorFor(s.name, s.cat); ctx2.fillRect(X(lo - a), yy, Math.max(1, X(hi - a) - X(lo - a)), repH);
+        segs.push({lo, hi, name: rankLane.id + " chips: " + s.name, y0: yy, y1: yy + repH});
+      }
+    }
+    m.replicas.slice(0, 4).forEach((rep, k) => {
+      const yy = y + 3 + barH + stripH + (k + (rankLane ? 1 : 0)) * (repH + 1);
+      for (const s of rep.states) {
+        const lo = Math.max(a, s.t0), hi = Math.min(b, s.t1);
+        if (hi <= lo) continue;
+        ctx2.fillStyle = COLORS["state." + s.state]; ctx2.fillRect(X(lo - a), yy, Math.max(1, X(hi - a) - X(lo - a)), repH);
+        segs.push({lo, hi, name: rep.id.replace("rollout_replica_", "replica ") + ": " + (STATE_LABEL[s.state] || s.state), y0: yy, y1: yy + repH});
+      }
+    });
+    sc.rows.push({st, y, segs});
+  });
+}
+function stepsChartHit(ev) {
+  const rect = sc.canvas.getBoundingClientRect(), x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+  const row = sc.rows.find(r => y >= r.y && y < r.y + sc.rowH);
+  if (!row) return null;
+  const W = sc.canvas.parentElement.clientWidth, d = (x - sc.labelW) / (W - sc.labelW - 10) * sc.maxDur;
+  const t = row.st.t0 + d;
+  const seg = row.segs.filter(g => y >= g.y0 - 1 && y <= g.y1 + 1 && t >= g.lo && t <= g.hi).sort((p, q) => (p.hi - p.lo) - (q.hi - q.lo))[0];
+  return {row, seg, d};
+}
+document.getElementById("steps-canvas").addEventListener("mousemove", ev => {
+  const h = stepsChartHit(ev);
+  if (h && h.seg) {
+    tooltip.innerHTML = "<b>" + esc(h.seg.name) + "</b> &middot; step " + h.row.st.step + "<br>" + kv("duration", fmtDur(h.seg.hi - h.seg.lo)) +
+      kv("from step start", fmtDur(h.seg.lo - h.row.st.t0) + " – " + fmtDur(h.seg.hi - h.row.st.t0));
+    tooltip.style.display = "block";
+    tooltip.style.left = Math.min(ev.clientX + 14, window.innerWidth - tooltip.offsetWidth - 8) + "px";
+    tooltip.style.top = (ev.clientY + 16) + "px";
+  } else tooltip.style.display = "none";
+});
+document.getElementById("steps-canvas").addEventListener("mouseleave", () => { tooltip.style.display = "none"; });
+document.getElementById("steps-canvas").addEventListener("click", ev => {
+  const h = stepsChartHit(ev);
+  if (h) { zoomStep(h.row.st); document.getElementById("tl-panel").scrollIntoView({behavior: "smooth"}); }
+});
+
+function renderLegend() {
+  const m = view.model, used = new Set();
+  for (const G of m.groups) for (const L of G.lanes) for (const s of L.spans) used.add(s.name + "\u0000" + s.cat);
+  const items = [];
+  const seen = new Set();
+  for (const k of used) {
+    const [name, cat] = k.split("\u0000");
+    if (cat === "worker") continue;
+    if (seen.has(name)) continue; seen.add(name);
+    items.push([name, colorFor(name, cat)]);
+  }
+  items.sort((p, q) => p[0].localeCompare(q[0]));
+  if (m.replicas.length) items.push(["rollout: generating", COLORS["state.busy"]], ["rollout: generating, gate closed", COLORS["state.drain"]],
+    ["rollout: paused", COLORS["state.paused"]],
+    ["rollout: idle", COLORS["state.idle"]], ["waiting requests", "rgba(0,137,123,0.30)"], ["request: decode (EOS)", COLORS["req.decode"]],
+    ["request: aborted", COLORS["req.abort"]], ["request: hit length", COLORS["req.length"]]);
+  document.getElementById("legend").innerHTML = items.map(([n, c]) => '<span class="it"><span class="sw" style="background:' + c +
+    '"></span>' + esc(n) + "</span>").join("");
+}
+
+
+// --------------------------------------------------------------------------------------------------------------------
+// HBM Memory tab (multi-panel SVG charts + per-step HBM phase correlation table)
+// --------------------------------------------------------------------------------------------------------------------
+const HBM_PHASE_COLORS = {
+  initial_weight_sync: "#ab47bc",
+  compute_ref_log_prob: "#9ccc65",
+  compute_log_prob: "#42a5f5",
+  update_actor: "#ef5350",
+  update_weights: "#8e24aa",
+  release_tpu_sync: "#ce93d8",
+  paused: "#fb8c00",
+};
+const HBM_CHIP_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#6a1b9a", "#00838f", "#ad1457", "#4e342e"];
+const GIB_TO_GB = 1.073741824;
+
+function fmtGibGb(v) {
+  if (v == null || !isFinite(v)) return "–";
+  return v.toFixed(2) + " GiB (" + (v * GIB_TO_GB).toFixed(2) + " GB)";
+}
+
+function trainerHbmShades(m) {
+  const shades = [];
+  if (m.loop) {
+    for (const s of m.loop.spans) {
+      if (s.name === "initial_weight_sync") shades.push({t0: s.t0, t1: s.t1, name: s.name});
+    }
+  }
+  const wg = m.groups.find(g => g.id === "trainer_workers");
+  const rank0 = wg && wg.lanes.length ? wg.lanes[0] : null;
+  if (rank0) {
+    for (const s of (rank0.byDepth[0] || [])) {
+      if (HBM_PHASE_COLORS[s.name]) shades.push({t0: s.t0, t1: s.t1, name: s.name});
+    }
+  }
+  return shades.sort((a, b) => a.t0 - b.t0);
+}
+
+function buildHbmSvgChart(title, H, t0, t1, shades, steps, width, height) {
+  const samples = H ? H.samples : [];
+  const cap = (H && H.cap) ? H.cap : 31.25;
+  const ymax = Math.max(Math.ceil(cap + 1.75), Math.ceil((H ? H.maxUsed : 0) + 1), 33);
+  const padL = 68, padR = 24, padT = 30, padB = 32;
+  const w = Math.max(200, width - padL - padR), h = height - padT - padB;
+  const span = Math.max(t1 - t0, 1e-6);
+  const X = t => padL + (t - t0) / span * w;
+  const Y = v => padT + h - (v / ymax) * h;
+
+  const out = [
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + width + " " + height + '" class="hbm-svg" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif" font-size="11">',
+    '<text x="' + padL + '" y="19" font-size="13" font-weight="600" fill="#1f2328">' + esc(title) + "</text>",
+  ];
+  for (const sh of shades) {
+    if (sh.t1 < t0 || sh.t0 > t1) continue;
+    const x0 = X(Math.max(sh.t0, t0)), rw = Math.max(0.6, X(Math.min(sh.t1, t1)) - x0);
+    const col = HBM_PHASE_COLORS[sh.name] || "#ccc";
+    out.push('<rect x="' + x0.toFixed(1) + '" y="' + padT + '" width="' + rw.toFixed(1) + '" height="' + h +
+             '" fill="' + col + '" opacity="0.24"><title>' + esc(sh.name) + " (" + fmtDur(sh.t1 - sh.t0) + " @ " + fmtClock(sh.t0) + ")</title></rect>");
+  }
+  const yStep = ymax > 48 ? 8 : 4;
+  for (let g = 0; g <= ymax; g += yStep) {
+    const yg = Y(g).toFixed(1);
+    out.push('<line x1="' + padL + '" x2="' + (padL + w) + '" y1="' + yg + '" y2="' + yg + '" stroke="#eaeef2"/>');
+    out.push('<text x="' + (padL - 6) + '" y="' + (Y(g) + 4).toFixed(1) + '" text-anchor="end" fill="#656d76">' + g + " GiB</text>");
+  }
+  for (const st of steps) {
+    if (st.t0 >= t0 && st.t0 <= t1) {
+      const xs = X(st.t0).toFixed(1);
+      out.push('<line x1="' + xs + '" x2="' + xs + '" y1="' + padT + '" y2="' + (padT + h) + '" stroke="#8c959f" stroke-dasharray="2,3"/>');
+      out.push('<text x="' + (X(st.t0) + 3).toFixed(1) + '" y="' + (padT + 11) + '" fill="#0969da" font-weight="600" font-size="10">S' + st.step + "</text>");
+    }
+  }
+  const nChips = H ? H.nChips : 0;
+  for (let c = 0; c < nChips; c++) {
+    const pts = [];
+    for (const s of samples) {
+      if (s.t < t0 || s.t > t1 || c >= s.used.length) continue;
+      pts.push(X(s.t).toFixed(1) + "," + Y(s.used[c]).toFixed(1));
+    }
+    const col = HBM_CHIP_COLORS[c % HBM_CHIP_COLORS.length];
+    if (pts.length) out.push('<polyline fill="none" stroke="' + col + '" stroke-width="1.4" points="' + pts.join(" ") + '"/>');
+    out.push('<text x="' + (padL + w - 66) + '" y="' + (padT + 14 + 14 * c) + '" fill="' + col + '" font-weight="600">chip ' + c + "</text>");
+  }
+  if (cap > 0) {
+    const yt = Y(cap).toFixed(1);
+    out.push('<line x1="' + padL + '" x2="' + (padL + w) + '" y1="' + yt + '" y2="' + yt + '" stroke="#b71c1c" stroke-dasharray="6,3"/>');
+    out.push('<text x="' + (padL + 6) + '" y="' + (Y(cap) - 5).toFixed(1) + '" fill="#b71c1c" font-weight="600">HBM capacity ' +
+             cap.toFixed(2) + " GiB (" + (cap * GIB_TO_GB).toFixed(2) + " GB)</text>");
+  }
+  const nTicks = 10;
+  for (let k = 0; k <= nTicks; k++) {
+    const tk = t0 + span * k / nTicks, xk = X(tk).toFixed(1);
+    out.push('<line x1="' + xk + '" x2="' + xk + '" y1="' + (padT + h) + '" y2="' + (padT + h + 4) + '" stroke="#8c959f"/>');
+    out.push('<text x="' + xk + '" y="' + (height - 9) + '" text-anchor="middle" fill="#656d76">+' +
+             (tk / 60).toFixed(1) + "m (" + tk.toFixed(0) + "s)</text>");
+  }
+  out.push("</svg>");
+  return out.join("");
+}
+
+function renderMemoryTab() {
+  const m = view.model;
+  if (!m) return;
+  const trHbm = m.hbm ? m.hbm.get("trainer_workers") : null;
+  const roHbms = [];
+  if (m.hbm) {
+    for (const [k, v] of m.hbm.entries()) {
+      if (k.startsWith("rollout_replica") && v.samples.length) roHbms.push(v);
+    }
+  }
+  const btnMem = document.getElementById("tab-btn-memory");
+  if (trHbm && trHbm.samples.length) {
+    btnMem.textContent = "HBM Memory (" + trHbm.maxUsed.toFixed(1) + " / " + (trHbm.cap || 31.25).toFixed(1) + " GiB)";
+  } else if (roHbms.length) {
+    btnMem.textContent = "HBM Memory (" + roHbms[0].maxUsed.toFixed(1) + " GiB)";
+  } else {
+    btnMem.textContent = "HBM Memory";
+  }
+  if (view.activeTab !== "memory") return;
+
+  const shades = trainerHbmShades(m);
+  const phaseMax = name => {
+    if (!trHbm || !trHbm.samples.length) return null;
+    let hi = null;
+    for (const sh of shades) {
+      if (sh.name !== name) continue;
+      const v = hbmMaxIn(trHbm, sh.t0, sh.t1);
+      if (v != null && (hi == null || v > hi)) hi = v;
+    }
+    return hi;
+  };
+  const refMax = phaseMax("compute_ref_log_prob");
+  const actorMax = phaseMax("update_actor");
+  const syncMax = Math.max(phaseMax("update_weights") || 0, phaseMax("initial_weight_sync") || 0) || null;
+
+  const cards = [];
+  if (trHbm && trHbm.samples.length) {
+    const cap = trHbm.cap || 31.25;
+    cards.push(["trainer peak HBM", trHbm.maxUsed.toFixed(2) + " / " + cap.toFixed(2) + " GiB (" + pct(trHbm.maxUsed / cap) + ")",
+                (trHbm.maxUsed * GIB_TO_GB).toFixed(2) + " / " + (cap * GIB_TO_GB).toFixed(2) + " GB · " + trHbm.nChips + " chips"]);
+    cards.push(["trainer idle floor", trHbm.minUsed.toFixed(2) + " GiB (" + pct(trHbm.minUsed / cap) + ")",
+                (trHbm.minUsed * GIB_TO_GB).toFixed(2) + " GB · " + trHbm.samples.length + " samples (1 Hz)"]);
+    if (refMax != null) cards.push(["compute_ref_log_prob max", refMax.toFixed(2) + " GiB", (refMax * GIB_TO_GB).toFixed(2) + " GB · reference forward"]);
+    if (actorMax != null) cards.push(["update_actor peak", actorMax.toFixed(2) + " GiB", (actorMax * GIB_TO_GB).toFixed(2) + " GB · fwd_bwd + optimizer_step"]);
+    if (syncMax != null) cards.push(["update_weights max", syncMax.toFixed(2) + " GiB", (syncMax * GIB_TO_GB).toFixed(2) + " GB · weight sync"]);
+  }
+  for (const rh of roHbms) {
+    const cap = rh.cap || 31.25;
+    cards.push([rh.group.replace("rollout_replica_", "rollout replica ") + " HBM",
+                rh.maxUsed.toFixed(2) + " / " + cap.toFixed(2) + " GiB (" + pct(rh.maxUsed / cap) + ")",
+                "floor " + rh.minUsed.toFixed(2) + " GiB · " + (rh.maxUsed * GIB_TO_GB).toFixed(2) + " GB · " + rh.nChips + " chips"]);
+  }
+  document.getElementById("hbm-sum-hint").textContent = (trHbm || roHbms.length)
+    ? "1 Hz per-chip HBM sampled via tpu-info · 1 GiB = 1.073741824 GB"
+    : "no HBM counter events in this log (run with VERL_TPU_TIMELINE=1 and tpu-info installed, or pass --hbm-csv)";
+  document.getElementById("hbm-cards").innerHTML = cards.map(c => '<div class="card"><div class="k">' + esc(c[0]) +
+    '</div><div class="v">' + esc(c[1]) + '</div><div class="s">' + esc(c[2] || "") + "</div></div>").join("");
+
+  const legItems = [
+    ["initial_weight_sync", HBM_PHASE_COLORS.initial_weight_sync],
+    ["compute_ref_log_prob (ref forward)", HBM_PHASE_COLORS.compute_ref_log_prob],
+    ["update_actor (fwd_bwd + optimizer_step)", HBM_PHASE_COLORS.update_actor],
+    ["update_weights (weight sync)", HBM_PHASE_COLORS.update_weights],
+    ["rollout paused (weight sync)", HBM_PHASE_COLORS.paused],
+  ];
+  document.getElementById("hbm-legend").innerHTML = legItems.map(([n, c]) =>
+    '<span class="it"><span class="sw" style="background:' + c + ';opacity:0.45"></span>' + esc(n) + "</span>"
+  ).join("");
+
+  const wrap = document.getElementById("hbm-charts");
+  const W = Math.max(680, (wrap.clientWidth || 1200) - 24);
+  const charts = [];
+  const allT = [];
+  if (trHbm) for (const s of trHbm.samples) allT.push(s.t);
+  for (const rh of roHbms) for (const s of rh.samples) allT.push(s.t);
+  const tMin = allT.length ? Math.min(0, ...allT) : 0;
+  const tMax = allT.length ? Math.max(m.duration || 1, ...allT) : Math.max(1, m.duration || 1);
+
+  if (trHbm && trHbm.samples.length) {
+    const cap = trHbm.cap || 31.25;
+    const st3 = m.steps.find(s => s.step === 3) || m.steps[Math.min(2, m.steps.length - 1)];
+    const tInitEnd = st3 ? st3.tNext : Math.min(tMax, tMin + 420);
+    charts.push(buildHbmSvgChart(
+      "1. Startup & Initial Build-Up (t = 0 to +" + (tInitEnd / 60).toFixed(1) + "m, Init → Step " + (st3 ? st3.step : 1) +
+      ") — Trainer Peak " + trHbm.maxUsed.toFixed(2) + " GiB / " + cap.toFixed(2) + " GiB",
+      trHbm, tMin, tInitEnd, shades, m.steps, W, 310
+    ));
+    const [s0, s1] = steadyWindow();
+    const z0 = (view.t1 > view.t0 && (view.t0 > 0 || view.t1 < m.duration)) ? Math.max(tMin, view.t0) : s0;
+    const z1 = (view.t1 > view.t0 && (view.t0 > 0 || view.t1 < m.duration)) ? Math.min(tMax, view.t1) : s1;
+    if (z1 > z0 + 1e-3) {
+      charts.push(buildHbmSvgChart(
+        "2. Zoomed / Steady-State Window (" + fmtClock(z0) + " – " + fmtClock(z1) +
+        "): compute_ref_log_prob (green) → update_actor (red) → update_weights (purple)",
+        trHbm, z0, z1, shades, m.steps, W, 310
+      ));
+    }
+    charts.push(buildHbmSvgChart(
+      "3. Full Run — Trainer " + trHbm.nChips + "× TPU Chips: HBM Used (GiB) with RL Phase Shading (Peak " +
+      trHbm.maxUsed.toFixed(2) + " GiB / " + cap.toFixed(2) + " GiB)",
+      trHbm, tMin, tMax, shades, m.steps, W, 310
+    ));
+  }
+  roHbms.forEach((rh, idx) => {
+    const cap = rh.cap || 31.25;
+    const rep = m.replicas.find(r => r.id === rh.group);
+    const roShades = rep ? rep.paused.map(([a, b]) => ({t0: a, t1: b, name: "paused"})) : [];
+    charts.push(buildHbmSvgChart(
+      (charts.length + 1) + ". Full Run — " + rh.group.replace("rollout_replica_", "Rollout Replica ") + " (" +
+      rh.nChips + "× TPU Chips): HBM Used (GiB) (Peak " + rh.maxUsed.toFixed(2) + " GiB / " + cap.toFixed(2) + " GiB)",
+      rh, tMin, tMax, roShades, m.steps, W, 300
+    ));
+  });
+  wrap.innerHTML = charts.length ? charts.join("") : '<div class="help">No 1 Hz HBM counter events found in this log.</div>';
+
+  // Per-Step HBM Memory Breakdown Table
+  const tbl = document.getElementById("hbm-steps-table");
+  if (!m.steps.length || (!trHbm && !roHbms.length)) {
+    tbl.innerHTML = "<tr><td>No per-step HBM samples available</td></tr>";
+    return;
+  }
+  const ro0 = roHbms[0] || null;
+  const cap = (trHbm && trHbm.cap) || (ro0 && ro0.cap) || 31.25;
+  let th = "<thead><tr><th>Step</th><th>Start</th><th>Window</th><th>Trainer Idle Floor</th>" +
+           "<th><code>compute_ref_log_prob</code> Max</th><th><code>update_actor</code> Peak</th>" +
+           "<th><code>update_weights</code> Max</th><th>Trainer Peak % Cap</th>";
+  if (ro0) th += "<th>Rollout Floor</th><th>Rollout Peak</th>";
+  th += "</tr></thead><tbody>";
+
+  const stepRows = [];
+  for (const st of m.steps) {
+    const a = st.t0, b = st.tNext;
+    const floor = hbmMinIn(trHbm, a, b);
+    const peak = hbmMaxIn(trHbm, a, b);
+    const stepPhMax = name => {
+      let hi = null;
+      for (const sh of shades) {
+        if (sh.name !== name || sh.t1 < a || sh.t0 > b) continue;
+        const v = hbmMaxIn(trHbm, Math.max(a, sh.t0), Math.min(b, sh.t1));
+        if (v != null && (hi == null || v > hi)) hi = v;
+      }
+      return hi;
+    };
+    const rRef = stepPhMax("compute_ref_log_prob");
+    const rAct = stepPhMax("update_actor");
+    const rSync = stepPhMax("update_weights");
+    const roFloor = ro0 ? hbmMinIn(ro0, a, b) : null;
+    const roPeak = ro0 ? hbmMaxIn(ro0, a, b) : null;
+    stepRows.push({st, floor, rRef, rAct, rSync, peak, roFloor, roPeak});
+    th += '<tr data-step="' + st.step + '">' +
+          "<td>Step " + st.step + "</td>" +
+          "<td>" + fmtClock(a) + "</td>" +
+          "<td>" + fmtDur(b - a) + "</td>" +
+          "<td>" + fmtGibGb(floor) + "</td>" +
+          "<td>" + fmtGibGb(rRef) + "</td>" +
+          "<td><b>" + fmtGibGb(rAct) + "</b></td>" +
+          "<td>" + fmtGibGb(rSync) + "</td>" +
+          "<td>" + (peak != null ? pct(peak / cap) : "–") + "</td>" +
+          (ro0 ? "<td>" + fmtGibGb(roFloor) + "</td><td>" + fmtGibGb(roPeak) + "</td>" : "") +
+          "</tr>";
+  }
+  const steady = stepRows.filter(r => r.st.step >= 2);
+  const avgSet = steady.length ? steady : stepRows;
+  if (avgSet.length > 1) {
+    const avg = fn => { const xs = avgSet.map(fn).filter(x => x != null && isFinite(x)); return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null; };
+    const aPeak = avg(r => r.peak);
+    th += '<tr style="background:#f6f8fa;font-weight:600">' +
+          "<td>Mean (steps " + avgSet[0].st.step + "–" + avgSet[avgSet.length - 1].st.step + ")</td>" +
+          "<td>–</td>" +
+          "<td>" + fmtDur(avg(r => r.st.tNext - r.st.t0)) + "</td>" +
+          "<td>" + fmtGibGb(avg(r => r.floor)) + "</td>" +
+          "<td>" + fmtGibGb(avg(r => r.rRef)) + "</td>" +
+          "<td><b>" + fmtGibGb(avg(r => r.rAct)) + "</b></td>" +
+          "<td>" + fmtGibGb(avg(r => r.rSync)) + "</td>" +
+          "<td>" + (aPeak != null ? pct(aPeak / cap) : "–") + "</td>" +
+          (ro0 ? "<td>" + fmtGibGb(avg(r => r.roFloor)) + "</td><td>" + fmtGibGb(avg(r => r.roPeak)) + "</td>" : "") +
+          "</tr>";
+  }
+  tbl.innerHTML = th + "</tbody>";
+  tbl.querySelectorAll("tbody tr[data-step]").forEach(tr => tr.addEventListener("click", () => {
+    const st = m.steps.find(s => String(s.step) === tr.dataset.step);
+    if (st) { zoomStep(st); document.getElementById("hbm-charts-panel").scrollIntoView({behavior: "smooth"}); }
+  }));
+}
+
+// --------------------------------------------------------------------------------------------------------------------
+// Comparison of two runs (steady state = steps >= 2, validation excluded from the step means)
+// --------------------------------------------------------------------------------------------------------------------
+function steadyStats(m) {
+  const steps = m.steps.filter(s => s.step >= 2);
+  const use = steps.length ? steps : m.steps;
+  const mean = f => { const v = use.map(f).filter(x => x != null && isFinite(x)); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; };
+  const ph = n => mean(s => s.phase[n] || 0);
+  const rows = [
+    ["steps averaged", use.length, "n"],
+    ["timing_s/step", mean(s => s.stepDur), "s"],
+    ["wall time per step (start→next, incl. validation)", mean(s => s.total), "s"],
+    ["wait for rollout (gen)", mean(s => (s.phase.gen || 0) + (s.phase.switch_wait || 0)), "s"],
+    ["old_log_prob", ph("old_log_prob"), "s"], ["ref", ph("ref"), "s"], ["adv", ph("adv"), "s"],
+    ["update_actor", ph("update_actor"), "s"], ["update_weights", ph("update_weights"), "s"],
+    ["↳ sync.quiesce", ph("sync.quiesce"), "s"], ["↳ sync.trainer_send", ph("sync.trainer_send"), "s"],
+    ["↳ sync.p2p_transfer", (ph("sync.p2p_transfer") || 0) + (ph("sync.transfer") || 0), "s"],
+    ["↳ sync.sampler_install", ph("sync.sampler_install"), "s"], ["↳ sync.parity_check", ph("sync.parity_check"), "s"],
+    ["metrics", ph("metrics"), "s"],
+    ["trainer HBM peak (GiB)", mean(s => s.hbmPeak), "x"],
+    ["trainer HBM floor (GiB)", mean(s => s.hbmFloor), "x"],
+  ];
+  if (m.replicas.length) {
+    rows.push(["rollout generating", mean(s => s.sampler.busy / s.total), "%"], ["rollout paused", mean(s => s.sampler.paused / s.total), "%"],
+              ["rollout idle", mean(s => s.sampler.idle / s.total), "%"], ["generated tokens/s", mean(s => s.sampler.tokPerS), "x"],
+              ["requests aborted per step", mean(s => s.sampler.nAbort), "x"]);
+  }
+  return rows;
+}
+function renderComparison(a, b) {
+  const A = steadyStats(a), B = steadyStats(b), Bmap = new Map(B.map(r => [r[0], r]));
+  const fmt = (v, u) => v == null ? "–" : u === "%" ? pct(v) : u === "n" ? String(v) : u === "x" ? v.toFixed(1) : v.toFixed(2);
+  let html = "<thead><tr><th>steady state (steps ≥ 2)</th><th>" + esc(a.source || "A") + "</th><th>" + esc(b.source || "B") +
+             "</th><th>B − A</th><th>B / A</th></tr></thead><tbody>";
+  for (const [name, va, u] of A) {
+    const vb = (Bmap.get(name) || [])[1];
+    const d = va != null && vb != null ? vb - va : null;
+    const ratio = va && vb != null && u !== "n" ? vb / va : null;
+    const better = d == null || u === "n" ? "" : ((u === "%" && name !== "rollout generating" ? d < 0 : u === "x" && name.startsWith("generated") ? d > 0 : d < 0) ? "color:#1a7f37" : "color:#cf222e");
+    html += "<tr><td>" + esc(name) + "</td><td>" + fmt(va, u) + "</td><td>" + fmt(vb, u) + '</td><td style="' + (Math.abs(d || 0) > 1e-9 ? better : "") + '">' +
+            (d == null || u === "n" ? "" : (d > 0 ? "+" : "") + (u === "%" ? (100 * d).toFixed(1) + " pp" : d.toFixed(2))) + "</td><td>" +
+            (ratio == null ? "" : ratio.toFixed(2) + "×") + "</td></tr>";
+  }
+  document.getElementById("cmp-table").innerHTML = html + "</tbody>";
+  document.getElementById("cmp-hint").textContent = "A = the loaded run, B = " + (b.source || "the comparison run") + "; green = B better";
+  document.getElementById("cmp-panel").classList.remove("hidden");
+}
+document.getElementById("file-cmp").addEventListener("change", async ev => {
+  const f = ev.target.files[0];
+  if (!f || !view.model) { if (!view.model) setStatus("load a log first, then compare", "warn"); return; }
+  const text = await f.text();
+  let parsed;
+  const m = /<script id="tl-embedded" type="application\/json">([\s\S]*?)<\/script>/.exec(text);  // a published report
+  if (m && m[1].trim()) parsed = JSON.parse(m[1]);
+  else { const p = createParser(); p.push(text); parsed = p.end(); }
+  renderComparison(view.model, buildModel(parsed, parsed.source || f.name));
+  document.getElementById("cmp-panel").scrollIntoView({behavior: "smooth"});
+});
+
+// --------------------------------------------------------------------------------------------------------------------
+// Exports
+// --------------------------------------------------------------------------------------------------------------------
+function download(name, text, type) {
+  try {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([text], {type}));
+    a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  } catch (e) { setStatus("download failed (sandboxed page?): " + e, "err"); }
+}
+function exportPerfetto() {
+  const m = view.model; if (!m) return;
+  const out = [], us = t => Math.round(t * 1e6);
+  m.groups.forEach((G, pi) => {
+    out.push({ph: "M", name: "process_name", pid: pi + 1, args: {name: G.id}});
+    G.lanes.forEach((L, ti) => {
+      out.push({ph: "M", name: "thread_name", pid: pi + 1, tid: ti + 1, args: {name: L.id}});
+      for (const s of L.spans) out.push({ph: "X", name: s.name, cat: s.cat || "", pid: pi + 1, tid: ti + 1, ts: us(s.t0), dur: us(s.t1 - s.t0), args: Object.assign({step: s.step}, s.args)});
+    });
+    const hbm = m.hbm ? m.hbm.get(G.id) : null;
+    if (hbm) {
+      for (const s of hbm.samples) {
+        const chipArgs = {};
+        s.used.forEach((u, c) => { chipArgs["chip_" + c + "_gib"] = u; });
+        out.push({ph: "C", name: "HBM (GiB)", pid: pi + 1, ts: us(s.t), args: chipArgs});
+      }
+    }
+    const rep = m.replicas.find(r => r.id === G.id);
+    if (rep) {
+      for (const q of rep.requests) out.push({ph: "X", name: "request:" + q.stop, cat: "req", pid: pi + 1, tid: 1000 + (q.row || 0),
+        ts: us(q.t0), dur: us(q.t1 - q.t0), args: {admit_s: q.tAdmit - q.t0, first_s: q.tFirst - q.t0, in: q.nIn, out: q.nOut, wv: q.wv}});
+      for (const o of rep.occ) out.push({ph: "C", name: "requests", pid: pi + 1, ts: us(o.t), args: {engine: o.engine, decode: o.decode, parked: o.parked}});
+    }
+  });
+  download((m.source || "timeline").replace(/\.[^.]*$/, "") + ".perfetto.json", JSON.stringify({traceEvents: out, displayTimeUnit: "ms"}), "application/json");
+}
+function exportCsv() {
+  const m = view.model; if (!m || !view.stepCols) return;
+  const cols = view.stepCols;
+  const lines = [cols.map(c => c[0]).join(",")];
+  for (const s of m.steps) lines.push(cols.map(c => { const v = c[1](s); return v == null ? "" : typeof v === "number" ? +v.toFixed(4) : '"' + v + '"'; }).join(","));
+  download((m.source || "timeline").replace(/\.[^.]*$/, "") + ".steps.csv", lines.join("\n"), "text/csv");
+}
+
+// --------------------------------------------------------------------------------------------------------------------
+// Loading
+// --------------------------------------------------------------------------------------------------------------------
+function setStatus(msg, cls) { const el = document.getElementById("status"); el.textContent = msg || ""; el.className = cls || ""; }
+
+function showModel(model, keepView) {
+  const prev = view.model;
+  const followEdge = keepView && prev && view.t1 >= prev.duration - 1;
+  view.model = model;
+  document.getElementById("drop").classList.add("hidden");
+  for (const id of ["sum-panel", "tl-panel", "steps-panel"]) document.getElementById(id).classList.remove("hidden");
+  document.getElementById("src-name").textContent = model.source || "";
+  // the "trainer ranks" toggle only matters for logs that have per-rank lanes
+  document.getElementById("opt-ranks").parentElement.style.display =
+    (model.groups || []).some(g => g.id === "trainer_workers") ? "" : "none";
+  const sel = document.getElementById("step-select");
+  sel.innerHTML = '<option value="">step&hellip;</option>' + model.steps.map(s => '<option value="' + s.step + '">step ' + s.step + "</option>").join("");
+  renderLegend();
+  renderSteps();
+  drawStepsChart();
+  renderMemoryTab();
+  const nReq = model.replicas.reduce((s, r) => s + r.requests.length, 0);
+  if (model.kind === "legacy") {
+    setStatus(model.steps.length ? "No VERL_TIMELINE lines in this log: showing an approximate trainer-only timeline rebuilt from " +
+      model.steps.length + " steps of timing_s/* metrics (phases laid end to end). Rerun with VERL_TPU_TIMELINE=1 for exact per-actor lanes."
+      : "Found neither VERL_TIMELINE lines nor step metrics in this file.", "warn");
+  } else {
+    setStatus(model.nEvents + " timeline events · " + model.steps.length + " steps" +
+      (model.synthesized ? " (trainer-loop phases laid out from timing_s/*, anchored at each step's weight sync)" : "") +
+      " · " + model.replicas.length + " rollout replica(s) · " +
+      nReq + " requests · run length " + fmtDur(model.duration) + " (t = 0 is " + fmtWall(model.T0) + ")");
+  }
+  resize();
+  if (followEdge) { const shift = model.duration - prev.duration; setView(view.t0 + (view.t0 > 0 ? shift : 0), view.t1 + shift); }
+  else if (keepView && view.t1 > view.t0) { draw(); updateSummary(); }
+  else if (model.steps.length > 2) { const [a, b] = steadyWindow(); setView(a - (b - a) * 0.01, b + (b - a) * 0.01); }
+  else fitAll();
+}
+
+async function loadFile(file) {
+  setStatus("reading " + file.name + " …");
+  const t = performance.now();
+  const parsed = await parseFile(file, f => setStatus("reading " + file.name + " … " + (100 * f).toFixed(0) + "%"));
+  const model = buildModel(parsed, file.name);
+  showModel(model);
+  if (parsed.bad) setStatus(document.getElementById("status").textContent + " · " + parsed.bad + " unparsable timeline lines", "warn");
+  console.log("parsed", parsed.lines, "lines in", (performance.now() - t).toFixed(0), "ms");
+}
+
+async function loadUrl(url, keepView) {
+  const r = await fetch(url, {cache: "no-store"});
+  if (!r.ok) throw new Error(r.status + " " + r.statusText);
+  const ct = r.headers.get("content-type") || "";
+  const text = await r.text();
+  let parsed;
+  if (ct.includes("json") || /^\s*\{\s*"(source|events)"/.test(text.slice(0, 200))) parsed = JSON.parse(text);
+  else { const p = createParser(); p.push(text); parsed = p.end(); }
+  showModel(buildModel(parsed, parsed.source || url.split("/").pop()), keepView);
+}
+
+document.getElementById("file").addEventListener("change", ev => { const f = ev.target.files[0]; if (f) loadFile(f); });
+const drop = document.getElementById("drop");
+for (const tgt of [document.body]) {
+  tgt.addEventListener("dragover", ev => { ev.preventDefault(); drop.classList.add("over"); });
+  tgt.addEventListener("dragleave", () => drop.classList.remove("over"));
+  tgt.addEventListener("drop", ev => { ev.preventDefault(); drop.classList.remove("over"); const f = ev.dataTransfer.files[0]; if (f) loadFile(f); });
+}
+document.getElementById("btn-fit").onclick = fitAll;
+document.getElementById("btn-steady").onclick = () => { const [a, b] = steadyWindow(); setView(a, b); };
+document.getElementById("step-select").onchange = ev => { const st = view.model && view.model.steps.find(s => String(s.step) === ev.target.value); if (st) zoomStep(st); };
+function stepNav(d) {
+  const m = view.model; if (!m || !m.steps.length) return;
+  const mid = (view.t0 + view.t1) / 2;
+  let i = m.steps.findIndex(s => s.t0 <= mid && mid < s.tNext);
+  i = i < 0 ? 0 : Math.max(0, Math.min(m.steps.length - 1, i + d));
+  zoomStep(m.steps[i]);
+}
+document.getElementById("btn-prev").onclick = () => stepNav(-1);
+document.getElementById("btn-next").onclick = () => stepNav(1);
+for (const id of ["opt-requests", "opt-ranks", "opt-depth", "opt-wv"]) document.getElementById(id).onchange = () => view.model && resize();
+document.getElementById("btn-export").onclick = exportPerfetto;
+document.getElementById("btn-csv").onclick = exportCsv;
+document.addEventListener("keydown", ev => {
+  if (ev.target.tagName === "INPUT" || ev.target.tagName === "SELECT") return;
+  if (ev.key === "ArrowLeft") stepNav(-1); else if (ev.key === "ArrowRight") stepNav(1);
+  else if (ev.key === "f") fitAll(); else if (ev.key === "s") document.getElementById("btn-steady").click();
+});
+
+(async function init() {
+  const runs = document.getElementById("tl-runs").textContent.trim();
+  if (runs) {
+    try {
+      const list = JSON.parse(runs);
+      document.getElementById("runs-list").innerHTML = "<ul>" + list.map(r => '<li><a href="' + esc(r.href) + '">' + esc(r.name) +
+        "</a>" + (r.desc ? " &mdash; " + esc(r.desc) : "") + (r.log ? ' (<a href="' + esc(r.log) + '">raw log</a>)' : "") + "</li>").join("") + "</ul>";
+      document.getElementById("runs-panel").classList.remove("hidden");
+    } catch (e) { console.warn("bad tl-runs", e); }
+  }
+  const emb = document.getElementById("tl-embedded").textContent.trim();
+  if (emb) {
+    try {
+      const d = JSON.parse(emb);
+      if (d.home) { const h = document.getElementById("home-link"); h.href = d.home; h.classList.remove("hidden"); }
+      showModel(buildModel(d, d.source || "embedded"));
+      applyHash();
+      return;
+    }
+    catch (e) { setStatus("embedded data is broken: " + e, "err"); }
+  }
+  const qs = new URLSearchParams(location.search);
+  const src = qs.get("src");
+  if (src) {
+    try {
+      await loadUrl(src);
+      applyHash();
+      const live = parseFloat(qs.get("live") || "0");
+      if (live > 0) setInterval(() => loadUrl(src, true).catch(e => setStatus("refresh failed: " + e, "err")), live * 1000);
+    } catch (e) { setStatus("could not fetch " + src + ": " + e + " — download it and drop it here instead.", "err"); }
+  }
+})();
+</script>
+</body>
+</html>

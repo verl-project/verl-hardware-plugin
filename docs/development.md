@@ -931,6 +931,7 @@ verl-hardware-plugin/
 │   │       ├── registration.py           # Engine, profiler, and rollout registration
 │   │       ├── platform_<vendor>.py      # Platform implementation
 │   │       ├── engines/                  # FSDP, Megatron, checkpoint engines, etc.
+│   │       │                             # (TPU: engines/ holds the training engine, weight_sync/ the checkpoint engines)
 │   │       ├── rollout/                  # Optional rollout implementations
 │   │       ├── profilers/                # Optional hardware profilers
 │   │       ├── patches/                  # Optional hardware patches
@@ -968,6 +969,7 @@ The following files in this repository serve as examples:
 | Cambricon MLU | `accelerators/mlu/platform_mlu.py` | `accelerators/mlu/engines/fsdp_mlu.py`, `accelerators/mlu/engines/megatron_mlu.py` |
 | MetaX | `accelerators/metax/platform_cuda_metax.py` | `accelerators/metax/engines/fsdp_metax.py`, `accelerators/metax/engines/megatron_metax.py` |
 | Enflame GCU | `accelerators/enflame/platform_enflame.py` | `accelerators/enflame/engines/fsdp_enflame.py`, `accelerators/enflame/engines/megatron_enflame.py` |
+| Google TPU | `accelerators/tpu/platform_tpu.py` | `accelerators/tpu/engines/torchtitan_tpu.py`, `accelerators/tpu/weight_sync/tpu_sync_checkpoint_engine.py`, `accelerators/tpu/rollout/tpu_vllm.py` |
 
 ---
 

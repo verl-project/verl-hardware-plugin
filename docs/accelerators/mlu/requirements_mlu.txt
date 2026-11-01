@@ -1,8 +1,25 @@
 # requirements.txt records the full set of dependencies for development
-# [Notice]:
-#   Before [pip install -r requirements_mlu.txt]
-#   Please [cd PATH/verl && pip install -e . && pip install -r requirements.txt]
 
+codetiming
+dill
+hydra-core
+numpy>=2.0.0
+pandas
+pyarrow>=19.0.0
+pybind11
+pylatexenc
+pre-commit
+ray[default]
+tensordict>=0.8.0,<=0.10.0,!=0.9.0
+torchdata
+wandb
+packaging>=20.0
+uvicorn
+fastapi
+latex2sympy2_extended
+math_verify
+tensorboard
+TransferQueue==0.1.11
 
 accelerate==1.14.0
 click==8.2.1
@@ -13,3 +30,4 @@ transformers==5.15.0 # support Qwen3.5
 peft==0.18.0
 
 # emerging-optimizers # for Muon in py3.12
+

@@ -1,9 +1,9 @@
 # Google TPU Quick Start
 
-> **TPU support is under active development and testing.** The TPU platform and the
-> TorchTitan TPU training engine are registered and can be verified on any host, but the
-> end-to-end training recipes are not published yet — see the status note in the
-> [User Guide](./README.md). This page covers what you can verify today.
+This page verifies the TPU platform and the TorchTitan TPU training engine. For end-to-end GRPO
+training (Qwen3-0.6B / Qwen3-4B on GSM8K, TorchTitan trainer + vLLM rollout on TPU v6e), follow verl's
+[`examples/tpu/grpo`](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo): it has the image `Dockerfile`, a KubeRay `RayCluster`
+and step-by-step commands (see also [Run GRPO](#6-run-grpo-on-tpu) below).
 
 ## 1. Select the Platform
 
@@ -81,3 +81,15 @@ torchrun --nnodes=1 --nproc_per_node=4 -m verl.trainer.sft_trainer \
     trainer.device=tpu
 ```
 
+## 6. Run GRPO on TPU
+
+verl's [`examples/tpu/grpo`](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) runs GRPO on GSM8K with a TorchTitan trainer on one TPU v6e
+slice and a vLLM rollout on another, with `tpu-sync` weight sync between them (see
+[vLLM Rollout](./rollout.md) and [Weight Sync](./weight_sync.md)). Its README covers the image, the GKE /
+KubeRay cluster (2 v6e-4 slices by default) and the `ray job submit` commands:
+
+- `run_qwen3_0_6b_torchtitan.sh`: 5-step smoke test (Qwen3-0.6B).
+- `run_qwen3_4b_torchtitan.sh`: 100-step GRPO run (Qwen3-4B).
+
+Ray ships this plugin to every worker with `py_modules` and `VERL_USE_EXTERNAL_MODULES=verl_hardware_plugin`,
+so no `pip install` is needed in the image.

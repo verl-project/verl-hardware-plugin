@@ -1,43 +1,27 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Monkeypatches for Google TPU (``tpu_dist``) distributed collectives and runtime helpers.
+"""Monkeypatch of ``torch.distributed.all_reduce`` for TPU tensors sent to Gloo-only process groups.
 
-Why this is needed:
-1. ``torch_tpu``'s ``ProcessGroupTPU`` (``tpu_dist``) implements ``ReduceOp.SUM``,
-   ``ReduceOp.MAX``, ``ReduceOp.MIN``, and ``ReduceOp.PRODUCT``, but does not
-   implement ``ReduceOp.AVG``. Call sites in verl-core (``verl/workers/engine_workers.py``,
-   ``verl/trainer/sft_trainer.py``, and ``verl/utils/profiler/performance.py::reduce_timing``)
-   call ``torch.distributed.all_reduce(x, op=ReduceOp.AVG, ...)`` directly.
-2. Subgroups created by ``init_device_mesh("tpu", ...)`` register only the ``tpu`` device
-   (``tpu_dist``), not ``cpu:gloo``. Calling ``torch.distributed.all_gather_object(..., group=dp_group)``
-   (via ``allgather_dict_into_dict`` in ``TrainingWorker._postprocess_output``) routes object
-   serialization to TPU tensors and invokes ``tensor.resize_()``, which PJRT/XLA rejects.
-3. ``verl.utils.distributed.set_numa_affinity`` queries ``pynvml`` (NVIDIA NVML) when
-   ``libnuma.so`` is present, and ``verl.utils.torch_functional.logprobs_from_logits``
-   falls back to row-wise Python loops (``logprobs_from_logits_v2``) instead of vectorized
-   ``logprobs_from_logits_naive`` on TPU.
+Why this is needed: with model parallelism (``dp_size < world_size``) the TorchTitan TPU engine returns a
+host-side Gloo data-parallel group, and verl's ``TrainingWorker._postprocess_output`` all-reduces a TPU tensor with
+``ReduceOp.AVG`` on it. Gloo cannot take TPU tensors and has no AVG, so the tensor is staged through CPU and AVG
+becomes SUM + divide. Every other call passes through unchanged (torch-tpu >= 0.2.0 implements AVG on ``tpu_dist``).
 
-All patches are applied lazily when ``PlatformTPU()`` is constructed (i.e. only when the
-``tpu`` platform is selected for the process).
+Applied lazily when ``PlatformTPU()`` is constructed (i.e. only when the ``tpu`` platform is selected).
 """
 
 import logging
 import os
-import pickle
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
-import verl.utils.distributed as verl_dist
-import verl.utils.torch_functional as verl_tf
-
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _applied = False
-_runtime_helpers_applied = False
 
 
 def _tpu_available() -> bool:
@@ -46,133 +30,73 @@ def _tpu_available() -> bool:
             import torch_tpu  # noqa: F401
         except Exception:
             return False
-    tpu = getattr(torch, "tpu", None)
-    is_avail = getattr(tpu, "is_available", None)
-    return bool(callable(is_avail) and is_avail())
+    from verl_hardware_plugin.accelerators.tpu import device_api
+
+    return device_api.is_available()
 
 
-def _is_tpu_all_reduce(tensor: Any, group: Any) -> bool:
-    backend = str(dist.get_backend(group))
-    if backend == "tpu_dist":
-        return True
-    if "tpu:tpu_dist" in backend:
-        device = getattr(tensor, "device", None)
-        return getattr(device, "type", None) == "tpu"
-    return False
-
-
-def _detach_tpu_tensors_to_cpu(obj: Any) -> Any:
-    if isinstance(obj, torch.Tensor):
-        if obj.device.type == "tpu":
-            return obj.detach().cpu()
-        return obj
-    if isinstance(obj, dict):
-        return {k: _detach_tpu_tensors_to_cpu(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_detach_tpu_tensors_to_cpu(v) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_detach_tpu_tensors_to_cpu(v) for v in obj)
-    return obj
-
-
-def _noop_numa_affinity() -> None:
-    return None
-
-
-def _apply_verl_runtime_helpers() -> None:
-    global _runtime_helpers_applied
-    if _runtime_helpers_applied:
-        return
-
+def _is_gloo_only_group_with_tpu_tensor(tensor: Any, group: Any) -> bool:
+    if group is None or torch.compiler.is_compiling():
+        return False
+    device = getattr(tensor, "device", None)
+    if getattr(device, "type", None) != "tpu":
+        return False
     try:
-        if hasattr(verl_dist, "set_numa_affinity"):
-            try:
-                verl_dist.set_numa_affinity.__code__ = _noop_numa_affinity.__code__
-            except Exception:
-                pass
-            verl_dist.set_numa_affinity = _noop_numa_affinity
-    except Exception as e:
-        logger.debug("Skipping set_numa_affinity TPU patch: %s", e)
-
-    try:
-        orig_logprobs = getattr(verl_tf, "logprobs_from_logits", None)
-        naive_logprobs = getattr(verl_tf, "logprobs_from_logits_naive", None)
-        if callable(orig_logprobs) and callable(naive_logprobs) and not getattr(orig_logprobs, "_tpu_patched", False):
-
-            def _patched_logprobs_from_logits(logits, labels, inplace_backward=True):
-                device = getattr(logits, "device", None)
-                if getattr(device, "type", None) == "tpu":
-                    return naive_logprobs(logits, labels)
-                return orig_logprobs(logits, labels, inplace_backward=inplace_backward)
-
-            _patched_logprobs_from_logits._tpu_patched = True  # type: ignore[attr-defined]
-            verl_tf.logprobs_from_logits = _patched_logprobs_from_logits
-    except Exception as e:
-        logger.debug("Skipping logprobs_from_logits TPU patch: %s", e)
-
-    _runtime_helpers_applied = True
+        backend = str(dist.get_backend(group))
+    except Exception:
+        return False
+    return "gloo" in backend and "tpu_dist" not in backend
 
 
 def apply() -> None:
     global _applied
-    _apply_verl_runtime_helpers()
     if _applied:
         return
     if not _tpu_available():
         return
 
     original_all_reduce = dist.all_reduce
-    original_all_gather_object = getattr(dist, "all_gather_object", None)
+    original_all_gather_into_tensor = getattr(dist, "all_gather_into_tensor", None)
 
-    def _patched_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
-        if op != dist.ReduceOp.AVG or async_op or not _is_tpu_all_reduce(tensor, group):
-            return original_all_reduce(tensor, op=op, group=group, async_op=async_op)
-
-        world_size = dist.get_world_size(group=group)
-        result = original_all_reduce(tensor, op=dist.ReduceOp.SUM, group=group, async_op=False)
-        tensor.div_(world_size)
-        return result
+    def _patched_all_reduce(tensor, op=None, group=None, async_op=False):
+        # Forward `op` only when the caller passed one. Under torch.compile, dynamo rewrites the original
+        # `dist.all_reduce` into a functional collective, but it only converts a ReduceOp to its string form when
+        # the traced function is the current `dist.all_reduce` attribute (i.e. this wrapper). A forwarded
+        # `ReduceOp.SUM` default would reach `_functional_collectives.all_reduce` unconverted and fail with
+        # "'RedOpType' object has no attribute 'lower'" (e.g. vLLM's compiled tensor-parallel all-reduce).
+        if not async_op and _is_gloo_only_group_with_tpu_tensor(tensor, group):
+            cpu_tensor = tensor.detach().cpu()
+            if op is None:
+                result = original_all_reduce(cpu_tensor, group=group, async_op=False)
+            elif op == dist.ReduceOp.AVG:
+                world_size = dist.get_world_size(group=group)
+                result = original_all_reduce(cpu_tensor, op=dist.ReduceOp.SUM, group=group, async_op=False)
+                cpu_tensor.div_(world_size)
+            else:
+                result = original_all_reduce(cpu_tensor, op=op, group=group, async_op=False)
+            tensor.copy_(cpu_tensor)
+            return result
+        if op is None:
+            return original_all_reduce(tensor, group=group, async_op=async_op)
+        # torch-tpu >= 0.2.0 implements ReduceOp.AVG on tpu_dist natively (SUM + divide inside the HLO).
+        return original_all_reduce(tensor, op=op, group=group, async_op=async_op)
 
     dist.all_reduce = _patched_all_reduce
 
-    if callable(original_all_gather_object):
+    if callable(original_all_gather_into_tensor):
 
-        def _patched_all_gather_object(object_list, obj, group=None):
-            cpu_obj = _detach_tpu_tensors_to_cpu(obj)
-            backend = str(dist.get_backend(group))
-            if backend != "tpu_dist":
-                return original_all_gather_object(object_list, cpu_obj, group=group)
+        def _patched_all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False):
+            # Same staging as all_reduce: a Gloo-only group (e.g. the CP-aware DP group) cannot take TPU tensors.
+            if not async_op and _is_gloo_only_group_with_tpu_tensor(input_tensor, group):
+                cpu_out = output_tensor.detach().cpu()
+                result = original_all_gather_into_tensor(
+                    cpu_out, input_tensor.detach().cpu(), group=group, async_op=False
+                )
+                output_tensor.copy_(cpu_out)
+                return result
+            return original_all_gather_into_tensor(output_tensor, input_tensor, group=group, async_op=async_op)
 
-            group_size = dist.get_world_size(group=group)
-            if group is not None and group_size == dist.get_world_size():
-                try:
-                    default_backend = str(dist.get_backend(None))
-                except Exception:
-                    default_backend = ""
-                if "gloo" in default_backend:
-                    return original_all_gather_object(object_list, cpu_obj, group=None)
-
-            raw_bytes = pickle.dumps(cpu_obj)
-            local_size = len(raw_bytes)
-            size_tensor = torch.tensor([local_size], dtype=torch.int32, device="tpu")
-            size_list = [torch.zeros(1, dtype=torch.int32, device="tpu") for _ in range(group_size)]
-            dist.all_gather(size_list, size_tensor, group=group)
-            sizes = [int(s.cpu().item()) for s in size_list]
-            max_size = max(max(sizes), 1)
-
-            padded = torch.zeros(max_size, dtype=torch.int32)
-            if local_size > 0:
-                padded[:local_size] = torch.frombuffer(bytearray(raw_bytes), dtype=torch.uint8).to(torch.int32)
-            send_tensor = padded.to(device="tpu")
-            recv_list = [torch.zeros(max_size, dtype=torch.int32, device="tpu") for _ in range(group_size)]
-            dist.all_gather(recv_list, send_tensor, group=group)
-            for idx, (recv_tensor, sz) in enumerate(zip(recv_list, sizes, strict=True)):
-                data_bytes = bytes(recv_tensor.cpu()[:sz].to(torch.uint8).tolist())
-                object_list[idx] = pickle.loads(data_bytes)
-
-        dist.all_gather_object = _patched_all_gather_object
+        dist.all_gather_into_tensor = _patched_all_gather_into_tensor
 
     _applied = True
-    logger.info(
-        "[verl_hardware_plugin] Patched torch.distributed.all_reduce(op=AVG) and all_gather_object for tpu_dist"
-    )
+    logger.info("[verl_hardware_plugin] Patched torch.distributed.all_reduce for TPU tensors on Gloo-only groups")

@@ -33,9 +33,19 @@ import torch
 
 from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
+from verl_hardware_plugin.accelerators.xpu.patches import (
+    numa_affinity_patch,
+    ray_device_pin_patch,
+    reduce_avg_allreduce_patch,
+)
+from verl_hardware_plugin.accelerators.xpu.profilers import register_vtune
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+# Every monkeypatch this platform installs, applied from __init__ below. See
+# each module's own docstring for what it patches and why.
+_PATCHES = (reduce_avg_allreduce_patch, ray_device_pin_patch, register_vtune, numa_affinity_patch)
 
 
 def _ensure_torch_xpu() -> bool:
@@ -78,20 +88,19 @@ class PlatformXPU(PlatformBase):
     """
 
     def __init__(self) -> None:
-        # Apply this platform's monkeypatch only now, when XPU is actually
-        # the platform verl selected for this process (verl.plugin.platform.
-        # platform_manager._create_platform() only constructs PlatformXPU()
-        # when platform detection -- explicit VERL_PLATFORM=intel or
-        # auto-detection -- picked "intel"). Applying it from the shared
-        # verl_hardware_plugin/__init__.py instead would fire on any host
-        # where XPU hardware/SDK merely happens to be present, even if a
-        # different platform ends up selected for this run -- e.g. a mixed
-        # host with VERL_PLATFORM=nvidia explicitly set would still get its
-        # process-wide torch.distributed.all_reduce(op=AVG) semantics
-        # changed for no reason.
-        from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch
+        """Apply this platform's monkeypatches (see ``_PATCHES`` above).
 
-        reduce_avg_allreduce_patch.apply()
+        Applied here rather than from the shared ``verl_hardware_plugin/__init__.py``
+        so a patch only installs on hosts where XPU is actually in play, not on
+        every host regardless of which platform verl selects -- that shared
+        init runs once for every vendor. ``PlatformXPU()`` is also constructed
+        as a losing detection probe on hosts where a different platform wins,
+        so this constructor running does not mean XPU was selected: each
+        patch's own ``apply()`` must gate its correctness at call time, not
+        here. See each patch module's own docstring for how it does that.
+        """
+        for patch_module in _PATCHES:
+            patch_module.apply()
 
     # ------------------------------------------------------------------
     # Core device management
@@ -231,6 +240,19 @@ class PlatformXPU(PlatformBase):
         # No-op: see profiler_start
         pass
 
+    def profiler_markers(self):
+        # Intel VTune (ITT) tracing markers. verl core asks the platform for
+        # these first, before falling back to nvtx/mstx/generic markers -- see
+        # verl/utils/profiler/__init__.py for how it discovers them.
+        from verl_hardware_plugin.accelerators.xpu.profilers import itt_profile_xpu
+
+        return (
+            itt_profile_xpu.mark_start_range,
+            itt_profile_xpu.mark_end_range,
+            itt_profile_xpu.mark_annotate,
+            itt_profile_xpu.marked_timer,
+        )
+
     # ------------------------------------------------------------------
     # Model patches
     # ------------------------------------------------------------------
@@ -255,9 +277,14 @@ class PlatformXPU(PlatformBase):
     # ------------------------------------------------------------------
 
     def get_collective_module(self) -> Any:
-        # Intel XPU does not expose a Python-level collective communication
-        # module like cupy.cuda.nccl. Return None to indicate unavailability.
-        return None
+        # No cupy-style raw comm-id primitive exists for XCCL; this shim
+        # bootstraps a hybrid cpu:gloo,xpu:xccl torch.distributed process
+        # group instead. See xccl_collective_xpu.py for why
+        # get_unique_id()/NcclCommunicator() carry (host, port) rather than
+        # a NCCL unique-id blob.
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
+
+        return xccl_collective_xpu
 
     # ------------------------------------------------------------------
     # Low-level runtime API

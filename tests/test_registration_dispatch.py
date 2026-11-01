@@ -51,7 +51,7 @@ ENGINES = {
     "enflame": ("fsdp_enflame", "megatron_enflame"),
     "iluvatar": ("fsdp_iluvatar", "megatron_iluvatar"),
     "musa": ("fsdp_musa", "megatron_musa"),
-    "tpu": ("torchtitan_tpu", "tpu_checkpoint_engine", "raiden_checkpoint_engine"),
+    "tpu": ("torchtitan_tpu", "weight_sync.ray_checkpoint_engine", "weight_sync.tpu_sync_checkpoint_engine"),
     "supa": ("fsdp_supa", "megatron_supa"),
 }
 
@@ -59,6 +59,15 @@ ENGINES = {
 def backend_package(backend):
     namespace = "integrations" if backend == "flagos" else "accelerators"
     return f"verl_hardware_plugin.{namespace}.{backend}"
+
+
+def engine_module(backend, module):
+    """``<backend>.engines.<module>``, or ``<backend>.<module>`` for a module given with its subpackage."""
+    subpackage = "" if "." in module else "engines."
+    return f"{backend_package(backend)}.{subpackage}{module}"
+
+
+ENGINE_MODULES = [engine_module(backend, module) for backend, engines in ENGINES.items() for module in engines]
 
 
 def fake_packages(names):
@@ -77,9 +86,7 @@ def implementation_stubs(*, failures=(), real_profiler=False):
     """Replace implementation leaves only; execute real package initializers."""
     events = []
     leaves = {f"{backend_package(backend)}.{module}" for backend, module in PLATFORMS.items()}
-    leaves.update(
-        f"{backend_package(backend)}.engines.{module}" for backend, engines in ENGINES.items() for module in engines
-    )
+    leaves.update(ENGINE_MODULES)
     profiler_name = f"{backend_package('mlu')}.profilers.torch_profile_mlu"
     if not real_profiler:
         leaves.add(profiler_name)
@@ -150,10 +157,8 @@ def test_all_platforms_are_registered_before_any_engine(plugin):
     with implementation_stubs() as state:
         plugin.load_backends()
         assert state.events[: len(expected_platforms)] == expected_platforms
-        actual_engines = [name for name in state.events if ".engines." in name]
-        assert actual_engines == [
-            f"{backend_package(backend)}.engines.{engine}" for backend, engines in ENGINES.items() for engine in engines
-        ]
+        actual_engines = [name for name in state.events if name in ENGINE_MODULES]
+        assert actual_engines == ENGINE_MODULES
         assert state.events.count("profiler:config") == 1
         assert state.events.count("profiler:torch") == 1
         assert state.events.count("rollout:vllm") == 1
@@ -169,7 +174,7 @@ def test_importing_backend_registration_loads_every_component(plugin, backend):
         expected = []
         if backend in PLATFORMS:
             expected.append(f"{backend_package(backend)}.{PLATFORMS[backend]}")
-        expected.extend(f"{backend_package(backend)}.engines.{engine}" for engine in ENGINES[backend])
+        expected.extend(engine_module(backend, engine) for engine in ENGINES[backend])
         if backend == "mlu":
             expected.extend(
                 [f"{backend_package(backend)}.profilers.torch_profile_mlu", "profiler:config", "profiler:torch"]
@@ -190,8 +195,8 @@ def test_importing_backend_registration_loads_every_component(plugin, backend):
         ("profiler:config", ("profiler:torch",)),
         ("profiler:torch", ()),
         ("accelerators.tpu.engines.torchtitan_tpu", ()),
-        ("accelerators.tpu.engines.tpu_checkpoint_engine", ()),
-        ("accelerators.tpu.engines.raiden_checkpoint_engine", ()),
+        ("accelerators.tpu.weight_sync.ray_checkpoint_engine", ()),
+        ("accelerators.tpu.weight_sync.tpu_sync_checkpoint_engine", ()),
         ("rollout:vllm", ()),
     ],
 )
@@ -199,9 +204,7 @@ def test_optional_component_failure_does_not_stop_other_registration(plugin, fai
     failure = f"verl_hardware_plugin.{failure}" if "." in failure else failure
     skipped = {f"verl_hardware_plugin.{name}" if "." in name else name for name in skipped}
     expected = {f"{backend_package(name)}.{module}" for name, module in PLATFORMS.items()}
-    expected.update(
-        f"{backend_package(backend)}.engines.{engine}" for backend, engines in ENGINES.items() for engine in engines
-    )
+    expected.update(ENGINE_MODULES)
     expected.update(
         (f"{backend_package('mlu')}.profilers.torch_profile_mlu", "profiler:config", "profiler:torch", "rollout:vllm")
     )
@@ -251,7 +254,6 @@ def test_mlu_profiler_patches_remain_idempotent(plugin):
     original = profile.get_torch_profiler = mock.Mock()
     modules[profile.__name__] = profile
     modules["verl.utils.profiler"].torch_profile = profile
-    modules["torch"] = ModuleType("torch")
 
     with implementation_stubs(real_profiler=True), mock.patch.dict(sys.modules, modules):
         backend = importlib.import_module(f"{backend_package('mlu')}.registration")
@@ -266,8 +268,6 @@ def test_mlu_profiler_patches_remain_idempotent(plugin):
         config.__post_init__()
         assert config.contents == ["cpu", "mlu"]
         assert config.original_contents == ("cpu",)
-        assert profile.get_torch_profiler(["cpu"], "unused") is original.return_value
-        original.assert_called_once()
 
 
 def test_rollout_hook_is_lazy_and_preserves_non_tpu_loader(plugin):

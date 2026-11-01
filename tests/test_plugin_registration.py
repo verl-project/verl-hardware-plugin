@@ -75,22 +75,10 @@ def _stub_training_engine_runtimes():
     megatron_transformer.MegatronEngineWithLMHead = _StubEngine
     megatron_transformer.MegatronEngineWithValueHead = _StubEngine
 
-    torchtitan_transformer = ModuleType("verl.workers.engine.torchtitan.transformer_impl")
-    torchtitan_transformer.TorchTitanEngine = _StubEngine
-    torchtitan_transformer.TorchTitanEngineWithLMHead = _StubEngine
-
-    torchtitan_utils = ModuleType("verl.workers.engine.torchtitan.utils")
-    torchtitan_utils.NoOpDataLoader = mock.MagicMock()
-    torchtitan_utils.derive_torchtitan_name_and_flavor = mock.MagicMock()
-    torchtitan_utils.enable_fsdp_gradient_division = mock.MagicMock()
-    torchtitan_utils.get_attention_masks = mock.MagicMock()
-
     engine_modules = {
         "verl.workers.engine.fsdp": fsdp,
         "verl.workers.engine.fsdp.transformer_impl": fsdp_transformer,
         "verl.workers.engine.megatron.transformer_impl": megatron_transformer,
-        "verl.workers.engine.torchtitan.transformer_impl": torchtitan_transformer,
-        "verl.workers.engine.torchtitan.utils": torchtitan_utils,
     }
     with (
         mock.patch.dict(os.environ, {"VERL_USE_EXTERNAL_PLUGINS": "none"}),
@@ -286,18 +274,12 @@ class TestPlatformRegistration:
         assert platform.ray_resource_options(0) == {}
 
     def test_tpu_core_hooks(self):
-        """The three PlatformBase hooks TPU needs from verl core.
-
-        Inert on verl 0.9.0 -- nothing calls them yet. They are defined
-        unconditionally so the plugin needs no change when core lands the call sites.
-        """
+        """The PlatformBase hooks TPU defines for verl core."""
         from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         platform = PlatformTPU()
         assert platform.supports_colocated_worker_groups() is False
-        assert "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS" in platform.ray_noset_envvars()
-        with mock.patch.dict(os.environ, {"TPU_VISIBLE_CHIPS": "3"}):
-            assert platform.ray_local_rank_override() == "3"
+        assert platform.ray_noset_envvars() == []
 
     def test_tpu_derives_from_platform_base(self):
         """PlatformTPU must not acquire another vendor's platform behaviour by inheritance.
@@ -336,17 +318,10 @@ class TestPlatformRegistration:
         assert platform.get_device_capability() == (None, None)
 
     def test_tpu_ray_noset_envvars(self):
-        """Both entries are load-bearing, including the CUDA one.
-
-        visible_devices_envvar() deliberately returns CUDA_VISIBLE_DEVICES, so Ray must be
-        told not to manage that variable either. Dropping it breaks rank mapping.
-        """
+        """Ray 2.59.0+ natively enumerates and assigns TPU_VISIBLE_CHIPS per actor."""
         from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
-        assert PlatformTPU().ray_noset_envvars() == [
-            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
-            "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
-        ]
+        assert PlatformTPU().ray_noset_envvars() == []
 
     def test_tpu_ipc_unsupported(self):
         """TPU has no CUDA-style IPC handle, so verl must fall back to shared memory.
@@ -363,8 +338,7 @@ class TestPlatformRegistration:
         """Intentional, not an oversight: TPU keeps CUDA_VISIBLE_DEVICES.
 
         Returning TPU_VISIBLE_CHIPS here would let vllm_async_server overwrite the
-        chip index that get_worker_env_vars() writes and ray_local_rank_override()
-        reads. See spec D4.
+        chip index managed by Ray.
         """
         from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
@@ -409,7 +383,7 @@ class TestPlatformRegistration:
         assert head == on_slice_host
         assert head["TPU_WORKER_HOSTNAMES"] == "10.0.0.1,10.0.0.2"
         assert len(head["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 8
-        assert head["CLOUD_TPU_TASK_ID"] == "1" and head["TPU_VISIBLE_CHIPS"] == "1"
+        assert head["CLOUD_TPU_TASK_ID"] == "1" and head["LOCAL_RANK"] == "1" and "TPU_VISIBLE_CHIPS" not in head
 
     def test_tpu_cudart_returns_none(self):
         """There is no CUDA runtime on a TPU host; PlatformBase documents None as the answer."""
@@ -779,6 +753,62 @@ class TestMayEnableFlagGems:
                         may_enable_flag_gems(phase="training")
 
 
+class TestXPUCollectiveModule:
+    """get_collective_module() must return the cupy.cuda.nccl-shaped XCCL shim.
+
+    verl.utils.rendezvous.ray_backend.create_nccl_communicator_in_ray() calls
+    collective.get_unique_id() and collective.NcclCommunicator(ndev, commId, rank)
+    on whatever get_collective_module() returns; it has no XPU-specific code of
+    its own, so the shim's shape is the entire contract.
+    """
+
+    def test_returns_module_with_nccl_shaped_api(self):
+        from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU
+
+        platform = PlatformXPU.__new__(PlatformXPU)
+        module = platform.get_collective_module()
+
+        assert callable(module.get_unique_id)
+        assert callable(module.NcclCommunicator)
+
+    def test_get_unique_id_returns_a_free_port_not_a_byte_blob(self):
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
+
+        with mock.patch("ray.util.get_node_ip_address", return_value="127.0.0.1"):
+            host, port = xccl_collective_xpu.get_unique_id()
+
+        assert host == "127.0.0.1"
+        assert isinstance(port, int) and port > 0
+
+    def test_constructor_calls_init_process_group_with_hybrid_backend(self):
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
+
+        with mock.patch("torch.distributed.init_process_group") as fake_init:
+            xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
+
+        fake_init.assert_called_once_with(
+            backend="cpu:gloo,xpu:xccl",
+            init_method="tcp://10.0.0.5:12345",
+            rank=1,
+            world_size=2,
+        )
+
+    def test_rank_id_reports_constructor_rank(self):
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
+
+        with mock.patch("torch.distributed.init_process_group"):
+            comm = xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
+
+        assert comm.rank_id() == 1
+
+    def test_pg_property_is_the_default_world_group(self):
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
+
+        with mock.patch("torch.distributed.init_process_group"), mock.patch("torch.distributed.group") as fake_group:
+            comm = xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
+            assert comm._pg is fake_group.WORLD
+
+
 class TestReduceAvgPatchWiring:
     """The reduce_avg monkeypatch must fire on platform *selection*, not on
     mere XPU hardware/SDK *presence*.
@@ -796,10 +826,26 @@ class TestReduceAvgPatchWiring:
     def test_platform_xpu_init_applies_patches(self):
         from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU
 
-        with mock.patch("verl_hardware_plugin.accelerators.xpu.patches.reduce_avg_allreduce_patch.apply") as fake_apply:
+        # Every entry PlatformXPU.__init__'s _PATCHES loop applies must be
+        # mocked here, not just reduce_avg's. ray_device_pin_patch.apply() is
+        # a real, permanent class-level monkeypatch of core's Worker with no
+        # cleanup outside tests -- unmocked, this call would leak a patched
+        # Worker._setup_env_cuda_visible_devices into every test that runs
+        # later in the same process, independent of which platform that
+        # process actually selected. register_vtune.apply() similarly leaks a
+        # permanent DistProfiler.__init__ patch if left unmocked.
+        with (
+            mock.patch("verl_hardware_plugin.accelerators.xpu.patches.reduce_avg_allreduce_patch.apply") as fake_apply,
+            mock.patch("verl_hardware_plugin.accelerators.xpu.patches.ray_device_pin_patch.apply") as fake_pin_apply,
+            mock.patch("verl_hardware_plugin.accelerators.xpu.profilers.register_vtune.apply") as fake_vtune_apply,
+            mock.patch("verl_hardware_plugin.accelerators.xpu.patches.numa_affinity_patch.apply") as fake_numa_apply,
+        ):
             PlatformXPU()
 
         fake_apply.assert_called_once()
+        fake_pin_apply.assert_called_once()
+        fake_vtune_apply.assert_called_once()
+        fake_numa_apply.assert_called_once()
 
     def test_platform_tpu_init_applies_patches(self):
         with mock.patch("verl_hardware_plugin.accelerators.tpu.patches.reduce_avg_allreduce_patch.apply") as fake_apply:
@@ -929,20 +975,172 @@ class TestReduceAvgAllReducePatch:
             assert dist.all_reduce is patched_once
 
 
+class TestProfilerMarkersHook:
+    """``profiler_markers()`` is the one ``PlatformBase`` hook this plugin implements.
+
+    verl core calls it to discover trace markers before falling back to nvtx/mstx/generic
+    ones, and unpacks the result positionally, so both the arity and the order matter.
+    """
+
+    @staticmethod
+    def _markers():
+        pytest.importorskip("verl_hardware_plugin.accelerators.xpu.profilers.itt_profile_xpu")
+        from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU
+
+        # Bypass __init__: it applies this platform's monkeypatches, which is not what
+        # is under test here (and self-gates to a no-op on a CPU-only host anyway).
+        return PlatformXPU.profiler_markers(object.__new__(PlatformXPU))
+
+    def test_returns_the_four_itt_markers_in_core_order(self):
+        from verl_hardware_plugin.accelerators.xpu.profilers import itt_profile_xpu
+
+        assert self._markers() == (
+            itt_profile_xpu.mark_start_range,
+            itt_profile_xpu.mark_end_range,
+            itt_profile_xpu.mark_annotate,
+            itt_profile_xpu.marked_timer,
+        )
+
+    def test_markers_are_callable_without_a_collector(self):
+        """ITT is notify-only: with no collector attached these must be no-ops, not errors."""
+        mark_start_range, mark_end_range, mark_annotate, marked_timer = self._markers()
+
+        mark_end_range(mark_start_range("probe"))
+
+        @mark_annotate("decorated")
+        def _work():
+            return 42
+
+        assert _work() == 42
+
+        timing = {}
+        with marked_timer("timed", timing):
+            pass
+        assert "timed" in timing
+
+
+class TestVtuneProfilerToolConfig:
+    """VtuneProfiler must accept any tool_config shape verl core hands it.
+
+    There is no ``tool_config.vtune`` schema entry, so core may pass None or the whole
+    tool_config mapping instead of a per-tool config. Neither may raise, and ``discrete``
+    must default to False.
+    """
+
+    @staticmethod
+    def _vtune_cls():
+        module = pytest.importorskip("verl_hardware_plugin.accelerators.xpu.profilers.itt_profile_xpu")
+        return module.VtuneProfiler
+
+    @pytest.mark.parametrize("enable", [True, False])
+    @pytest.mark.parametrize(
+        "tool_config",
+        [
+            None,
+            {},
+            # What core passes when no `vtune` block exists: the full tool_config mapping.
+            {"nsys": {"discrete": False}, "npu": {}, "torch": {}},
+        ],
+        ids=["none", "empty", "whole-tool_config-mapping"],
+    )
+    def test_discrete_defaults_false_without_vtune_block(self, tool_config, enable):
+        from verl.utils.profiler.config import ProfilerConfig
+
+        profiler = self._vtune_cls()(rank=0, config=ProfilerConfig(ranks=[0], enable=enable), tool_config=tool_config)
+        assert profiler.discrete is False
+
+    def test_explicit_discrete_is_honoured(self):
+        """An explicit `+tool_config.vtune.*` override is still read, even though XPU ignores it."""
+        from verl.utils.profiler.config import NsightToolConfig, ProfilerConfig
+
+        profiler = self._vtune_cls()(
+            rank=0,
+            config=ProfilerConfig(ranks=[0], enable=True),
+            tool_config=NsightToolConfig(discrete=True),
+        )
+        assert profiler.discrete is True
+
+
+class TestVtuneProfilerRegistration:
+    """`profiler.tool: vtune` must resolve to VtuneProfiler once the patch is applied.
+
+    Core's own tool names must keep resolving to their core implementations, and an
+    unrecognised name must still fall through to core's no-op profiler.
+    """
+
+    @pytest.fixture
+    def patched(self):
+        pytest.importorskip("verl_hardware_plugin.accelerators.xpu.profilers.itt_profile_xpu")
+        from verl.utils.profiler.profile import DistProfiler
+        from verl_hardware_plugin.accelerators.xpu.profilers import register_vtune
+
+        original_init = DistProfiler.__init__
+        original_flag = register_vtune._PATCHED
+        register_vtune._PATCHED = False
+        # The patch self-gates on a live XPU device; these tests are CPU-only.
+        with mock.patch.object(register_vtune, "_xpu_available", return_value=True):
+            register_vtune.apply_vtune_profiler_patch()
+        try:
+            yield DistProfiler
+        finally:
+            DistProfiler.__init__ = original_init
+            register_vtune._PATCHED = original_flag
+
+    def test_vtune_tool_resolves_to_vtune_profiler(self, patched):
+        from verl.utils.profiler.config import ProfilerConfig
+        from verl_hardware_plugin.accelerators.xpu.profilers.itt_profile_xpu import VtuneProfiler
+
+        profiler = patched(rank=0, config=ProfilerConfig(ranks=[0], enable=True, tool="vtune"))
+        assert isinstance(profiler._impl, VtuneProfiler)
+
+    def test_builtin_tools_are_untouched(self, patched):
+        """The patch must only claim the `vtune` name, not shadow core's own dispatch."""
+        from verl.utils.profiler.config import ProfilerConfig
+        from verl.utils.profiler.profile import _NoOpProfiler
+        from verl_hardware_plugin.accelerators.xpu.profilers.itt_profile_xpu import VtuneProfiler
+
+        # An unknown tool still falls through to core's no-op, as before.
+        profiler = patched(rank=0, config=ProfilerConfig(ranks=[0], enable=True, tool="not-a-tool"))
+        assert isinstance(profiler._impl, _NoOpProfiler)
+        assert not isinstance(profiler._impl, VtuneProfiler)
+
+    def test_patch_is_idempotent(self, patched):
+        """PlatformXPU may be constructed more than once; the wrapper must not stack."""
+        from verl_hardware_plugin.accelerators.xpu.profilers import register_vtune
+
+        init_after_first = patched.__init__
+        register_vtune.apply_vtune_profiler_patch()
+        assert patched.__init__ is init_after_first
+
+    def test_noop_when_xpu_unavailable(self):
+        """Constructing PlatformXPU on a non-XPU host must leave DistProfiler alone."""
+        from verl.utils.profiler.profile import DistProfiler
+        from verl_hardware_plugin.accelerators.xpu.profilers import register_vtune
+
+        original_init = DistProfiler.__init__
+        original_flag = register_vtune._PATCHED
+        register_vtune._PATCHED = False
+        try:
+            with mock.patch.object(register_vtune, "_xpu_available", return_value=False):
+                register_vtune.apply_vtune_profiler_patch()
+            assert DistProfiler.__init__ is original_init
+            assert register_vtune._PATCHED is False
+        finally:
+            DistProfiler.__init__ = original_init
+            register_vtune._PATCHED = original_flag
+
+
 class TestReduceAvgAllReducePatchTPU:
-    """torch.distributed.all_reduce(op=AVG) -> SUM + manual divide and
-    all_gather_object Gloo routing, scoped to tpu_dist process groups.
+    """torch.distributed.all_reduce: passthrough on tpu_dist (AVG is native since torch-tpu 0.2.0) and CPU
+    staging of TPU tensors on Gloo-only groups. all_gather_object is no longer patched.
     """
 
     @pytest.fixture(autouse=True)
     def _reset_patch_state(self):
         original_all_reduce = dist.all_reduce
-        original_all_gather_object = getattr(dist, "all_gather_object", None)
         tpu_patch_mod._applied = False
         yield
         dist.all_reduce = original_all_reduce
-        if original_all_gather_object is not None:
-            dist.all_gather_object = original_all_gather_object
         tpu_patch_mod._applied = False
 
     def test_noop_when_tpu_unavailable(self):
@@ -952,7 +1150,8 @@ class TestReduceAvgAllReducePatchTPU:
 
         assert dist.all_reduce is before
 
-    def test_avg_becomes_sum_plus_divide_on_tpu_dist(self):
+    def test_avg_passes_through_natively_on_tpu_dist(self):
+        """torch-tpu >= 0.2.0 implements ReduceOp.AVG on tpu_dist, so the patch no longer rewrites it."""
         fake_original = mock.MagicMock()
         tensor = torch.tensor([8.0])
         with mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True):
@@ -962,13 +1161,12 @@ class TestReduceAvgAllReducePatchTPU:
                 assert patched is not fake_original
 
                 with mock.patch.object(dist, "get_backend", return_value="tpu_dist"):
-                    with mock.patch.object(dist, "get_world_size", return_value=4):
-                        patched(tensor, op=dist.ReduceOp.AVG, group="dp_group")
+                    patched(tensor, op=dist.ReduceOp.AVG, group="dp_group")
 
-        fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.SUM, group="dp_group", async_op=False)
-        assert tensor.item() == 2.0
+        fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.AVG, group="dp_group", async_op=False)
+        assert tensor.item() == 8.0
 
-    def test_avg_becomes_sum_plus_divide_on_composite_backend_with_tpu_tensor(self):
+    def test_avg_passes_through_on_composite_backend_with_tpu_tensor(self):
         fake_original = mock.MagicMock()
         fake_tpu_tensor = mock.MagicMock()
         fake_tpu_tensor.device = SimpleNamespace(type="tpu")
@@ -976,11 +1174,10 @@ class TestReduceAvgAllReducePatchTPU:
             with mock.patch.object(dist, "all_reduce", fake_original):
                 tpu_patch_mod.apply()
                 with mock.patch.object(dist, "get_backend", return_value="cpu:gloo,tpu:tpu_dist"):
-                    with mock.patch.object(dist, "get_world_size", return_value=8):
-                        dist.all_reduce(fake_tpu_tensor, op=dist.ReduceOp.AVG)
+                    dist.all_reduce(fake_tpu_tensor, op=dist.ReduceOp.AVG)
 
-        fake_original.assert_called_once_with(fake_tpu_tensor, op=dist.ReduceOp.SUM, group=None, async_op=False)
-        fake_tpu_tensor.div_.assert_called_once_with(8)
+        fake_original.assert_called_once_with(fake_tpu_tensor, op=dist.ReduceOp.AVG, group=None, async_op=False)
+        fake_tpu_tensor.div_.assert_not_called()
 
     def test_composite_backend_with_cpu_tensor_passes_through(self):
         fake_original = mock.MagicMock()
@@ -1005,23 +1202,12 @@ class TestReduceAvgAllReducePatchTPU:
 
         fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.AVG, group="cpu_group", async_op=False)
 
-    def test_all_gather_object_routes_full_world_tpu_dist_group_to_default_gloo(self):
-        fake_all_gather_obj = mock.MagicMock()
+    def test_all_gather_object_is_not_patched(self):
+        before = dist.all_gather_object
         with mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True):
-            with mock.patch.object(dist, "all_gather_object", fake_all_gather_obj):
-                tpu_patch_mod.apply()
-                out = [None, None]
-                with (
-                    mock.patch.object(
-                        dist,
-                        "get_backend",
-                        side_effect=lambda g=None: "tpu_dist" if g == "dp_group" else "cpu:gloo,tpu:tpu_dist",
-                    ),
-                    mock.patch.object(dist, "get_world_size", return_value=2),
-                ):
-                    dist.all_gather_object(out, {"lr": 1e-4}, group="dp_group")
+            tpu_patch_mod.apply()
 
-        fake_all_gather_obj.assert_called_once_with(out, {"lr": 1e-4}, group=None)
+        assert dist.all_gather_object is before
 
     def test_idempotent(self):
         with mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True):
@@ -1050,13 +1236,11 @@ class TestReduceAvgAllReducePatchTPU:
 
     def test_training_worker_postprocess_output_uses_tpu_patches(self):
         def _fake_tpu_dist_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
-            if op == dist.ReduceOp.AVG:
-                raise RuntimeError("tpu_dist does not support ReduceOp.AVG")
-            tensor.mul_(4.0)
+            # Native tpu_dist semantics over 4 ranks holding the same value: SUM multiplies, AVG keeps it.
+            if op == dist.ReduceOp.SUM:
+                tensor.mul_(4.0)
 
         def _fake_all_gather_object(object_list, obj, group=None):
-            if group == "dp_group":
-                raise RuntimeError("tpu_dist group does not support all_gather_object")
             for idx in range(len(object_list)):
                 object_list[idx] = dict(obj)
 
@@ -1108,9 +1292,9 @@ class TestReduceAvgAllReducePatchTPU:
                 )
 
         assert raw_all_reduce.call_count == 2
-        assert raw_all_reduce.call_args_list[0].kwargs["op"] == dist.ReduceOp.SUM
+        assert raw_all_reduce.call_args_list[0].kwargs["op"] == dist.ReduceOp.AVG
         assert raw_all_gather_obj.call_count == 2
-        assert raw_all_gather_obj.call_args_list[0].kwargs["group"] is None
+        assert raw_all_gather_obj.call_args_list[0].kwargs["group"] == "dp_group"
         assert res["metrics"]["loss"] == pytest.approx(4.0)
         assert res["metrics"]["custom_metric"] == [0.5, 0.5, 0.5, 0.5]
         assert val_res["metrics"]["loss"] == pytest.approx(3.0)

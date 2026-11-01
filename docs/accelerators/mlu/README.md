@@ -1,7 +1,5 @@
 # Cambricon MLU User Guide
 
-Last updated: 06/16/2026.
-
 ## Introduction
 
 This document describes how to use verl for reinforcement learning training on Cambricon MLU.
@@ -28,16 +26,19 @@ And docs to start.
 
 ```
 docs/accelerators/mlu/
-├── README.md              # This file
-├── install_guidance.md    # Installation guide
-├── quick_start.md         # Quick start
-└── profiling.md           # Profiling guide
+├── README.md                 # This file
+├── install_guidance.md       # Installation guide
+├── quick_start.md            # Quick start
+├── mlu_feature_support.md    # MLU support list
+├── profiling.md              # Profiling guide
+└── requirements_mlu.txt      # Packages needed for verl training on MLU
 ```
 
 ## Getting Started
 
 - [Installation Guide](./install_guidance.md) — Docker setup, component installation
 - [Quick Start](./quick_start.md) — Run your first GRPO training job
+- [MLU feature support](./mlu_feature_support.md) — Check supported features on MLU
 - [Profiling Guide](./profiling.md) — Use community torch profile on MLU
 
 ## Platform Summary

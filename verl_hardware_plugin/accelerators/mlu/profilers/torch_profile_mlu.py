@@ -63,27 +63,20 @@ def _patch_get_torch_profiler():
 
     _original_get_torch_profiler = tp.get_torch_profiler
 
-    def _mlu_get_torch_profiler(contents, save_path, role=None, save_file_prefix=None, rank=0, schedule=None, **kwargs):
-        # get_torch_profiler's real signature has grown parameters (e.g.
-        # profile_step, name_mini_batch_window) that this hand-copied
-        # reimplementation never learned about. Delegate to the saved
-        # original whenever MLU isn't actually requested, instead of
-        # TypeError'ing on every other platform that hits a newer call site.
-        if not contents or "mlu" not in contents:
-            return _original_get_torch_profiler(
-                contents=contents,
-                save_path=save_path,
-                role=role,
-                save_file_prefix=save_file_prefix,
-                rank=rank,
-                schedule=schedule,
-                **kwargs,
-            )
-        save_dir = os.path.join(save_path, role) if role else save_path
-        os.makedirs(save_dir, exist_ok=True)
-
+    def _mlu_get_torch_profiler(
+        contents,
+        save_path,
+        role=None,
+        save_file_prefix=None,
+        rank=0,
+        profile_step=None,
+        schedule=None,
+        name_mini_batch_window=False,
+    ):
         if hasattr(tp, "build_trace_basename"):
-            base_file_name = tp.build_trace_basename(rank=rank, role=role, save_file_prefix=save_file_prefix)
+            base_file_name = tp.build_trace_basename(
+                rank=rank, role=role, save_file_prefix=save_file_prefix, profile_step=profile_step
+            )
         else:
             ts = datetime.now(tz=timezone.utc).astimezone().strftime("%Y%m%d%H%M%S%f")[:-3]
             fname = f"prof_rank-{rank}_{os.getpid()}_{ts}"
@@ -91,18 +84,40 @@ def _patch_get_torch_profiler():
 
         handler_state = {"count": 0}
 
+        def _scheduled_mini_batch_range(step_num: int) -> tuple[int, int]:
+            skip_first = int(schedule.get("skip_first", 0) or 0)
+            wait = int(schedule.get("wait", 0) or 0)
+            warmup = int(schedule.get("warmup", 0) or 0)
+            active = max(int(schedule.get("active", 1) or 1), 1)
+
+            last_mb = max(step_num - 1, 0)
+            cycle_len = wait + warmup + active
+            cycle = max(last_mb - skip_first, 0) // cycle_len if cycle_len else 0
+            # Recording starts after this cycle's skipped, idle and warmup mini-batches.
+            first_mb = skip_first + cycle * cycle_len + wait + warmup
+            return min(first_mb, last_mb), last_mb
+
         def _trace_handler(prof):
             idx = handler_state["count"]
             handler_state["count"] += 1
-            suffix = "" if idx == 0 else f"_cycle{idx}"
-            out_path = os.path.join(save_dir, f"{base_file_name}{suffix}.json.gz")
-            logger.info("[Profiler] Saving trace to %s", out_path)
+            suffix = ""
+            if schedule and name_mini_batch_window:
+                step_num = getattr(prof, "step_num", None)
+                if isinstance(step_num, int):
+                    first_mb, last_mb = _scheduled_mini_batch_range(step_num)
+                    suffix = f"_mb{first_mb}" if first_mb == last_mb else f"_mb{first_mb}-{last_mb}"
+                else:
+                    suffix = f"_part{idx}"
+                # Always append callback counter to ensure unique filenames
+                suffix = f"{suffix}_c{idx}"
+            elif idx:
+                suffix = f"_part{idx}"
+            out_path = os.path.join(save_path, f"{base_file_name}{suffix}.json.gz")
+            print(f"[Profiler] Saving trace to {out_path}")
             prof.export_chrome_trace(out_path)
 
         _contents = set(contents) if contents else set()
-        activities = []
-        if not _contents or "cpu" in _contents:
-            activities.append(torch.profiler.ProfilerActivity.CPU)
+        activities = [torch.profiler.ProfilerActivity.CPU]
 
         if not _contents or "mlu" in _contents:
             if hasattr(torch.profiler.ProfilerActivity, "MLU"):
@@ -122,7 +137,11 @@ def _patch_get_torch_profiler():
         if schedule:
             profile_kwargs["schedule"] = torch.profiler.schedule(**schedule)
 
-        return torch.profiler.profile(**profile_kwargs)
+        prof = torch.profiler.profile(**profile_kwargs)
+        if schedule:
+            prof.record_steps = False
+
+        return prof
 
     tp.get_torch_profiler = _mlu_get_torch_profiler
     logger.info("[verl_hardware_plugin] Patched get_torch_profiler: +MLU activity")

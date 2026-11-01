@@ -36,10 +36,11 @@ design smell" rather than "clean":
   worker's xccl group) is untouched and keeps native `AVG` -- but anyone
   reading verl-core's source still can't see, from that source alone, that
   an xccl group's `ReduceOp.AVG` silently becomes SUM+divide. That is a
-  legitimate argument for fixing this in verl-core instead
-  (verl-project/verl#7917's `is_reduce_avg_supported()` hook covers exactly
-  these 3 call sites) -- this patch exists to show it is *possible* without
-  core changes, not to claim it is the better design.
+  legitimate argument for fixing this in verl-core instead. An
+  `is_reduce_avg_supported()` `PlatformBase` hook for exactly that was once
+  proposed upstream but was dropped from the narrowed hook surface, so there
+  is no core-side seam today. This patch exists to show it is *possible*
+  without core changes, not to claim it is the better design.
 
 async_op=True is intentionally unsupported: correctly dividing the result
 requires the collective to have already completed, which async_op explicitly

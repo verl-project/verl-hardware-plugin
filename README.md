@@ -31,7 +31,7 @@ The platforms and engines in this repository are **reference implementations** �
 | Huawei NPU | Ascend 910B | HCCL | Built-in (verl core) | [Ascend Tutorial](https://github.com/verl-project/verl/tree/main/docs/ascend_tutorial) |
 | Iluvatar | BI-V150 (CUDA-compatible) | IXCCL | ✅ Supported | [User Guide](docs/accelerators/iluvatar/README.md) |
 | Moore Threads | MUSA | MCCL | ✅ Supported | [User Guide](docs/accelerators/musa/README.md) |
-| Google TPU | v6e | tpu_dist | Developing and testing | [User Guide](docs/accelerators/tpu/README.md) |
+| Google TPU | v6e | tpu_dist | ✅ Supported | [User Guide](docs/accelerators/tpu/README.md), [GRPO example](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) |
 | Biren | SUPA (CUDA-compatible) | BCCL | ✅ Example (requires vendor support) | [User Guide](docs/accelerators/supa/README.md) |
 
 
@@ -54,8 +54,12 @@ For platform-specific usage and configuration, please refer to each platform's d
 
 Accelerator-specific code is grouped in `verl_hardware_plugin/accelerators/<backend>/`,
 with each backend owning its platform module and any `engines/`, `rollout/`,
-`profilers/`, `patches/`, or `utils/` subdirectories it needs. The layout applies
-equally to domestic and international hardware, including Intel XPU and Google TPU.
+`profilers/`, `patches/`, or `utils/` subdirectories it needs. A backend may add
+subdirectories for other verl components; Google TPU keeps its training engine in
+`engines/` and adds `losses/` (`verl/workers/utils/losses.py`), `rollout/`
+(`verl/workers/rollout`) and `weight_sync/` (checkpoint engines, `verl/checkpoint_engine`).
+The layout applies equally to domestic and international hardware, including Intel XPU
+and Google TPU.
 
 ```text
 verl_hardware_plugin/
@@ -115,6 +119,8 @@ verl (main framework)
             ├── EngineRegistry.register(device="musa", vendor="moore_threads")
             ├── EngineRegistry.register(device="tpu", vendor="google")
             ├── EngineRegistry.register(device="supa", vendor="biren")
+            │
+            ├── CheckpointEngineRegistry.register("ray-plasma-store" / "tpu-sync") → Google TPU
             │
             └── RolloutReplicaRegistry.register("vllm")  → TPUvLLMReplica on TPU
 ```

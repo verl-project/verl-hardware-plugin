@@ -3,9 +3,10 @@
 ## Prerequisites
 
 - A Cloud TPU VM or a GKE node pool with TPU v6e chips attached.
-- A container image providing `torch`, `torch_tpu`, and `libtpu`. `torch_tpu` registers both the
-  `tpu` device type and the `tpu_dist` distributed backend; `torch.tpu` does not exist until it is
-  imported.
+- A container image providing `torch`, `torch_tpu` (`pip install torch-tpu`, 0.2.0 or newer), and `libtpu`.
+  `torch_tpu` registers both the `tpu` device type and the `tpu_dist` distributed backend; `torch.tpu`
+  does not exist until it is imported. The `Dockerfile` in verl's [`examples/tpu/grpo`](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) builds a tested image
+  (Ray, `torch_tpu`, JAX/`libtpu`, `tpu-sync`, torchtitan, vLLM + vllm-torchtpu).
 - Network access to download models and datasets.
 - A verl checkout and this plugin checkout.
 
@@ -29,7 +30,7 @@ pip install -e .
 ## 2. Verify the TPU Runtime
 
 ```bash
-python3 -c 'import torch, torch_tpu; print(torch.tpu.is_available(), torch.tpu.device_count())'
+python3 -c 'import torch, torch_tpu; print(torch.accelerator.is_available(), torch.accelerator.device_count())'
 ```
 
 Expected: `True` followed by the number of chips visible to this process.

@@ -4,22 +4,27 @@
 """vLLM / vllm-torchtpu runtime patches for multi-host TPU rollout.
 
 ``patch_vllm_for_tpu`` lets the vLLM engine of a ``TPUvLLMHttpServer`` run on all hosts of a TPU
-slice through Ray. Each patch fills a gap in the pinned vLLM (v0.29.0) and vllm-torchtpu
-(9faafb17) and can be dropped once upstream closes it:
+slice through Ray. Each patch fills a gap in vLLM (v0.29.0 - v0.32.0) and vllm-torchtpu
+(9faafb17 - 732c4346) and can be dropped once upstream closes it:
 
 * ``EngineArgs.create_engine_config``, ``initialize_ray_cluster`` and
   ``RayDistributedExecutor._init_workers_ray``: run the engine on vLLM's generic Ray executor,
   on the placement groups verl reserved for the replica (one per host), with one worker per chip
-  that gets the TPU multi-host environment. vllm-torchtpu's own Ray executor can use only a
-  single placement group. Upstream fix: let it use several.
+  that gets the TPU multi-host environment, and run ``current_platform.update_block_size_for_backend``
+  after ``load_model`` so hybrid GatedDeltaNet + full-attention models align their unified KV pool
+  block size. vllm-torchtpu's own Ray executor can use only a single placement group (and omits
+  ``update_block_size_for_backend``). Upstream fix: let it use several and update block size.
 * ``RayDistributedExecutor._execute_dag``: run each step with plain Ray calls instead of a
   compiled Ray graph. The graph runs the model on a background thread, where vllm-torchtpu's
   raised torch.compile recompile limit does not apply, so the first request fails. Upstream fix:
   raise the limit on every thread.
 * ``TPUWorker.reset_encoder_cache``: no-op. verl resets vLLM's caches after every weight update,
   and vllm-torchtpu's worker does not implement this call. Upstream fix: implement it.
-* ``TPUModelRunner.gather_logprobs`` and ``sample_from_logits``: normalize log probabilities
-  and draw sampling noise in FP32, avoiding BF16 cancellation and sampling bias.
+* ``TPUModelRunner.gather_logprobs``: normalize log probabilities in FP32, avoiding BF16
+  cancellation. Skipped when vllm-torchtpu already does it (#2024).
+* ``TPUModelRunner.sample_from_logits``: redraw BF16 sampling noise in FP32, avoiding sampling
+  bias. vllm-torchtpu #1747 draws the noise in FP32 at the call sites, so there the wrapper
+  passes it through unchanged.
 * ``VLLM_DISABLE_COMPILE_CACHE=1``: a reloaded compile-cache artifact can make vLLM run the model
   eagerly, which crashes libtpu (b/501165531). Upstream fix: that bug.
 * ``multiprocessing.process.BaseProcess.__init__`` and ``RayWorkerWrapper.__init__``: install
@@ -39,11 +44,24 @@ import torch
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from verl_hardware_plugin.accelerators.tpu.platform_tpu import resolve_tpu_topology_bounds
+from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
+    TPU_V7X_DEVICES_PER_HOST,
+    is_tpu_v7x,
+    ray_tpu_accelerator_name,
+    tpu_mesh_env,
+)
 
 logger = logging.getLogger(__name__)
 
 _PATCHES_APPLIED = False
+
+
+def _source_upcasts_to_fp32(fn) -> bool:
+    """Whether ``fn``'s source already computes in FP32 (vllm-torchtpu >= #2024's ``gather_logprobs`` does)."""
+    try:
+        return "torch.float32" in inspect.getsource(inspect.unwrap(fn))
+    except (OSError, TypeError):
+        return False
 
 
 def patch_tpu_logprobs() -> None:
@@ -55,6 +73,11 @@ def patch_tpu_logprobs() -> None:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
     if getattr(TPUModelRunner, "_verl_fp32_logprobs_patched", False):
+        return
+    if _source_upcasts_to_fp32(getattr(TPUModelRunner, "gather_logprobs", None)):
+        # vllm-torchtpu #2024 normalizes the log probabilities in FP32 itself.
+        TPUModelRunner._verl_fp32_logprobs_patched = True
+        logger.info("vllm-torchtpu already computes log probabilities in FP32; logprob patch not needed.")
         return
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -93,11 +116,15 @@ def patch_tpu_logprobs() -> None:
 _fp32_sampling_noise_logged = False
 
 
-# TODO: Remove once vllm-torchtpu draws its sampling uniforms in FP32.
+# TODO: Remove once the minimum supported vllm-torchtpu includes #1747.
 def patch_tpu_sampler() -> None:
     """Draw TPU sampling noise from FP32 random values to reduce BF16 rounding bias.
 
-    Use the runner's sampling generator when available.
+    Older vllm-torchtpu draws the Gumbel-Max uniforms ``u`` in the logits dtype (BF16); the wrapper
+    redraws them in FP32 with the runner's sampling generator when available. vllm-torchtpu #1747
+    draws ``u`` in FP32 at the call sites rather than inside ``sample_from_logits``, so the
+    function's own source cannot tell the versions apart; the wrapper checks ``u.dtype`` at run
+    time instead and passes FP32 noise through unchanged.
     Apply this patch before the TPU model runner is created.
     """
     if importlib.util.find_spec("vllm_torchtpu") is None:
@@ -109,6 +136,8 @@ def patch_tpu_sampler() -> None:
         return
 
     original = getattr(TPUModelRunner, "sample_from_logits", None)
+    # Later vllm-torchtpu releases append parameters (e.g. ``topk_candidates``); only the leading
+    # ones are used here and the rest are forwarded unchanged.
     expected = ["self", "logits", "temperatures", "u", "top_k", "top_p", "all_greedy"]
     try:
         parameters = list(inspect.signature(original).parameters) if callable(original) else None
@@ -117,7 +146,7 @@ def patch_tpu_sampler() -> None:
         parameters = expected
     if parameters in (["args", "kwargs"], ["self", "args", "kwargs"]):
         parameters = expected
-    if parameters != expected:
+    if parameters is None or parameters[: len(expected)] != expected:
         logger.error(
             "TPU sampler FP32 patch NOT applied: TPUModelRunner.sample_from_logits has parameters %s, "
             "expected %s. Sampling noise stays BF16, which biases policy-gradient training.",
@@ -126,7 +155,7 @@ def patch_tpu_sampler() -> None:
         )
         return
 
-    def sample_from_logits(self, logits, temperatures, u, top_k, top_p, all_greedy=False):
+    def sample_from_logits(self, logits, temperatures, u, top_k, top_p, all_greedy=False, *args, **kwargs):
         # The all-greedy path never reads ``u``; preserve its compiled graph.
         if not all_greedy and u.dtype != torch.float32:
             global _fp32_sampling_noise_logged
@@ -144,7 +173,7 @@ def patch_tpu_sampler() -> None:
                 # None during precompile warm-up, where the call site also uses the global RNG.
                 generator=getattr(self, "_sampling_generator", None),
             )
-        return original(self, logits, temperatures, u, top_k, top_p, all_greedy=all_greedy)
+        return original(self, logits, temperatures, u, top_k, top_p, all_greedy, *args, **kwargs)
 
     # functools.wraps copies torch.compile's bookkeeping attributes, which can let
     # Dynamo unwrap straight to the compiled function and skip the redraw.
@@ -274,9 +303,10 @@ def _init_workers_ray(self, placement_group, **ray_remote_kwargs) -> None:
     }
     # torch_tpu's own rendezvous, separate from the torch.distributed one below.
     torch_tpu_master = {"MASTER_ADDR": ips[0], "MASTER_PORT": str(get_open_port())}
+    pod_type = ray_tpu_accelerator_name(node_ips=ips)
     self._env_vars_for_all_workers = [
         {**driver_env, **torch_tpu_master, **tpu_env}
-        for tpu_env in _tpu_worker_envs(ips, vllm_torchtpu_envs.TORCH_TPU_BASE_PORT)
+        for tpu_env in _tpu_worker_envs(ips, vllm_torchtpu_envs.TORCH_TPU_BASE_PORT, pod_type=pod_type)
     ]
     self.collective_rpc("update_environment_variables", args=(self._get_env_vars_to_be_updated(),))
     logger.info("TPU rollout process addresses: %s", self._env_vars_for_all_workers[0]["TPU_PROCESS_ADDRESSES"])
@@ -296,6 +326,24 @@ def _init_workers_ray(self, placement_group, **ray_remote_kwargs) -> None:
     self.collective_rpc("init_worker", args=(all_kwargs,))
     self.collective_rpc("init_device")
     self.collective_rpc("load_model")
+    self.collective_rpc(_update_worker_block_size)
+
+
+def _update_worker_block_size(worker) -> None:
+    """Finalize ``worker.vllm_config`` KV-cache block sizing after ``load_model``.
+
+    vLLM >= 0.31 moved ``current_platform.update_block_size_for_backend`` out of
+    ``EngineArgs.create_engine_config`` and into the executor right after ``load_model`` (because
+    ``_find_non_ssm_backends`` inspects the loaded model's ``static_forward_context``). Skipping it
+    leaves hybrid GatedDeltaNet + full-attention models (Qwen3.5) with ``block_size=16`` instead of
+    the aligned ``mamba_fit_block_size`` (e.g. ``272``), crashing the unified block pool with
+    ``AssertionError: pool page mismatch``.
+    """
+    from vllm.platforms import current_platform
+
+    update_fn = getattr(current_platform, "update_block_size_for_backend", None)
+    if callable(update_fn):
+        update_fn(worker.vllm_config)
 
 
 def _local_ranks(worker_ips: list[str]) -> list[int]:
@@ -303,33 +351,48 @@ def _local_ranks(worker_ips: list[str]) -> list[int]:
     return [worker_ips[:rank].count(ip) for rank, ip in enumerate(worker_ips)]
 
 
-def _tpu_worker_envs(worker_ips: list[str], base_port: int) -> list[dict[str, str]]:
+def _tpu_worker_envs(worker_ips: list[str], base_port: int, pod_type: str = "") -> list[dict[str, str]]:
     """The TPU multi-host environment of each vLLM worker, for workers in rank order.
 
     Ranks on one host must be contiguous. A worker drives chip ``local_rank`` of its host and serves
     the slice builder on ``base_port + local_rank``. These are the variables libtpu and torch_tpu
-    read to join the workers into one TPU mesh.
+    read to join the workers into one TPU mesh. On TPU 7x (``pod_type`` or the accelerator-type
+    environment) a worker drives one TensorCore, the mesh is laid out by process, and an engine must span
+    whole hosts: a standalone process can open only a chip's first core, so an engine with fewer workers on
+    a host than that host has TensorCores has no layout and is rejected here.
     """
     hosts = list(dict.fromkeys(worker_ips))
     local_ranks = _local_ranks(worker_ips)
+    # The engine's worker count defines its mesh: an engine may use part of a host's chips (two TP=4 engines
+    # on a v6e-8, say), so the pod type only tells TPU 7x apart and never selects a v6e layout.
+    v7x = is_tpu_v7x(pod_type)
+    pod_type = pod_type if v7x else ""
+    if v7x:
+        partial = {ip: n for ip, n in Counter(worker_ips).items() if n != TPU_V7X_DEVICES_PER_HOST}
+        if partial:
+            raise ValueError(
+                f"On TPU 7x a vLLM engine spans whole hosts of {TPU_V7X_DEVICES_PER_HOST} TensorCore workers; "
+                f"this engine has {partial} workers per host. Set tensor_model_parallel_size to a multiple of "
+                f"{TPU_V7X_DEVICES_PER_HOST} (one engine per host, or per group of hosts)."
+            )
     addresses = ",".join(
         f"{ip}:{base_port + local_rank}" for ip, local_rank in zip(worker_ips, local_ranks, strict=True)
     )
-    topology, host_bounds, chips_per_host_bounds, _ = resolve_tpu_topology_bounds(len(worker_ips), len(hosts))
-    return [
-        {
+    envs = []
+    for rank, (ip, local_rank) in enumerate(zip(worker_ips, local_ranks, strict=True)):
+        env = {
             "TPU_VISIBLE_CHIPS": str(local_rank),
             "TPU_PROCESS_PORT": str(base_port + local_rank),
             "TPU_PROCESS_ADDRESSES": addresses,
             "TORCH_TPU_SLICEBUILDER_ADDRESSES": addresses,
             "CLOUD_TPU_TASK_ID": str(hosts.index(ip)),
             "TPU_WORKER_HOSTNAMES": ",".join(hosts),
-            "TORCH_TPU_TOPOLOGY": topology,
-            "TPU_HOST_BOUNDS": host_bounds,
-            "TPU_CHIPS_PER_HOST_BOUNDS": chips_per_host_bounds,
         }
-        for ip, local_rank in zip(worker_ips, local_ranks, strict=True)
-    ]
+        mesh_env = tpu_mesh_env(len(worker_ips), len(hosts), rank=rank, local_rank=local_rank, pod_type=pod_type)
+        mesh_env.pop("CHIPS_PER_HOST")  # a trainer-side variable; the rollout workers never carried it
+        env.update(mesh_env)
+        envs.append(env)
+    return envs
 
 
 def _execute_dag(self, scheduler_output, grammar_output, non_block=False):
