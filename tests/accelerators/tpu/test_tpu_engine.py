@@ -1348,6 +1348,255 @@ def test_chunked_optimizer_step_matches_unchunked_adamw():
     assert opt_a.param_groups[0]["params"] == params_a
 
 
+@pytest.mark.parametrize("host_offload", [False, True])
+def test_chunked_optimizer_step_fp32_master(host_offload):
+    """``fp32_master``: bf16 params follow an FP32 AdamW run (cast to bf16) and keep tiny updates bf16 alone loses."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+    from verl_hardware_plugin.accelerators.tpu.options import TPUEngineOptions
+
+    torch.manual_seed(0)
+    names = [f"layers.{i}.wq.weight" for i in range(6)] + ["norm.weight"]
+    ref = [torch.nn.Parameter(torch.randn(8, 8)) for _ in names]
+    params = [torch.nn.Parameter(p.detach().to(torch.bfloat16)) for p in ref]
+    for p in ref:  # the reference starts from the same (bf16-representable) weights
+        p.data.copy_(p.data.to(torch.bfloat16).float())
+    lr = 1e-6  # ~3 orders of magnitude below a bf16 ulp of these weights
+    opt_ref = torch.optim.AdamW([{"params": ref, "lr": lr, "foreach": True}])
+    opt = torch.optim.AdamW([{"params": params, "param_names": names, "lr": lr, "foreach": True}])
+
+    fake_engine = SimpleNamespace(
+        _tpu_eager_mode=None,
+        _tpu_options=TPUEngineOptions(param_dtype="bfloat16", fp32_master=True, optimizer_host_offload=host_offload),
+        module=[SimpleNamespace(named_parameters=lambda: list(zip(names, params, strict=True)))],
+        optimizer=SimpleNamespace(optimizers=[opt], zero_grad=opt.zero_grad),
+        parallel_dims=SimpleNamespace(ep_enabled=False, get_optional_mesh=lambda _: None),
+        config=SimpleNamespace(training=SimpleNamespace(max_norm=1e9)),
+    )
+    for helper in ("_optimizer_param_chunks", "_chunked_grad_norm", "_chunked_clip_and_step"):
+        setattr(fake_engine, helper, getattr(TorchTitanTPUEngine, helper).__get__(fake_engine))
+
+    initial = [p.detach().clone() for p in params]
+    for _ in range(300):
+        for p, r in zip(params, ref, strict=True):
+            g = torch.randn_like(r)
+            r.grad = g.clone()
+            p.grad = g.to(torch.bfloat16)
+        opt_ref.step()
+        TorchTitanTPUEngine.optimizer_step(fake_engine)
+    store = fake_engine._fp32_master_store
+    for p, r in zip(params, ref, strict=True):
+        assert p.dtype == torch.bfloat16 and p.grad is None
+        master, state = store._entries[id(p)]
+        assert master.dtype == torch.float32 and state["exp_avg"].dtype == torch.float32
+        torch.testing.assert_close(master, r.detach(), rtol=1e-3, atol=1e-6)  # bf16 grads, fp32 everything else
+        torch.testing.assert_close(p.detach(), master.to(torch.bfloat16), rtol=0, atol=0)
+    # 300 steps x 1e-6 move the masters by ~3e-4, enough to flip some bf16 weights.
+    assert any(not torch.equal(p.detach(), i) for p, i in zip(params, initial, strict=True))
+    assert opt.state == {} and opt.param_groups[0]["params"] == params
+
+
+def test_fp32_master_host_offload_cpu_fused_adamw_bitwise_parity_and_buffer_reuse():
+    """CPU ``fused=True`` host-offload matches fused FP32 AdamW to 0 ULP, matches device masters, & reuses RAM."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import (
+        TorchTitanTPUEngine,
+        _cpu_fused_adamw_supported,
+        _move_optimizer_state,
+    )
+    from verl_hardware_plugin.accelerators.tpu.options import TPUEngineOptions
+
+    # 12 layers -> 3 chunks (> 2 double-buffer slots) + 2 param groups (decayed & non-decayed).
+    names_decayed = [f"layers.{i}.wq.weight" for i in range(12)]
+    names_nodecay = [f"layers.{i}.norm.weight" for i in range(12)]
+    all_names = names_decayed + names_nodecay
+
+    def _build(host_offload: bool):
+        gen = torch.Generator().manual_seed(42)
+        p_dec = [torch.nn.Parameter(torch.randn(16, 8, generator=gen, dtype=torch.bfloat16)) for _ in names_decayed]
+        p_nod = [torch.nn.Parameter(torch.randn(8, generator=gen, dtype=torch.bfloat16)) for _ in names_nodecay]
+        all_p = p_dec + p_nod
+        opt = torch.optim.AdamW(
+            [
+                {"params": p_dec, "param_names": names_decayed, "lr": 3e-4, "weight_decay": 0.05, "foreach": True},
+                {"params": p_nod, "param_names": names_nodecay, "lr": 1e-4, "weight_decay": 0.0, "foreach": True},
+            ]
+        )
+        eng = SimpleNamespace(
+            _tpu_eager_mode=None,
+            _tpu_options=TPUEngineOptions(
+                param_dtype="bfloat16", fp32_master=True, optimizer_host_offload=host_offload
+            ),
+            module=[SimpleNamespace(named_parameters=lambda: list(zip(all_names, all_p, strict=True)))],
+            optimizer=SimpleNamespace(optimizers=[opt], zero_grad=opt.zero_grad),
+            parallel_dims=SimpleNamespace(ep_enabled=False, get_optional_mesh=lambda _: None),
+            config=SimpleNamespace(training=SimpleNamespace(max_norm=0.25)),
+        )
+        for helper in ("_optimizer_param_chunks", "_chunked_grad_norm", "_chunked_clip_and_step"):
+            setattr(eng, helper, getattr(TorchTitanTPUEngine, helper).__get__(eng))
+        return eng, opt, all_p
+
+    eng_dev, opt_dev, p_dev = _build(host_offload=False)
+    eng_cpu, opt_cpu, p_cpu = _build(host_offload=True)
+
+    # Pure FP32 reference using the exact same CPU ``fused`` kernel selection as ``_Fp32Masters`` (0-ULP oracle).
+    ref_p = [torch.nn.Parameter(p.detach().to(torch.float32)) for p in p_cpu]
+    use_fused = _cpu_fused_adamw_supported()
+    opt_ref = torch.optim.AdamW(
+        [
+            {"params": ref_p[:12], "lr": 3e-4, "weight_decay": 0.05, "fused": use_fused, "foreach": not use_fused},
+            {"params": ref_p[12:], "lr": 1e-4, "weight_decay": 0.0, "fused": use_fused, "foreach": not use_fused},
+        ]
+    )
+
+    master_ptrs_step1: dict[int, tuple[int, int, int]] = {}
+    slot_ptrs_step1: tuple[dict, dict] = ({}, {})
+
+    for step in range(1, 9):
+        lr_scale = 0.5 + 0.1 * step
+        for opt in (opt_dev, opt_cpu, opt_ref):
+            opt.param_groups[0]["lr"] = 3e-4 * lr_scale
+            opt.param_groups[1]["lr"] = 1e-4 * lr_scale
+        g_gen = torch.Generator().manual_seed(1000 + step)
+        raw_grads = [torch.randn(pd.shape, generator=g_gen, dtype=torch.bfloat16) for pd in p_dev]
+        for pd, pc, g in zip(p_dev, p_cpu, raw_grads, strict=True):
+            pd.grad = g.clone()
+            pc.grad = g.clone()
+
+        norm_dev = TorchTitanTPUEngine.optimizer_step(eng_dev)
+        norm_cpu = TorchTitanTPUEngine.optimizer_step(eng_cpu)
+        assert torch.equal(torch.as_tensor(norm_dev), torch.as_tensor(norm_cpu))
+        # Apply the exact same bf16 gradient clipping before FP32 cast as ``_Fp32Masters``:
+        ref_bf16 = [torch.nn.Parameter(torch.empty_like(g), requires_grad=False) for g in raw_grads]
+        for rb, g in zip(ref_bf16, raw_grads, strict=True):
+            rb.grad = g.clone()
+        torch.nn.utils.clip_grads_with_norm_(
+            ref_bf16, 0.25, torch.as_tensor(norm_cpu, dtype=torch.bfloat16), foreach=False
+        )
+        for pr, rb in zip(ref_p, ref_bf16, strict=True):
+            pr.grad = rb.grad.to(torch.float32)
+        opt_ref.step()
+        opt_ref.zero_grad(set_to_none=True)
+
+        store_cpu = eng_cpu._fp32_master_store
+        if step == 1:
+            for pc in p_cpu:
+                m, st = store_cpu._entries[id(pc)]
+                master_ptrs_step1[id(pc)] = (m.data_ptr(), st["exp_avg"].data_ptr(), st["exp_avg_sq"].data_ptr())
+            slot_ptrs_step1 = (
+                {k: b.data_ptr() for k, b in store_cpu._staging_slots[0].items()},
+                {k: b.data_ptr() for k, b in store_cpu._staging_slots[1].items()},
+            )
+
+    store_dev = eng_dev._fp32_master_store
+    store_cpu = eng_cpu._fp32_master_store
+    for pd, pc, pr in zip(p_dev, p_cpu, ref_p, strict=True):
+        md, sd = store_dev._entries[id(pd)]
+        mc, sc = store_cpu._entries[id(pc)]
+        sr = opt_ref.state[pr]
+        # Exact 0-ULP bitwise parity against reference fused FP32 AdamW across all CPU ISAs:
+        assert torch.equal(mc, pr.detach())
+        assert torch.equal(pc.detach(), pr.detach().to(torch.bfloat16))
+        assert torch.equal(sc["exp_avg"], sr["exp_avg"])
+        assert torch.equal(sc["exp_avg_sq"], sr["exp_avg_sq"])
+        # Device ``foreach=True`` vs CPU ``fused=True`` differs only by single-rounding FMA (~1 FP32 ULP):
+        torch.testing.assert_close(pc.detach(), pd.detach(), rtol=1e-2, atol=1e-3)
+        torch.testing.assert_close(mc, md, rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(sc["exp_avg"], sd["exp_avg"], rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(sc["exp_avg_sq"], sd["exp_avg_sq"], rtol=1e-6, atol=1e-7)
+        # Zero per-step reallocation of FP32 masters or moments across steps 1..8:
+        assert (mc.data_ptr(), sc["exp_avg"].data_ptr(), sc["exp_avg_sq"].data_ptr()) == master_ptrs_step1[id(pc)]
+
+    assert {k: b.data_ptr() for k, b in store_cpu._staging_slots[0].items()} == slot_ptrs_step1[0]
+    assert {k: b.data_ptr() for k, b in store_cpu._staging_slots[1].items()} == slot_ptrs_step1[1]
+
+    # Verify ``_move_optimizer_state`` initializes and reuses ``_tpu_pinned_host_state`` cache.
+    p_plain = torch.nn.Parameter(torch.ones(4, 4, dtype=torch.float32))
+    p_plain.grad = torch.ones_like(p_plain)
+    opt_plain = torch.optim.AdamW([p_plain], lr=1e-3)
+    opt_plain.step()
+    _move_optimizer_state(opt_plain, [p_plain], "cpu")
+    assert isinstance(opt_plain._tpu_pinned_host_state, dict)
+
+
+def _fp32_master_host_offload_dtensor_worker(rank: int, world: int, init_file: str) -> None:
+    import torch.distributed as dist
+    from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor, init_device_mesh
+
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+    from verl_hardware_plugin.accelerators.tpu.options import TPUEngineOptions
+
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
+    try:
+        mesh = init_device_mesh("cpu", (world,))
+
+        def _make(host_offload: bool):
+            gen = torch.Generator().manual_seed(17)
+            params = [
+                torch.nn.Parameter(
+                    distribute_tensor(torch.randn(8, 4, generator=gen, dtype=torch.bfloat16), mesh, [Shard(0)])
+                ),
+                torch.nn.Parameter(
+                    distribute_tensor(torch.randn(5, 4, generator=gen, dtype=torch.bfloat16), mesh, [Shard(0)])
+                ),
+                torch.nn.Parameter(
+                    distribute_tensor(torch.randn(4, generator=gen, dtype=torch.bfloat16), mesh, [Replicate()])
+                ),
+            ]
+            names = ["layers.0.wq.weight", "layers.4.wo.weight", "norm.weight"]
+            opt = torch.optim.AdamW([{"params": params, "param_names": names, "lr": 2e-4, "foreach": True}])
+            eng = SimpleNamespace(
+                _tpu_eager_mode=None,
+                _tpu_options=TPUEngineOptions(
+                    param_dtype="bfloat16", fp32_master=True, optimizer_host_offload=host_offload
+                ),
+                module=[SimpleNamespace(named_parameters=lambda: list(zip(names, params, strict=True)))],
+                optimizer=SimpleNamespace(optimizers=[opt], zero_grad=opt.zero_grad),
+                parallel_dims=SimpleNamespace(ep_enabled=False, get_optional_mesh=lambda _: None),
+                config=SimpleNamespace(training=SimpleNamespace(max_norm=0.5)),
+            )
+            for helper in ("_optimizer_param_chunks", "_chunked_grad_norm", "_chunked_clip_and_step"):
+                setattr(eng, helper, getattr(TorchTitanTPUEngine, helper).__get__(eng))
+            return eng, params
+
+        eng_dev, p_dev = _make(host_offload=False)
+        eng_cpu, p_cpu = _make(host_offload=True)
+        for step in range(1, 5):
+            g_gen = torch.Generator().manual_seed(200 + step)
+            grads = [
+                distribute_tensor(torch.randn(8, 4, generator=g_gen, dtype=torch.bfloat16), mesh, [Shard(0)]),
+                distribute_tensor(torch.randn(5, 4, generator=g_gen, dtype=torch.bfloat16), mesh, [Shard(0)]),
+                distribute_tensor(torch.randn(4, generator=g_gen, dtype=torch.bfloat16), mesh, [Replicate()]),
+            ]
+            for pd, pc, g in zip(p_dev, p_cpu, grads, strict=True):
+                pd.grad = g
+                pc.grad = g.clone()
+            TorchTitanTPUEngine.optimizer_step(eng_dev)
+            TorchTitanTPUEngine.optimizer_step(eng_cpu)
+
+        for pd, pc in zip(p_dev, p_cpu, strict=True):
+            md, sd = eng_dev._fp32_master_store._entries[id(pd)]
+            mc, sc = eng_cpu._fp32_master_store._entries[id(pc)]
+            assert isinstance(mc, DTensor) and isinstance(sc["exp_avg"], DTensor)
+            torch.testing.assert_close(pc._local_tensor, pd._local_tensor, rtol=1e-2, atol=1e-3)
+            torch.testing.assert_close(mc._local_tensor, md._local_tensor, rtol=1e-6, atol=1e-7)
+            torch.testing.assert_close(sc["exp_avg"]._local_tensor, sd["exp_avg"]._local_tensor, rtol=1e-6, atol=1e-7)
+            torch.testing.assert_close(
+                sc["exp_avg_sq"]._local_tensor, sd["exp_avg_sq"]._local_tensor, rtol=1e-6, atol=1e-7
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_fp32_master_host_offload_dtensor_shards(tmp_path):
+    """2-rank ``DTensor`` shards match 0-ULP between CPU ``fused=True`` host-offload and device ``fp32_master``."""
+    torch.multiprocessing.start_processes(
+        _fp32_master_host_offload_dtensor_worker,
+        args=(2, str(tmp_path / "pg_dt")),
+        nprocs=2,
+        join=True,
+        start_method="fork",
+    )
+
+
 def test_to_hf_named_param_chunks_converts_one_layer_at_a_time():
     """``get_per_tensor_param`` converts the state dict to HF names one transformer layer at a time, lazily."""
     from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine

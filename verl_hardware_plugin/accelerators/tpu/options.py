@@ -158,6 +158,17 @@ class TPUEngineOptions:
             ``rollout/qwen3_5_layout.py``). Temporary for large MoEs whose expert shard cannot afford a second HBM
             staging copy alongside weights + KV cache (e.g. Qwen3.5-397B-A17B); remove once ``tpu-sync`` stages on
             host DRAM and H2Ds directly into vLLM weights (the default ``False`` path already supports vLLM EP).
+        param_dtype: Storage dtype of the trained parameters, their gradients and (with the default AdamW) the
+            optimizer states: ``float32`` (default) or ``bfloat16``. ``bfloat16`` halves the parameter and gradient
+            memory (pure bf16 training, no fp32 master), e.g. for models whose fp32 training state does not fit.
+        optimizer_host_offload: Keep the optimizer states in host memory (default: ``False``). Unlike verl's
+            ``optimizer_offload``, the whole state never has to fit on the device. With ``fp32_master=True`` and
+            ``AdamW``, FP32 masters and moments stay resident on CPU and step with CPU ``fused=True`` ``AdamW`` while
+            pipelining pinned ``bfloat16`` gradient D2H and stepped-weight H2D one parameter chunk at a time.
+        fp32_master: With ``param_dtype=bfloat16``, the optimizer steps FP32 master weights with FP32 AdamW states
+            and casts the result into the bf16 parameters (default: ``False``). Without it, bf16 weights absorb no
+            update smaller than half a bf16 ulp (lr 1e-6 updates mostly round to zero). With
+            ``optimizer_host_offload`` the masters stay resident in host memory with the optimizer states.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -171,6 +182,9 @@ class TPUEngineOptions:
     model_kernels: Optional[str] = None
     ep_capacity_factor: Optional[float] = None
     rollout_expert_parallel: Optional[bool] = None
+    param_dtype: Optional[str] = None
+    optimizer_host_offload: Optional[bool] = None
+    fp32_master: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -185,6 +199,9 @@ _ENGINE_KINDS: dict[str, type] = {
     "model_kernels": str,
     "ep_capacity_factor": float,
     "rollout_expert_parallel": bool,
+    "param_dtype": str,
+    "optimizer_host_offload": bool,
+    "fp32_master": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
@@ -232,6 +249,13 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
     _apply_legacy_env(
         values, _ENGINE_KINDS, _ENGINE_LEGACY_ENV_VARS, f"torchtitan.engine_kwargs.{TPU_ENGINE_KWARGS_KEY}"
     )
+    if values.get("param_dtype") not in (None, "float32", "bfloat16"):
+        raise ValueError(
+            f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.param_dtype must be float32 or bfloat16, "
+            f"got {values['param_dtype']!r}"
+        )
+    if values.get("fp32_master") and values.get("param_dtype") != "bfloat16":
+        raise ValueError(f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.fp32_master needs param_dtype=bfloat16")
     return TPUEngineOptions(**values)
 
 

@@ -52,6 +52,9 @@ def test_engine_kwargs_are_parsed_and_typed():
                 "context_parallel_strategy": "ulysses",
                 "ep_capacity_factor": "4.0",
                 "rollout_expert_parallel": "true",
+                "param_dtype": "bfloat16",
+                "optimizer_host_offload": "true",
+                "fp32_master": "true",
             }
         )
     )
@@ -65,6 +68,9 @@ def test_engine_kwargs_are_parsed_and_typed():
         context_parallel_strategy="ulysses",
         ep_capacity_factor=4.0,
         rollout_expert_parallel=True,
+        param_dtype="bfloat16",
+        optimizer_host_offload=True,
+        fp32_master=True,
     )
     assert get_tpu_engine_options(_cfg()) == TPUEngineOptions()
     assert get_tpu_engine_options(None) == TPUEngineOptions()
@@ -80,6 +86,9 @@ def test_engine_kwargs_are_parsed_and_typed():
         ({"ep_capacity_factor": 0}, "Invalid TPU engine option ep_capacity_factor"),
         ({"ep_capacity_factor": "nan"}, "Invalid TPU engine option ep_capacity_factor"),
         ({"ep_capacity_factor": True}, "Invalid TPU engine option ep_capacity_factor"),
+        ({"param_dtype": "float16"}, "param_dtype must be float32 or bfloat16"),
+        ({"fp32_master": True}, "fp32_master needs param_dtype=bfloat16"),
+        ({"param_dtype": "float32", "fp32_master": True}, "fp32_master needs param_dtype=bfloat16"),
     ],
 )
 def test_bad_engine_kwargs_raise(tpu, match):
