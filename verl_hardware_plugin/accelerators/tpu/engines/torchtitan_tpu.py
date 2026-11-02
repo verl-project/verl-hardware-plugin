@@ -118,6 +118,34 @@ _OPTIMIZER_STEP_LAYERS_PER_CHUNK = 4
 _OPTIMIZER_STEP_MAX_PARAMS_PER_CHUNK = 64
 
 
+# TODO: Upstream ``hf_range_reader`` into ``torchtitan`` (``StateDictAdapter.get_hf_storage_reader``) and remove
+# ``_use_threaded_hf_reader`` once upstreamed.
+# Safetensors files that the initial HF load reads in parallel (one thread per file; see engines/hf_range_reader.py).
+_HF_LOAD_THREADS_ENV = "VERL_TPU_HF_LOAD_THREADS"
+
+
+def _use_threaded_hf_reader(checkpointer: Any) -> None:
+    """Makes the initial HF load pread byte ranges from ``VERL_TPU_HF_LOAD_THREADS`` (default 16) files at a time.
+
+    torch's reader reads through mmap slices, ~6 MB/s per reader on a gcsfuse mount (hours for a 740 GB checkpoint).
+    """
+    sd_adapter = getattr(checkpointer, "sd_adapter", None)
+    threads = int(os.environ.get(_HF_LOAD_THREADS_ENV, "16"))
+    if sd_adapter is None or threads < 1 or not hasattr(sd_adapter, "get_hf_storage_reader"):
+        return
+    original = sd_adapter.get_hf_storage_reader
+
+    def get_hf_storage_reader(path: str, from_quantized: bool = False, *args: Any, **kwargs: Any):
+        reader = original(path, from_quantized, *args, **kwargs)
+        if from_quantized or type(reader).__name__ != "HuggingFaceStorageReader":
+            return reader
+        from verl_hardware_plugin.accelerators.tpu.engines.hf_range_reader import make_range_read_hf_storage_reader
+
+        return make_range_read_hf_storage_reader(type(reader), path, threads)
+
+    sd_adapter.get_hf_storage_reader = get_hf_storage_reader
+
+
 def _partition_params_into_chunks(
     params: list[torch.nn.Parameter],
     param_names: list[str] | None = None,
@@ -601,6 +629,7 @@ class TorchTitanTPUEngine(BaseEngine):
         """Initialize model/checkpointer and release unused optimizer state on forward-only reference workers."""
         self.module = self.trainer.model_parts
         self.checkpointer = self.trainer.checkpointer
+        _use_threaded_hf_reader(self.checkpointer)
         # load initial HF weights
         self.checkpointer.load()
         tpu_synchronize(wait=True)
