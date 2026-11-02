@@ -23,15 +23,14 @@ import os
 import time
 from typing import Any, NamedTuple, Optional
 
-import ray
 import torch
+from vllm.utils.network_utils import get_ip
 
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
 from verl_hardware_plugin.accelerators.tpu.rollout import qwen3_5_layout
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_api
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_checkpoint_engine as tpu_sync_engine
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import ExactParityCheck, compute_tensor_stats
-from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous import get_tpu_sync_rendezvous
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import (
     get_parent_module,
     resolve_model_key,
@@ -41,9 +40,6 @@ from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends impo
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-# How long a rollout worker waits for the controller address and the trainer's tensor shapes.
-_REGISTRY_POLL_ATTEMPTS = 30
-_REGISTRY_POLL_INTERVAL_S = 0.5
 # Row-parallel layers: vLLM shards their input dimension (dim 1) across TP ranks; every other 2-D weight
 # whose output dimension divides evenly is sharded on dim 0.
 _ROW_PARALLEL_SUFFIXES = (".o_proj.weight", ".down_proj.weight")
@@ -153,39 +149,21 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         worker: Any = getattr(self, "worker", self)
         return worker.model_runner.model
 
-    def _wait_for_tpu_sync_rendezvous(
-        self, rank_val: int, rendezvous_name: Optional[str] = None
-    ) -> tuple[str, dict[str, list[int]]]:
-        """Returns the controller address and the trainer's global tensor shapes from the job's rendezvous actor."""
-        for _ in range(_REGISTRY_POLL_ATTEMPTS):
-            try:
-                rendezvous = get_tpu_sync_rendezvous(rendezvous_name)
-                addr, shapes = ray.get(
-                    [rendezvous.get_controller_address.remote(), rendezvous.get_global_shapes.remote()]
-                )
-                if addr and shapes:
-                    return addr, shapes
-            except Exception as e:
-                logger.debug(f"tpu-sync Sampler Rank {rank_val}: registry lookup failed: {e}")
-            time.sleep(_REGISTRY_POLL_INTERVAL_S)
-        raise RuntimeError(
-            f"tpu-sync Sampler Rank {rank_val}: No tpu-sync controller address or "
-            f"global shapes found in the tpu-sync rendezvous {rendezvous_name!r} after timeout"
-        )
-
     def init_tpu_sync_on_worker(
         self,
+        controller_address: str,
+        global_shapes: dict[str, list[int]],
         parallelism: int = tpu_sync_engine.TPU_SYNC_DEFAULT_PARALLELISM,
         job_name: str = "sampler0",
-        rendezvous_name: Optional[str] = None,
     ) -> bool:
         """Initialize tpu-sync WeightSynchronizer listener and register with the central tpu-sync controller.
 
-        ``job_name`` is the tpu-sync job this worker's replica registers under (the driver names every rollout
-        replica after its ``replica_rank``), so the ranks ``0..TP-1`` of several replicas do not collide on
-        the controller. ``rendezvous_name`` is the job's ``TpuSyncRendezvous`` actor, which the driver names.
-        Only the first call does work: the receive buffers, the synchronizer and the
-        registration are reused by every later sync.
+        ``controller_address`` is the ``host:port`` of the driver's tpu-sync controller and ``global_shapes`` the
+        full shape of every tensor the trainer sends; the driver passes both, because vLLM's ``mp`` workers are
+        not Ray processes. ``job_name`` is the tpu-sync job this worker's replica registers under (the driver
+        names every rollout replica after its ``replica_rank``), so the ranks ``0..TP-1`` of several replicas do
+        not collide on the controller. Only the first call does work: the receive buffers, the synchronizer and
+        the registration are reused by every later sync.
         """
         if getattr(self, "_tpu_sync_ws", None) is not None:
             return True
@@ -195,14 +173,18 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             logger.warning("tpu-sync Sampler: could not locate vllm_model to bind parameters.")
             return False
 
-        bind_ip = ray.util.get_node_ip_address().strip("[]")
+        bind_ip = get_ip().strip("[]")
         rank_val = getattr(self, "rank", 0)
         # The listener port is assigned by the OS, as on the trainer side, and registered with the controller
         # below; fixed ``base + rank`` ports collided when two replicas shared a host.
         listener_port = 0
 
-        # 1. Fetch tpu-sync controller address and un-fused global shapes from the job's rendezvous
-        controller_addr, global_shapes_map = self._wait_for_tpu_sync_rendezvous(rank_val, rendezvous_name)
+        controller_addr, global_shapes_map = controller_address, global_shapes
+        if not controller_addr or not global_shapes_map:
+            raise RuntimeError(
+                f"tpu-sync Sampler Rank {rank_val}: the driver passed no tpu-sync controller address "
+                f"({controller_addr!r}) or no trainer tensor shapes ({len(global_shapes_map or {})} entries)"
+            )
 
         # 2. Determine tensor parallel size from vLLM V1 config
         worker: Any = getattr(self, "worker", self)
