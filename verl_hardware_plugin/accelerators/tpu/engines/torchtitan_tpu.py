@@ -63,6 +63,10 @@ from verl.workers.engine.utils import (
     prepare_micro_batches,
 )
 from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_precision import (
+    apply_fp32_logits_tpu,
+    apply_tpu_precision_patches,
+)
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
@@ -94,6 +98,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
 )
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
 from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import prepare_tpu_loss_inputs
+from verl_hardware_plugin.accelerators.tpu.losses.ppo_diagnostics import call_tpu_loss_function
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 
@@ -402,7 +407,11 @@ class TorchTitanTPUEngine(BaseEngine):
             "disable_cuda_graphs": True,
             "max_norm": self.optimizer_config.clip_grad,
         }
+        if tpu_options.mixed_precision_param is not None:
+            training_kwargs["mixed_precision_param"] = tpu_options.mixed_precision_param
         if self.engine_config.forward_only:
+            # dtype controls parameter storage; mixed_precision_param controls
+            # FSDP's compute/all-gather dtype. Preserve both independent choices.
             engine_dtype = getattr(self.engine_config, "dtype", "bfloat16")
             if engine_dtype in ("bfloat16", "float32"):
                 training_kwargs["dtype"] = engine_dtype
@@ -488,6 +497,9 @@ class TorchTitanTPUEngine(BaseEngine):
             for model_part in model_parts:
                 enable_fsdp_gradient_division(model_part, dp_size)
 
+        apply_tpu_precision_patches(model_parts)
+        if tpu_options.fp32_logits and not self._use_fused_linear_cross_entropy:
+            apply_fp32_logits_tpu(model_parts)
         install_tpu_attention(model_parts, use_splash=self._use_splash_attention)
         if self.parallel_dims.ep_enabled:
             ep_cap = (
@@ -1434,8 +1446,11 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
                 if loss_function is not None:
                     loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
-                    loss, metrics = loss_function(
-                        model_output=loss_model_output, data=loss_data, dp_group=self.get_data_parallel_group()
+                    loss, metrics = call_tpu_loss_function(
+                        loss_function,
+                        model_output=loss_model_output,
+                        data=loss_data,
+                        dp_group=self.get_data_parallel_group(),
                     )
                 else:
                     assert forward_only, "loss_function must be provided when not forward_only"

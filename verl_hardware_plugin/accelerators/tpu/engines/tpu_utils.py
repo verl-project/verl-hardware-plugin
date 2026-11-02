@@ -15,8 +15,9 @@ import importlib
 import logging
 import math
 import os
+import sys
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -28,9 +29,15 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import TorchtitanEngineConfig
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_precision import (
+    attention_compute_dtype,
+    precision_splash_attention_cls,
+    tpu_precision_compiler_context,
+)
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 
 logger = logging.getLogger(__name__)
@@ -285,6 +292,10 @@ def extend_torchtitan_engine_config() -> None:
     """
     extras: list[tuple[str, Any, Any]] = [
         ("engine_kwargs", dict[str, Any], field(default_factory=dict)),
+        ("mixed_precision_param", Optional[str], None),
+        # None preserves the existing automatic fused-loss default; an explicit
+        # False requests the BF16 head and disables that default.
+        ("fp32_logits", Optional[bool], None),
         # Deprecated: use engine_kwargs.tpu.<name>.
         ("use_splash_attention", Optional[bool], None),
         ("use_simple_fsdp", Optional[bool], None),
@@ -359,17 +370,33 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
 def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any) -> bool:
     """Resolve whether to use the TPU Pallas fused linear + softmax cross-entropy kernel for logprobs.
 
-    On by default with ``use_torch_compile`` when ``tensor_parallel_size == 1``. The kernel never writes the
+    On by default with ``use_torch_compile`` when ``tensor_parallel_size == 1``, unless ``fp32_logits``
+    explicitly selects the BF16 or PR #76 FP32 head. The kernel never writes the
     ``[tokens, vocab]`` logits to HBM and keeps them in fp32, so its log-probs are more precise than verl's GPU
     path, which rounds the logits to bf16 before the fp32 log-softmax. Disabled when ``tensor_parallel_size > 1``
     because ``FusedLossLinearWrapper`` returns a ``(hidden_states, weight_t)`` tuple that is incompatible with
     TorchTitan's ``ColwiseParallel`` output redistribution (TP uses :func:`compute_tpu_logprobs_chunked` instead).
     """
+    options = get_tpu_engine_options(engine_config)
+    requested = options.use_fused_linear_cross_entropy
+    fp32_logits = options.fp32_logits
+    if requested is True and fp32_logits is not None:
+        raise ValueError(
+            f"torchtitan.fp32_logits={fp32_logits} explicitly selects the LM-head precision, but "
+            "engine_kwargs.tpu.use_fused_linear_cross_entropy=True bypasses that head. "
+            "Set use_fused_linear_cross_entropy=False, or unset fp32_logits to use the fused kernel's precision."
+        )
     if getattr(engine_config, "tensor_parallel_size", 1) > 1:
+        if fp32_logits:
+            raise ValueError(
+                "torchtitan.fp32_logits=True supports tensor_parallel_size=1 only; "
+                "its local FP32 LM-head projection cannot preserve tensor-parallel output sharding. "
+                "Set fp32_logits=False or tensor_parallel_size=1."
+            )
         return False
     return _or_default(
-        get_tpu_engine_options(engine_config).use_fused_linear_cross_entropy,
-        bool(getattr(engine_config, "use_torch_compile", False)),
+        requested,
+        bool(getattr(engine_config, "use_torch_compile", False)) and fp32_logits is None,
     )
 
 
@@ -737,7 +764,7 @@ def tpu_synchronize(
 
 
 def tpu_eager_mode_context(mode: Optional[str]):
-    """Context manager running the enclosed ops under the ``torch_tpu`` eager ``mode`` (no-op for ``None``).
+    """Run trainer operations with the eager ``mode`` and FP32 affine-gradient reductions.
 
     Mirrors torchtitan's ``tpu_config.eager_mode`` (``torchtitan/experiments/tpu/gmain.py``), which TPU
     recipes set to ``DEFER_AND_FUSE``: ops outside the compiled blocks are deferred and compiled into
@@ -747,14 +774,25 @@ def tpu_eager_mode_context(mode: Optional[str]):
     Uses torch_tpu's public ``torch.tpu.set_eager_mode`` / ``torch.tpu.EagerMode`` (torch_tpu >= 0.2.0), the same
     context manager as the private ``torch_tpu._internal.execution_mode.set_eager_mode``.
     """
-    if mode is None:
-        return nullcontext()
     tpu = getattr(torch, "tpu", None)
     set_eager_mode = getattr(tpu, "set_eager_mode", None)
     eager_mode = getattr(tpu, "EagerMode", None)
-    if set_eager_mode is None or eager_mode is None:  # no torch_tpu, e.g. the CPU tests
-        return nullcontext()
-    return set_eager_mode(getattr(eager_mode, mode))
+    eager_context = (
+        set_eager_mode(getattr(eager_mode, mode))
+        if mode is not None and set_eager_mode is not None and eager_mode is not None
+        else nullcontext()
+    )
+    if "torch_tpu" not in sys.modules:  # no torch_tpu, e.g. the CPU tests
+        return eager_context
+
+    @contextmanager
+    def trainer_context():
+        with ExitStack() as stack:
+            stack.enter_context(eager_context)
+            stack.enter_context(tpu_precision_compiler_context())
+            yield
+
+    return trainer_context()
 
 
 @torch.no_grad()
@@ -1038,6 +1076,14 @@ class TPUVarlenAttention(torch.nn.Module):
 
     def forward(self, q, k, v, *, scale=None, positions=None, segment_ids=None, out_transform=None, **kwargs):
         _reject_out_transform(out_transform)
+        input_dtype = q.dtype
+        compute_dtype = attention_compute_dtype(q)
+        if compute_dtype is not None:
+            q, k, v = (t.to(compute_dtype) for t in (q, k, v))
+        elif q.dtype != k.dtype or q.dtype != v.dtype:
+            # FP32 Q/K norms can coexist with a BF16 value projection without
+            # autocast; the math reference requires a common dtype.
+            q, k, v = (t.to(torch.float32) for t in (q, k, v))
         segment_ids = _document_ids(positions, segment_ids)
         was_3d = q.dim() == 3
         if was_3d:
@@ -1060,7 +1106,9 @@ class TPUVarlenAttention(torch.nn.Module):
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))
         if q.shape[1] != k.shape[1]:  # GQA
             k, v = (t.repeat_interleave(q.shape[1] // k.shape[1], dim=1) for t in (k, v))
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask.unsqueeze(1), scale=scale).transpose(1, 2)
+        with sdpa_kernel([SDPBackend.MATH]) if q.dtype == torch.float32 else nullcontext():
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask.unsqueeze(1), scale=scale).transpose(1, 2)
+        out = out.to(input_dtype)
         return out.squeeze(0) if was_3d else out
 
 
@@ -1094,7 +1142,7 @@ def _tpu_attention(inner: torch.nn.Module, use_splash: bool, local_window_size: 
     reference = inner.local_forward if _is_kv_all_gather_cp(inner) else TPUVarlenAttention(local_window_size)
     if not use_splash:
         return reference
-    return _splash_attention_cls()(
+    return precision_splash_attention_cls(_splash_attention_cls())(
         is_causal=True,
         local_window_size=local_window_size,
         original_module=reference,

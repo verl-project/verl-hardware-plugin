@@ -90,6 +90,9 @@ docs/accelerators/tpu/
 
 ## Configuration
 
+For the trainer and rollout precision corrections from verl-upstream PR #76, including a BF16 compute/logit
+preset, see [Numerical consistency](./numerical_consistency.md).
+
 Every TPU option goes in the verl config, in the per-backend `engine_kwargs` dict of the component it
 configures, the same channel verl uses for its own backends. All TPU-only options (the ones verl's GPU config has no
 field for) are defined and parsed in one module, `verl_hardware_plugin/accelerators/tpu/options.py`: unknown keys and
@@ -98,7 +101,7 @@ replacement. verl's `TorchtitanEngineConfig` has no `engine_kwargs` field yet; t
 
 | Component | Where the options go | Read by | Options |
 |-----------|----------------------|---------|---------|
-| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `context_parallel_strategy`; see [vLLM Rollout](./rollout.md) |
+| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `context_parallel_strategy`, `mixed_precision_param`, `fp32_logits`; see [vLLM Rollout](./rollout.md) and [Numerical consistency](./numerical_consistency.md) |
 | Rollout (vLLM on TPU) | `actor_rollout_ref.rollout.engine_kwargs.vllm.*` | verl core, passed to vLLM as is | vLLM engine arguments. The TPU replica forces `distributed_executor_backend=external_launcher` and `enable_sleep_mode=False`; there are no TPU-only rollout options. |
 | Weight sync | `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.*` | verl core passes them to the checkpoint engine's constructor; `options.py`: `TPUSyncOptions` | `tpu-sync`: `parallelism`, `verify_parity`, `release_buffers_after_sync`, `tie_word_embeddings`; `ray-plasma-store`: none. See [Weight Sync](./weight_sync.md#configuration) |
 
