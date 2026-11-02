@@ -153,6 +153,10 @@ class TPUEngineOptions:
         ep_capacity_factor: Per-destination-rank token capacity multiplier of ``TpuQwen35TokenDispatcher`` when
             ``expert_parallel_size > 1`` (default: ``4.0``). torchtitan's pretraining default (``1.25``) drops
             skewed RL / math tokens across 32-64 EP ranks while vLLM rollout is dropless.
+        qwen3_pallas_experts: Select TPU Pallas grouped experts for Qwen3-30B-A3B (default: ``True``).
+            ``False`` retains native grouped matmuls for diagnostics.
+        moe_paired_gemm: Pair the Qwen3-30B-A3B gate/up expert projections (default: ``True`` at EP=1).
+            Expert parallelism always uses separate kernels.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -165,6 +169,8 @@ class TPUEngineOptions:
     seq_bucket_size: Optional[int] = None
     model_kernels: Optional[str] = None
     ep_capacity_factor: Optional[float] = None
+    qwen3_pallas_experts: Optional[bool] = None
+    moe_paired_gemm: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -178,6 +184,8 @@ _ENGINE_KINDS: dict[str, type] = {
     "seq_bucket_size": int,
     "model_kernels": str,
     "ep_capacity_factor": float,
+    "qwen3_pallas_experts": bool,
+    "moe_paired_gemm": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
@@ -189,6 +197,8 @@ _ENGINE_LEGACY_ENV_VARS = {
     "tpu_eager_mode": "VERL_TPU_EAGER_MODE",
     "optim_impl": "VERL_TPU_OPTIM_IMPL",
     "seq_bucket_size": "VERL_TPU_SEQ_BUCKET_SIZE",
+    "qwen3_pallas_experts": "VERL_TPU_QWEN3_PALLAS_EXPERTS",
+    "moe_paired_gemm": "VERL_MOE_PAIRED_GEMM",
 }
 _ENGINE_LEGACY_CONFIG_FIELDS = (
     "use_splash_attention",

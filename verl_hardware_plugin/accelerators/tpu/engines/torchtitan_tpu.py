@@ -63,6 +63,7 @@ from verl.workers.engine.utils import (
     prepare_micro_batches,
 )
 from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels
+from verl_hardware_plugin.accelerators.tpu.engines.qwen3_moe import configure_qwen3_moe_for_rl
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
@@ -333,6 +334,16 @@ class TorchTitanTPUEngine(BaseEngine):
             **fuse_qkv_kwargs,
             **tpu_model_kernels.model_registry_kwargs(self._tpu_kernels),
         )
+        moe_model_config = configure_qwen3_moe_for_rl(
+            model_spec.model,
+            model_type=self.model_config.hf_config.model_type,
+            model_flavor=torchtitan_flavor,
+            expert_parallel_degree=self.engine_config.expert_parallel_size,
+            pallas_experts=tpu_options.qwen3_pallas_experts,
+            paired_gemm=tpu_options.moe_paired_gemm,
+        )
+        if moe_model_config is not model_spec.model:
+            model_spec = dataclasses.replace(model_spec, model=moe_model_config)
         tpu_model_kernels.configure_model_spec(
             model_spec,
             self._tpu_kernels,
