@@ -692,7 +692,13 @@ class PlatformTPU(PlatformBase):
                         for res in node.get("Resources", {}):
                             if res.startswith("tpu-group-"):
                                 tpu_slices.add(res)
-                slices = sorted(tpu_slices)
+                slices = sorted(
+                    tpu_slices,
+                    key=lambda s: (
+                        int(s.removeprefix("tpu-group-")) if s.removeprefix("tpu-group-").isdigit() else float("inf"),
+                        s,
+                    ),
+                )
                 for tpu_slice in slices:
                     if tpu_slice not in self._claimed_slices:
                         self._claimed_slices.add(tpu_slice)

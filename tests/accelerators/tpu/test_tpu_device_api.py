@@ -195,3 +195,23 @@ def test_platform_leaves_torch_tpu_untouched():
         platform.empty_cache()
     for name in ("empty_cache", "memory_stats", "reset_peak_memory_stats", "get_device_name", "get_device_properties"):
         assert not hasattr(tpu, name)
+
+
+def test_placement_group_claims_tpu_slices_in_numeric_order():
+    """Clusters with >=10 TPU slices claim tpu-group-0, tpu-group-1, ..., tpu-group-10 in numeric order."""
+    import ray
+
+    from verl_hardware_plugin.accelerators.tpu import platform_tpu as platform_tpu_mod
+    from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
+
+    nodes = [{"Alive": True, "Resources": {f"tpu-group-{i}": 8.0}} for i in (10, 2, 0, 1, 9)]
+    tpu = types.ModuleType("torch.tpu")
+    with (
+        mock.patch.object(torch, "tpu", tpu, create=True),
+        mock.patch.object(ray, "is_initialized", return_value=True),
+        mock.patch.object(ray, "nodes", return_value=nodes),
+    ):
+        platform = PlatformTPU()
+        claimed = [platform.auto_assign_accelerator_type(f"pool_{k}", None) for k in range(6)]
+    assert claimed == ["tpu-group-0", "tpu-group-1", "tpu-group-2", "tpu-group-9", "tpu-group-10", "tpu-group-10"]
+    assert platform_tpu_mod is not None
