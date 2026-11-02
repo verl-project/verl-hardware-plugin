@@ -50,6 +50,7 @@ def test_engine_kwargs_are_parsed_and_typed():
                 "optim_impl": "for-loop",
                 "seq_bucket_size": "512",
                 "context_parallel_strategy": "ulysses",
+                "ep_capacity_factor": "4.0",
             }
         )
     )
@@ -61,6 +62,7 @@ def test_engine_kwargs_are_parsed_and_typed():
         optim_impl="for-loop",
         seq_bucket_size=512,
         context_parallel_strategy="ulysses",
+        ep_capacity_factor=4.0,
     )
     assert get_tpu_engine_options(_cfg()) == TPUEngineOptions()
     assert get_tpu_engine_options(None) == TPUEngineOptions()
@@ -72,6 +74,10 @@ def test_engine_kwargs_are_parsed_and_typed():
         ({"use_splash_attn": True}, "Unknown TPU engine option"),
         ({"use_simple_fsdp": "maybe"}, "Invalid TPU engine option use_simple_fsdp"),
         ({"seq_bucket_size": 0}, "Invalid TPU engine option seq_bucket_size"),
+        ({"seq_bucket_size": True}, "Invalid TPU engine option seq_bucket_size"),
+        ({"ep_capacity_factor": 0}, "Invalid TPU engine option ep_capacity_factor"),
+        ({"ep_capacity_factor": "nan"}, "Invalid TPU engine option ep_capacity_factor"),
+        ({"ep_capacity_factor": True}, "Invalid TPU engine option ep_capacity_factor"),
     ],
 )
 def test_bad_engine_kwargs_raise(tpu, match):

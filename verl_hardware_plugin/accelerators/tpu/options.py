@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import os
 from collections.abc import Mapping
 from typing import Any, Optional
@@ -78,10 +79,19 @@ def _parse(name: str, kind: type, value: Any, source: str, label: str = "TPU") -
                 return False
             raise ValueError(value)
         if kind is int:
+            if isinstance(value, bool):
+                raise ValueError(value)
             parsed = int(value)
             if parsed <= 0:
                 raise ValueError(value)
             return parsed
+        if kind is float:
+            if isinstance(value, bool):
+                raise ValueError(value)
+            parsed_float = float(value)
+            if not math.isfinite(parsed_float) or parsed_float <= 0:
+                raise ValueError(value)
+            return parsed_float
         # Strings are passed through; e.g. tpu_eager_mode="NONE" explicitly disables the eager mode.
         return str(value)
     except (TypeError, ValueError) as e:
@@ -126,7 +136,7 @@ class TPUEngineOptions:
     Attributes:
         use_splash_attention: Use the Pallas splash attention kernel (default: ``use_torch_compile`` or
             ``context_parallel_size > 1``).
-        use_simple_fsdp: Shard with SimpleFSDP (default: ``use_torch_compile`` when PP and EP are 1).
+        use_simple_fsdp: Shard with SimpleFSDP (default: ``use_torch_compile`` when PP is 1).
         use_fused_linear_cross_entropy: Use the Pallas fused linear + cross-entropy kernel for log-probs
             (default: ``use_torch_compile`` when TP is 1).
         fuse_qkv: Fuse attention Q/K/V projections in the model (default: ``True``; ``False`` avoids
@@ -140,6 +150,9 @@ class TPUEngineOptions:
             ``pad_to_length`` is set, else 256).
         model_kernels: Optional torchtitan TPU kernels of the model (``engines.tpu_model_kernels``): ``auto``
             (default: what the installed torchtitan provides), ``none``, ``all``, or a comma-separated subset.
+        ep_capacity_factor: Per-destination-rank token capacity multiplier of ``TpuQwen35TokenDispatcher`` when
+            ``expert_parallel_size > 1`` (default: ``4.0``). torchtitan's pretraining default (``1.25``) drops
+            skewed RL / math tokens across 32-64 EP ranks while vLLM rollout is dropless.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -151,6 +164,7 @@ class TPUEngineOptions:
     optim_impl: Optional[str] = None
     seq_bucket_size: Optional[int] = None
     model_kernels: Optional[str] = None
+    ep_capacity_factor: Optional[float] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -163,6 +177,7 @@ _ENGINE_KINDS: dict[str, type] = {
     "optim_impl": str,
     "seq_bucket_size": int,
     "model_kernels": str,
+    "ep_capacity_factor": float,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 

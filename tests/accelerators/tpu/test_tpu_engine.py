@@ -138,7 +138,8 @@ def test_pad_packed_inputs_for_tpu_pads_to_bucket_and_aligned_length():
             device=torch.device("cpu"),
         )
     assert orig_seq_len == 5
-    assert ids.tolist() == [10, 11, 12, 20, 21, 0, 0, 0]
+    # Pad tokens cycle real input_ids so MoE routers spread pad traffic across experts.
+    assert ids.tolist() == [10, 11, 12, 20, 21, 10, 11, 12]
     # Pad tokens get position 0: each one is its own document for the attention.
     assert pos.tolist() == [0, 1, 2, 0, 1, 0, 0, 0]
     assert labels.tolist() == [11, 12, 20, 21, 10, 0, 0, 0]
@@ -295,6 +296,19 @@ def test_resolve_tpu_torchtitan_options_and_config_extension():
         expert_parallel_size=1,
     )
     assert resolve_tpu_torchtitan_options(cfg_cp) == (True, True, "DEFER_AND_FUSE")
+
+    # EP: SimpleFSDP composes with expert_parallel_size > 1 when pipeline_parallel_size == 1.
+    cfg_ep = SimpleNamespace(
+        use_torch_compile=True,
+        use_splash_attention=None,
+        use_simple_fsdp=None,
+        tpu_eager_mode=None,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        context_parallel_size=1,
+        expert_parallel_size=8,
+    )
+    assert resolve_tpu_torchtitan_options(cfg_ep) == (True, True, "DEFER_AND_FUSE")
 
 
 def test_install_tpu_attention_dense():
@@ -1438,3 +1452,159 @@ def test_packed_document_budget_keeps_every_rl_sequence_apart():
     assert tokamax_ids(1)[0, 300].item() == tokamax_ids(1)[0, 299].item()
     ids = tokamax_ids(3)[0]
     assert ids[:300].eq(1).all() and ids[300:608].eq(2).all() and ids[608:].eq(3).all()
+
+
+def test_ep_capacity_factor_and_strided_pad_tokens():
+    """Non-Module ``RoutedExperts.token_dispatcher`` gets ``capacity_factor``, and padding strides across vocab."""
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_model_kernels import set_ep_capacity_factor
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import pad_packed_inputs_for_tpu
+
+    class TpuQwen35TokenDispatcher:  # plain Configurable object in torchtitan (NOT an nn.Module)
+        def __init__(self):
+            self.capacity_factor = 1.25
+
+    class RoutedExperts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.token_dispatcher = TpuQwen35TokenDispatcher()
+
+    model = torch.nn.Sequential(RoutedExperts(), torch.nn.Linear(2, 2), RoutedExperts())
+    assert set_ep_capacity_factor([model], 4.0) == 2
+    assert all(m.token_dispatcher.capacity_factor == 4.0 for m in model if isinstance(m, RoutedExperts))
+    assert set_ep_capacity_factor([model], 4.0) == 0
+
+    ids = torch.nested.nested_tensor_from_jagged(torch.tensor([11, 22, 33, 44, 55]), torch.tensor([0, 3, 5]))
+    pos = torch.nested.nested_tensor_from_jagged(torch.tensor([0, 1, 2, 0, 1]), torch.tensor([0, 3, 5]))
+    mb = TensorDict({}, batch_size=[2])
+    tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", 12)
+    padded_ids, padded_pos, padded_labels, orig_len = pad_packed_inputs_for_tpu(
+        ids, pos, mb, device="cpu", bucket_size=8, vocab_size=1000
+    )
+    assert orig_len == 5 and padded_ids.shape == (12,)
+    assert padded_ids[:5].tolist() == [11, 22, 33, 44, 55]
+    assert padded_ids[5:].tolist() == [(i * 9973) % 1000 for i in range(7)]
+    assert len(set(padded_ids[5:].tolist())) == 7
+    assert padded_pos.tolist() == [0, 1, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+    assert padded_labels.tolist() == [22, 33, 44, 55, 11, 0, 0, 0, 0, 0, 0, 0]
+
+    # Fallback when vocab_size is omitted: cycle real token IDs so tiny synthetic vocabs never go out of bounds.
+    fallback_ids, _, _, _ = pad_packed_inputs_for_tpu(ids, pos, mb, device="cpu", bucket_size=8)
+    assert fallback_ids.tolist() == [11, 22, 33, 44, 55, 11, 22, 33, 44, 55, 11, 22]
+
+    # Wide-MoE (dim > 2048) dWeight TGMM tiling vs narrow-MoE (dim <= 2048), and EP > 1 paired-gmm disable.
+    class _FakeExpertsCfg:
+        def __init__(self, dim):
+            self.dim = dim
+            self.use_pallas_paired_grouped_mm = True
+            self.pallas_grouped_mm_tile_m = None
+            self.pallas_grouped_mm_tgmm_tiling = None
+            self.pallas_grouped_mm_w2_tgmm_tiling = None
+
+    class _FakeTpuGroupedExperts:
+        Config = _FakeExpertsCfg
+
+    narrow_exp = _FakeExpertsCfg(dim=2048)
+    wide_exp = _FakeExpertsCfg(dim=4096)
+    fake_spec = SimpleNamespace(
+        model=SimpleNamespace(traverse=lambda cls: [(None, narrow_exp, None, None), (None, wide_exp, None, None)])
+    )
+    fake_ge = types.ModuleType("torchtitan.experiments.tpu.grouped_experts")
+    fake_ge.TpuGroupedExperts = _FakeTpuGroupedExperts  # type: ignore[attr-defined]
+    fake_reg = SimpleNamespace(_use_tpu_moe_kernels=lambda _: None)
+    with (
+        mock.patch.dict(sys.modules, {"torchtitan.experiments.tpu.grouped_experts": fake_ge}),
+        mock.patch.object(tpu_model_kernels, "_qwen3_5_config_registry", return_value=fake_reg),
+    ):
+        tpu_model_kernels.configure_model_spec(fake_spec, frozenset({"moe"}))
+        assert narrow_exp.use_pallas_paired_grouped_mm is True
+        assert wide_exp.use_pallas_paired_grouped_mm is True
+        tpu_model_kernels.configure_model_spec(fake_spec, frozenset({"moe"}), expert_parallel_degree=4)
+    assert narrow_exp.use_pallas_paired_grouped_mm is False
+    assert wide_exp.use_pallas_paired_grouped_mm is False
+    assert narrow_exp.pallas_grouped_mm_tile_m == 512
+    assert narrow_exp.pallas_grouped_mm_tgmm_tiling == (512, 0, 0)
+    assert narrow_exp.pallas_grouped_mm_w2_tgmm_tiling is None
+    assert wide_exp.pallas_grouped_mm_tile_m is None
+    assert wide_exp.pallas_grouped_mm_tgmm_tiling == (256, 1024, 0)
+    assert wide_exp.pallas_grouped_mm_w2_tgmm_tiling == (256, 1024, 1024)
+
+
+def test_torchtitan_head_compatibility_for_kda_multi_mesh_and_ep_simple_fsdp(monkeypatch):
+    """Compat with torchtitan HEAD before #73-#80/#6 land: tokamax kda probe, multi-mesh chunks, and EP SimpleFSDP."""
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu, tpu_model_kernels, tpu_utils
+
+    # 1. PyPI tokamax==0.0.14 has ``tokamax`` without ``tokamax._src.ops.kda``: "auto" must not enable ``kda``.
+    fake_reg = SimpleNamespace(_use_tpu_moe_kernels=lambda _: None, TOKAMAX_GATED_DELTA_OVERRIDE="kda_override")
+    monkeypatch.setattr(tpu_model_kernels, "_qwen3_5_config_registry", lambda: fake_reg)
+    monkeypatch.setattr(
+        tpu_model_kernels.importlib.util,
+        "find_spec",
+        lambda name: object() if name == "tokamax" else None,
+    )
+    assert tpu_model_kernels.resolve_tpu_model_kernels("qwen3_5", "auto") == frozenset({"moe", "lce"})
+    monkeypatch.setattr(
+        tpu_model_kernels.importlib.util,
+        "find_spec",
+        lambda name: object() if name in ("tokamax", "tokamax._src.ops.kda") else None,
+    )
+    assert tpu_model_kernels.resolve_tpu_model_kernels("qwen3_5", "auto") == frozenset({"moe", "kda", "lce"})
+
+    # 2. Multi-mesh optimizer param group (torchtitan HEAD without _split_optimizer_groups_by_mesh):
+    #    _partition_params_into_chunks separates (fsdp,) and (efsdp, ep) params deterministically by first-seen mesh.
+    mesh_fsdp, mesh_ep = object(), object()
+    p_dense0 = torch.nn.Parameter(torch.ones(2))
+    p_exp0 = torch.nn.Parameter(torch.ones(2))
+    p_dense1 = torch.nn.Parameter(torch.ones(2))
+    p_exp1 = torch.nn.Parameter(torch.ones(2))
+    p_dense0._spec = SimpleNamespace(mesh=mesh_fsdp)  # type: ignore[attr-defined]
+    p_dense1._spec = SimpleNamespace(mesh=mesh_fsdp)  # type: ignore[attr-defined]
+    p_exp0._spec = SimpleNamespace(mesh=mesh_ep)  # type: ignore[attr-defined]
+    p_exp1._spec = SimpleNamespace(mesh=mesh_ep)  # type: ignore[attr-defined]
+    params = [p_dense0, p_exp0, p_dense1, p_exp1]
+    names = [
+        "layers.0.attention.wq.weight",
+        "layers.0.moe.experts.w1",
+        "layers.1.attention.wq.weight",
+        "layers.1.moe.experts.w1",
+    ]
+    chunks = torchtitan_tpu._partition_params_into_chunks(params, names, layers_per_chunk=4)
+    assert chunks == [[p_dense0, p_dense1], [p_exp0, p_exp1]]
+    assert torchtitan_tpu._partition_params_into_chunks(params, None) == [[p_dense0, p_dense1], [p_exp0, p_exp1]]
+
+    # 3. Non-static EP dispatcher (AllToAllTokenDispatcher on torchtitan HEAD) relaxes MoE block compile to
+    #    fullgraph=False while static TpuQwen35TokenDispatcher keeps fullgraph=True.
+    compile_calls: list[tuple[str, str, bool]] = []
+
+    class AllToAllTokenDispatcher:
+        pass
+
+    class TpuQwen35TokenDispatcher:
+        pass
+
+    class _Block(torch.nn.Module):
+        def __init__(self, name: str, dispatcher: object):
+            super().__init__()
+            self._name = name
+            self._compiled_call_impl = object()
+            self.routed = torch.nn.Module()
+            if dispatcher is not None:
+                self.routed.token_dispatcher = dispatcher
+
+        def compile(self, *, backend: str = "tpu", fullgraph: bool = True, **kwargs: object):
+            compile_calls.append((self._name, backend, fullgraph))
+
+    fake_model = torch.nn.Module()
+    fake_model.layers = torch.nn.ModuleDict(
+        {
+            "0": _Block("head_moe", AllToAllTokenDispatcher()),
+            "1": _Block("static_ep_moe", TpuQwen35TokenDispatcher()),
+            "2": _Block("dense", None),
+        }
+    )
+    tpu_utils._relax_non_static_ep_moe_compile(
+        fake_model,
+        parallel_dims=SimpleNamespace(ep_enabled=True),
+        compile_config=SimpleNamespace(enable=True, backend="tpu"),
+    )
+    assert compile_calls == [("head_moe", "tpu", False)]

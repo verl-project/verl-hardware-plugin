@@ -27,6 +27,7 @@ from __future__ import annotations
 import dataclasses
 import gc
 import importlib
+import inspect
 import logging
 import math
 import os
@@ -74,6 +75,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
     fused_linear_logprobs_tpu,
+    get_text_config,
     get_torchtitan_model_module_name,
     get_tpu_seq_bucket_size,
     get_tpu_simple_fsdp_parallelize_fn,
@@ -146,6 +148,13 @@ def _use_threaded_hf_reader(checkpointer: Any) -> None:
     sd_adapter.get_hf_storage_reader = get_hf_storage_reader
 
 
+def _param_mesh_key(param: torch.Tensor) -> int | None:
+    """Object identity of ``param``'s ``DeviceMesh`` when ``param`` is a ``DTensor``, else ``None``."""
+    spec = getattr(param, "_spec", None)
+    mesh = getattr(spec, "mesh", None) if spec is not None else None
+    return None if mesh is None else id(mesh)
+
+
 def _partition_params_into_chunks(
     params: list[torch.nn.Parameter],
     param_names: list[str] | None = None,
@@ -153,22 +162,40 @@ def _partition_params_into_chunks(
     layers_per_chunk: int = _OPTIMIZER_STEP_LAYERS_PER_CHUNK,
     max_params_per_chunk: int = _OPTIMIZER_STEP_MAX_PARAMS_PER_CHUNK,
 ) -> list[list[torch.nn.Parameter]]:
-    """Group parameters into bounded chunks (by 4-layer block when FQNs are available).
+    """Group parameters into bounded single-mesh chunks (by 4-layer block when FQNs are available).
 
     Under ``DEFER_AND_FUSE``, clipping and stepping all parameters of a large MoE model in a single
     un-synchronized graph fuses 500+ parameter updates into one giant HLO module whose live input/output
     temporaries exceed TPU HBM (``CompileTimeHbmOom``). Grouping by 4-layer cycle keeps each HLO module
     small and gives identical parameter shapes across repeating hybrid layer blocks for XLA cache hits.
+    Splitting by ``DeviceMesh`` (in deterministic first-seen parameter order across ranks) also keeps
+    ``(fsdp,)`` dense and ``(efsdp, ep)`` routed-expert ``DTensor``s in separate ``foreach``/``fused`` AdamW
+    calls on torchtitan builds that do not split optimizer param groups by mesh.
     """
     if not params:
         return []
-    if param_names is None or len(param_names) != len(params):
-        return [params[i : i + max_params_per_chunk] for i in range(0, len(params), max_params_per_chunk)]
+    mesh_order: dict[int | None, int] = {}
 
-    buckets: dict[tuple[int, int], list[torch.nn.Parameter]] = {}
+    def _mesh_slot(p: torch.nn.Parameter) -> int:
+        mk = _param_mesh_key(p)
+        return mesh_order.setdefault(mk, len(mesh_order))
+
+    if param_names is None or len(param_names) != len(params):
+        by_mesh: dict[int, list[torch.nn.Parameter]] = {}
+        for p in params:
+            by_mesh.setdefault(_mesh_slot(p), []).append(p)
+        return [
+            bucket[i : i + max_params_per_chunk]
+            for slot in sorted(by_mesh)
+            for bucket in (by_mesh[slot],)
+            for i in range(0, len(bucket), max_params_per_chunk)
+        ]
+
+    buckets: dict[tuple[int, int, int], list[torch.nn.Parameter]] = {}
     for p, name in zip(params, param_names, strict=True):
         m = _LAYER_FQN_RE.search(name)
-        key = (0, int(m.group(1)) // layers_per_chunk) if m is not None else (1, 0)
+        layer_key = (0, int(m.group(1)) // layers_per_chunk) if m is not None else (1, 0)
+        key = (*layer_key, _mesh_slot(p))
         buckets.setdefault(key, []).append(p)
 
     chunks: list[list[torch.nn.Parameter]] = []
@@ -251,7 +278,11 @@ class TorchTitanTPUEngine(BaseEngine):
         from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer, ParamGroupConfig
         from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
         from torchtitan.distributed.activation_checkpoint import FullAC
-        from torchtitan.experiments.tpu.activation_checkpoint import TPUSelectiveAC
+
+        try:
+            from torchtitan.experiments.tpu.activation_checkpoint import TPUSelectiveAC
+        except ImportError:
+            from torchtitan.distributed.activation_checkpoint import SelectiveAC as TPUSelectiveAC
         from torchtitan.trainer import Trainer
 
         super().__init__()
@@ -285,14 +316,28 @@ class TorchTitanTPUEngine(BaseEngine):
         self._tpu_kernels = tpu_model_kernels.resolve_tpu_model_kernels(torchtitan_name, tpu_options.model_kernels)
         if self._tpu_kernels:
             logger.info("Optional torchtitan TPU kernels of %s: %s", torchtitan_name, sorted(self._tpu_kernels))
+        registry_params = inspect.signature(model_module.model_registry).parameters
+        fuse_qkv_kwargs = (
+            {"fuse_qkv": False}
+            if tpu_options.fuse_qkv is False
+            and (
+                "fuse_qkv" in registry_params
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in registry_params.values())
+            )
+            else {}
+        )
         model_spec = model_module.model_registry(
             torchtitan_flavor,
             attn_backend=torchtitan_model_attn_backend(torchtitan_name, self.engine_config.attn_type),
             seq_len=self.engine_config.max_seq_len,
-            **({} if tpu_options.fuse_qkv is not False else {"fuse_qkv": False}),
+            **fuse_qkv_kwargs,
             **tpu_model_kernels.model_registry_kwargs(self._tpu_kernels),
         )
-        tpu_model_kernels.configure_model_spec(model_spec, self._tpu_kernels)
+        tpu_model_kernels.configure_model_spec(
+            model_spec,
+            self._tpu_kernels,
+            expert_parallel_degree=self.engine_config.expert_parallel_size,
+        )
         if self._use_simple_fsdp:
             model_spec = dataclasses.replace(
                 model_spec,
@@ -412,10 +457,17 @@ class TorchTitanTPUEngine(BaseEngine):
             loss=CrossEntropyLoss.Config(),
         )
         if self._use_fused_linear_cross_entropy:
-            from torchtitan.experiments.tpu.qwen3.config_registry import _FUSED_LOSS_OVERRIDE
-
-            if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
-                self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+            try:
+                from torchtitan.experiments.tpu.qwen3.config_registry import _FUSED_LOSS_OVERRIDE
+            except ImportError:
+                logger.warning(
+                    "Disabling use_fused_linear_cross_entropy: "
+                    "torchtitan.experiments.tpu.qwen3.config_registry not found"
+                )
+                self._use_fused_linear_cross_entropy = False
+            else:
+                if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
+                    self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
         for override_import in tpu_model_kernels.override_imports(self._tpu_kernels):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
@@ -437,6 +489,15 @@ class TorchTitanTPUEngine(BaseEngine):
                 enable_fsdp_gradient_division(model_part, dp_size)
 
         install_tpu_attention(model_parts, use_splash=self._use_splash_attention)
+        if self.parallel_dims.ep_enabled:
+            ep_cap = (
+                tpu_options.ep_capacity_factor
+                if tpu_options.ep_capacity_factor is not None
+                else tpu_model_kernels.DEFAULT_EP_CAPACITY_FACTOR
+            )
+            n_ep = tpu_model_kernels.set_ep_capacity_factor(model_parts, ep_cap)
+            if n_ep:
+                logger.warning("Set TpuQwen35TokenDispatcher.capacity_factor=%.2f on %d dispatchers", ep_cap, n_ep)
 
         if engine_config.use_torch_compile:
             n_compiled = sum(
@@ -1135,12 +1196,14 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
         bucket_size = get_tpu_seq_bucket_size(self.engine_config)
         if use_remove_padding:
+            vocab_size = getattr(get_text_config(self.model_config.hf_config), "vocab_size", None)
             input_ids, position_ids, labels, orig_seq_len = pad_packed_inputs_for_tpu(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 micro_batch=micro_batch,
                 device=get_device_id(),
                 bucket_size=bucket_size,
+                vocab_size=vocab_size,
             )
             output_args["orig_seq_len"] = orig_seq_len
         else:
