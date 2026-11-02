@@ -22,11 +22,16 @@ from typing import AsyncGenerator, Generator, Optional
 import ray
 import torch
 import zmq
-from vllm.distributed.utils import StatelessProcessGroup
 
-from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry, TensorMeta
-from verl.utils.distributed import stateless_init_process_group
+from verl.checkpoint_engine.base import (
+    CheckpointEngine,
+    CheckpointEngineRegistry,
+    TensorMeta,
+    merge_weight_chunks,
+    split_weight_chunks,
+)
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
+from verl_hardware_plugin.accelerators.mlu.utils.cncl_communicator import CNCLCommunicator
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -41,11 +46,11 @@ class MasterMetadata:
 
 
 class BroadcastOperation:
-    """Async broadcast operation with CNCL in separate thread.
+    """Broadcast metadata over ZeroMQ and device buffers through ProcessGroupCNCL.
 
     Args:
         rank (int): The rank of the current process.
-        group_name (str): The name of the CNCL process group.
+        communicator (CNCLCommunicator): The independent CNCL communicator.
         bucket (torch.Tensor): The tensor to broadcast.
         metadata (dict[str, TensorMeta]): The metadata of the tensor.
         socket (zmq.Socket): The zeromq socket to communicate with master.
@@ -55,40 +60,32 @@ class BroadcastOperation:
     def __init__(
         self,
         rank: int,
-        process_group: StatelessProcessGroup | str,
+        communicator: CNCLCommunicator | None,
         bucket: torch.Tensor,
         metadata: dict[str, TensorMeta] | None,
         socket: zmq.Socket,  # type: ignore[name-defined]
         topic: str,
     ) -> None:
         self.rank = rank
-        self.pycncl = process_group
+        self.cncl_communicator = communicator
         self.bucket = bucket
-        self.metadata = metadata
         self.socket = socket
         self.topic = topic
 
-        self._run()
+        self.metadata = self._run(metadata)
 
-    def _run(self):
+    def _run(self, metadata):
         # broadcast tensor meta via zeromq PUB/SUB
         if self.rank == 0:
             self.socket.send_string(self.topic, flags=zmq.SNDMORE)
-            self.socket.send_pyobj(self.metadata)
+            self.socket.send_pyobj(metadata)
         else:
             self.socket.recv_string()
-            self.metadata = self.socket.recv_pyobj()
+            metadata = self.socket.recv_pyobj()
 
         # broadcast tensor via CNCL
-        self.pycncl.broadcast(self.bucket, src=0)
-
-    async def wait_for_complete(self):
-        """Wait for the broadcast operation to complete.
-
-        Returns:
-            dict[str, TensorMeta]: The bucket meta after broadcast.
-        """
-        return self.metadata
+        self.cncl_communicator.broadcast(self.bucket, src=0)
+        return metadata
 
 
 @CheckpointEngineRegistry.register("cncl")
@@ -116,7 +113,7 @@ class CNCLCheckpointEngine(CheckpointEngine):
         self.group_name = group_name
         self.rebuild_group = rebuild_group
         self.rollout_dtype = rollout_dtype
-        self.pycncl = None
+        self.cncl_communicator: CNCLCommunicator | None = None
         self.device = torch.mlu.current_device()
 
         # start zeromq server for broadcasting bucket tensor metadata
@@ -140,8 +137,8 @@ class CNCLCheckpointEngine(CheckpointEngine):
         """Destroy the CNCL process group if rebuild_group is True."""
         if self.rebuild_group:
             if self.rank >= 0:
-                self.pycncl.destroyComm(self.pycncl.comm)
-                self.pycncl = None
+                self.cncl_communicator.close()
+                self.cncl_communicator = None
             self.rank = None
             self.world_size = None
 
@@ -203,8 +200,8 @@ class CNCLCheckpointEngine(CheckpointEngine):
             self.world_size = world_size
             return
 
-        if self.rebuild_group or self.pycncl is None:
-            self.pycncl = stateless_init_process_group(
+        if self.rebuild_group or self.cncl_communicator is None:
+            self.cncl_communicator = CNCLCommunicator(
                 master_metadata.dist_ip, master_metadata.dist_port, rank, world_size, self.device
             )
             self.rank = rank
@@ -215,12 +212,11 @@ class CNCLCheckpointEngine(CheckpointEngine):
                 f"world_size {world_size} is not equal to self.world_size {self.world_size}"
             )
 
-        if self.rank > 0:
+        # Reuse the subscription so later updates do not race a new connection.
+        if self.rank > 0 and not hasattr(self, "socket"):
             self._connect_zmq_client(master_metadata)
 
-        # barrier
-        signal = torch.tensor([1], dtype=torch.int8, device=torch.mlu.current_device())
-        self.pycncl.all_reduce(signal)
+        self.cncl_communicator.barrier()
 
         logger.info(f"init_process_group rank: {self.rank}, world_size: {self.world_size}")
 
@@ -244,23 +240,19 @@ class CNCLCheckpointEngine(CheckpointEngine):
             return
 
         send_buf, recv_buf = self.send_buf, self.recv_buf
-        broadcast_op = None
 
         start_time = time.time()
         bucket_meta: dict[str, TensorMeta] = {}
         offset = 0
-        for name, weight in weights:
+        async for tensor_meta, chunk in split_weight_chunks(weights, self.bucket_size):
             # fill the tensor bucket
-            if offset + weight.nbytes > self.bucket_size:
+            if offset + tensor_meta.chunk_size > self.bucket_size:
+                # readies recv_buf
                 torch.mlu.synchronize()
 
-                # wait previous broadcast op finish
-                if broadcast_op is not None:
-                    await broadcast_op.wait_for_complete()
-
-                broadcast_op = BroadcastOperation(
+                BroadcastOperation(
                     rank=self.rank,
-                    process_group=self.pycncl,
+                    communicator=self.cncl_communicator,
                     bucket=send_buf,
                     metadata={"bucket_meta": bucket_meta, "is_last": False},
                     socket=self.socket,
@@ -272,33 +264,27 @@ class CNCLCheckpointEngine(CheckpointEngine):
                 bucket_meta = {}
                 offset = 0
 
-            assert offset + weight.nbytes <= self.bucket_size, (
-                f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
-            )
+            assert offset + tensor_meta.chunk_size <= self.bucket_size
+            assert tensor_meta.name not in bucket_meta
 
-            bucket_meta[name] = {
-                "name": name,
-                "shape": weight.shape,
-                "dtype": weight.dtype,
-                "offset": offset,
-            }
-            send_buf[offset : offset + weight.nbytes] = weight.view(-1).view(torch.uint8)
-            offset += weight.nbytes
+            tensor_meta.offset = offset
+            bucket_meta[tensor_meta.name] = tensor_meta
+            send_buf[offset : offset + tensor_meta.chunk_size] = chunk
+            offset += tensor_meta.chunk_size
 
         # broadcast last bucket
-        torch.mlu.synchronize()
-        if broadcast_op is not None:
-            await broadcast_op.wait_for_complete()
-
-        broadcast_op = BroadcastOperation(
+        BroadcastOperation(
             rank=self.rank,
-            process_group=self.pycncl,
+            communicator=self.cncl_communicator,
             bucket=send_buf,
             metadata={"bucket_meta": bucket_meta, "is_last": True},
             socket=self.socket,
             topic=self.topic,
         )
-        await broadcast_op.wait_for_complete()
+
+        # Wait for the final broadcast before its buffers can be released.
+        torch.mlu.synchronize()
+
         logger.info(f"Rank {self.rank} send weights done, time cost: {time.time() - start_time:.2f}s")
 
     @torch.no_grad()
@@ -311,6 +297,11 @@ class CNCLCheckpointEngine(CheckpointEngine):
         Yields:
             A tuple of the name of the weight tensor and the tensor itself.
         """
+        async for name, weight in merge_weight_chunks(self._receive_weight_chunks(), self.bucket_size):
+            yield name, weight
+
+    async def _receive_weight_chunks(self) -> AsyncGenerator[tuple[TensorMeta, torch.Tensor], None]:
+        """Receive weight chunks and their metadata."""
         assert self.rank > 0, "Rank 0 should not receive weights."
         send_buf, recv_buf = self.send_buf, self.recv_buf
         total_bytes, total_params = 0, 0
@@ -319,15 +310,19 @@ class CNCLCheckpointEngine(CheckpointEngine):
         start_time = time.time()
         broadcast_op = BroadcastOperation(
             rank=self.rank,
-            process_group=self.pycncl,
+            communicator=self.cncl_communicator,
             bucket=recv_buf,
             metadata=None,
             socket=self.socket,
             topic=self.topic,
         )
-        metadata = await broadcast_op.wait_for_complete()
+        metadata = broadcast_op.metadata
         total_bytes += self.bucket_size
         total_params += len(metadata["bucket_meta"])
+
+        # Finish the first broadcast before exposing the received chunks.
+        # readies send_buf
+        torch.mlu.synchronize()
 
         # swap send_buf and recv_buf
         send_buf, recv_buf = recv_buf, send_buf
@@ -335,7 +330,7 @@ class CNCLCheckpointEngine(CheckpointEngine):
             # 1. receive next bucket
             broadcast_op = BroadcastOperation(
                 rank=self.rank,
-                process_group=self.pycncl,
+                communicator=self.cncl_communicator,
                 bucket=recv_buf,
                 metadata=None,
                 socket=self.socket,
@@ -343,27 +338,24 @@ class CNCLCheckpointEngine(CheckpointEngine):
             )
 
             # 2. yield tensor from send_buf
-            for name, meta in metadata["bucket_meta"].items():
-                dtype, shape = meta["dtype"], meta["shape"]
-                size = dtype.itemsize * shape.numel()
-                tensor = send_buf[meta["offset"] : meta["offset"] + size].view(dtype=dtype).view(shape)
-                yield name, tensor
+            for name, tensor_meta in metadata["bucket_meta"].items():
+                tensor = send_buf[tensor_meta.offset : tensor_meta.offset + tensor_meta.chunk_size]
+                yield tensor_meta, tensor
 
-            # 3. wait for next bucket broadcast finish
-            metadata = await broadcast_op.wait_for_complete()
+            # 3. read next bucket metadata
+            metadata = broadcast_op.metadata
             total_bytes += self.bucket_size
             total_params += len(metadata["bucket_meta"])
 
             # 4. swap send_buf and recv_buf
+            # readies recv_buf
             torch.mlu.synchronize()  # sync non-blocking copy
             send_buf, recv_buf = recv_buf, send_buf
 
         # yield tensor from send_buf
-        for name, meta in metadata["bucket_meta"].items():
-            dtype, shape = meta["dtype"], meta["shape"]
-            size = dtype.itemsize * shape.numel()
-            tensor = send_buf[meta["offset"] : meta["offset"] + size].view(dtype=dtype).view(shape)
-            yield name, tensor
+        for name, tensor_meta in metadata["bucket_meta"].items():
+            tensor = send_buf[tensor_meta.offset : tensor_meta.offset + tensor_meta.chunk_size]
+            yield tensor_meta, tensor
 
         time_cost = time.time() - start_time
         bandwidth = total_bytes / time_cost / (1024 * 1024 * 1024)
