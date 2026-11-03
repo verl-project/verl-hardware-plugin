@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl_hardware_plugin.accelerators.tpu.rollout import qwen3_5_layout
+from verl_hardware_plugin.accelerators.tpu.rollout import moe_weights, qwen3_5_layout
 
 GDN = "model.layers.0.linear_attn"
 EXPERTS = "model.layers.0.mlp.experts"
@@ -125,7 +125,7 @@ def test_direct_install_matches_vllm_loaders(tp_size, padded, nested):
                 expected[nested_key] = expected.pop(key)
 
         staging = _received(full, tp_rank, tp_size)
-        layout = qwen3_5_layout.MOE_LAYOUT_TPU if padded else qwen3_5_layout.MOE_LAYOUT_VLLM
+        layout = moe_weights.MOE_LAYOUT_TPU if padded else moe_weights.MOE_LAYOUT_VLLM
         plan = _plan(tp_rank, tp_size, layout)
         consumed = qwen3_5_layout.install(
             staging, model_sd, lambda k, model_sd=model_sd: k if k in model_sd else None, _copy_into(model_sd), plan
@@ -146,14 +146,10 @@ def test_direct_install_refuses_a_mismatched_layout():
         return key if key in model_sd else None
 
     with pytest.raises(RuntimeError, match="w13_weight"):
-        qwen3_5_layout.install(
-            staging, model_sd, find, _copy_into(model_sd), _plan(0, 1, qwen3_5_layout.MOE_LAYOUT_VLLM)
-        )
+        qwen3_5_layout.install(staging, model_sd, find, _copy_into(model_sd), _plan(0, 1, moe_weights.MOE_LAYOUT_VLLM))
     model_sd[f"{EXPERTS}.w13_weight"][..., INTER] = 1.0  # non-zero padding
     with pytest.raises(RuntimeError, match="padding is not zero"):
-        qwen3_5_layout.install(
-            staging, model_sd, find, _copy_into(model_sd), _plan(0, 1, qwen3_5_layout.MOE_LAYOUT_TPU)
-        )
+        qwen3_5_layout.install(staging, model_sd, find, _copy_into(model_sd), _plan(0, 1, moe_weights.MOE_LAYOUT_TPU))
 
 
 def test_direct_install_refuses_a_too_small_target():
@@ -168,7 +164,7 @@ def test_direct_install_refuses_a_too_small_target():
             model_sd,
             lambda k: k if k in model_sd else None,
             _copy_into(model_sd),
-            _plan(0, 1, qwen3_5_layout.MOE_LAYOUT_TPU),
+            _plan(0, 1, moe_weights.MOE_LAYOUT_TPU),
         )
 
 
@@ -250,11 +246,11 @@ SHAPES = {
 
 def test_plan_direct_install():
     plan, reason = qwen3_5_layout.plan_direct_install(_vllm_model(), SHAPES, CONFIG, 2, 0)
-    assert reason == "" and plan.moe_layout == qwen3_5_layout.MOE_LAYOUT_TPU and (plan.tp_rank, plan.tp_size) == (0, 2)
+    assert reason == "" and plan.moe_layout == moe_weights.MOE_LAYOUT_TPU and (plan.tp_rank, plan.tp_size) == (0, 2)
     plan, _ = qwen3_5_layout.plan_direct_install(
         _vllm_model(experts=_Experts(UnquantizedFusedMoEMethod())), SHAPES, CONFIG, 2, 0
     )
-    assert plan.moe_layout == qwen3_5_layout.MOE_LAYOUT_VLLM
+    assert plan.moe_layout == moe_weights.MOE_LAYOUT_VLLM
 
     def reason(model=None, shapes=SHAPES, config=CONFIG, tp=2, rank=0):
         plan, why = qwen3_5_layout.plan_direct_install(model or _vllm_model(), shapes, config, tp, rank)
@@ -307,3 +303,23 @@ def test_refuse_split_tensors_for_vllm_loaders():
     partial = [(n, t) for n, t in sorted(split.items()) if not n.endswith("up_proj")]
     with pytest.raises(RuntimeError, match="missing pieces"):
         list(qwen3_5_layout.refuse_split_tensors(iter(partial)))
+
+
+def test_direct_install_runs_the_exact_parity_check_on_the_expert_writes():
+    """``check`` sees every region of w13 / w2 that the install overwrites (the step-0 exact parity check)."""
+    from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import ExactParityCheck
+
+    full = _hf_tensors(torch.Generator().manual_seed(0))
+    staging = _received(full, 0, 1)
+    model_sd = {k: t.clone() for k, t in _vllm_reference(full, 0, 1, 128).items()}  # vLLM holds the checkpoint
+    model_sd[f"{EXPERTS}.w2_weight"][1, 0, 0] += 1  # one misplaced expert value
+
+    def find(key):
+        return key if key in model_sd else None
+
+    parity = ExactParityCheck()
+    qwen3_5_layout.install(
+        staging, model_sd, find, _copy_into(model_sd), _plan(0, 1, moe_weights.MOE_LAYOUT_TPU), check=parity.check
+    )
+    assert parity.checked == 3  # w13 gate, w13 up, w2 (copy_into's own tensors are checked by the worker)
+    assert [line.split(":")[0] for line in parity.mismatched] == [f"{EXPERTS}.w2_weight"]
