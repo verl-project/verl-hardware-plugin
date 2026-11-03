@@ -361,7 +361,7 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
 
 
 def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any, *, required: bool = False) -> bool:
-    """Whether to compute log-probs with the fused LM-head + cross-entropy kernel (``tokamax_logprob``).
+    """Whether to compute log-probs with the fused LM-head + cross-entropy kernel (``engines.fused_logprob``).
 
     The kernel never materializes the ``[tokens, vocab]`` logits, which saves memory and keeps them in fp32.
     It only supports ``tensor_parallel_size == 1``.
@@ -1217,43 +1217,6 @@ def install_tpu_attention(modules: Any, use_splash: bool) -> int:
             "SplashAttention" if use_splash else "TPUVarlenAttention",
         )
     return replaced
-
-
-def fused_linear_logprobs_tpu(
-    hidden_states: torch.Tensor,
-    labels: torch.Tensor,
-    weight_t: torch.Tensor,
-    *,
-    temperature: float = 1.0,
-    b_block_size: int = 1024,
-    h_block_size: int = 512,
-    v_block_size: int = 2048,
-) -> torch.Tensor:
-    """Per-token ``log_probs`` on TPU with Tokamax's fused linear + softmax cross-entropy kernel.
-
-    Avoids materializing the ``[T, V]`` logits and ``float32`` log-softmax tensors in HBM, in forward and backward
-    (``engines.tokamax_logprob``: Pallas forward, chunked backward). Temperature is applied by scaling
-    ``hidden_states`` (``logits / t == (x / t) @ W``). ``T`` is padded to a multiple of ``b_block_size`` inside the
-    kernel wrapper.
-    """
-    from verl_hardware_plugin.accelerators.tpu.engines.tokamax_logprob import tokamax_linear_logprob
-
-    if hidden_states.dim() > 2:
-        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-    if labels.dim() > 1:
-        labels = labels.reshape(-1)
-    x = hidden_states
-    temp = float(temperature)
-    if temp != 1.0:
-        x = x * (1.0 / temp)
-    return tokamax_linear_logprob(
-        x.to(weight_t.dtype),
-        labels,
-        weight_t,
-        b_block_size=b_block_size,
-        h_block_size=h_block_size,
-        v_block_size=v_block_size,
-    )
 
 
 FUSED_ENTROPY_MAX_CHUNK = 4096

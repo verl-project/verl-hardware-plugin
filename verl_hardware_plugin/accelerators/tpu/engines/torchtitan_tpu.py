@@ -68,6 +68,7 @@ from verl.workers.engine.utils import (
     prepare_micro_batches,
 )
 from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels, tpu_ragged_ep
+from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
@@ -80,7 +81,6 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     create_noop_dataloader_config,
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
-    fused_linear_logprobs_tpu,
     get_text_config,
     get_torchtitan_model_module_name,
     get_tpu_seq_bucket_size,
@@ -2141,7 +2141,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         Without them the fused log-prob is turned off with a warning, or, if the model requires it, the engine
         raises.
         """
-        from verl_hardware_plugin.accelerators.tpu.engines.tokamax_logprob import require_tokamax
+        from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import require_tokamax
 
         try:
             from torchtitan.experiments.tpu.qwen3.config_registry import _FUSED_LOSS_OVERRIDE

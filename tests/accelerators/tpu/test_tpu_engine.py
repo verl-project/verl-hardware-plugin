@@ -751,11 +751,9 @@ def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
 
 
 def test_fused_linear_cross_entropy_tpu_and_logprobs():
-    from verl_hardware_plugin.accelerators.tpu.engines import tokamax_logprob
-    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
-        fused_linear_logprobs_tpu,
-        resolve_tpu_use_fused_linear_cross_entropy,
-    )
+    from verl_hardware_plugin.accelerators.tpu.engines import fused_logprob
+    from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import resolve_tpu_use_fused_linear_cross_entropy
 
     class _FakeFusedLossLinearWrapper(torch.nn.Linear):
         def forward(self, x: torch.Tensor):
@@ -789,7 +787,7 @@ def test_fused_linear_cross_entropy_tpu_and_logprobs():
         is False
     )
     labels = torch.randint(0, 32, (2, 5))
-    with mock.patch.object(tokamax_logprob, "_forward_op", _fake_forward_op):
+    with mock.patch.object(fused_logprob, "_forward_op", _fake_forward_op):
         logprobs = fused_linear_logprobs_tpu(out_fused[0], labels, out_fused[1])
     assert logprobs.shape == (10,)
     assert torch.allclose(logprobs, torch.full((10,), -0.5))
@@ -800,18 +798,14 @@ def test_fused_linear_cross_entropy_tpu_and_logprobs():
 
 
 def test_fused_logprob_chunked_backward_matches_autograd():
-    """The chunked backward of the fused log-prob gives the gradients of log_softmax(x @ W)[label]."""
-    from verl_hardware_plugin.accelerators.tpu.engines import tokamax_logprob
+    """The chunked backward of the fused log-prob gives the gradients of log_softmax(x @ W / t)[label]."""
+    from verl_hardware_plugin.accelerators.tpu.engines import fused_logprob
 
     torch.manual_seed(0)
     x = torch.randn(10, 8)
     weight_t = torch.randn(8, 30) * 0.3
     labels = torch.randint(0, 30, (10,))
     cotangent = torch.randn(10)
-
-    xr, wr = x.clone().requires_grad_(), weight_t.clone().requires_grad_()
-    expected = torch.log_softmax(xr @ wr, -1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
-    (expected * cotangent).sum().backward()
 
     def _forward_op(b_block, h_block, v_block):
         def op(x, labels, weight_t):
@@ -821,16 +815,21 @@ def test_fused_logprob_chunked_backward_matches_autograd():
 
         return op
 
-    xk, wk = x.clone().requires_grad_(), weight_t.clone().requires_grad_()
-    with (
-        mock.patch.object(tokamax_logprob, "_forward_op", _forward_op),
-        mock.patch.object(tokamax_logprob, "BACKWARD_CHUNK", 4),  # several chunks, the last one ragged
-    ):
-        logp = tokamax_logprob.tokamax_linear_logprob(xk, labels, wk, b_block_size=16)
-    (logp * cotangent).sum().backward()
-    torch.testing.assert_close(logp, expected.detach())
-    torch.testing.assert_close(xk.grad, xr.grad, rtol=1e-4, atol=1e-5)
-    torch.testing.assert_close(wk.grad, wr.grad, rtol=1e-4, atol=1e-5)
+    for temperature in (1.0, 2.0):
+        xr, wr = x.clone().requires_grad_(), weight_t.clone().requires_grad_()
+        expected = torch.log_softmax(xr @ wr / temperature, -1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+        (expected * cotangent).sum().backward()
+
+        xk, wk = x.clone().requires_grad_(), weight_t.clone().requires_grad_()
+        with (
+            mock.patch.object(fused_logprob, "_forward_op", _forward_op),
+            mock.patch.object(fused_logprob, "BACKWARD_CHUNK", 4),  # several chunks, the last one ragged
+        ):
+            logp = fused_logprob.fused_linear_logprobs_tpu(xk, labels, wk, temperature=temperature, b_block_size=16)
+        (logp * cotangent).sum().backward()
+        torch.testing.assert_close(logp, expected.detach())
+        torch.testing.assert_close(xk.grad, xr.grad, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(wk.grad, wr.grad, rtol=1e-4, atol=1e-5)
 
 
 def test_fused_log_prob_is_required_for_moe():
