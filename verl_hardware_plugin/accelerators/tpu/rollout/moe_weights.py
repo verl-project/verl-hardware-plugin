@@ -11,7 +11,7 @@ orientation, ``gate`` / ``up`` [E, I, H] and ``down`` [E, H, I].
 from __future__ import annotations
 
 import re
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -19,12 +19,73 @@ import torch
 # (transposed, each w13 half padded to a multiple of 128) and vLLM's own unquantized method ([E, 2I, H] / [E, H, I]).
 MOE_LAYOUT_TPU = "tpu_transposed_padded"
 MOE_LAYOUT_VLLM = "vllm"
+MOE_LAYOUT_TPU_EP = "tpu_expert_parallel"  # vllm-torchtpu zero-copy EP layout (see qwen3_5_layout.EP_EXPERT_TENSORS)
 MOE_LAYOUTS = {"VllmUnquantizedFusedMoEMethod": MOE_LAYOUT_TPU, "UnquantizedFusedMoEMethod": MOE_LAYOUT_VLLM}
 _MOE_PAD_MULTIPLE = 128  # vllm-torchtpu's VllmUnquantizedFusedMoEMethod.process_weights_after_loading
 # ``ExactParityCheck.check(name, target, received)``: called on a target region before it is overwritten.
 ParityCheckFn = Callable[[str, torch.Tensor, torch.Tensor], None]
 
 _ERROR_PREFIX = "tpu-sync direct install"
+
+
+def moe_attr(module: Any, name: str, default: Any) -> Any:
+    """``module.<name>``, else ``module.moe_config.<name>`` (vLLM keeps the EP geometry on both, version-dependent)."""
+    value = getattr(module, name, None)
+    if value is None:
+        value = getattr(getattr(module, "moe_config", None), name, None)
+    return default if value is None else value
+
+
+def moe_parallel_mode(
+    module: Any, num_experts: int, moe_intermediate_size: int, tp_size: int, tp_rank: int
+) -> tuple[Optional[bool], str]:
+    """``(expert_parallel, "")`` for a vLLM MoE layer that can be written directly on TP rank ``tp_rank``, else
+    ``(None, reason)``.
+
+    ``expert_parallel`` is True if the layer holds whole experts ``[r * E / tp, (r + 1) * E / tp)`` (EP over the whole
+    TP group, linear placement), False if it holds slice ``r`` of every expert's intermediate dimension (no EP).
+    """
+    global_experts = int(moe_attr(module, "global_num_experts", 0) or 0)
+    local_experts = int(moe_attr(module, "local_num_experts", 0) or 0)
+    if global_experts and global_experts != num_experts:
+        return None, f"{global_experts} experts, the config gives {num_experts}"
+    activation = str(moe_attr(module, "activation", "silu")).lower()
+    if "swigluoai" in activation or getattr(module, "w13_bias", None) is not None:
+        return None, f"activation {activation} / expert bias not supported"
+    if tp_size == 1:
+        return True, ""
+    if not bool(moe_attr(module, "use_ep", False)):
+        # vLLM slices every expert's intermediate dimension over TP: one dim-1 (gate / up) or dim-2 (down) block of
+        # each stack per rank.
+        if moe_intermediate_size % tp_size:
+            return None, f"moe_intermediate_size {moe_intermediate_size} does not split over TP={tp_size}"
+        if local_experts and local_experts != num_experts:
+            return None, f"{local_experts} local experts without expert parallelism, the config gives {num_experts}"
+        moe_tp_size, moe_tp_rank = (
+            int(moe_attr(module, "tp_size", tp_size)),
+            int(moe_attr(module, "tp_rank", tp_rank)),
+        )
+        if (moe_tp_size, moe_tp_rank) != (tp_size, tp_rank):
+            return None, f"MoE TP size {moe_tp_size} / rank {moe_tp_rank}, needs the TP group ({tp_size} / {tp_rank})"
+        return False, ""
+    if num_experts % tp_size:
+        return None, f"{num_experts} experts do not split over TP={tp_size} (expert parallelism)"
+    ep_size, ep_rank = int(moe_attr(module, "ep_size", 0) or 0), int(moe_attr(module, "ep_rank", -1))
+    if ep_size != tp_size or ep_rank != tp_rank:
+        return (
+            None,
+            f"EP size {ep_size} / rank {ep_rank}, needs expert parallelism over the whole TP group "
+            f"({tp_size} / {tp_rank})",
+        )
+    placement = str(moe_attr(module, "expert_placement_strategy", "linear"))
+    if placement != "linear":
+        return None, f"expert placement {placement!r}, needs 'linear'"
+    if local_experts and local_experts * tp_size != num_experts:
+        return (
+            None,
+            f"{local_experts} local experts on each of {tp_size} ranks, the config gives {num_experts} in total",
+        )
+    return True, ""
 
 
 def expert_param(

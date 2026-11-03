@@ -44,6 +44,10 @@ class DirectInstallLayout:
     install: InstallFn  # writes the model-specific tensors, every sync; the dense path installs the rest
     # vLLM parameters fused from several trainer tensors, in addition to the dense path's: (fused suffix, sources).
     fused_targets: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # TODO(tpu): Remove once tpu-sync stages in host DRAM and H2Ds directly into vLLM weights.
+    # Optional ``(plan, model_sd, find_model_key, global_shapes) -> {wire_name: vllm_weight}`` for tensors bound
+    # straight to WeightSynchronizer with no HBM staging copy (e.g. Qwen3.5 397B experts under rollout_expert_parallel).
+    zero_copy_targets: Optional[Callable[..., dict[str, torch.Tensor]]] = None
     # vLLM-loader fallback (no layout planned): ``(weights, hf_text_config) -> weights`` back in HF's checkpoint
     # layout, undoing how the trainer sends this model's tensors over tpu-sync.
     loader_weights: Optional[Callable[[WeightsIterator, Any], WeightsIterator]] = None

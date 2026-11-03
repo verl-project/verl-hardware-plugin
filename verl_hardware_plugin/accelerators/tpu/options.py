@@ -153,6 +153,11 @@ class TPUEngineOptions:
         ep_capacity_factor: Per-destination-rank token capacity multiplier of ``TpuQwen35TokenDispatcher`` when
             ``expert_parallel_size > 1`` (default: ``4.0``). torchtitan's pretraining default (``1.25``) drops
             skewed RL / math tokens across 32-64 EP ranks while vLLM rollout is dropless.
+        rollout_expert_parallel: Export Qwen3.5 MoE experts in vLLM's expert-parallel layout so the rollout
+            receives them straight into its expert weights with no HBM staging copy (default: ``False``, see
+            ``rollout/qwen3_5_layout.py``). Temporary for large MoEs whose expert shard cannot afford a second HBM
+            staging copy alongside weights + KV cache (e.g. Qwen3.5-397B-A17B); remove once ``tpu-sync`` stages on
+            host DRAM and H2Ds directly into vLLM weights (the default ``False`` path already supports vLLM EP).
     """
 
     use_splash_attention: Optional[bool] = None
@@ -165,6 +170,7 @@ class TPUEngineOptions:
     seq_bucket_size: Optional[int] = None
     model_kernels: Optional[str] = None
     ep_capacity_factor: Optional[float] = None
+    rollout_expert_parallel: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -178,6 +184,7 @@ _ENGINE_KINDS: dict[str, type] = {
     "seq_bucket_size": int,
     "model_kernels": str,
     "ep_capacity_factor": float,
+    "rollout_expert_parallel": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
