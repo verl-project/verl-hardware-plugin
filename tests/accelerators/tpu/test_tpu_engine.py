@@ -885,65 +885,6 @@ def test_compute_tpu_logprobs_chunked_matches_naive_and_propagates_grad():
     assert torch.allclose(logits_ref.grad, logits_chk.grad, atol=1e-3, rtol=1e-3)
 
 
-def test_install_parallel_dims_cache_for_tpu_reuses_parallel_dims_and_mesh():
-    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
-
-    build_calls = []
-
-    class _FakeParallelDims:
-        def __init__(self, cfg, ws):
-            self.cfg = cfg
-            self.ws = ws
-            self._world_mesh = None
-            self._single_axis_meshes = None
-
-        @classmethod
-        def from_config(cls, cfg, ws):
-            return cls(cfg, ws)
-
-        def build_mesh(self):
-            build_calls.append(1)
-            self._world_mesh = object()
-            self._single_axis_meshes = {"tp": object()}
-            return self._world_mesh
-
-    fake_pd_mod = types.ModuleType("torchtitan.distributed.parallel_dims")
-    fake_pd_mod.ParallelDims = _FakeParallelDims  # type: ignore[attr-defined]
-    fake_dist_mod = types.ModuleType("torchtitan.distributed")
-    fake_dist_mod.parallel_dims = fake_pd_mod  # type: ignore[attr-defined]
-
-    with (
-        mock.patch.dict(
-            sys.modules,
-            {
-                "torchtitan.distributed": fake_dist_mod,
-                "torchtitan.distributed.parallel_dims": fake_pd_mod,
-            },
-        ),
-        mock.patch.object(tpu_utils, "_PARALLEL_DIMS_PATCHED", False),
-        mock.patch.object(tpu_utils, "_PARALLEL_DIMS_CACHE", {}),
-    ):
-        tpu_utils.install_parallel_dims_cache_for_tpu()
-        cfg1 = SimpleNamespace(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=2,
-            context_parallel_degree=1,
-            tensor_parallel_degree=2,
-            pipeline_parallel_degree=1,
-            expert_parallel_degree=1,
-            spmd_backend="spmd_types",
-            enable_tpu_topo_mesh=False,
-        )
-        cfg2 = SimpleNamespace(**vars(cfg1))
-        pd1 = _FakeParallelDims.from_config(cfg1, 4)
-        pd2 = _FakeParallelDims.from_config(cfg2, 4)
-        assert pd1 is pd2
-        m1 = pd1.build_mesh()
-        m2 = pd2.build_mesh()
-        assert m1 is m2
-        assert len(build_calls) == 1
-
-
 def test_install_sync_dtensor_redistribute_for_tpu_forces_sync_only_in_eager():
     import torch.distributed.tensor._api as dt_api
     import torch.distributed.tensor._dispatch as dt_disp

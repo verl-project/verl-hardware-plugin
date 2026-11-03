@@ -79,7 +79,6 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     get_torchtitan_model_module_name,
     get_tpu_seq_bucket_size,
     get_tpu_simple_fsdp_parallelize_fn,
-    install_parallel_dims_cache_for_tpu,
     install_sync_dtensor_redistribute_for_tpu,
     install_tpu_attention,
     move_tpu_params_,
@@ -471,7 +470,6 @@ class TorchTitanTPUEngine(BaseEngine):
         for override_import in tpu_model_kernels.override_imports(self._tpu_kernels):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
-        install_parallel_dims_cache_for_tpu()
         self.trainer = Trainer(self.config)
         self.parallel_dims = self.trainer.parallel_dims
         self._dp_group = self._build_dp_gloo_group()
