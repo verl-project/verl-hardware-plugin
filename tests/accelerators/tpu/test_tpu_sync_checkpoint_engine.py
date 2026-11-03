@@ -542,10 +542,17 @@ def worker_ext(fake_tpu_sync, monkeypatch):
     utils = ModuleType("verl.workers.rollout.vllm_rollout.utils")
     utils.vLLMColocateWorkerExtension = _WorkerExtensionBase  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "verl.workers.rollout.vllm_rollout.utils", utils)
+    # vLLM's mp workers are not Ray processes: the extension takes its bind address from vLLM.
+    network_utils = ModuleType("vllm.utils.network_utils")
+    network_utils.get_ip = lambda: "10.0.0.1"  # type: ignore[attr-defined]
+    for name, mod in {
+        "vllm": ModuleType("vllm"),
+        "vllm.utils": ModuleType("vllm.utils"),
+        "vllm.utils.network_utils": network_utils,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, mod)
     sys.modules.pop(TPU_SYNC_WORKER_EXTENSION, None)
     module = importlib.import_module(TPU_SYNC_WORKER_EXTENSION)
-    monkeypatch.setattr(module, "get_tpu_sync_rendezvous", fake_tpu_sync.get_rendezvous)
-    monkeypatch.setattr(module, "_REGISTRY_POLL_INTERVAL_S", 0.0)
     yield module
     sys.modules.pop(TPU_SYNC_WORKER_EXTENSION, None)
 
@@ -958,7 +965,8 @@ def test_update_tpu_sync_weights_end_to_end(fake_tpu_sync, worker_ext, caplog, t
     assert server.global_steps == 0
     # The manager holds the rendezvous handle: the actor is not detached, so Ray would destroy it otherwise.
     assert manager._tpu_sync_rendezvous is fake_tpu_sync.registry
-    assert set(fake_tpu_sync.rendezvous_lookups) <= {None, "TpuSyncRendezvous-test"}
+    # The rollout workers get the controller address and the shapes from the driver, not from the rendezvous.
+    assert set(fake_tpu_sync.rendezvous_lookups) <= {None}
     assert set(metrics) == TIMING_KEYS and min(metrics.values()) >= 0
     (transfer,) = fake_tpu_sync.transfers
     assert transfer["src_units"] == [TpuSyncId("trainer", str(r), "weights") for r in range(trainer_ranks)]
@@ -1559,16 +1567,13 @@ def test_update_tpu_sync_weights_gqa_replicated_kv_heads(fake_tpu_sync, worker_e
 
 
 def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, worker_ext):
-    fake_tpu_sync.registry_state.set_controller_address("10.0.0.2:7777")
-    fake_tpu_sync.registry_state.set_global_shapes(
-        {
-            "model.norm.weight": [128],
-            LAYER + "self_attn.o_proj.weight": [128, 256],
-            LAYER + "self_attn.k_proj.weight": [16, 64],
-        }
-    )
+    shapes = {
+        "model.norm.weight": [128],
+        LAYER + "self_attn.o_proj.weight": [128, 256],
+        LAYER + "self_attn.k_proj.weight": [16, 64],
+    }
     sampler = _make_sampler(worker_ext, rank=1, tp=2, model=_FakeVllmModel(2))
-    assert sampler.init_tpu_sync_on_worker(parallelism=4) is True
+    assert sampler.init_tpu_sync_on_worker("10.0.0.2:7777", shapes, parallelism=4) is True
 
     (ws,) = fake_tpu_sync.synchronizers
     assert (ws.parallelism, ws.bind_ip) == (4, "10.0.0.1")
@@ -1595,15 +1600,18 @@ def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, worker_ex
     }
 
     # Later syncs reuse the receive buffers and the registration.
-    assert sampler.init_tpu_sync_on_worker(parallelism=4) is True
+    assert sampler.init_tpu_sync_on_worker("10.0.0.2:7777", shapes, parallelism=4) is True
     assert len(fake_tpu_sync.synchronizers) == 1
 
 
 def test_sampler_init_registers_under_its_replica_job_name(fake_tpu_sync, worker_ext):
-    fake_tpu_sync.registry_state.set_controller_address("10.0.0.2:7777")
-    fake_tpu_sync.registry_state.set_global_shapes({"model.norm.weight": [128]})
     sampler = _make_sampler(worker_ext, rank=1, tp=2, model=_FakeVllmModel(2))
-    assert sampler.init_tpu_sync_on_worker(parallelism=4, job_name="sampler1") is True
+    assert (
+        sampler.init_tpu_sync_on_worker(
+            "10.0.0.2:7777", {"model.norm.weight": [128]}, parallelism=4, job_name="sampler1"
+        )
+        is True
+    )
 
     (ws,) = fake_tpu_sync.synchronizers
     assert TpuSyncId("sampler0", "1", "weights") not in fake_tpu_sync.registrations
@@ -1611,11 +1619,11 @@ def test_sampler_init_registers_under_its_replica_job_name(fake_tpu_sync, worker
     assert registration.listener_address == f"10.0.0.1:{ws.listener_port}"
 
 
-def test_sampler_init_times_out_without_registry(fake_tpu_sync, worker_ext, monkeypatch):
-    monkeypatch.setattr(worker_ext, "_REGISTRY_POLL_ATTEMPTS", 2)
+@pytest.mark.parametrize("address, shapes", [(None, {"model.norm.weight": [128]}), ("10.0.0.2:7777", {})])
+def test_sampler_init_requires_the_controller_address_and_shapes(fake_tpu_sync, worker_ext, address, shapes):
     sampler = _make_sampler(worker_ext, rank=0, tp=2, model=_FakeVllmModel(2))
-    with pytest.raises(RuntimeError, match="No tpu-sync controller address"):
-        sampler.init_tpu_sync_on_worker()
+    with pytest.raises(RuntimeError, match="the driver passed no tpu-sync controller address"):
+        sampler.init_tpu_sync_on_worker(address, shapes)
     assert fake_tpu_sync.synchronizers == []
 
 
@@ -1655,3 +1663,223 @@ def test_update_tpu_sync_weights_prints_timeline(fake_tpu_sync, worker_ext, monk
     assert loop == [("initial_weight_sync", 0), ("update_weights", 1)]
     worker = {e["name"] for e in events if e["group"] == "trainer_workers" and e["lane"] == "rank0"}
     assert {"update_weights", "gather", "bind", "release_tpu_sync"} <= worker
+
+
+# ---------------------------------------------------------------------------
+# Qwen3 MoE: 3-D expert stacks installed straight into vLLM's w13 / w2 (EP or TP-sliced experts)
+# ---------------------------------------------------------------------------
+
+MOE_E, MOE_INTER, MOE_PAD = 4, 4, 128  # experts, expert intermediate size, vllm-torchtpu's padded half
+MOE_CONFIG = SimpleNamespace(
+    model_type="qwen3_moe", num_experts=MOE_E, moe_intermediate_size=MOE_INTER, hidden_size=HIDDEN
+)
+MOE_EXPERTS = LAYER + "mlp.experts"
+MOE_PROJS = ("gate_proj", "up_proj", "down_proj")
+MOE_TRAINER_SHAPES = {
+    "lm_head.weight": (VOCAB, HIDDEN),
+    "model.embed_tokens.weight": (VOCAB, HIDDEN),
+    LAYER + "mlp.gate.weight": (MOE_E, HIDDEN),
+    f"{MOE_EXPERTS}.gate_proj.weight": (MOE_E, MOE_INTER, HIDDEN),
+    f"{MOE_EXPERTS}.up_proj.weight": (MOE_E, MOE_INTER, HIDDEN),
+    f"{MOE_EXPERTS}.down_proj.weight": (MOE_E, HIDDEN, MOE_INTER),
+    "model.norm.weight": (HIDDEN,),
+}
+
+
+class VllmUnquantizedFusedMoEMethod:  # vllm-torchtpu's unquantized MoE method, matched by class name
+    pass
+
+
+class _FakeFusedMoE(nn.Module):
+    """vLLM's MoE layer on TP rank ``rank``: with EP it holds whole experts ``[rank * E / tp, (rank + 1) * E / tp)``
+    in vllm-torchtpu's transposed, padded layout; without EP every expert's intermediate slice."""
+
+    def __init__(self, tp, rank, use_ep=True, **attrs):
+        super().__init__()
+        local = MOE_E // tp if use_ep else MOE_E
+        self.w13_weight = nn.Parameter(torch.zeros(local, HIDDEN, 2 * MOE_PAD, dtype=torch.bfloat16), False)
+        self.w2_weight = nn.Parameter(torch.zeros(local, MOE_PAD, HIDDEN, dtype=torch.bfloat16), False)
+        self.quant_method = VllmUnquantizedFusedMoEMethod()
+        self.use_ep, self.ep_size, self.ep_rank = use_ep, (tp if use_ep else 1), (rank if use_ep else 0)
+        self.global_num_experts, self.local_num_experts = MOE_E, local
+        for k, v in attrs.items():
+            setattr(self, k, v)
+
+
+class _FakeQwen3MoeVllmModel(nn.Module):
+    """One TP rank of vLLM's Qwen3 MoE: vocab-parallel embeddings, a replicated router and the fused experts."""
+
+    def __init__(self, tp, rank, use_ep=True, **moe_attrs):
+        super().__init__()
+        mlp = nn.Module()
+        mlp.gate = _Linear(MOE_E, HIDDEN)
+        mlp.experts = _FakeFusedMoE(tp, rank, use_ep=use_ep, **moe_attrs)
+        layer = nn.Module()
+        layer.mlp = mlp
+        self.model = nn.Module()
+        self.model.embed_tokens = _Linear(VOCAB // tp, HIDDEN)
+        self.model.layers = nn.ModuleList([layer])
+        self.model.norm = _Linear(HIDDEN)
+        self.lm_head = _Linear(VOCAB // tp, HIDDEN)
+
+
+def _moe_trainer_weights(seed: int = 0) -> dict[str, torch.Tensor]:
+    generator = torch.Generator().manual_seed(seed)
+    return {n: torch.randn(s, generator=generator).to(torch.bfloat16) for n, s in MOE_TRAINER_SHAPES.items()}
+
+
+def _expected_moe_state(weights, rank, tp, use_ep=True):
+    """Rank ``rank``'s vLLM state after a sync: its experts in w13 / w2 (whole with EP, every expert's intermediate
+    slice without), the router whole."""
+
+    def rows(name):
+        return weights[name].chunk(tp, dim=0)[rank]
+
+    gate, up, down = (weights[f"{MOE_EXPERTS}.{p}.weight"] for p in MOE_PROJS)
+    if use_ep:
+        gate, up, down = (t.chunk(tp, dim=0)[rank] for t in (gate, up, down))
+    else:
+        gate, up, down = gate.chunk(tp, dim=1)[rank], up.chunk(tp, dim=1)[rank], down.chunk(tp, dim=2)[rank]
+    local, inter = gate.shape[0], gate.shape[1]
+    w13 = torch.zeros(local, HIDDEN, 2 * MOE_PAD, dtype=torch.bfloat16)
+    w13[..., :inter] = gate.transpose(1, 2)
+    w13[..., MOE_PAD : MOE_PAD + inter] = up.transpose(1, 2)
+    w2 = torch.zeros(local, MOE_PAD, HIDDEN, dtype=torch.bfloat16)
+    w2[:, :inter] = down.transpose(1, 2)
+    return {
+        "model.embed_tokens.weight": rows("model.embed_tokens.weight"),
+        LAYER + "mlp.gate.weight": weights[LAYER + "mlp.gate.weight"],
+        f"{MOE_EXPERTS}.w13_weight": w13,
+        f"{MOE_EXPERTS}.w2_weight": w2,
+        "model.norm.weight": weights["model.norm.weight"],
+        "lm_head.weight": rows("lm_head.weight"),
+    }
+
+
+def _make_moe_sampler(module, rank, tp, model):
+    sampler = _make_sampler(module, rank, tp, model)
+    sampler.vllm_config.model_config.hf_text_config = MOE_CONFIG
+    return sampler
+
+
+@pytest.mark.parametrize(("trainer_ranks", "tp"), [(2, 2), (4, 2), (2, 4)])
+@pytest.mark.parametrize("use_ep", [True, False])
+def test_update_tpu_sync_weights_installs_qwen3_moe_experts_directly(
+    fake_tpu_sync, worker_ext, caplog, trainer_ranks, tp, use_ep
+):
+    """Trainer ranks send their whole-expert blocks of the 3-D stacks; every vLLM rank receives its own experts (EP)
+    or its slice of every expert (no EP) and writes them into w13 / w2. The step-0 exact check covers those writes,
+    and the norm check passes."""
+    weights = {"current": _moe_trainer_weights(seed=0)}
+    models = [_FakeQwen3MoeVllmModel(tp, rank, use_ep=use_ep) for rank in range(tp)]
+    for rank, model in enumerate(models):  # vLLM holds the checkpoint before the step-0 sync
+        model.load_state_dict(_expected_moe_state(weights["current"], rank, tp, use_ep))
+    samplers = [_make_moe_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+    manager, _ = _make_manager(
+        [_trainer_engine(rank, verify_parity="all") for rank in range(trainer_ranks)],
+        lambda rank: _LocalShardWeights(weights["current"], rank, trainer_ranks),
+        samplers,
+        [],
+        verify_parity="all",
+    )
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    # 4 tensors through copy_into (embed, router, norm, lm_head) + the 3 expert regions (w13 gate / up, w2).
+    assert f"[TPU-SYNC PARITY EXACT | Step 0] {tp} rollout ranks, [7] tensors checked per rank, 0 mismatched" in (
+        caplog.text
+    )
+    assert all(
+        s._tpu_sync_layout.name == "qwen3_moe" and s._tpu_sync_plan is not None and not s._tpu_sync_use_vllm_loaders
+        for s in samplers
+    )
+    for rank in range(tp):
+        variables = {
+            v.name: v for v in fake_tpu_sync.registrations[TpuSyncId("sampler0", str(rank), "weights")].variables
+        }
+        for proj in MOE_PROJS:  # one block per rank: whole experts (EP) or every expert's intermediate slice
+            var = variables[f"{MOE_EXPERTS}.{proj}.weight"]
+            dim = 0 if use_ep else 2 if proj == "down_proj" else 1
+            spec, mesh = ["", "", ""], [1, 1, 1]
+            spec[dim], mesh[dim] = "tp", tp
+            assert (var.sharding_spec, var.mesh_shape) == (spec, mesh)
+        router = variables[LAYER + "mlp.gate.weight"]
+        assert (router.sharding_spec, router.mesh_shape) == (["", ""], [1, 1])  # vLLM keeps the router whole
+
+    weights["current"] = _moe_trainer_weights(seed=1)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_moe_state(weights["current"], rank, tp, use_ep))
+    assert "TPU-SYNC PARITY VERIFIED | Step 1" in caplog.text
+    assert "MISMATCH" not in caplog.text
+    # The trainer registered its expert blocks as local shards: nothing was gathered.
+    registration = fake_tpu_sync.registrations[TpuSyncId("trainer", "0", "weights")]
+    var = next(v for v in registration.variables if v.name == f"{MOE_EXPERTS}.gate_proj.weight")
+    assert (var.mesh_shape, var.global_shard_indices) == ([trainer_ranks, 1, 1], [0])
+
+
+def test_exact_parity_reports_a_misplaced_expert(fake_tpu_sync, worker_ext, caplog):
+    tp = 2
+    weights = _moe_trainer_weights()
+    models = [_FakeQwen3MoeVllmModel(tp, rank) for rank in range(tp)]
+    for rank, model in enumerate(models):
+        model.load_state_dict(_expected_moe_state(weights, rank, tp))
+    with torch.no_grad():  # vLLM's copy of one expert's up projection differs from what the trainer sends
+        models[1].model.layers[0].mlp.experts.w13_weight[0, :, MOE_PAD] += 1
+    samplers = [_make_moe_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+    manager, _ = _make_manager(
+        [_trainer_engine(rank) for rank in range(2)],
+        lambda rank: _LocalShardWeights(weights, rank, 2),
+        samplers,
+        [],
+        verify_parity="exact",
+    )
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        with pytest.raises(parity.TPUSyncParityError, match=r"\[7\] tensors checked per rank, 1 mismatched") as excinfo:
+            asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    assert f"rank 1: {MOE_EXPERTS}.w13_weight[up]: max|diff|=1" in str(excinfo.value) + caplog.text
+
+
+def test_qwen3_moe_with_unsupported_expert_placement_falls_back_to_vllm_loaders(fake_tpu_sync, worker_ext, monkeypatch):
+    """An expert layout the direct install does not know (here vLLM's round-robin EP placement) goes through vLLM's
+    loaders, which get HF's per-expert tensors back from the 3-D stacks."""
+    tp = 2
+    weights = _moe_trainer_weights()
+    models = [_FakeQwen3MoeVllmModel(tp, rank, expert_placement_strategy="round_robin") for rank in range(tp)]
+    samplers = [_make_moe_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+    loaded: list[dict] = []
+    for sampler in samplers:
+        received: dict = {}
+        loaded.append(received)
+        sampler.model_runner.reload_weights = lambda weights_iterator, is_checkpoint_format, r=received: r.update(
+            weights_iterator
+        )
+
+    def all_gather(t, dim=0):  # the TP group: every rank's slice of the same staging tensor
+        for sampler in samplers:
+            for name, staged in sampler._tpu_sync_staging.items():
+                if staged is t:
+                    return torch.cat([s._tpu_sync_staging[name] for s in samplers], dim=dim)
+        raise AssertionError("not a staging tensor")
+
+    vllm_mod, distributed = ModuleType("vllm"), ModuleType("vllm.distributed")
+    distributed.get_tp_group = lambda: SimpleNamespace(all_gather=all_gather)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed)
+    manager, _ = _make_manager(
+        [_trainer_engine(rank) for rank in range(2)], lambda rank: _LocalShardWeights(weights, rank, 2), samplers, []
+    )
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+
+    assert all(
+        s._tpu_sync_layout is None and s._tpu_sync_plan is None and s._tpu_sync_use_vllm_loaders for s in samplers
+    )
+    for received in loaded:
+        expected = {n: t for n, t in weights.items() if ".experts." not in n}
+        for proj in MOE_PROJS:
+            for e, block in enumerate(weights[f"{MOE_EXPERTS}.{proj}.weight"].unbind(0)):
+                expected[f"{MOE_EXPERTS}.{e}.{proj}.weight"] = block
+        assert sorted(received) == sorted(expected)
+        for name, tensor in expected.items():
+            assert torch.equal(received[name], tensor), name

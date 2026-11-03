@@ -29,8 +29,14 @@ for this backend):
    - a replicated weight is already full on every rank and is registered full, without further communication.
      Note that q/k/v_proj are replicated only because torchtitan's `FusedQKVLinear` `state_dict()` hook already
      all-gathers the FSDP-sharded `wqkv` before splitting it (TODO: split it locally);
-   - every other layout (uneven cuts, FSDP x TP or HSDP 2-D meshes, fused expert stacks) is all-gathered and
-     registered full. Each such tensor is logged at INFO, with a per-sync summary line.
+   - Qwen3 MoE expert stacks (torchtitan's `[E, I, H]` / `[E, H, I]` per projection) are sent as is, one 3-D
+     tensor per projection and layer (`model.layers.N.mlp.experts.gate_proj.weight` `[E, I, H]`, likewise
+     `up_proj`, and `down_proj` `[E, H, I]`, as Qwen3.5's expert pieces). An FSDP shard of whole experts is a dim-0
+     block of that tensor and is registered locally; any other expert layout (e.g. torchtitan's dim-1 expert
+     sharding once the FSDP degree exceeds the expert count) is all-gathered first. Other MoE models' expert stacks
+     are all-gathered and sent as one tensor per expert;
+   - every other layout (uneven cuts, FSDP x TP or HSDP 2-D meshes) is all-gathered and registered full. Each
+     such tensor is logged at INFO, with a per-sync summary line.
 
    On the first sync it creates that synchronizer and registers it with the tpu-sync controller, which the
    driver starts at the same time; later syncs rebind the new tensors to the existing synchronizer, as long as
@@ -45,7 +51,7 @@ for this backend):
    skip the CPU (de)tiling pass.
 5. The trainer unbinds its send buffers, returning their HBM to training, and keeps the synchronizer (its
    pinned host buffers and controller registration) for the next sync. Meanwhile, each rollout worker copies
-   the weights to HBM and fuses q/k/v and gate/up into vLLM's parameters.
+   the weights to HBM and fuses q/k/v and gate/up into vLLM's parameters (see [Rollout install](#rollout-install)).
 6. Generation resumes, tagged with the new weight version.
 
 ## Requirements
@@ -80,6 +86,22 @@ actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 | `verify_parity` | `off` | Weight-sync check: `off`, `norm`, `exact` or `all` (`True` means `norm`). See [Parity checks](#parity-checks). A failed check stops the run. Meant for bring-up and after changing sharding or upgrading tpu-sync. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The deprecated environment variable `VERL_TPU_SYNC_RELEASE_BUFFERS` still overrides the option on the trainer workers and logs a deprecation warning. |
 
+## Rollout install
+
+Each rollout worker picks an install mode on the first sync, logged as `install mode ...`:
+
+| Mode | Models | How |
+|------|--------|-----|
+| `direct` | Dense models (Qwen3, Llama) | Each rank receives its TP shard and copies it into vLLM's (fused, possibly transposed) parameters. |
+| `qwen3_5 direct` | Qwen3.5 | As `direct`, plus the GatedDeltaNet and expert layouts of `rollout/qwen3_5_layout.py` (experts sliced on their intermediate dimension). |
+| `qwen3_moe direct` | Qwen3 MoE (e.g. Qwen3-30B-A3B), with vLLM expert parallelism over the whole TP group (`enable_expert_parallel`, EP size = TP size) or without it | Each rank receives one block of each 3-D expert stack: with EP its own whole experts (dim 0), without EP its slice of every expert's intermediate dimension (as Qwen3.5); it writes them into vLLM's `w13_weight` / `w2_weight`. The router is received whole (`rollout/qwen3_moe_layout.py`). |
+| `vllm loaders` | Any other hybrid or MoE model or layout (e.g. quantized experts, EP that does not cover the TP group) | Every rank all-gathers every tensor and runs vLLM's own checkpoint loaders. Correct, but slow; the log says why no direct install was possible. |
+
+The model-specific direct modes are the entries of `rollout/direct_install.py`, tried in order; the first whose
+checks pass on the live vLLM model is used. To add one, write `rollout/<model>_layout.py` with a
+`DirectInstallLayout` and add it to that table; the worker extension stays unchanged. The expert writers for vLLM's
+fused-MoE weights are shared in `rollout/moe_weights.py`.
+
 ## Parity checks
 
 `verify_parity` selects two complementary checks:
@@ -98,9 +120,9 @@ extra compare per tensor, once. The driver logs one line per replica:
 ```
 
 followed, on a mismatch, by one line per mismatched tensor and rank. It covers every tensor installed directly into
-vLLM's parameters. Qwen3.5's stacked experts are not compared. Models installed through vLLM's weight loaders cannot
-be checked bit for bit (the loaders re-shard the tensors themselves); the check logs `not run` and fails, so use
-`verify_parity=norm` for them.
+vLLM's parameters, including each written region of the experts' `w13_weight` (`[gate]` / `[up]`) and `w2_weight`
+for Qwen3.5 and Qwen3 MoE. Models installed through vLLM's weight loaders cannot be checked bit for bit (the loaders
+re-shard the tensors themselves); the check logs `not run` and fails, so use `verify_parity=norm` for them.
 
 An enabled check that fails raises `TPUSyncParityError` on the driver, which stops the run. It fails on a mismatch
 (including `unresolved` tensors in the `exact` check), and also when it cannot collect what it needs: trainer ranks
