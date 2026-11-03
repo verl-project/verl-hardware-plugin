@@ -216,13 +216,14 @@ def tpu_v7x_process_env(topology: str, rank: int, local_rank: int) -> dict[str, 
     }
 
 
-def ray_tpu_accelerator_name(node_ips: Optional[list[str]] = None) -> str:
+def ray_tpu_accelerator_name(node_ips: Optional[list[str]] = None, node_ids: Optional[list[str]] = None) -> str:
     """The pod type or accelerator type Ray reports for a TPU node (``""`` without Ray or TPU nodes).
 
     Reads ``ray.io/tpu-pod-type``, else ``ray.io/accelerator-type``, of the alive TPU nodes. With
-    ``node_ips`` (the hosts of the pool being configured) only those nodes count, so a cluster that mixes
-    generations is read per pool; when none of them is a TPU node Ray knows, this warns and returns ``""``
-    rather than describing some other node, and the caller falls back to the environment.
+    ``node_ips`` or ``node_ids`` (the hosts of the pool being configured, by IP or Ray node id) only those
+    nodes count, so a cluster that mixes generations is read per pool; when none of them is a TPU node Ray
+    knows, this warns and returns ``""`` rather than describing some other node, and the caller falls back
+    to the environment.
     """
     try:
         if not ray.is_initialized():
@@ -231,12 +232,13 @@ def ray_tpu_accelerator_name(node_ips: Optional[list[str]] = None) -> str:
     except Exception as e:
         logger.debug("Could not read the TPU node labels from Ray: %s", e)
         return ""
-    if node_ips:
-        tpu_nodes = [node for node in tpu_nodes if node.get("NodeManagerAddress") in node_ips]
+    if node_ips or node_ids:
+        ips, ids = set(node_ips or ()), set(node_ids or ())
+        tpu_nodes = [node for node in tpu_nodes if node.get("NodeManagerAddress") in ips or node.get("NodeID") in ids]
         if not tpu_nodes:
             logger.warning(
                 "None of the pool's hosts %s is a TPU node Ray knows; the TPU type comes from the environment",
-                sorted(node_ips),
+                sorted(ips | ids),
             )
             return ""
     names = []
@@ -271,6 +273,20 @@ def tpu_mesh_env(total_chips: int, num_nodes: int, rank: int, local_rank: int, p
     if is_tpu_v7x(pod_type):
         env.update(tpu_v7x_process_env(topology, rank=rank, local_rank=local_rank))
     return env
+
+
+def single_host_tpu_topology(num_chips: int, pod_type: str = "") -> str:
+    """The mesh of ``num_chips`` chips (TensorCore devices on TPU 7x) of one host, e.g. a rollout replica that uses
+    one host of a multi-host slice, or ``""`` when no mesh of that size is known.
+
+    Such a replica must not inherit the slice's ``TORCH_TPU_TOPOLOGY`` (set by the GKE TPU webhook or the job):
+    vllm-torchtpu builds the slice-builder addresses of its local workers only, and libtpu then fails with
+    "Expected <slice chips> worker addresses, got <host chips>". Sizes without a known mesh (e.g. 2 or 4 TPU 7x
+    devices, a TP=2 / TP=4 replica: ``TPU_V7X_TOPOLOGY_MAP`` lists whole hosts only) return ``""`` so that the
+    caller keeps the inherited environment rather than failing.
+    """
+    topology_map = TPU_V7X_TOPOLOGY_MAP if is_tpu_v7x(pod_type) else DEFAULT_TPU_TOPOLOGY_MAP
+    return topology_map.get(num_chips, "")
 
 
 def resolve_tpu_topology_bounds(

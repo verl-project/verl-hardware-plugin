@@ -11,6 +11,7 @@ eager-mode contexts for ``torch_tpu`` training.
 
 from __future__ import annotations
 
+import functools
 import importlib
 import inspect
 import logging
@@ -359,21 +360,71 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
     return use_splash_attention, use_simple_fsdp, tpu_eager_mode
 
 
-def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any) -> bool:
-    """Resolve whether to use the TPU Pallas fused linear + softmax cross-entropy kernel for logprobs.
+def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any, *, required: bool = False) -> bool:
+    """Whether to compute log-probs with the fused LM-head + cross-entropy kernel (``tokamax_logprob``).
 
-    On by default with ``use_torch_compile`` when ``tensor_parallel_size == 1``. The kernel never writes the
-    ``[tokens, vocab]`` logits to HBM and keeps them in fp32, so its log-probs are more precise than verl's GPU
-    path, which rounds the logits to bf16 before the fp32 log-softmax. Disabled when ``tensor_parallel_size > 1``
-    because ``FusedLossLinearWrapper`` returns a ``(hidden_states, weight_t)`` tuple that is incompatible with
-    TorchTitan's ``ColwiseParallel`` output redistribution (TP uses :func:`compute_tpu_logprobs_chunked` instead).
+    The kernel never materializes the ``[tokens, vocab]`` logits, which saves memory and keeps them in fp32.
+    It only supports ``tensor_parallel_size == 1``.
+
+    Default: on with ``use_torch_compile``. With ``required`` (set by the engine for models that need it, e.g. MoE),
+    it is on by default and TP > 1 raises instead of falling back. ``use_fused_linear_cross_entropy=False`` always
+    turns it off.
     """
-    if getattr(engine_config, "tensor_parallel_size", 1) > 1:
+    user_choice = get_tpu_engine_options(engine_config).use_fused_linear_cross_entropy  # None (unset), True or False
+    tp_size = int(getattr(engine_config, "tensor_parallel_size", 1) or 1)
+
+    # 1. An explicit opt-out always wins.
+    if user_choice is False:
+        if required:
+            logger.warning(
+                "use_fused_linear_cross_entropy=False on a model that requires the fused log-prob: the "
+                "[tokens, vocab] logits are materialized and large token budgets may run out of memory"
+            )
         return False
-    return _or_default(
-        get_tpu_engine_options(engine_config).use_fused_linear_cross_entropy,
-        bool(getattr(engine_config, "use_torch_compile", False)),
-    )
+
+    # 2. The kernel does not support tensor parallelism.
+    if tp_size > 1:
+        if required:
+            raise ValueError(
+                f"tensor_parallel_size={tp_size}: this model requires the fused LM-head log-prob "
+                "(engine_kwargs.tpu.use_fused_linear_cross_entropy), which supports tensor_parallel_size=1 only. "
+                "Use FSDP (data_parallel_shard_size) instead, or set use_fused_linear_cross_entropy=False."
+            )
+        return False
+
+    # 3. On if the model requires it or the user asked for it; if unset, on with torch.compile.
+    if required or user_choice:
+        return True
+    return bool(getattr(engine_config, "use_torch_compile", False))
+
+
+_DEFAULT_SPLASH_MAX_BLOCK_SIZE = 512  # torchtitan's splash_block_size_for default
+_MIN_SPLASH_BLOCK_SIZE = 128
+
+
+def resolve_tpu_splash_max_block_size(engine_config: Any) -> int:
+    """``engine_kwargs.tpu.splash_max_block_size`` (default 512); a power of two >= 128."""
+    value = get_tpu_engine_options(engine_config).splash_max_block_size
+    block = _DEFAULT_SPLASH_MAX_BLOCK_SIZE if value is None else int(value)
+    if block < _MIN_SPLASH_BLOCK_SIZE or block & (block - 1):
+        raise ValueError(f"engine_kwargs.tpu.splash_max_block_size must be a power of two >= 128, got {value!r}")
+    return block
+
+
+_MIXED_PRECISION_REDUCE_DTYPES = ("float32", "bfloat16")
+
+
+def resolve_tpu_mixed_precision_reduce(engine_config: Any) -> Optional[str]:
+    """``engine_kwargs.tpu.mixed_precision_reduce`` (``float32`` / ``bfloat16``), or ``None`` for torchtitan's."""
+    value = get_tpu_engine_options(engine_config).mixed_precision_reduce
+    if value is None:
+        return None
+    dtype = value.strip().lower()
+    if dtype not in _MIXED_PRECISION_REDUCE_DTYPES:
+        raise ValueError(
+            f"engine_kwargs.tpu.mixed_precision_reduce must be one of {_MIXED_PRECISION_REDUCE_DTYPES}, got {value!r}"
+        )
+    return dtype
 
 
 _SYNC_DTENSOR_REDISTRIBUTE_PATCHED = False
@@ -1099,6 +1150,32 @@ def _tpu_attention(inner: torch.nn.Module, use_splash: bool, local_window_size: 
     )
 
 
+def set_splash_max_block_size(max_block_size: int) -> None:
+    """Sets the largest block size torchtitan's ``SplashAttention`` (``auto_block_size=True``) picks per call.
+
+    ``SplashAttention`` takes its block size from the module-level ``splash_block_size_for(seq_len)``, whose cap is
+    512; long packed micro-batches (8-24k tokens) run faster with larger blocks, since Splash's grid grows as
+    ``(seq_len / block)^2``. Rebinds that function to one with ``max_block_size`` (the original for 512).
+    Process-wide, like the engine option it implements; a no-op without torchtitan's TPU kernels.
+
+    TODO(torchtitan): add a ``max_block_size`` parameter to ``SplashAttention`` upstream in torchtitan and pass it
+    when constructing the attention module instead of rebinding ``splash_block_size_for``.
+    """
+    try:
+        from torchtitan.experiments.tpu.kernels import splash_attention as splash_module
+    except ImportError:
+        return
+    original = getattr(splash_module, "_verl_original_splash_block_size_for", None)
+    if original is None:
+        original = splash_module.splash_block_size_for
+        splash_module._verl_original_splash_block_size_for = original
+    if max_block_size == _DEFAULT_SPLASH_MAX_BLOCK_SIZE:
+        splash_module.splash_block_size_for = original
+    else:
+        splash_module.splash_block_size_for = functools.partial(original, max_block_size=max_block_size)
+    logger.info("Splash attention: largest block size %d", max_block_size)
+
+
 def install_tpu_attention(modules: Any, use_splash: bool) -> int:
     """Run TPU attention for every ``inner_attention``: torchtitan's ``SplashAttention`` or ``TPUVarlenAttention``.
 
@@ -1142,103 +1219,81 @@ def install_tpu_attention(modules: Any, use_splash: bool) -> int:
     return replaced
 
 
-def _enable_reduction_none_in_torchtitan_linear_loss() -> Any:
-    """Import ``torchtitan.experiments.tpu.kernels.linear_softmax_cross_entropy_loss`` and allow ``reduction='none'``.
-
-    Tokamax's ``pallas_mosaic_tpu_kernel`` and reference kernel natively support ``reduction='none'`` in both
-    forward (returning per-token NLL of shape ``(B,)``) and backward (accepting per-token cotangent ``dout``
-    of shape ``(B,)``). TorchTitan's ``_my_bwd`` unconditionally calls ``jax.numpy.reshape(dout, ())`` for
-    scalar reductions (``'sum'``/``'mean'``); rebinding ``jax.numpy.reshape`` in ``_my_bwd``'s globals to
-    preserve 1D ``dout`` when ``dout.size != 1`` lets us call TorchTitan's ``linear_softmax_cross_entropy_loss``
-    directly without duplicating any kernel or custom-op code.
-    """
-    from torchtitan.experiments.tpu.kernels import linear_softmax_cross_entropy_loss as lce_mod
-
-    if getattr(lce_mod, "_verl_reduction_none_patched", False):
-        return lce_mod
-
-    import types
-
-    orig_bwd = lce_mod._my_bwd
-    real_jax = lce_mod.jax
-
-    class _JaxNumpyProxy:
-        @staticmethod
-        def reshape(a: Any, shape: Any, *args: Any, **kwargs: Any) -> Any:
-            if shape == () and getattr(a, "size", 1) != 1:
-                return a
-            return real_jax.numpy.reshape(a, shape, *args, **kwargs)
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(real_jax.numpy, name)
-
-    class _JaxProxy:
-        numpy = _JaxNumpyProxy()
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(real_jax, name)
-
-    lce_mod._my_bwd = types.FunctionType(
-        orig_bwd.__code__,
-        {**orig_bwd.__globals__, "jax": _JaxProxy()},
-        orig_bwd.__name__,
-        orig_bwd.__defaults__,
-        orig_bwd.__closure__,
-    )
-    lce_mod._verl_reduction_none_patched = True
-    return lce_mod
-
-
 def fused_linear_logprobs_tpu(
     hidden_states: torch.Tensor,
     labels: torch.Tensor,
     weight_t: torch.Tensor,
     *,
     temperature: float = 1.0,
-    implementation: str = "mosaic_tpu",
     b_block_size: int = 1024,
     h_block_size: int = 512,
     v_block_size: int = 2048,
 ) -> torch.Tensor:
-    """Compute per-token ``log_probs`` on TPU via the Pallas fused linear + softmax cross-entropy kernel.
+    """Per-token ``log_probs`` on TPU with Tokamax's fused linear + softmax cross-entropy kernel.
 
-    Avoids materializing the ``[T, V]`` logits and ``float32`` log-softmax tensors in HBM. Pads ``T`` up to
-    a multiple of ``b_block_size`` (1024) as required by Mosaic TPU tiles and slices back to ``[:T]``, so
-    padded rows receive zero upstream gradient in the backward pass.
+    Avoids materializing the ``[T, V]`` logits and ``float32`` log-softmax tensors in HBM, in forward and backward
+    (``engines.tokamax_logprob``: Pallas forward, chunked backward). Temperature is applied by scaling
+    ``hidden_states`` (``logits / t == (x / t) @ W``). ``T`` is padded to a multiple of ``b_block_size`` inside the
+    kernel wrapper.
     """
+    from verl_hardware_plugin.accelerators.tpu.engines.tokamax_logprob import tokamax_linear_logprob
+
     if hidden_states.dim() > 2:
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     if labels.dim() > 1:
         labels = labels.reshape(-1)
-
-    b_dim = int(hidden_states.shape[0])
     x = hidden_states
     temp = float(temperature)
     if temp != 1.0:
-        x = (x * (1.0 / temp)).to(weight_t.dtype)
-    elif x.dtype != weight_t.dtype:
-        x = x.to(weight_t.dtype)
-
-    padded_b = max(b_block_size, ((b_dim + b_block_size - 1) // b_block_size) * b_block_size)
-    pad_b = padded_b - b_dim
-    if pad_b > 0:
-        x = F.pad(x, (0, 0, 0, pad_b))
-        labels = F.pad(labels, (0, pad_b), value=0)
-
-    lce_mod = _enable_reduction_none_in_torchtitan_linear_loss()
-    nll = lce_mod.linear_softmax_cross_entropy_loss(
-        x.contiguous(),
-        labels.contiguous(),
+        x = x * (1.0 / temp)
+    return tokamax_linear_logprob(
+        x.to(weight_t.dtype),
+        labels,
         weight_t,
-        reduction="none",
-        implementation=implementation,
         b_block_size=b_block_size,
         h_block_size=h_block_size,
         v_block_size=v_block_size,
     )
-    if pad_b > 0:
-        nll = nll[:b_dim]
-    return -nll
+
+
+FUSED_ENTROPY_MAX_CHUNK = 4096
+
+
+def fused_entropy_chunk_size(num_tokens: int, max_chunk: int = FUSED_ENTROPY_MAX_CHUNK, align: int = 256) -> int:
+    """Largest multiple of ``align`` that divides ``num_tokens`` and is <= ``max_chunk``; ``num_tokens`` otherwise.
+
+    One static chunk shape keeps the chunk loop to a single compiled program per micro-batch shape.
+    """
+    if num_tokens <= max_chunk:
+        return num_tokens
+    chunk = (max_chunk // align) * align
+    while chunk >= align:
+        if num_tokens % chunk == 0:
+            return chunk
+        chunk -= align
+    return num_tokens
+
+
+@torch.no_grad()
+def chunked_entropy_from_hidden_tpu(
+    hidden_states: torch.Tensor, weight_t: torch.Tensor, temperature: float, chunk_size: Optional[int] = None
+) -> torch.Tensor:
+    """Per-token entropy of ``softmax(hidden_states @ weight_t / temperature)``, in token chunks, without gradient.
+
+    For passes that report the entropy but do not differentiate it (old log-probs): the logits of one chunk of
+    tokens at a time are materialized (bf16 matmul as the unfused LM head, fp32 entropy as on GPU) instead of the
+    whole ``[T, V]`` logits.
+    """
+    from verl.utils.torch_functional import entropy_from_logits
+
+    hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+    num_tokens = int(hidden.shape[0])
+    chunk = chunk_size or fused_entropy_chunk_size(num_tokens)
+    out = []
+    for start in range(0, num_tokens, chunk):
+        logits = (hidden[start : start + chunk] @ weight_t) / temperature
+        out.append(entropy_from_logits(logits.float()))
+    return torch.cat(out)
 
 
 _PAD_VOCAB_STRIDE = 9973  # prime stride: spreads packed-padding token IDs across vocab instead of 1 or math experts

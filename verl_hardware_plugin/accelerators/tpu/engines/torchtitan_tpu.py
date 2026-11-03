@@ -73,6 +73,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     ContextParallelGather,
     align_micro_batch_shapes_across_ranks,
     bucket_length,
+    chunked_entropy_from_hidden_tpu,
     compute_global_batch_num_tokens,
     compute_tpu_logprobs_chunked,
     configure_torch_compile_for_tpu,
@@ -88,8 +89,11 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     install_tpu_attention,
     move_tpu_params_,
     pad_packed_inputs_for_tpu,
+    resolve_tpu_mixed_precision_reduce,
+    resolve_tpu_splash_max_block_size,
     resolve_tpu_torchtitan_options,
     resolve_tpu_use_fused_linear_cross_entropy,
+    set_splash_max_block_size,
     spmd_no_typecheck_context,
     torchtitan_model_attn_backend,
     tpu_eager_mode_context,
@@ -867,7 +871,6 @@ class TorchTitanTPUEngine(BaseEngine):
             self._use_simple_fsdp,
             self._tpu_eager_mode,
         ) = resolve_tpu_torchtitan_options(engine_config)
-        self._use_fused_linear_cross_entropy = resolve_tpu_use_fused_linear_cross_entropy(engine_config)
 
         if engine_config.use_torch_compile:
             configure_torch_compile_for_tpu()
@@ -900,6 +903,12 @@ class TorchTitanTPUEngine(BaseEngine):
         )
         # Mandatory per-model TPU setup (engines/tpu_model_kernels.py, _MODEL_SETUPS), e.g. Qwen3 MoE.
         setup = tpu_model_kernels.model_setup(torchtitan_name, self.model_config.hf_config)
+        # MoE models require the fused LM-head log-prob: their per-chip token budgets only fit without the
+        # [tokens, vocab] logits, so the engine raises rather than falling back to them.
+        self._fused_logprob_required = setup is not None and setup.requires_fused_logprob
+        self._use_fused_linear_cross_entropy = resolve_tpu_use_fused_linear_cross_entropy(
+            engine_config, required=self._fused_logprob_required
+        )
         model_spec = model_module.model_registry(
             torchtitan_flavor,
             attn_backend=torchtitan_model_attn_backend(torchtitan_name, self.engine_config.attn_type),
@@ -921,6 +930,8 @@ class TorchTitanTPUEngine(BaseEngine):
                 tpu_model_kernels.ModelSetupContext(
                     expert_parallel_size=self.engine_config.expert_parallel_size,
                     seq_bucket_size=get_tpu_seq_bucket_size(self.engine_config),
+                    moe_paired_grouped_mm=bool(tpu_options.moe_paired_grouped_mm),
+                    moe_native_weight_layout=bool(tpu_options.moe_native_weight_layout),
                 ),
             )
         if self._use_simple_fsdp:
@@ -1001,6 +1012,9 @@ class TorchTitanTPUEngine(BaseEngine):
             training_kwargs["mixed_precision_reduce"] = "bfloat16"
         if self.engine_config.max_seq_len is not None:
             training_kwargs["max_context_length"] = self.engine_config.max_seq_len
+        mixed_precision_reduce = resolve_tpu_mixed_precision_reduce(engine_config)
+        if mixed_precision_reduce is not None:
+            training_kwargs["mixed_precision_reduce"] = mixed_precision_reduce
         training = TrainingConfig(**training_kwargs)
 
         # Pad positions run 0..pad_size-1 (< bucket) and index the RoPE cache sized by max_context_length.
@@ -1052,17 +1066,13 @@ class TorchTitanTPUEngine(BaseEngine):
             loss=CrossEntropyLoss.Config(),
         )
         if self._use_fused_linear_cross_entropy:
-            try:
-                from torchtitan.experiments.tpu.qwen3.config_registry import _FUSED_LOSS_OVERRIDE
-            except ImportError:
-                logger.warning(
-                    "Disabling use_fused_linear_cross_entropy: "
-                    "torchtitan.experiments.tpu.qwen3.config_registry not found"
-                )
-                self._use_fused_linear_cross_entropy = False
-            else:
-                if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
-                    self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+            self._enable_fused_logprob_head()
+        logger.warning(
+            "TPU log-prob path: %s",
+            "fused Tokamax linear + log-softmax (Pallas forward, chunked backward)"
+            if self._use_fused_linear_cross_entropy
+            else "LM-head logits + chunked log-softmax",
+        )
         for override_import in tpu_model_kernels.override_imports(self._tpu_kernels):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
@@ -1084,6 +1094,8 @@ class TorchTitanTPUEngine(BaseEngine):
             for model_part in model_parts:
                 enable_fsdp_gradient_division(model_part, dp_size)
 
+        if self._use_splash_attention:
+            set_splash_max_block_size(resolve_tpu_splash_max_block_size(engine_config))
         install_tpu_attention(model_parts, use_splash=self._use_splash_attention)
         if self.parallel_dims.ep_enabled:
             ep_cap = (
@@ -2122,6 +2134,31 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
         return input_ids, extra_inputs, extra_kwargs, output_args
 
+    def _enable_fused_logprob_head(self) -> None:
+        """Makes the LM head return ``(hidden_states, weight_t)`` (torchtitan's fused-loss override) for the fused
+        log-prob, and checks that the Tokamax kernel can be imported.
+
+        Without them the fused log-prob is turned off with a warning, or, if the model requires it, the engine
+        raises.
+        """
+        from verl_hardware_plugin.accelerators.tpu.engines.tokamax_logprob import require_tokamax
+
+        try:
+            from torchtitan.experiments.tpu.qwen3.config_registry import _FUSED_LOSS_OVERRIDE
+
+            require_tokamax()
+        except (ImportError, RuntimeError) as e:
+            if self._fused_logprob_required:
+                raise RuntimeError(
+                    "This model requires the fused LM-head log-prob (engine_kwargs.tpu.use_fused_linear_cross_entropy)"
+                    f", but it is unavailable: {e!r}. Set use_fused_linear_cross_entropy=False to run without it."
+                ) from e
+            logger.warning("Disabling use_fused_linear_cross_entropy: %r", e)
+            self._use_fused_linear_cross_entropy = False
+            return
+        if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
+            self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+
     def _maybe_gather_context_parallel(self, tensor: torch.Tensor, output_args: dict) -> torch.Tensor:
         """Under CP, gather this rank's token shard into the full bucket-padded sequence (original token order)."""
         if not self.parallel_dims.cp_enabled:
@@ -2166,12 +2203,21 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                         vocab_size=int(lm_head_weight_t.shape[1]),
                     ),
                 )
-                if not calculate_entropy:
+                if calculate_entropy and not torch.is_grad_enabled():
+                    # Entropy without gradient (old log-probs): one chunk of logits at a time, never all of them.
+                    entropy_rmpad = chunked_entropy_from_hidden_tpu(hidden_rmpad, lm_head_weight_t, temperature)
+                    model_output["entropy"] = _to_jagged(
+                        self._maybe_gather_context_parallel(entropy_rmpad, output_args),
+                        cu_seqlens,
+                        output_args.get("orig_seq_len"),
+                    )
+                if not calculate_entropy or not torch.is_grad_enabled():
                     fused_log_probs = self._maybe_gather_context_parallel(fused_log_probs, output_args)
                     model_output["log_probs"] = _to_jagged(fused_log_probs, cu_seqlens, output_args.get("orig_seq_len"))
                     return model_output
-            # Entropy needs the logits. The log-probs still come from the fused kernel, so the reference, old-log-prob
-            # and update passes all compute them the same way (an on-policy PPO ratio is exactly 1).
+            # A differentiated entropy (entropy loss) needs the logits. The log-probs still come from the fused kernel,
+            # so the reference, old-log-prob and update passes all compute them the same way (an on-policy PPO ratio
+            # is exactly 1).
             logits = hidden_states @ lm_head_weight_t
 
         if use_remove_padding:
