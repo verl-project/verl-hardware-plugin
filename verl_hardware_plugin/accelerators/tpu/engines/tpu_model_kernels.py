@@ -190,10 +190,11 @@ def qwen3_moe_model_registry_kwargs() -> dict[str, Any]:
 def configure_qwen3_moe(model_spec: Any, *, expert_parallel_size: int, seq_bucket_size: int) -> None:
     """Sets up a Qwen3 MoE ``model_spec.model`` for RL on TPU, in place.
 
-    - Turns off expert-bias load balancing and the aux loss: the HF checkpoint the rollout serves has no expert bias,
-      so the trainer must route like it.
-    - Runs the routed experts with the Pallas grouped matmul in the canonical layout: the native
-      ``torch._grouped_mm`` backward is wrong on TPU (torch_tpu#2668).
+    - Turns off torchtitan's expert-bias load balancing: vLLM and the HF checkpoint have no expert bias, so with it
+      the trainer would pick different experts than the rollout. The aux loss keeps torchtitan's default (off).
+    - Runs the routed experts on torchtitan's Pallas grouped matmul (``TpuGroupedExperts``), unpaired and in the
+      canonical w1/w2/w3 layout that the weight export expects. Pallas is required: torchtitan's default
+      ``torch._grouped_mm`` path has a wrong backward on TPU (torch_tpu#2668).
 
     Raises:
         ValueError: if ``expert_parallel_size > 1``, or if ``seq_bucket_size * top_k`` is not a multiple of the
@@ -204,10 +205,9 @@ def configure_qwen3_moe(model_spec: Any, *, expert_parallel_size: int, seq_bucke
 
     if expert_parallel_size > 1:
         raise ValueError(
-            f"expert_parallel_size={expert_parallel_size} is not supported for Qwen3 MoE on TPU: the Pallas grouped "
-            "matmul needs EP=1 (exact, tile-aligned routed rows), and the native torch._grouped_mm fallback computes "
-            "a wrong expert dWeight on TPU (torch_tpu#2668). Use expert_parallel_size=1 with FSDP "
-            "(data_parallel_shard_size) instead."
+            f"expert_parallel_size={expert_parallel_size} is not supported for Qwen3 MoE on TPU yet: the Pallas "
+            "grouped matmul setup here is validated only at EP=1 (as in torchtitan's Qwen3 TPU recipe). Use "
+            "expert_parallel_size=1 with FSDP (data_parallel_shard_size) instead."
         )
     model_config = model_spec.model
     moe_configs = [moe for _, moe, _, _ in model_config.traverse(MoE.Config)]
@@ -224,14 +224,16 @@ def configure_qwen3_moe(model_spec: Any, *, expert_parallel_size: int, seq_bucke
                 f"(top_k={top_k}). Set engine_kwargs.tpu.seq_bucket_size so that it times top_k is a multiple of "
                 f"{tile_m} (the default 256 is)."
             )
+        # TODO: pass load_balance_coeff=None to torchtitan's model_registry once it accepts it, and remove this line.
         moe.load_balance_coeff = None
-        moe.router.aux_loss = None
     experts_configs = [experts for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config)]
     if len(experts_configs) != len(moe_configs):
         raise ValueError(
             f"Qwen3 MoE: {len(experts_configs)} of {len(moe_configs)} MoE layers use TpuGroupedExperts; build the "
             "model with qwen3_moe_model_registry_kwargs()"
         )
+    # Same values as torchtitan's Qwen3-30B-A3B TPU recipe, except unpaired and the canonical layout.
+    # TODO: call torchtitan's _use_tpu_moe_kernels (as for Qwen3.5) once the pinned torchtitan has it.
     for experts in experts_configs:
         experts.use_pallas_grouped_mm = True
         experts.use_pallas_paired_grouped_mm = False
@@ -239,8 +241,8 @@ def configure_qwen3_moe(model_spec: Any, *, expert_parallel_size: int, seq_bucke
         experts.pallas_grouped_mm_tile_m = tile_m
         experts.pallas_grouped_mm_tgmm_tiling = _QWEN3_MOE_GROUPED_MM_TGMM_TILING
     logger.info(
-        "Qwen3 MoE: %d layers route without expert bias or aux loss; TPU token dispatcher and Pallas grouped "
-        "matmul experts (tile_m=%d)",
+        "Qwen3 MoE: %d layers route without expert bias; TPU token dispatcher and Pallas grouped matmul experts "
+        "(tile_m=%d)",
         len(moe_configs),
         tile_m,
     )

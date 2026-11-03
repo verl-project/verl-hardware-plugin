@@ -1532,7 +1532,7 @@ def _fake_qwen3_moe_model_spec(modules, *, n_layers=2, top_k=8, tpu_experts=True
     nodes = []
     for _ in range(n_layers):
         experts = experts_cls.Config()
-        router = SimpleNamespace(top_k=top_k, aux_loss="batch_wise global aux loss")
+        router = SimpleNamespace(top_k=top_k, aux_loss="flavor aux loss setting")
         nodes += [MoE.Config(router=router, routed_experts=experts), experts]
 
     def traverse(cls):
@@ -1601,8 +1601,9 @@ def test_configure_qwen3_moe_routes_like_hf_with_tpu_grouped_experts():
         kernels_mod.configure_qwen3_moe(spec, expert_parallel_size=1, seq_bucket_size=1024)
 
     moes, experts = spec.nodes[0::2], spec.nodes[1::2]
-    # No expert-bias balancer (the HF checkpoint has no expert bias) and no aux loss.
-    assert all(m.load_balance_coeff is None and m.router.aux_loss is None for m in moes)
+    # Expert bias off; aux loss untouched.
+    assert all(m.load_balance_coeff is None for m in moes)
+    assert all(m.router.aux_loss == "flavor aux loss setting" for m in moes)
     for e in experts:
         assert e.use_pallas_grouped_mm and not e.use_pallas_paired_grouped_mm
         assert not e.use_kernel_native_weight_layout  # canonical w1/w2/w3 layout, which the weight export assumes
