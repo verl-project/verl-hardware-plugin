@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
+# Diagnostics adapted from verl: Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # Licensed under the Apache License, Version 2.0.
 
 """Standalone TorchTitan training engine for Google TPU (``torch_tpu``) devices.
@@ -33,6 +34,7 @@ import math
 import os
 import re
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, Callable, Iterator, Optional
 
 import torch
@@ -43,6 +45,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.experimental._context_parallel._load_balancer import _HeadTailLoadBalancer
 
 from verl.trainer.config import CheckpointConfig
+from verl.trainer.ppo.core_algos import agg_loss
 from verl.utils import tensordict_utils as tu
 from verl.utils import torch_functional as verl_F
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -52,6 +55,7 @@ from verl.utils.fsdp_utils import (
     load_fsdp_optimizer,
     offload_fsdp_optimizer,
 )
+from verl.utils.metric import AggregationType, Metric
 from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits_naive
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
@@ -62,15 +66,15 @@ from verl.workers.engine.utils import (
     postprocess_batch_func,
     prepare_micro_batches,
 )
+from verl.workers.utils.losses import ppo_loss
+from verl.workers.utils.padding import no_padding_2_padding
 from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels
-from verl_hardware_plugin.accelerators.tpu.engines.tpu_precision import (
-    apply_fp32_logits_tpu,
-    apply_tpu_precision_patches,
-)
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
     align_micro_batch_shapes_across_ranks,
+    apply_fp32_logits_tpu,
+    apply_tpu_precision_patches,
     bucket_length,
     compute_global_batch_num_tokens,
     compute_tpu_logprobs_chunked,
@@ -98,7 +102,6 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
 )
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
 from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import prepare_tpu_loss_inputs
-from verl_hardware_plugin.accelerators.tpu.losses.ppo_diagnostics import call_tpu_loss_function
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 
@@ -1465,12 +1468,51 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
                 if loss_function is not None:
                     loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
-                    loss, metrics = call_tpu_loss_function(
-                        loss_function,
+                    loss, metrics = loss_function(
                         model_output=loss_model_output,
                         data=loss_data,
                         dp_group=self.get_data_parallel_group(),
                     )
+                    names = (
+                        "actor/ppo_kl_token_mean",
+                        "actor/ppo_k3_token_mean",
+                        "actor/logprob_gap_abs_token_mean",
+                    )
+                    if (
+                        isinstance(loss_function, partial)
+                        and loss_function.func is ppo_loss
+                        and any(name not in metrics for name in names)
+                    ):
+                        config = loss_function.keywords.get("config")
+                        if config is None and loss_function.args:
+                            config = loss_function.args[0]
+                        if config is not None and config.global_batch_info.get("batch_num_tokens") is not None:
+                            mode = config.policy_loss.get("loss_mode", "vanilla")
+                            correction = config.policy_loss.get("rollout_correction") or {}
+                            # Rejection sampling and other losses use a different token denominator.
+                            if mode == "vanilla" or (
+                                mode == "bypass_mode"
+                                and correction.get("loss_type", "ppo_clip") == "ppo_clip"
+                                and correction.get("rollout_rs") is None
+                            ):
+                                with torch.no_grad():
+                                    log_prob = no_padding_2_padding(loss_model_output["log_probs"], loss_data)
+                                    fields = loss_data.select("old_log_probs", "response_mask").to_padded_tensor()
+                                    mask = fields["response_mask"]
+                                    gap = torch.where(
+                                        mask.bool(), log_prob.float() - fields["old_log_probs"].float(), 0.0
+                                    )
+                                    ratio = gap.clamp(-20.0, 20.0)
+                                    values = (-ratio, (ratio.exp() - ratio - 1.0).clamp_min(0.0), gap.abs())
+                                    # SUM micro-batches, then MEAN DP ranks: global token means.
+                                    for name, value in zip(names, values, strict=True):
+                                        metrics.setdefault(
+                                            name,
+                                            Metric(
+                                                AggregationType.SUM,
+                                                agg_loss(value, mask, "token-mean", **config.global_batch_info),
+                                            ),
+                                        )
                 else:
                     assert forward_only, "loss_function must be provided when not forward_only"
                     loss = torch.tensor(1.0, device=device_name)
