@@ -332,6 +332,40 @@ class TorchTitanTPUEngine(BaseEngine):
             **fuse_qkv_kwargs,
             **tpu_model_kernels.model_registry_kwargs(self._tpu_kernels),
         )
+        if self.model_config.hf_config.model_type == "qwen3_moe" and torchtitan_flavor in (
+            "30B-A3B",
+            "30B-A3B-global-aux",
+        ):
+            from torchtitan.models.common.moe import MoE
+
+            # Match HF routing: no training-only expert bias or auxiliary router loss.
+            moe_configs = list(model_spec.model.traverse(MoE.Config))
+            if not moe_configs:
+                raise ValueError("Qwen3-30B config has no MoE layers")
+            for _, moe, _, _ in moe_configs:
+                moe.load_balance_coeff = None
+                if hasattr(moe, "aux_loss"):
+                    moe.aux_loss = None
+                if hasattr(moe.router, "aux_loss"):
+                    moe.router.aux_loss = None
+            if tpu_options.qwen3_pallas_experts is not False:
+                from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts, TpuGroupedExpertsConverter
+                from torchtitan.experiments.tpu.token_dispatcher import TpuTokenDispatcherConverter
+
+                model = TpuTokenDispatcherConverter.Config().build().convert(model_spec.model)
+                model = TpuGroupedExpertsConverter.Config().build().convert(model)
+                experts_configs = list(model.traverse(TpuGroupedExperts.Config))
+                if len(experts_configs) != len(moe_configs):
+                    raise ValueError("Qwen3-30B Pallas conversion must provide one expert config per MoE layer")
+                for _, experts, _, _ in experts_configs:
+                    experts.use_pallas_grouped_mm = True
+                    experts.use_pallas_paired_grouped_mm = (
+                        tpu_options.moe_paired_gemm is not False and self.engine_config.expert_parallel_size == 1
+                    )
+                    experts.use_kernel_native_weight_layout = False  # Preserve HF weight export and FSDP layout.
+                    experts.pallas_grouped_mm_tile_m = 256
+                    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
+                model_spec = dataclasses.replace(model_spec, model=model)
         tpu_model_kernels.configure_model_spec(
             model_spec,
             self._tpu_kernels,

@@ -66,6 +66,9 @@ The rollout settings that matter on TPU (the recipes already set them):
 
 ## Verify
 
+For the optional Qwen3-30B-A3B routing-weight precision patch and its exact dependency requirements, see
+[Qwen3-30B-A3B MoE numerical consistency](./qwen3_30b_moe.md#vllm-rollout).
+
 On any host, without vLLM or a TPU:
 
 ```bash
