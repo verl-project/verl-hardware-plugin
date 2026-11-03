@@ -25,8 +25,6 @@ slice through Ray. Each patch fills a gap in vLLM (v0.29.0 - v0.32.0) and vllm-t
 * ``TPUModelRunner.sample_from_logits``: redraw BF16 sampling noise in FP32, avoiding sampling
   bias. vllm-torchtpu #1747 draws the noise in FP32 at the call sites, so there the wrapper
   passes it through unchanged.
-* Qwen3 MoE routing: optionally retain FP32 routing weights and accumulate weighted expert
-  outputs in FP32. Dense-model attention, normalization and activation paths are unchanged.
 * ``VLLM_DISABLE_COMPILE_CACHE=1``: a reloaded compile-cache artifact can make vLLM run the model
   eagerly, which crashes libtpu (b/501165531). Upstream fix: that bug.
 * ``multiprocessing.process.BaseProcess.__init__`` and ``RayWorkerWrapper.__init__``: install
@@ -48,12 +46,10 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
     TPU_V7X_DEVICES_PER_HOST,
-    driver_tpu_env_for_workers,
     is_tpu_v7x,
     ray_tpu_accelerator_name,
     tpu_mesh_env,
 )
-from verl_hardware_plugin.accelerators.tpu.rollout.tpu_moe_precision import patch_tpu_fp32_routing_weights
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +216,6 @@ def patch_vllm_for_tpu() -> None:
         # TPU. It does not support async scheduling, which vLLM turned on for the
         # external_launcher backend that TPUvLLMHttpServer passes in.
         vllm_config = original_create_engine_config(self, *args, **kwargs)
-        patch_tpu_fp32_routing_weights(hf_config=vllm_config.model_config.hf_config)
         vllm_config.parallel_config.distributed_executor_backend = "ray"
         vllm_config.scheduler_config.async_scheduling = False
         return vllm_config
@@ -233,29 +228,14 @@ def patch_vllm_for_tpu() -> None:
         patch_vllm_for_tpu()
         original_worker_init(self, *args, **kwargs)
 
-    original_init_worker = RayWorkerWrapper.init_worker
-
-    def init_worker(self, *args, **kwargs):
-        # The executor delivers environment variables after __init__, before
-        # init_worker constructs the worker and model. Apply the opt-in here too.
-        return _init_worker_with_moe_precision(original_init_worker, self, *args, **kwargs)
-
     EngineArgs.create_engine_config = create_engine_config
     RayWorkerWrapper.__init__ = worker_init
-    RayWorkerWrapper.init_worker = init_worker
     TPUWorker.reset_encoder_cache = _reset_encoder_cache
     ray_executor.initialize_ray_cluster = _initialize_ray_cluster
     ray_executor.RayDistributedExecutor._init_workers_ray = _init_workers_ray
     ray_executor.RayDistributedExecutor._execute_dag = _execute_dag
     _PATCHES_APPLIED = True
     logger.info("Successfully applied all TPU patches to vLLM and vllm-torchtpu.")
-
-
-def _init_worker_with_moe_precision(original, self, all_kwargs, *args, **kwargs):
-    # vLLM's WorkerWrapperBase.init_worker selects its config by rpc_rank.
-    config = all_kwargs[self.rpc_rank]["vllm_config"]
-    patch_tpu_fp32_routing_weights(hf_config=config.model_config.hf_config)
-    return original(self, all_kwargs, *args, **kwargs)
 
 
 def _initialize_ray_cluster(parallel_config, ray_address=None) -> None:
@@ -321,7 +301,6 @@ def _init_workers_ray(self, placement_group, **ray_remote_kwargs) -> None:
         )
         if name in os.environ
     }
-    driver_env.update(driver_tpu_env_for_workers())
     # torch_tpu's own rendezvous, separate from the torch.distributed one below.
     torch_tpu_master = {"MASTER_ADDR": ips[0], "MASTER_PORT": str(get_open_port())}
     pod_type = ray_tpu_accelerator_name(node_ips=ips)

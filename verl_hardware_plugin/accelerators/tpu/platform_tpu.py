@@ -56,14 +56,7 @@ _ensure_torch_tpu()  # Attempt at module load time so availability checks are fa
 # read: the libtpu / XLA compiler flags, and the plugin's own knobs (``VERL_TPU_*``, including ``VERL_TPU_SYNC_*``). Ray
 # workers start from the raylet's environment, not the driver's, so the platform names them in the job's
 # runtime_env for them to reach the trainer workers, the rollout servers and vLLM's engine workers.
-TPU_FORWARDED_ENV_VARS = (
-    "LIBTPU_INIT_ARGS",
-    "XLA_FLAGS",
-    # The MoE routing patch and expert backend read these names without the VERL_TPU_ prefix.
-    "USE_MOE_SPARSE_CORE",
-    "TPU_MOE_DENSE_EXPERT_THRESHOLD",
-    "VERL_MOE_PAIRED_GEMM",
-)
+TPU_FORWARDED_ENV_VARS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS", "VERL_MOE_PAIRED_GEMM")
 TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_",)
 
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
@@ -676,10 +669,6 @@ class PlatformTPU(PlatformBase):
             }
         }
 
-    def rollout_env_vars(self) -> dict[str, str]:
-        """Deliver the driver's TPU and MoE options before the rollout server imports its kernels."""
-        return {**super().rollout_env_vars(), **driver_tpu_env_for_workers()}
-
     def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
         """Pin a resource pool to its own TPU slice on multi-slice clusters.
 
@@ -812,7 +801,7 @@ class PlatformTPU(PlatformBase):
         device_name: str,
     ) -> dict[str, str]:
         """Return platform-specific TPU environment variables for worker nodes."""
-        env_vars = driver_tpu_env_for_workers()
+        env_vars = {}
         if "VERL_PLATFORM" in os.environ:
             env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
         for var in self.ray_noset_envvars():
