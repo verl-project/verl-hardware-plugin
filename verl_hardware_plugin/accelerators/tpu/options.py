@@ -153,6 +153,10 @@ class TPUEngineOptions:
         ep_capacity_factor: Per-destination-rank token capacity multiplier of ``TpuQwen35TokenDispatcher`` when
             ``expert_parallel_size > 1`` (default: ``4.0``). torchtitan's pretraining default (``1.25``) drops
             skewed RL / math tokens across 32-64 EP ranks while vLLM rollout is dropless.
+        mixed_precision_param: TorchTitan mixed-precision parameter dtype, ``bfloat16`` or ``float32``;
+            unset preserves its default and FP32 master parameters.
+        fp32_logits: Preserve FP32 LM-head accumulators with BF16 operands; ``False`` requests BF16 logits.
+            Either explicit value disables the automatic fused-linear-loss default so this head is used.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -165,6 +169,8 @@ class TPUEngineOptions:
     seq_bucket_size: Optional[int] = None
     model_kernels: Optional[str] = None
     ep_capacity_factor: Optional[float] = None
+    mixed_precision_param: Optional[str] = None
+    fp32_logits: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -178,6 +184,8 @@ _ENGINE_KINDS: dict[str, type] = {
     "seq_bucket_size": int,
     "model_kernels": str,
     "ep_capacity_factor": float,
+    "mixed_precision_param": str,
+    "fp32_logits": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
@@ -189,6 +197,7 @@ _ENGINE_LEGACY_ENV_VARS = {
     "tpu_eager_mode": "VERL_TPU_EAGER_MODE",
     "optim_impl": "VERL_TPU_OPTIM_IMPL",
     "seq_bucket_size": "VERL_TPU_SEQ_BUCKET_SIZE",
+    "fp32_logits": "VERL_TPU_FP32_LOGITS",
 }
 _ENGINE_LEGACY_CONFIG_FIELDS = (
     "use_splash_attention",
@@ -196,6 +205,8 @@ _ENGINE_LEGACY_CONFIG_FIELDS = (
     "use_fused_linear_cross_entropy",
     "fuse_qkv",
     "tpu_eager_mode",
+    "mixed_precision_param",
+    "fp32_logits",
 )
 
 
@@ -225,6 +236,9 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
     _apply_legacy_env(
         values, _ENGINE_KINDS, _ENGINE_LEGACY_ENV_VARS, f"torchtitan.engine_kwargs.{TPU_ENGINE_KWARGS_KEY}"
     )
+    mixed_precision_param = values.get("mixed_precision_param")
+    if mixed_precision_param not in (None, "bfloat16", "float32"):
+        raise ValueError("TPU engine mixed_precision_param must be bfloat16, float32, or null")
     return TPUEngineOptions(**values)
 
 
