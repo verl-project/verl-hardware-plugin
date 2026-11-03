@@ -855,16 +855,18 @@ def _relax_non_static_ep_moe_compile(model: nn.Module, *, parallel_dims: Any, co
     if layers is None:
         return
     backend = getattr(compile_config, "backend", "tpu")
+    _static_dispatchers = ("TpuQwen35TokenDispatcher", "TpuRaggedEPTokenDispatcher")
     for _, block in layers.named_children():
         if getattr(block, "_compiled_call_impl", None) is None:
             continue
         needs_graph_break = any(
             getattr(m, "token_dispatcher", None) is not None
-            and not any(c.__name__ == "TpuQwen35TokenDispatcher" for c in type(m.token_dispatcher).__mro__)
+            and not any(c.__name__ in _static_dispatchers for c in type(m.token_dispatcher).__mro__)
             for m in block.modules()
         )
         if needs_graph_break:
             block.compile(backend=backend, fullgraph=False)
+            block._tpu_compile_relaxed = True  # type: ignore[attr-defined]
 
 
 def get_tpu_simple_fsdp_parallelize_fn(torchtitan_name: str) -> Callable[..., nn.Module]:

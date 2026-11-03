@@ -222,3 +222,22 @@ def test_tpu_chips_per_host_override(monkeypatch):
     monkeypatch.setenv("VERL_TPU_CHIPS_PER_HOST", "four")
     with pytest.raises(ValueError, match="VERL_TPU_CHIPS_PER_HOST"):
         tpu_chips_per_host_override()
+
+
+def test_ep_dispatcher_and_topo_mesh_options():
+    from types import SimpleNamespace
+
+    opts = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": " RAGGED ", "enable_tpu_topo_mesh": True}})
+    )
+    assert opts.ep_dispatcher == "ragged"
+    assert opts.enable_tpu_topo_mesh is True
+
+    opts_static = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": "static", "enable_tpu_topo_mesh": False}})
+    )
+    assert opts_static.ep_dispatcher == "static"
+    assert opts_static.enable_tpu_topo_mesh is False
+
+    with pytest.raises(ValueError, match="engine_kwargs.tpu.ep_dispatcher"):
+        tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": "deepep"}}))

@@ -67,7 +67,7 @@ from verl.workers.engine.utils import (
     postprocess_batch_func,
     prepare_micro_batches,
 )
-from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels
+from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels, tpu_ragged_ep
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
@@ -913,17 +913,21 @@ class TorchTitanTPUEngine(BaseEngine):
             decay_type=self.optimizer_config.decay_type,
             min_lr_factor=self.optimizer_config.min_lr_factor,
         )
-        parallelism = ParallelismConfig(
-            data_parallel_replicate_degree=self.engine_config.data_parallel_replicate_size,
-            data_parallel_shard_degree=self.engine_config.data_parallel_shard_size,
-            fsdp_reshard_after_forward=self.engine_config.reshard_after_forward,
-            tensor_parallel_degree=self.engine_config.tensor_parallel_size,
-            pipeline_parallel_degree=self.engine_config.pipeline_parallel_size,
-            context_parallel_degree=self.engine_config.context_parallel_size,
-            expert_parallel_degree=self.engine_config.expert_parallel_size,
-            spmd_backend=self.engine_config.spmd_backend,
-            use_simple_fsdp=self._use_simple_fsdp,
-        )
+        parallelism_kwargs: dict[str, Any] = {
+            "data_parallel_replicate_degree": self.engine_config.data_parallel_replicate_size,
+            "data_parallel_shard_degree": self.engine_config.data_parallel_shard_size,
+            "fsdp_reshard_after_forward": self.engine_config.reshard_after_forward,
+            "tensor_parallel_degree": self.engine_config.tensor_parallel_size,
+            "pipeline_parallel_degree": self.engine_config.pipeline_parallel_size,
+            "context_parallel_degree": self.engine_config.context_parallel_size,
+            "expert_parallel_degree": self.engine_config.expert_parallel_size,
+            "spmd_backend": self.engine_config.spmd_backend,
+            "use_simple_fsdp": self._use_simple_fsdp,
+        }
+        topo_mesh = tpu_ragged_ep.should_enable_tpu_topo_mesh(tpu_options.enable_tpu_topo_mesh, ParallelismConfig)
+        if topo_mesh is not None:
+            parallelism_kwargs["enable_tpu_topo_mesh"] = topo_mesh
+        parallelism = ParallelismConfig(**parallelism_kwargs)
         if parallelism.context_parallel_degree > 1:
             self._enable_context_parallel(parallelism, model_spec.model)
         # interval=1: save whenever verl calls save_checkpoint (TorchTitan's default 500 skips the other steps).
@@ -1035,9 +1039,20 @@ class TorchTitanTPUEngine(BaseEngine):
                 if tpu_options.ep_capacity_factor is not None
                 else tpu_model_kernels.DEFAULT_EP_CAPACITY_FACTOR
             )
-            n_ep = tpu_model_kernels.set_ep_capacity_factor(model_parts, ep_cap)
+            ep_mode, n_ep = tpu_ragged_ep.install_tpu_ep_token_dispatcher(
+                model_parts,
+                ep_dispatcher=tpu_options.ep_dispatcher,
+                capacity_factor=ep_cap,
+                spmd_backend=parallelism.spmd_backend,
+                compile_config=compile_config,
+            )
             if n_ep:
-                logger.warning("Set TpuQwen35TokenDispatcher.capacity_factor=%.2f on %d dispatchers", ep_cap, n_ep)
+                logger.warning(
+                    "Configured %s TPU EP token dispatcher (capacity_factor=%.2f) on %d modules",
+                    ep_mode,
+                    ep_cap,
+                    n_ep,
+                )
 
         if engine_config.use_torch_compile:
             n_compiled = sum(

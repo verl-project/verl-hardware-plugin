@@ -2195,3 +2195,459 @@ def test_gcs_ckpt_blob_target_resolution(monkeypatch):
         "verl/checkpoints/exp1/global_step_5/actor/shard.pt",
     )
     assert _gcs_ckpt_blob_target("/tmp/local_ckpt/global_step_5/actor/shard.pt") is None
+
+
+def test_should_enable_tpu_topo_mesh_and_install_ep_dispatcher(monkeypatch):
+    from dataclasses import dataclass
+
+    import torch.distributed.device_mesh as dm_mod
+
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_ragged_ep, tpu_utils
+
+    @dataclass
+    class _NoTopoParallelism:
+        expert_parallel_degree: int = 1
+
+    @dataclass
+    class _TopoParallelism:
+        enable_tpu_topo_mesh: bool = False
+
+    assert tpu_ragged_ep.should_enable_tpu_topo_mesh(None, _NoTopoParallelism) is None
+    assert tpu_ragged_ep.should_enable_tpu_topo_mesh(True, _TopoParallelism) is True
+    assert tpu_ragged_ep.should_enable_tpu_topo_mesh(False, _TopoParallelism) is False
+
+    class _OldDeviceMesh:
+        def __init__(self, device_type: str, mesh: object):
+            pass
+
+    class _NewDeviceMesh:
+        def __init__(self, device_type: str, mesh: object, *, preserve_rank_order: bool = False):
+            pass
+
+    monkeypatch.setattr(dm_mod, "DeviceMesh", _OldDeviceMesh)
+    assert tpu_ragged_ep.should_enable_tpu_topo_mesh(None, _TopoParallelism) is False
+    monkeypatch.setattr(dm_mod, "DeviceMesh", _NewDeviceMesh)
+    assert tpu_ragged_ep.should_enable_tpu_topo_mesh(None, _TopoParallelism) is True
+
+    # Verify auto/static/ragged installation on non-nn.Module Configurable-style TorchTitan dispatchers,
+    # Pallas tile alignment, score_before_experts=False default, and restoring fullgraph=True on relaxed blocks.
+    compile_calls: list[tuple[str, str, bool]] = []
+
+    class AllToAllTokenDispatcher:
+        def __init__(self):
+            self.num_experts = 8
+            self.top_k = 2
+            self.fuse_route_score_backward = True
+
+        def dispatch(self, *args: object):
+            return args
+
+        def combine(self, *args: object):
+            return args[0]
+
+    class TpuQwen35TokenDispatcher(AllToAllTokenDispatcher):
+        def __init__(self):
+            super().__init__()
+            self.capacity_factor = None
+
+    class _FakePallasExperts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.use_pallas_grouped_mm = True
+            self.pallas_grouped_mm_tile_m = 512
+            self.pallas_grouped_mm_tgmm_tiling = (256, 1024, 0)
+            self.pallas_grouped_mm_w2_tgmm_tiling = (384, 1024, 1024)
+
+    class _MoeBlock(torch.nn.Module):
+        def __init__(self, dispatcher: object):
+            super().__init__()
+            self._compiled_call_impl = object()
+            self.routed = torch.nn.Module()
+            self.routed.inner_experts = _FakePallasExperts()
+            self.routed.token_dispatcher = dispatcher
+
+        def compile(self, *, backend: str = "tpu", fullgraph: bool = True, **kwargs: object):
+            compile_calls.append(("moe_block", backend, fullgraph))
+
+    static_root = torch.nn.Module()
+    static_root.layers = torch.nn.ModuleDict({"0": _MoeBlock(TpuQwen35TokenDispatcher())})
+    mode_s, n_s = tpu_ragged_ep.install_tpu_ep_token_dispatcher(
+        [static_root],
+        ep_dispatcher="static",
+        capacity_factor=4.0,
+        spmd_backend="default",
+    )
+    assert (mode_s, n_s) == ("static", 1)
+    assert static_root.layers["0"].routed.token_dispatcher.capacity_factor == 4.0
+
+    root = torch.nn.Module()
+    root.layers = torch.nn.ModuleDict({"0": _MoeBlock(AllToAllTokenDispatcher())})
+    compile_cfg = SimpleNamespace(enable=True, backend="tpu")
+    tpu_utils._relax_non_static_ep_moe_compile(
+        root,
+        parallel_dims=SimpleNamespace(ep_enabled=True),
+        compile_config=compile_cfg,
+    )
+    assert compile_calls == [("moe_block", "tpu", False)]
+
+    mode, n_installed = tpu_ragged_ep.install_tpu_ep_token_dispatcher(
+        [root],
+        ep_dispatcher="ragged",
+        capacity_factor=3.5,
+        spmd_backend="default",
+        compile_config=compile_cfg,
+    )
+    assert (mode, n_installed) == ("ragged", 1)
+    td = root.layers["0"].routed.token_dispatcher
+    assert isinstance(td, tpu_ragged_ep.TpuRaggedEPTokenDispatcher)
+    assert not isinstance(td, torch.nn.Module)
+    assert td.score_before_experts is False
+    assert td.fuse_route_score_backward is True
+    assert td.capacity_factor == 3.5
+    assert td.unpadded_expert_counts is True
+    assert td.row_align == 1536  # lcm(512, 256, 384)
+    assert compile_calls == [("moe_block", "tpu", False), ("moe_block", "tpu", True)]
+
+
+def _dense_static_ep_reference(
+    x_TD: torch.Tensor,
+    scores_TK: torch.Tensor,
+    expert_ids_TK: torch.Tensor,
+    counts_E: torch.Tensor,
+    weights_EDE: torch.Tensor,
+    *,
+    ep_mesh: object,
+    capacity_factor: float | None,
+    score_before_experts: bool,
+) -> torch.Tensor:
+    """Pure-PyTorch reference matching ``TpuQwen35TokenDispatcher`` + per-local-expert matmul."""
+    import math as _math
+
+    import torch.distributed._functional_collectives as funcol
+
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_ragged_ep import (
+        _default_combine_reduce,
+        _default_local_reorder,
+        _wait_collective,
+    )
+
+    ep_size = ep_mesh.size()  # type: ignore[attr-defined]
+    pg = ep_mesh.get_group()  # type: ignore[attr-defined]
+    num_experts = int(counts_E.shape[0])
+    e = num_experts // ep_size
+    routed_ND, tok_idx_N, scores_N = _default_local_reorder(x_TD, scores_TK, expert_ids_TK, score_before_experts)
+    n_routed = int(routed_ND.shape[0])
+    cap = (
+        max(n_routed, 1)
+        if capacity_factor is None
+        else max(1, min(max(n_routed, 1), _math.ceil(capacity_factor * n_routed / ep_size)))
+    )
+    local_EP_e = counts_E.to(torch.int32).reshape(ep_size, e)
+    if capacity_factor is not None:
+        cum = local_EP_e.cumsum(dim=1).clamp(max=cap)
+        capped_EP_e = torch.cat([cum[:, :1], cum[:, 1:] - cum[:, :-1]], dim=1)
+    else:
+        capped_EP_e = local_EP_e
+    send_EP = local_EP_e.sum(dim=1)
+    send_cap_EP = capped_EP_e.sum(dim=1)
+    starts_EP = send_EP.cumsum(dim=0) - send_EP
+
+    # Pack dense [ep_size, cap, D] send buffer:
+    send_buf = routed_ND.new_zeros((ep_size, cap, routed_ND.shape[1]))
+    for dst in range(ep_size):
+        cnt = int(send_cap_EP[dst].item())
+        if cnt > 0:
+            st = int(starts_EP[dst].item())
+            send_buf[dst, :cnt] = routed_ND[st : st + cnt]
+
+    recv_counts = _wait_collective(funcol.all_to_all_single(capped_EP_e.reshape(-1), None, None, group=pg)).reshape(
+        ep_size, e
+    )
+    recv_buf = _wait_collective(
+        funcol.all_to_all_single(send_buf.reshape(ep_size * cap, -1), None, None, group=pg)
+    ).reshape(ep_size, cap, -1)
+
+    # Apply local expert linear layers weights_EDE [e, D, D] per sender & local expert:
+    out_recv_buf = torch.zeros_like(recv_buf)
+    for sender in range(ep_size):
+        cur = 0
+        for le in range(e):
+            cnt = int(recv_counts[sender, le].item())
+            if cnt > 0:
+                tokens = recv_buf[sender, cur : cur + cnt]
+                out_recv_buf[sender, cur : cur + cnt] = tokens @ weights_EDE[le]
+                cur += cnt
+
+    send_back = _wait_collective(
+        funcol.all_to_all_single(out_recv_buf.reshape(ep_size * cap, -1), None, None, group=pg)
+    ).reshape(ep_size, cap, -1)
+
+    out_ND = routed_ND.new_zeros(routed_ND.shape)
+    for dst in range(ep_size):
+        cnt = int(send_cap_EP[dst].item())
+        if cnt > 0:
+            st = int(starts_EP[dst].item())
+            out_ND[st : st + cnt] = send_back[dst, :cnt]
+
+    return _default_combine_reduce(
+        out_ND,
+        tok_idx_N,
+        scores_N,
+        x_TD,
+        top_k=int(expert_ids_TK.shape[1]),
+        score_before_experts=score_before_experts,
+    )
+
+
+def _ragged_ep_dist_worker(rank: int, world: int, init_file: str) -> None:
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_ragged_ep
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_ragged_ep import (
+        TpuRaggedEPTokenDispatcher,
+        _default_local_reorder,
+    )
+
+    def _exact_2arg_scale_route_weights(routed_output_ND: torch.Tensor, scores_N: torch.Tensor) -> torch.Tensor:
+        return (routed_output_ND.to(torch.float32) * scores_N.reshape(-1, 1).to(torch.float32)).to(
+            routed_output_ND.dtype
+        )
+
+    def _exact_3arg_stable_grouped_reduce(src_ND: torch.Tensor, index_N: torch.Tensor, top_k: int) -> torch.Tensor:
+        num_tokens = src_ND.shape[0] // top_k
+        perm = torch.argsort(index_N, stable=True)
+        return src_ND.index_select(0, perm).to(torch.float32).reshape(num_tokens, top_k, -1).sum(dim=1).to(src_ND.dtype)
+
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
+    try:
+        ep_mesh = init_device_mesh("cpu", (world,))
+        num_experts = 8
+        e = num_experts // world
+        top_k = 2
+        dim = 16
+
+        # Case 1: Skewed routing with capacity dropping (capacity_factor=0.75) + unpadded MegaBlox NaN tail rows!
+        # Case 2: Rank 1 sends 0 tokens to Rank 0 + real TorchTitan base_dispatcher (fuse_route_score_backward=True,
+        #         no score_before_experts attr -> False, exact 2-arg scale_route_weights & 3-arg stable_grouped_reduce)!
+        scenarios = [
+            (0.75, True, True, False),
+            (4.0, False, False, True),
+        ]
+        for sc_idx, (cap_factor, score_before, unpadded, use_tt_base) in enumerate(scenarios):
+            gen = torch.Generator().manual_seed(500 + sc_idx * 10 + rank)
+            t_tokens = 12
+            x_ref = torch.randn(t_tokens, dim, generator=gen, dtype=torch.float32, requires_grad=True)
+            scores_ref = torch.rand(t_tokens, top_k, generator=gen, dtype=torch.float32, requires_grad=True)
+            w_ref = torch.randn(e, dim, dim, generator=gen, dtype=torch.float32, requires_grad=True)
+            grad_out = torch.randn(t_tokens, dim, generator=gen, dtype=torch.float32)
+
+            if sc_idx == 0:
+                # Heavy skew onto rank 1's local experts (experts 4..7) to exercise capacity clamping:
+                exp_ids = torch.tensor(
+                    [[4, 5], [4, 6], [5, 7], [4, 5], [6, 7], [0, 4], [4, 5], [5, 6], [4, 7], [1, 4], [4, 6], [5, 7]],
+                    dtype=torch.int64,
+                )
+            else:
+                # Rank 0 routes only to experts 0..1; Rank 1 routes only to experts 4..5 (0 cross-rank traffic!).
+                base_e = 0 if rank == 0 else 4
+                exp_ids = torch.tensor([[base_e, base_e + 1]] * t_tokens, dtype=torch.int64)
+            counts_E = torch.bincount(exp_ids.reshape(-1), minlength=num_experts).to(torch.int32)
+
+            out_ref = _dense_static_ep_reference(
+                x_ref,
+                scores_ref,
+                exp_ids,
+                counts_E,
+                w_ref,
+                ep_mesh=ep_mesh,
+                capacity_factor=cap_factor,
+                score_before_experts=score_before,
+            )
+            (out_ref * grad_out).sum().backward()
+
+            x_rag = x_ref.detach().clone().requires_grad_(True)
+            scores_rag = scores_ref.detach().clone().requires_grad_(True)
+            w_rag = w_ref.detach().clone().requires_grad_(True)
+
+            if use_tt_base:
+                tpu_ragged_ep._tt_scale_route_weights = _exact_2arg_scale_route_weights
+                tpu_ragged_ep._tt_stable_grouped_reduce = _exact_3arg_stable_grouped_reduce
+
+                class _FakeTTBase:
+                    def __init__(self):
+                        self.num_experts = num_experts
+                        self.top_k = top_k
+                        self.fuse_route_score_backward = True
+                        self.ep_mesh = ep_mesh
+
+                    def _local_reorder(self, x_t, s_tk, id_tk):
+                        return _default_local_reorder(x_t, s_tk, id_tk, False)
+
+                disp = TpuRaggedEPTokenDispatcher(
+                    _FakeTTBase(),
+                    capacity_factor=cap_factor,
+                    unpadded_expert_counts=unpadded,
+                    row_align=16,
+                )
+                assert disp.score_before_experts is False
+            else:
+                disp = TpuRaggedEPTokenDispatcher(
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    score_before_experts=score_before,
+                    capacity_factor=cap_factor,
+                    unpadded_expert_counts=unpadded,
+                    row_align=16,
+                    ep_mesh=ep_mesh,
+                )
+            routed_in_RD, counts_local_e, meta = disp.dispatch(x_rag, scores_rag, exp_ids, counts_E)
+            assert routed_in_RD.shape[0] % 16 == 0
+            assert counts_local_e.dtype == torch.int32
+            for field_name in (
+                "disp_in_off_EP",
+                "disp_send_sz_EP",
+                "disp_out_off_EP",
+                "disp_recv_sz_EP",
+                "comb_in_off_EP",
+                "comb_out_off_EP",
+                "perm_idx_R",
+                "inv_perm_idx_R",
+            ):
+                assert getattr(meta, field_name).dtype == torch.int32, field_name
+            total_valid = int(meta.valid_mask_R1.sum().item())
+            if unpadded:
+                assert int(counts_local_e.sum().item()) == total_valid
+
+                # Inject NaNs into backward grad of invalid tail rows >= total_valid to verify NaN-safe torch.where!
+                def _poison_tail_grad(g: torch.Tensor, tv: int = total_valid) -> torch.Tensor:
+                    poisoned = g.clone()
+                    poisoned[tv:] = float("nan")
+                    return poisoned
+
+                routed_in_RD.register_hook(_poison_tail_grad)
+            else:
+                assert int(counts_local_e.sum().item()) == routed_in_RD.shape[0]
+
+            # Apply local experts on valid segments (and fill tail >= total_valid with NaN when unpadded, mimicking
+            # MegaBlox gmm leaving out[total_valid:] uninitialized in recycled HBM):
+            pieces: list[torch.Tensor] = []
+            cursor = 0
+            for le in range(e):
+                cnt = (
+                    int(counts_local_e[le].item())
+                    if unpadded
+                    else int(min(max(total_valid - cursor, 0), int(counts_local_e[le].item())))
+                )
+                if cnt > 0:
+                    pieces.append(routed_in_RD[cursor : cursor + cnt] @ w_rag[le])
+                    cursor += cnt
+            valid_out = torch.cat(pieces, dim=0) if pieces else routed_in_RD[:0]
+            tail_rows = routed_in_RD.shape[0] - valid_out.shape[0]
+            tail_fill = float("nan") if unpadded else 0.0
+            tail = torch.full((tail_rows, dim), tail_fill, dtype=routed_in_RD.dtype)
+            routed_out_RD = torch.cat([valid_out, tail], dim=0)
+
+            out_rag = disp.combine(routed_out_RD, meta, x_rag)
+            (out_rag * grad_out).sum().backward()
+
+            assert not torch.isnan(out_rag).any()
+            assert x_rag.grad is not None and not torch.isnan(x_rag.grad).any()
+            assert scores_rag.grad is not None and not torch.isnan(scores_rag.grad).any()
+            assert w_rag.grad is not None and not torch.isnan(w_rag.grad).any()
+            torch.testing.assert_close(out_rag, out_ref, rtol=1e-6, atol=1e-6)
+            torch.testing.assert_close(x_rag.grad, x_ref.grad, rtol=1e-6, atol=1e-6)
+            torch.testing.assert_close(scores_rag.grad, scores_ref.grad, rtol=1e-6, atol=1e-6)
+            torch.testing.assert_close(w_rag.grad, w_ref.grad, rtol=1e-6, atol=1e-6)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_ragged_ep_token_dispatcher_distributed_parity_and_nan_tail_immunity(tmp_path):
+    """2-rank ``gloo`` parity for ``TpuRaggedEPTokenDispatcher`` (skew, dropping, 0-token peers, & NaN tail safety)."""
+    torch.multiprocessing.start_processes(
+        _ragged_ep_dist_worker,
+        args=(2, str(tmp_path / "pg_ragged_ep")),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
+
+
+def _ragged_ep_fullgraph_compile_worker(rank: int, world: int, init_file: str) -> None:
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_ragged_ep
+
+    # Register a test ``tpu::_ragged_all_to_all`` custom op with CPU + Meta kernels so ``torch.compile(...,
+    # fullgraph=True)`` traces the exact custom-op path used on TPU!
+    if not tpu_ragged_ep.has_tpu_ragged_all_to_all():
+        lib = torch.library.Library("tpu", "DEF")
+        lib.define(
+            "_ragged_all_to_all(Tensor operand, Tensor output, Tensor input_offsets, Tensor send_sizes, "
+            "Tensor output_offsets, Tensor recv_sizes, str group_name) -> Tensor"
+        )
+        impl_cpu = torch.library.Library("tpu", "IMPL", "CPU")
+        impl_meta = torch.library.Library("tpu", "IMPL", "Meta")
+
+        def _cpu_kernel(operand, output, in_off, s_sz, out_off, r_sz, group_name):
+            for t in (in_off, s_sz, out_off, r_sz):
+                assert t.dtype == torch.int32, f"ragged_all_to_all metadata must be int32, got {t.dtype}"
+            pg = dist.distributed_c10d._resolve_process_group(group_name)
+            return tpu_ragged_ep._cpu_ragged_all_to_all(operand, output, in_off, s_sz, out_off, r_sz, pg)
+
+        def _meta_kernel(operand, output, in_off, s_sz, out_off, r_sz, group_name):
+            for t in (in_off, s_sz, out_off, r_sz):
+                assert t.dtype == torch.int32, f"ragged_all_to_all metadata must be int32, got {t.dtype}"
+            return torch.empty_like(output)
+
+        impl_cpu.impl("_ragged_all_to_all", _cpu_kernel)
+        impl_meta.impl("_ragged_all_to_all", _meta_kernel)
+        # Keep library handles alive for the worker lifetime:
+        tpu_ragged_ep._TEST_TPU_LIBS = (lib, impl_cpu, impl_meta)  # type: ignore[attr-defined]
+
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
+    try:
+        ep_mesh = init_device_mesh("cpu", (world,))
+        tpu_ragged_ep._FORCE_TPU_CUSTOM_OP_ON_CPU = True
+        disp = tpu_ragged_ep.TpuRaggedEPTokenDispatcher(
+            num_experts=4,
+            top_k=2,
+            score_before_experts=True,
+            capacity_factor=2.0,
+            unpadded_expert_counts=True,
+            row_align=8,
+            ep_mesh=ep_mesh,
+        )
+
+        def _step_fn(x, scores, exp_ids, counts, w):
+            rin, _, meta = disp.dispatch(x, scores, exp_ids, counts)
+            rout = rin @ w
+            return disp.combine(rout, meta, x)
+
+        compiled_fn = torch.compile(_step_fn, backend="aot_eager", fullgraph=True)
+        x = torch.randn(6, 8, requires_grad=True)
+        scores = torch.rand(6, 2, requires_grad=True)
+        w = torch.randn(8, 8, requires_grad=True)
+        exp_ids = torch.tensor([[0, 2], [1, 3], [2, 3], [0, 1], [2, 3], [1, 2]], dtype=torch.int64)
+        counts = torch.bincount(exp_ids.reshape(-1), minlength=4).to(torch.int32)
+
+        out = compiled_fn(x, scores, exp_ids, counts, w)
+        out.sum().backward()
+        assert out.shape == (6, 8) and not torch.isnan(out).any()
+        assert x.grad is not None and not torch.isnan(x.grad).any()
+    finally:
+        tpu_ragged_ep._FORCE_TPU_CUSTOM_OP_ON_CPU = False
+        dist.destroy_process_group()
+
+
+def test_ragged_ep_token_dispatcher_fullgraph_compile(tmp_path):
+    """``TpuRaggedEPTokenDispatcher`` traces through ``torch.compile(..., fullgraph=True)`` with 0 graph breaks."""
+    torch.multiprocessing.start_processes(
+        _ragged_ep_fullgraph_compile_worker,
+        args=(2, str(tmp_path / "pg_ragged_compile")),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
