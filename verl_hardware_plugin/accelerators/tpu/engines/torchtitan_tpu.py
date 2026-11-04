@@ -1355,7 +1355,9 @@ class TorchTitanTPUEngine(BaseEngine):
                 align_micro_batch_shapes_across_ranks(
                     micro_batches, bucket_size=get_tpu_seq_bucket_size(self.engine_config)
                 )
-            self._set_packed_document_budget(max((int(mb.batch_size[0]) for mb in micro_batches), default=0) + 1)
+            if "kda" in getattr(self, "_tpu_kernels", ()):
+                # Largest micro-batch plus the bucket-padding tail; only computed when the kernels need it.
+                self._set_packed_document_budget(max(int(mb.batch_size[0]) for mb in micro_batches) + 1)
 
         output_lst = []
         ctx = torch.no_grad() if forward_only else nullcontext()
