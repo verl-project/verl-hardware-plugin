@@ -38,6 +38,7 @@ import dataclasses
 import logging
 import math
 import os
+import re
 from collections.abc import Mapping
 from typing import Any, Optional
 
@@ -177,6 +178,18 @@ class TPUEngineOptions:
         enable_tpu_topo_mesh: Preserve physical 3D ICI torus ``(x, y, z)`` rank order on ``ParallelismConfig``
             (``torch.tpu.topology_aware_mesh`` + ``DeviceMesh(preserve_rank_order=True)``). ``None`` (default) enables
             it automatically whenever supported by the installed ``torchtitan`` and ``torch`` (``torch >= 2.15``).
+        fixed_shape_rows: Packed-row lengths of fixed-shape micro-batches (``engines/tpu_fixed_shapes.py``), as
+            colon-, comma- or space-separated integers or a list, e.g. ``8192:14336:16384``; each a multiple of the
+            sequence bucket. Unset (default) keeps verl's dynamic micro-batching. When set (with
+            ``use_dynamic_bsz=True``), every rank packs each mini-batch into the same micro-batch layout built from
+            these row lengths, so the XLA programs compiled in the first update are reused by every later one.
+        fixed_shape_max_seqs: Maximum number of sequences per fixed-shape micro-batch, and the row count of its PPO
+            loss inputs (default: ``64``).
+        fixed_shape_response_len: Response width of the PPO loss inputs of fixed-shape micro-batches, rounded up to
+            the sequence bucket; required with ``fixed_shape_rows``. Set it to ``data.max_response_length``.
+        fixed_shape_prewarm: Compile every row length on the first training call and time it, so the layouts are
+            chosen by measured cost (default: ``True``). Without it, the cost of a row is its length plus a fixed
+            per-micro-batch overhead.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -195,6 +208,10 @@ class TPUEngineOptions:
     fp32_master: Optional[bool] = None
     ep_dispatcher: Optional[str] = None
     enable_tpu_topo_mesh: Optional[bool] = None
+    fixed_shape_rows: Optional[str] = None
+    fixed_shape_max_seqs: Optional[int] = None
+    fixed_shape_response_len: Optional[int] = None
+    fixed_shape_prewarm: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -214,6 +231,10 @@ _ENGINE_KINDS: dict[str, type] = {
     "fp32_master": bool,
     "ep_dispatcher": str,
     "enable_tpu_topo_mesh": bool,
+    "fixed_shape_rows": str,
+    "fixed_shape_max_seqs": int,
+    "fixed_shape_response_len": int,
+    "fixed_shape_prewarm": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
@@ -233,6 +254,8 @@ _ENGINE_LEGACY_CONFIG_FIELDS = (
     "fuse_qkv",
     "tpu_eager_mode",
 )
+# Options that only apply together with fixed_shape_rows.
+_FIXED_SHAPE_OPTIONS = ("fixed_shape_max_seqs", "fixed_shape_response_len", "fixed_shape_prewarm")
 
 
 def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
@@ -276,7 +299,49 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
                 f"got {values['ep_dispatcher']!r}"
             )
         values["ep_dispatcher"] = ep_disp
+    if values.get("fixed_shape_rows") is not None:
+        rows = parse_fixed_shape_rows(values["fixed_shape_rows"])
+        values["fixed_shape_rows"] = ":".join(str(row) for row in rows)
+        if values.get("fixed_shape_response_len") is None:
+            raise ValueError(
+                f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.fixed_shape_response_len is required with fixed_shape_rows "
+                "(set it to data.max_response_length)"
+            )
+    else:
+        orphans = [name for name in _FIXED_SHAPE_OPTIONS if values.get(name) is not None]
+        if orphans:
+            raise ValueError(f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY} options {orphans} need fixed_shape_rows")
     return TPUEngineOptions(**values)
+
+
+def parse_fixed_shape_rows(value: Any) -> tuple[int, ...]:
+    """Parses ``fixed_shape_rows`` into sorted, unique row lengths.
+
+    Accepts integers separated by colons, commas or whitespace (``"8192:14336:16384"``), optionally in brackets (the
+    string form of a list from the config), or a list / tuple of integers.
+
+    Raises:
+        ValueError: when the value is empty or holds anything but positive integers.
+    """
+    error = ValueError(f"fixed_shape_rows must be positive integers, got {value!r}")
+    if isinstance(value, str):
+        items: list[Any] = [item for item in re.split(r"[\s,:]+", value.strip().strip("[]()")) if item]
+    elif isinstance(value, int):
+        items = [value]
+    else:
+        try:
+            items = list(value)
+        except TypeError:
+            raise error from None
+    if any(isinstance(item, bool) or not isinstance(item, int | str) for item in items):
+        raise error
+    try:
+        rows = sorted({int(item) for item in items})
+    except ValueError:
+        raise error from None
+    if not rows or rows[0] <= 0:
+        raise error
+    return tuple(rows)
 
 
 # ---------------------------------------------------------------------------------------------------------------

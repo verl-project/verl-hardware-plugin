@@ -61,6 +61,25 @@ backward on TPU). This needs `expert_parallel_size=1` and a `seq_bucket_size` th
 multiple of 256 (the default 256 is); otherwise the engine raises. `use_dynamic_bsz=True` works on TPU: the plugin runs
 its int64 MAX / MIN all-reduces in int32, which `tpu_dist` supports.
 
+With `use_dynamic_bsz=True`, every update gets a new number of micro-batches and of sequences per micro-batch, and each
+new packed length or sequence count compiles new XLA programs. Fixed-shape micro-batches (opt-in,
+`engines/tpu_fixed_shapes.py`) remove these recompiles: every rank packs each mini-batch into the same layout of
+packed-row lengths taken from a small fixed set, and the PPO loss inputs always have `fixed_shape_max_seqs` rows of
+`fixed_shape_response_len` tokens (the extra rows are empty sequences, so the loss and its gradients are unchanged). On
+the first training call, every row length is compiled and timed once, and the layouts are then chosen by measured cost:
+
+```bash
++actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.seq_bucket_size=2048
++actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.fixed_shape_rows=8192:14336:16384
++actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.fixed_shape_max_seqs=64
++actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.fixed_shape_response_len=4096
+```
+
+Set `fixed_shape_response_len` to `data.max_response_length`. The row lengths must be multiples of `seq_bucket_size`,
+and the largest must hold the longest sequence. Fixed-shape micro-batches need packed inputs (`use_remove_padding=True`)
+and no context or pipeline parallelism; otherwise the engine keeps verl's partition and logs a warning.
+`fixed_shape_prewarm=False` skips the compile-and-time pass and ranks layouts by their padded token count instead.
+
 The rollout settings that matter on TPU (the recipes already set them):
 
 | Setting | Value on TPU |
