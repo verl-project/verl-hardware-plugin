@@ -408,8 +408,8 @@ def test_consumer_failure_fails_everyone_fast(mori_env):
 
 
 async def _consume_like_worker(e, step, fail_at=None):
-    """Consume the way CheckpointEngineWorker.update_weights does: the caller keeps the generator (a traceback would
-    too) and closes it explicitly when its consumer fails."""
+    """Consume through a caller that keeps the stream (as a traceback would) and closes it explicitly when its
+    consumer fails, so the failure path runs now rather than when the stream is garbage-collected."""
     weights = e.receive_weights(global_steps=step)
     try:
         got = {}
@@ -735,31 +735,8 @@ def test_control_inbox_drops_foreign_messages(mori_env):
     assert all(e._unusable is None for e in actors + rollouts)
 
 
-def _worker_closes_stream_on_failure():
-    """Whether verl's CheckpointEngineWorker.update_weights closes the receive stream when the server adapter fails.
-    Older verl leaves it to garbage collection, so peers learn of such a failure only after timeout_s."""
-    from verl.checkpoint_engine.base import CheckpointEngineWorker
-
-    closed = []
-
-    class Stream:
-        async def aclose(self):
-            closed.append(True)
-
-    async def failing_adapter(weights, **kwargs):
-        raise RuntimeError("adapter failed")
-
-    worker = types.SimpleNamespace(
-        checkpoint_engine=types.SimpleNamespace(receive_weights=lambda global_steps=None: Stream()),
-        server_adapter=types.SimpleNamespace(update_weights=failing_adapter),
-    )
-    with pytest.raises(RuntimeError, match="adapter failed"):
-        asyncio.run(CheckpointEngineWorker.update_weights(worker, 0))
-    return bool(closed)
-
-
 async def _update_weights_closing_on_failure(self, global_steps=None):
-    """CheckpointEngineWorker.update_weights of a verl that closes the receive stream when the adapter fails."""
+    """Like verl's CheckpointEngineWorker.update_weights, but closes the receive stream when the adapter fails."""
     weights = self.checkpoint_engine.receive_weights(global_steps=global_steps)
     try:
         await self.server_adapter.update_weights(weights, global_steps=global_steps)
@@ -768,19 +745,12 @@ async def _update_weights_closing_on_failure(self, global_steps=None):
         raise
 
 
-@pytest.mark.parametrize("via", ["verl", "closing-worker"])
 @pytest.mark.parametrize("how", ["error", "aiter-then-error", "cancel"])
-def test_adapter_failing_before_its_first_tensor_ends_the_sync(mori_env, how, via):
+def test_adapter_failing_before_its_first_tensor_ends_the_sync(mori_env, how):
     """The server adapter fails (or the update is cancelled) before it iterates the weights, as an adapter setting up
-    its IPC buffers can: once the worker closes the receive stream, the receiver must end the sync as failed, refuse
-    reuse, and its peers must stop instead of waiting for it. Run through the installed verl's
-    CheckpointEngineWorker.update_weights (skipped where it does not close the stream) and through a worker that
-    does."""
-    from verl.checkpoint_engine.base import CheckpointEngineWorker
-
-    if via == "verl" and not _worker_closes_stream_on_failure():
-        pytest.skip("this verl's CheckpointEngineWorker.update_weights does not close the receive stream on failure")
-    update_weights = CheckpointEngineWorker.update_weights if via == "verl" else _update_weights_closing_on_failure
+    its IPC buffers can: once the caller closes the receive stream, the receiver must end the sync as failed, refuse
+    reuse, and its peers must stop instead of waiting for it."""
+    update_weights = _update_weights_closing_on_failure
     mod, fab = mori_env
     actors = [_new(mod, 2, node="trainer", is_master=(i == 0)) for i in range(2)]
     rollouts = [_new(mod, 2, node="r0") for _ in range(3)]
