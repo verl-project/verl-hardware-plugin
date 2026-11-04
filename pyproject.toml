@@ -16,7 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "orjson>=3.9",
-    "pytest>=7.0",
+    "pytest>=8.2",  # importorskip(exc_type=...)
     "pyzmq",  # ROCm MoRI checkpoint engine tests
 ]
 

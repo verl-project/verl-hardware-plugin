@@ -22,11 +22,12 @@ has entered the sync. No worker synchronizes the whole device: a write waits for
 copies, and a receiver frees a slot once an event recorded after the consumer's reads fired (consumers read on the
 current stream, as verl's server adapters do) and the slot's forward writes completed. build_topology gives each
 topology a random id that tags every message, so workers that join, leave or are replaced never act on another sync's
-messages, and messages without it (malformed or from outside the job) are dropped.
+messages; messages of other syncs, malformed ones and ones that do not fit the topology are dropped. The id is not
+authentication: the control network is assumed trusted.
 
-Failures are fail-stop: a worker whose sync fails, is cancelled or is closed early refuses all further use, and a
-worker refuses a new sync while its previous one runs; peers that leave are released, and the MoRI engine is replaced
-once many have left. Why and how: see docs/accelerators/rocm/mori_checkpoint_engine.md.
+Failures are fail-stop: a worker whose engine sees its sync fail, be cancelled or be closed early refuses all further
+use, and a worker refuses a new sync while its previous one runs; peers that leave are released, and the MoRI engine
+is replaced once many have left. Why and how: see docs/accelerators/rocm/mori_checkpoint_engine.md.
 
 Notes (MI355X, Pollara, MoRI 1.2.4): MoRI cannot register PyTorch expandable-segment (VMM) memory, so the region is
 allocated with cupy; transfer chunking must be on (off halves the bandwidth of one transfer); XGMI writes raise no
@@ -64,7 +65,7 @@ import sys
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, AsyncGenerator, AsyncIterator, Generator
+from typing import Any, AsyncGenerator, AsyncIterator, Generator, TypeGuard
 
 import torch
 import zmq
@@ -135,6 +136,10 @@ def _dumps(msg: dict) -> bytes:
         ]
         msg = {**msg, "metas": metas}
     return json.dumps(msg).encode()
+
+
+def _is_int(x: object) -> TypeGuard[int]:
+    return isinstance(x, int) and not isinstance(x, bool)
 
 
 def _loads(raw: bytes) -> dict | None:
@@ -605,28 +610,70 @@ class MoriCheckpointEngine(CheckpointEngine):
         # no credit yet: a next hop grants its slots once it is receiving (see _receive), so nothing is ever written
         # into a worker that has not entered this sync
 
+        def wake(reason: str):  # every waiter re-checks self._abort
+            self._abort = reason
+            for e in self._credit.values():
+                e.set()
+            for q in self._buckets.values():
+                q.put_nowait({"t": "abort", "seq": seq, "reason": reason})
+
         async def pump():
-            while True:
-                raw = await self._inbox.recv()
-                msg = _loads(raw)
-                if msg is None:
-                    logger.warning(f"mori: dropping a malformed control message ({len(raw)} B) during sync {seq}")
-                    continue
-                if msg["seq"] != seq:
-                    logger.warning(f"mori: dropping message from sync {msg['seq']} during sync {seq}: {msg.get('t')}")
-                    continue
-                if msg["t"] == "bucket":
-                    self._buckets[msg["c"]].put_nowait(msg)
-                elif msg["t"] == "free":
-                    self._credit[(msg["c"], msg["slot"], msg["from"])].set()
-                elif msg["t"] == "abort":  # wake every waiter; they re-check self._abort
-                    self._abort = msg["reason"]
-                    for e in self._credit.values():
-                        e.set()
-                    for q in self._buckets.values():
-                        q.put_nowait(msg)
+            try:
+                while True:
+                    raw = await self._inbox.recv()
+                    msg = _loads(raw)
+                    if msg is None:
+                        logger.warning(f"mori: dropping a malformed control message ({len(raw)} B) during sync {seq}")
+                        continue
+                    if msg["seq"] != seq:
+                        logger.warning(f"mori: dropping message from sync {msg['seq']} during sync {seq}")
+                        continue
+                    why = self._invalid(msg)
+                    if why is not None:
+                        logger.warning(f"mori: dropping an invalid control message during sync {seq}: {why}")
+                        continue
+                    if msg["t"] == "bucket":
+                        self._buckets[msg["c"]].put_nowait(msg)
+                    elif msg["t"] == "free":
+                        self._credit[(msg["c"], msg["slot"], msg["from"])].set()
+                    else:  # abort
+                        wake(msg["reason"])
+            except Exception as e:  # never stop silently: fail this sync now instead of at timeout_s
+                logger.exception(f"mori: control message handling failed during sync {seq}")
+                wake(f"{self._key}: control message handling failed: {type(e).__name__}: {e}")
 
         self._pump = asyncio.ensure_future(pump())
+
+    def _invalid(self, msg: dict) -> str | None:
+        """Why `msg`, a message of the current sync, does not fit this sync's topology and protocol (None if it does).
+        Messages are only checked, not authenticated: anyone who can read the control traffic can forge them."""
+        t, c = msg.get("t"), msg.get("c")
+        if t == "abort":
+            return None if isinstance(msg.get("reason"), str) else "abort without a reason"
+        if t == "free":
+            j, sender = msg.get("slot"), msg.get("from")
+            if not (_is_int(c) and _is_int(j) and isinstance(sender, str) and (c, j, sender) in self._credit):
+                return f"free of an unknown slot ({c!r}, {j!r}, {sender!r})"
+            return None
+        if t != "bucket":
+            return f"unknown type {t!r}"
+        if not (_is_int(c) and c in self._buckets):
+            return f"bucket of an unknown stripe {c!r}"
+        k, j, used, metas = msg.get("k"), msg.get("slot"), msg.get("used"), msg.get("metas")
+        if not (_is_int(k) and k >= 0 and _is_int(j) and 0 <= j < self.num_slots):
+            return f"bucket with bad k / slot ({k!r}, {j!r})"
+        if not (_is_int(used) and 0 <= used <= self.chain_bucket and isinstance(metas, list)):
+            return f"bucket with bad size or metas ({used!r})"
+        for m in metas:
+            if not (isinstance(m.name, str) and _is_int(m.offset) and m.offset >= 0 and _is_int(m.chunk_size)):
+                return f"bucket with a bad tensor entry {m.name!r}"
+            if not (0 <= m.chunk_size and m.offset + m.chunk_size <= used and _is_int(m.chunk_offset)):
+                return f"bucket with a tensor entry outside the bucket {m.name!r}"
+        if not isinstance(msg.get("is_last"), bool) or not isinstance(msg.get("notified", True), bool):
+            return "bucket with bad flags"
+        if not all(msg.get(f) is None or _is_int(msg.get(f)) for f in ("uid", "global_steps")):
+            return "bucket with a bad uid or step"
+        return None
 
     def _check_abort(self):
         if self._abort is not None:

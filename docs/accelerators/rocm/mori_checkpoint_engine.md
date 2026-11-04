@@ -24,9 +24,11 @@ Code: `verl_hardware_plugin/accelerators/rocm/engines/mori_checkpoint_engine.py`
   worker before it guards its region.
 - **No full-device synchronization.** A write waits for an event recorded after its packing copies; a receiver
   frees a slot once an event recorded after the consumer's reads has fired and the slot's forward writes are done.
-- **Control messages** (bucket announcements, slot credits, aborts) travel as JSON over ZMQ. Each worker listens on
-  its own address only, and every message carries the random id of its topology; anything else is dropped without
-  being decoded further.
+- **Control messages** (bucket announcements, slot credits, aborts) travel as JSON over ZMQ, never pickle, so
+  decoding a message cannot run code. Each worker listens on the address it publishes (its Ray node IP by default),
+  not on every interface. Every message carries the random id of its topology and the sync's round; messages of
+  other syncs, malformed messages and messages that do not fit the topology are dropped. The id is not
+  authentication: whoever can read the control traffic can forge messages, so the control network must be trusted.
 
 ## Requirements
 
@@ -35,9 +37,7 @@ Code: `verl_hardware_plugin/accelerators/rocm/engines/mori_checkpoint_engine.py`
 - cupy, to allocate the region outside PyTorch's caching allocator: MoRI cannot register PyTorch expandable-segment
   (VMM) memory. Without cupy the region is allocated with expandable segments switched off for that allocation.
 - pyzmq (part of verl's ROCm images).
-- verl 0.9.1 or newer. If a rollout worker's server adapter fails before its first tensor, the driver sees the error
-  at once (the manager's `ray.get` returns on the first error); the other workers stop when `timeout_s` expires, as
-  verl's `CheckpointEngineWorker.update_weights` does not close the receive stream.
+- verl 0.9.1 or newer.
 
 ## Configuration
 
@@ -93,16 +93,22 @@ adapters see the same `(name, full tensor)` stream.
 ## Failures are fail-stop
 
 MoRI 1.2.4 does not guarantee that a failed or abandoned transfer has stopped touching memory (a FAILED status can
-leave work requests posted), and a GPU consumer may still read a slot when its sync is aborted. So a worker whose
-sync fails, raises, is cancelled or is closed early marks its engine unusable before anything else and tells its
-peers, which then fail at once. It keeps its MoRI engine, region and transfer statuses alive for the rest of the
-process and refuses every further call; recreate the rollout and trainer workers to continue.
+leave work requests posted), and a GPU consumer may still read a slot when its sync is aborted. So when a worker's
+engine sees its sync fail (a transfer or protocol error, a timeout, cancellation, or the receive stream closed before
+it ended), it marks itself unusable before anything else and tells its peers, which then fail at once. It keeps its
+MoRI engine, region and transfer statuses alive for the rest of the process and refuses every further call; recreate
+the rollout and trainer workers to continue.
 
 - A worker refuses `prepare`, `init_process_group` and a new sync while its previous sync is still running.
   `CheckpointEngineManager` waits with `ray.get`, which returns on the first error, so a retry could otherwise reach
   a worker that is still unwinding.
 - A receiver's sync starts when `receive_weights` is called, not at its first iteration; closing the stream before
   the first tensor fails the sync too.
+- A server adapter that raises while consuming the stream does not close it: verl's
+  `CheckpointEngineWorker.update_weights` passes the error on and leaves the stream to garbage collection. The driver
+  sees the error at once (`ray.get` returns on the first error). The engine sees it only when an unfinished stream is
+  finalized, and not at all if the adapter failed before its first tensor; until then that receiver stays busy and
+  refuses new syncs, and its peers stop when `timeout_s` expires.
 
 ## Rollout workers that join, leave or are replaced
 
@@ -128,7 +134,7 @@ rollout side, median of 9 syncs after the first:
 
 The first two syncs of every configuration matched the HF checkpoint tensor by tensor on all 8 rollout workers. The
 sharded export ships bf16 (61 GB for this model, what the rollout loads); the full export ships the trainer's fp32
-parameters (122 GB). Earlier runs (16 runs, 3 node pairs) gave medians of 1.28-1.46 s for `nccl` and 0.65-0.83 s
+parameters (122 GB). Earlier runs (16 runs, 5 node pairs) gave medians of 1.28-1.46 s for `nccl` and 0.65-0.83 s
 for `mori`, 1.6-2.2x faster within each run. End to end (GRPO on GSM8K with a vLLM rollout, 2 nodes,
 Qwen2.5-7B-Instruct, 20 steps), test accuracy went from 0.785 to 0.892 with `mori`, to 0.909 with `export: shard` and
 to 0.901 with `nccl`.
