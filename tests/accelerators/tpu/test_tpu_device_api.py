@@ -3,12 +3,17 @@
 
 """TPU device queries go through torch.accelerator (torch_tpu >= 0.2.0)."""
 
+import ast
+import logging
+import os
 import types
+from pathlib import Path
 from unittest import mock
 
 import pytest
 import torch
 
+import verl_hardware_plugin.accelerators.tpu as tpu_pkg
 from verl_hardware_plugin.accelerators.tpu import device_api
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import TPUDeviceModuleProxy
 
@@ -186,6 +191,42 @@ def test_platform_leaves_torch_tpu_untouched():
         platform.empty_cache()
     for name in ("empty_cache", "memory_stats", "reset_peak_memory_stats", "get_device_name", "get_device_properties"):
         assert not hasattr(tpu, name)
+
+
+def test_consolidated_synchronize_wait_event_and_no_internal_imports(caplog):
+    """device_api.synchronize backs both get_torch_device().synchronize and tpu_synchronize with zero _internal deps."""
+    pkg_dir = Path(tpu_pkg.__file__).resolve().parent
+    for py_file in sorted(pkg_dir.rglob("*.py")):
+        for node in ast.walk(ast.parse(py_file.read_text(encoding="utf-8"))):
+            mods = [a.name for a in node.names] if isinstance(node, ast.Import) else []
+            if isinstance(node, ast.ImportFrom) and node.module:
+                mods.append(node.module)
+            assert not any(m == "torch_tpu._internal" or m.startswith("torch_tpu._internal.") for m in mods), py_file
+
+    acc = _fake_accelerator()
+    tpu_mod = types.SimpleNamespace(is_initialized=lambda: True)
+    fake_event = mock.MagicMock()
+    fake_event_cls = mock.MagicMock(return_value=fake_event)
+    with (
+        mock.patch.object(torch, "accelerator", acc),
+        mock.patch.object(torch, "tpu", tpu_mod, create=True),
+        mock.patch.object(torch, "Event", fake_event_cls),
+    ):
+        device_api.synchronize(torch.ones(4), wait=True, strict=True)  # CPU tensor fast-exit
+        acc.synchronize.assert_not_called()
+        device_api.synchronize(wait=True)
+        assert device_api._tpu_runtime_up_pid == os.getpid()
+        acc.synchronize.assert_called_once_with(None)
+        device_api.synchronize(wait=False)
+        fake_event_cls.assert_called_once_with()
+        fake_event.record.assert_called_once_with()
+
+        fake_event.record.side_effect = RuntimeError("stream dispatch failed")
+        with pytest.raises(RuntimeError, match="TPU synchronization failed: stream dispatch failed"):
+            device_api.synchronize(wait=False, strict=True)
+        with caplog.at_level(logging.WARNING, logger=device_api.__name__):
+            device_api.synchronize(wait=False, strict=False)
+        assert "Could not synchronize TPU device" in caplog.text
 
 
 def test_placement_group_claims_tpu_slices_in_numeric_order():

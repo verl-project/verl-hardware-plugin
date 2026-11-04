@@ -61,9 +61,34 @@ def current_device() -> int:
     return torch.accelerator.current_device_index() if accelerator_is_tpu() else 0
 
 
-def synchronize(device: Any = None) -> None:
-    if accelerator_is_tpu() and _tpu_runtime_initialized(default_when_absent=True):
-        torch.accelerator.synchronize(device)
+def synchronize(target: Any = None, *, wait: bool = True, strict: bool = False) -> None:
+    """Materialize and synchronize pending TPU operations (blocking when ``wait=True``, async when ``False``).
+
+    Serves both ``get_torch_device().synchronize(device)`` and plugin-internal ``tpu_synchronize(tensors, ...)``:
+    ``wait=True`` calls ``torch.accelerator.synchronize``, while ``wait=False`` records a throwaway ``torch.Event``
+    so ``DEFER_AND_FUSE`` cuts and dispatches the active stream without blocking the host until completion.
+    """
+    if isinstance(target, torch.Tensor):
+        if target.device.type != "tpu":
+            return
+        device: Any = target.device
+    else:
+        device = target
+    if not accelerator_is_tpu():
+        if strict:
+            raise RuntimeError("TPU synchronization failed: TPU accelerator is not available")
+        return
+    if not _tpu_runtime_initialized(default_when_absent=True):
+        return
+    try:
+        if wait:
+            torch.accelerator.synchronize(device)
+        else:
+            (torch.Event() if device is None else torch.Event(device=device)).record()
+    except Exception as e:
+        if strict:
+            raise RuntimeError(f"TPU synchronization failed: {e}") from e
+        logger.warning("Could not synchronize TPU device: %s", e)
 
 
 def current_stream(device: Any = None):
