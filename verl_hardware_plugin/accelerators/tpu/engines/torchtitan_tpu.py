@@ -325,18 +325,29 @@ class TorchTitanTPUEngine(BaseEngine):
             )
             else {}
         )
+        # Mandatory per-model TPU setup (engines/tpu_model_kernels.py, _MODEL_SETUPS), e.g. Qwen3 MoE.
+        setup = tpu_model_kernels.model_setup(torchtitan_name, self.model_config.hf_config)
         model_spec = model_module.model_registry(
             torchtitan_flavor,
             attn_backend=torchtitan_model_attn_backend(torchtitan_name, self.engine_config.attn_type),
             seq_len=self.engine_config.max_seq_len,
             **fuse_qkv_kwargs,
             **tpu_model_kernels.model_registry_kwargs(self._tpu_kernels),
+            **(setup.registry_kwargs() if setup else {}),
         )
         tpu_model_kernels.configure_model_spec(
             model_spec,
             self._tpu_kernels,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
         )
+        if setup is not None and setup.configure is not None:
+            setup.configure(
+                model_spec,
+                tpu_model_kernels.ModelSetupContext(
+                    expert_parallel_size=self.engine_config.expert_parallel_size,
+                    seq_bucket_size=get_tpu_seq_bucket_size(self.engine_config),
+                ),
+            )
         if self._use_simple_fsdp:
             model_spec = dataclasses.replace(
                 model_spec,
@@ -963,7 +974,8 @@ class TorchTitanTPUEngine(BaseEngine):
         Each inner optimizer steps only the current chunk: its param groups are narrowed to the chunk's parameters
         for the call (and restored afterwards), so the optimizer state and hyperparameters are untouched. Stepping
         the inner optimizers bypasses ``OptimizersContainer.step()``, so its pre/post step hooks run here, e.g. the
-        MoE load-balancing expert-bias update that torchtitan registers as a pre-step hook.
+        MoE load-balancing expert-bias update that torchtitan registers as a pre-step hook. It is registered only for
+        MoE models that keep load balancing on; a ``ModelSetup`` may turn it off (e.g. Qwen3 MoE).
         """
         for hook in getattr(self.optimizer, "_optimizer_step_pre_hooks", {}).values():
             hook(self.optimizer, (), {})
