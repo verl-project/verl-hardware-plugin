@@ -483,19 +483,42 @@ _DYNAMO_CACHE_TARGETS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+def _is_dynamo_constant_primitive(value: Any) -> bool:
+    if isinstance(value, type(None) | bool | int | float | str):
+        return True
+    if isinstance(value, tuple):
+        return all(_is_dynamo_constant_primitive(item) for item in value)
+    return False
+
+
 def _pin_dynamo_constant_zero_arg(module: Any, attr_name: str) -> bool:
-    """Evaluates zero-arg ``module.<attr_name>()`` once and replaces it with a Dynamo-constant closure."""
+    """Evaluates zero-arg ``module.<attr_name>()`` once and replaces ``@lru_cache`` with a Dynamo-safe getter.
+
+    Scalar/primitive return values (such as ``_tpu_generation() -> int | None``) are wrapped in
+    ``torch._dynamo.assume_constant_result``. Callable/object return values (such as
+    ``_import_kda() -> (kimi_delta_attention, None)``) must NOT use ``assume_constant_result`` because PyTorch
+    Dynamo tags the returned function with ``ConstantSource``, whose ``make_guard(GuardBuilder.CLOSURE_MATCH)``
+    raises ``NotImplementedError`` under ``checkpoint_wrapper``; storing the pre-evaluated value on a module
+    global gives it a regular ``GlobalSource`` that supports ``CLOSURE_MATCH`` without tracing ``@lru_cache``.
+    """
     fn = getattr(module, attr_name, None)
     if not callable(fn) or getattr(fn, "_verl_dynamo_constant", False):
         return False
     value = fn()
-    assume_constant = getattr(getattr(torch, "_dynamo", None), "assume_constant_result", None)
+    if _is_dynamo_constant_primitive(value):
+        assume_constant = getattr(getattr(torch, "_dynamo", None), "assume_constant_result", None)
 
-    def _const_fn(_val: Any = value) -> Any:
-        return _val
+        def _const_fn(_val: Any = value) -> Any:
+            return _val
 
-    if callable(assume_constant):
-        _const_fn = assume_constant(_const_fn)
+        if callable(assume_constant):
+            _const_fn = assume_constant(_const_fn)
+    else:
+        cache_attr = f"_verl_const_{attr_name}"
+        setattr(module, cache_attr, value)
+        ns: dict[str, Any] = {}
+        exec(f"def {attr_name}():\n    return {cache_attr}\n", module.__dict__, ns)
+        _const_fn = ns[attr_name]
     _const_fn._verl_dynamo_constant = True  # type: ignore[attr-defined]
     setattr(module, attr_name, _const_fn)
     return True

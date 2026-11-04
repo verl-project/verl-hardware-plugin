@@ -2740,10 +2740,16 @@ def test_ragged_ep_token_dispatcher_fullgraph_compile(tmp_path):
 
 
 def test_patch_torchtitan_tpu_dynamo_caches_fixes_lru_cache_listdir_fullgraph(monkeypatch):
-    """Regression test for torchtitan#142 ``@lru_cache`` ``_tpu_generation()`` -> ``posix.listdir`` under fullgraph."""
+    """Regression test for torchtitan#142 ``@lru_cache`` helpers under ``checkpoint_wrapper`` + ``fullgraph=True``."""
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+
     from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels
 
     fake_kda = types.ModuleType("torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta")
+
+    def _fake_kda_op(x: torch.Tensor) -> torch.Tensor:
+        return x + 1.0
 
     @functools.lru_cache(maxsize=1)
     def _tpu_generation():
@@ -2753,27 +2759,53 @@ def test_patch_torchtitan_tpu_dynamo_caches_fixes_lru_cache_listdir_fullgraph(mo
 
     @functools.lru_cache(maxsize=1)
     def _import_kda():
-        return ("kda_fn", None)
+        return (_fake_kda_op, None)
+
+    def _require_tokamax_kda():
+        kimi_delta_attention, error = fake_kda._import_kda()
+        if kimi_delta_attention is None:
+            raise ImportError("missing tokamax kda") from error
+        return kimi_delta_attention
 
     fake_kda._tpu_generation = _tpu_generation  # type: ignore[attr-defined]
     fake_kda._import_kda = _import_kda  # type: ignore[attr-defined]
+    fake_kda._require_tokamax_kda = _require_tokamax_kda  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta", fake_kda)
 
-    def _recurrence_step(x: torch.Tensor) -> torch.Tensor:
-        gen = fake_kda._tpu_generation()
-        return x * float(gen) if gen is not None and gen >= 6 else x
+    class _Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.ones(4))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            gen = fake_kda._tpu_generation()
+            fn = fake_kda._require_tokamax_kda()
+            out = fn(x * self.w)
+            return out * float(gen) if gen is not None and gen >= 6 else out
+
+    def _policy_fn(ctx, op, *args, **kwargs):
+        return CheckpointPolicy.MUST_SAVE if op == torch.ops.aten.topk.default else CheckpointPolicy.PREFER_RECOMPUTE
 
     torch._dynamo.reset()
     with pytest.raises(torch._dynamo.exc.Unsupported):
-        torch.compile(_recurrence_step, backend="eager", fullgraph=True)(torch.ones(4))
+        torch.compile(_Block(), backend="eager", fullgraph=True)(torch.ones(4))
 
     patched = tpu_model_kernels.patch_torchtitan_tpu_dynamo_caches()
     assert patched >= 2
     assert tpu_model_kernels.patch_torchtitan_tpu_dynamo_caches() == 0  # idempotent
 
     torch._dynamo.reset()
-    out = torch.compile(_recurrence_step, backend="eager", fullgraph=True)(torch.ones(4))
-    assert torch.equal(out, torch.full((4,), 7.0))
+    wrapped = checkpoint_wrapper(
+        _Block(),
+        context_fn=functools.partial(create_selective_checkpoint_contexts, _policy_fn),
+        preserve_rng_state=False,
+    )
+    wrapped.compile(backend="aot_eager", fullgraph=True)
+    x = torch.ones(4, requires_grad=True)
+    out = wrapped(x)
+    out.sum().backward()
+    assert torch.equal(out.detach(), torch.full((4,), 14.0))
+    assert x.grad is not None and torch.equal(x.grad, torch.full((4,), 7.0))
 
 
 def test_64mib_vmem_397b_moe_tiles_lce_blocks_and_splash_1024(monkeypatch):
@@ -2850,8 +2882,28 @@ def test_64mib_vmem_397b_moe_tiles_lce_blocks_and_splash_1024(monkeypatch):
     assert attn._splash_1024.sa_kwargs["block_q"] == 1024
     assert attn._splash_1024.sa_kwargs["block_kv_compute"] == 512
     assert attn._splash_1024.sa_kwargs["block_kv_dkv_compute"] == 512
-    q_cpu = torch.ones(1, 2048, 2, 4)
-    assert torch.equal(attn(q_cpu, q_cpu, q_cpu), q_cpu * 3)
+    q_cpu = torch.ones(1, 2048, 2, 4, requires_grad=True)
+    out_cpu = attn(q_cpu, q_cpu, q_cpu)
+    assert torch.equal(out_cpu.detach(), torch.full_like(q_cpu, 3.0))
+
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+
+    def _splash_policy(ctx, op, *args, **kwargs):
+        return CheckpointPolicy.MUST_SAVE if op == torch.ops.aten.topk.default else CheckpointPolicy.PREFER_RECOMPUTE
+
+    torch._dynamo.reset()
+    wrapped_attn = checkpoint_wrapper(
+        attn,
+        context_fn=functools.partial(create_selective_checkpoint_contexts, _splash_policy),
+        preserve_rng_state=False,
+    )
+    wrapped_attn.compile(backend="aot_eager", fullgraph=True)
+    q_cmp = torch.ones(1, 2048, 2, 4, requires_grad=True)
+    out_cmp = wrapped_attn(q_cmp, q_cmp, q_cmp)
+    out_cmp.sum().backward()
+    assert torch.equal(out_cmp.detach(), torch.full_like(q_cmp, 3.0))
+    assert q_cmp.grad is not None and torch.equal(q_cmp.grad, torch.full_like(q_cmp, 3.0))
 
 
 def test_ep_chunk_barriers_and_dynamic_bucket_resolution_fullgraph(monkeypatch):
