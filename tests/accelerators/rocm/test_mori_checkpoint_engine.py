@@ -735,6 +735,93 @@ def test_control_inbox_drops_foreign_messages(mori_env):
     assert all(e._unusable is None for e in actors + rollouts)
 
 
+def _push_raw(addresses, messages):
+    """Send raw control messages to the given inboxes, as anyone on the network could; delivered before returning."""
+    import zmq
+
+    ctx = zmq.Context()
+    try:
+        for address in addresses:
+            sock = ctx.socket(zmq.PUSH)
+            sock.setsockopt(zmq.LINGER, 1000)
+            sock.connect(address)
+            for raw in messages:
+                sock.send(raw)
+            sock.close()
+    finally:
+        ctx.term()
+
+
+def test_control_inbox_drops_invalid_messages_of_the_current_sync(mori_env):
+    """Well-formed JSON with the current sync's id but a wrong structure or outside this topology (no type, a free
+    of an unknown slot or peer, a bucket of an unknown stripe or with bad fields, an abort without a reason) is
+    dropped: it must neither stop the inbox nor be taken for a real bucket, and the sync completes."""
+    import json
+
+    mod, fab = mori_env
+    actors = [_new(mod, 2, node="trainer", is_master=(i == 0)) for i in range(2)]
+    rollouts = [_new(mod, 2, node=f"r{i % 2}") for i in range(4)]
+    _wire(actors, rollouts, fab)
+    seq = [actors[0]._sync_id, actors[0]._round + 1]  # the id of the sync started below
+    bucket = {"t": "bucket", "seq": seq, "k": 0, "slot": 0, "metas": [], "used": 0, "is_last": True, "uid": None}
+    invalid = [
+        {"seq": seq},
+        {"t": "noop", "seq": seq},
+        {"t": "abort", "seq": seq},
+        {"t": "free", "seq": seq, "c": 0, "slot": 0, "from": "nobody"},
+        {"t": "free", "seq": seq, "c": [0], "slot": {}, "from": None},
+        {**bucket, "c": 99},
+        {**bucket, "c": 0, "slot": 7},
+        {**bucket, "c": 0, "used": "all"},
+        {**bucket, "c": 0, "used": 8, "metas": [["w", [4], "float32", 0, 16, 0]]},  # entry beyond the bucket
+        {**bucket, "c": 0, "is_last": "yes"},
+        {**bucket, "c": 0, "uid": "x"},
+    ]
+    _push_raw([e._inbox_addr for e in actors + rollouts], [json.dumps(m).encode() for m in invalid])
+
+    async def run():
+        ws = _make_weights(6)
+        res = await asyncio.gather(
+            *[a.send_weights(iter(ws), global_steps=6) for a in actors], *[_consume(r, 6) for r in rollouts]
+        )
+        for got in res[len(actors) :]:
+            assert set(got) == {n for n, _ in ws} and all(_same(got[n], w) for n, w in ws)
+
+    t = time.time()
+    asyncio.run(run())
+    assert time.time() - t < 5
+    assert all(e._unusable is None for e in actors + rollouts)
+
+
+def test_a_failing_control_inbox_fails_the_sync_at_once(mori_env, monkeypatch):
+    """If handling a control message ever raises, the sync fails at once on that worker (and so on its peers)
+    instead of every waiter running into timeout_s."""
+    import json
+
+    mod, fab = mori_env
+    actors = [_new(mod, 1, node="trainer", is_master=True)]
+    rollouts = [_new(mod, 1, node="r0") for _ in range(2)]
+    _wire(actors, rollouts, fab)
+    monkeypatch.setattr(mod.MoriCheckpointEngine, "_invalid", lambda self, msg: None)  # let a bad message through
+    seq = [actors[0]._sync_id, actors[0]._round + 1]
+    _push_raw(
+        [rollouts[0]._inbox_addr], [json.dumps({"t": "free", "seq": seq, "c": 5, "slot": 0, "from": "x"}).encode()]
+    )
+
+    async def run():
+        return await asyncio.gather(
+            *[a.send_weights(iter(_make_weights(0)), global_steps=0) for a in actors],
+            *[_consume(r, 0) for r in rollouts],
+            return_exceptions=True,
+        )
+
+    t = time.time()
+    res = asyncio.run(run())
+    assert time.time() - t < 5  # far below timeout_s
+    assert any(isinstance(x, RuntimeError) and "control message handling failed" in str(x) for x in res), res
+    _fail_stop_holds(actors + rollouts, res)
+
+
 async def _update_weights_closing_on_failure(self, global_steps=None):
     """Like verl's CheckpointEngineWorker.update_weights, but closes the receive stream when the adapter fails."""
     weights = self.checkpoint_engine.receive_weights(global_steps=global_steps)

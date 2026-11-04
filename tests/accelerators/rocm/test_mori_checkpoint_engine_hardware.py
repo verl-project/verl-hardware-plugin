@@ -12,7 +12,9 @@ GPUs of this node with real MoRI-IO transfers, 2 trainer workers to the others, 
   their own and the rollout workers are split into two "nodes", so every hop goes through the NICs, with the
   topology of a multi-node job: stripes from the trainers, chains across rollout nodes, fan-out inside each node.
 
-Skipped unless MoRI, Ray and at least 4 ROCm GPUs are present, so the CPU CI run is unaffected.
+Skipped unless MoRI, Ray and at least 4 ROCm GPUs are present, so the CPU CI run is unaffected; the ``rdma`` case also
+needs RDMA NICs. With 4 GPUs each "rollout node" of the ``rdma`` case has one GPU, so only 8 GPUs cover the fan-out
+inside a node.
 """
 
 import pytest
@@ -102,6 +104,8 @@ def test_every_rollout_gets_every_tensor(num_chains, num_slots, intra_node):
         ).MoriCheckpointEngine
         for seed in range(3):  # the region, queue pairs and sockets are kept across syncs
             meta = ray.get([w.prepare.remote() for w in trainers + rollouts], timeout=300)
+            # the engine falls back to RDMA if it cannot create the XGMI backend: make sure each case runs its path
+            assert [m["xgmi"] for m in meta] == [intra_node == "xgmi"] * len(meta), [m["xgmi"] for m in meta]
             trainer_kwargs, rollout_kwargs = engine_cls.build_topology(n_trainers, n_rollouts, meta)
             ray.get(
                 [
