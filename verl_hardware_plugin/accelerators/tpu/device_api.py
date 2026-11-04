@@ -19,6 +19,7 @@ no memory functions.
 """
 
 import logging
+import os
 import warnings
 from typing import Any, Optional
 
@@ -27,6 +28,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 _accelerator_is_tpu_cache: Optional[bool] = None
+_tpu_runtime_up_pid: Optional[int] = None
 
 
 def accelerator_is_tpu() -> bool:
@@ -60,7 +62,7 @@ def current_device() -> int:
 
 
 def synchronize(device: Any = None) -> None:
-    if accelerator_is_tpu():
+    if accelerator_is_tpu() and _tpu_runtime_initialized(default_when_absent=True):
         torch.accelerator.synchronize(device)
 
 
@@ -98,19 +100,26 @@ def initial_seed() -> int:
     return _default_generator().initial_seed()
 
 
-def _tpu_runtime_initialized() -> bool:
-    """Whether this process has started its TPU runtime (the PJRT client)."""
+def _tpu_runtime_initialized(*, default_when_absent: bool = False) -> bool:
+    """Whether this process has started its TPU runtime (the PJRT client), cached per-PID once True."""
+    global _tpu_runtime_up_pid
+    pid = os.getpid()
+    if _tpu_runtime_up_pid == pid:
+        return True
     is_initialized = getattr(getattr(torch, "tpu", None), "is_initialized", None)
     if is_initialized is None:
-        return False
+        return default_when_absent
     try:
         # Experimental in torch_tpu 0.2.0; its one-time warning is noise in every worker's log.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            return bool(is_initialized())
+            up = bool(is_initialized())
     except Exception as e:
         logger.debug("torch.tpu.is_initialized() failed: %s", e)
         return False
+    if up:
+        _tpu_runtime_up_pid = pid
+    return up
 
 
 def _memory_fn(name: str):

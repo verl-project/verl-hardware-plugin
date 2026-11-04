@@ -31,6 +31,7 @@ from torch.distributed.tensor import DTensor
 
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import TorchtitanEngineConfig
+from verl_hardware_plugin.accelerators.tpu import device_api
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 
 logger = logging.getLogger(__name__)
@@ -649,25 +650,37 @@ def tpu_synchronize(
 ) -> None:
     """Materialize and synchronize pending TPU operations (for ``tensors`` or the whole device).
 
+    Uses PyTorch's public ``torch.accelerator.synchronize`` when ``wait=True`` and ``torch.Event.record``
+    when ``wait=False`` (which materializes the active TPU stream and waits only until execution starts,
+    avoiding host-blocking stalls between ``DEFER_AND_FUSE`` chunks).
+
     Args:
-        tensors: Optional tensor (e.g. ``loss``) to materialize; ``None`` synchronizes the whole TPU device.
+        tensors: Optional tensor (e.g. ``loss``) on the target device; ``None`` targets the active TPU device.
         wait: Wait for device execution to complete when ``True``; dispatch asynchronously when ``False``.
-        strict: Raise ``RuntimeError`` if ``torch_tpu`` cannot synchronize instead of logging a warning.
+        strict: Raise ``RuntimeError`` if synchronization fails instead of logging a warning.
     """
     if isinstance(tensors, torch.Tensor) and tensors.device.type != "tpu":
         return
+    if not device_api.accelerator_is_tpu():
+        if strict:
+            raise RuntimeError("TPU synchronization failed: TPU accelerator is not available")
+        return
+    if not device_api._tpu_runtime_initialized(default_when_absent=True):
+        return
+    device = tensors.device if isinstance(tensors, torch.Tensor) else None
     try:
-        from torch_tpu._internal import sync
-
-        if tensors is None:
-            sync.synchronize(wait=wait)
+        if wait:
+            if device is None:
+                torch.accelerator.synchronize()
+            else:
+                torch.accelerator.synchronize(device)
         else:
-            sync.synchronize(tensors, wait=wait)
-    except Exception as e:  # ImportError on hosts without torch_tpu (CPU tests) included
+            ev = torch.Event() if device is None else torch.Event(device=device)
+            ev.record()
+    except Exception as e:
         if strict:
             raise RuntimeError(f"TPU synchronization failed: {e}") from e
-        if not isinstance(e, ImportError):
-            logger.warning("Could not synchronize via torch_tpu: %s", e)
+        logger.warning("Could not synchronize TPU device: %s", e)
 
 
 def tpu_eager_mode_context(mode: Optional[str]):

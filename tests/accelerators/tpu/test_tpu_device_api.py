@@ -16,8 +16,10 @@ from verl_hardware_plugin.accelerators.tpu.platform_tpu import TPUDeviceModulePr
 @pytest.fixture(autouse=True)
 def _reset_cache():
     device_api._accelerator_is_tpu_cache = None
+    device_api._tpu_runtime_up_pid = None
     yield
     device_api._accelerator_is_tpu_cache = None
+    device_api._tpu_runtime_up_pid = None
 
 
 def _internal(name):
@@ -141,7 +143,8 @@ def test_memory_statistics_are_zero_until_the_tpu_runtime_is_up(current_accelera
         assert proxy.memory_stats() == {}
         assert proxy.mem_get_info() == (0, 0)
         proxy.reset_peak_memory_stats()
-    for name in ("memory_allocated", "memory_stats", "get_memory_info", "reset_peak_memory_stats"):
+        proxy.synchronize()
+    for name in ("memory_allocated", "memory_stats", "get_memory_info", "reset_peak_memory_stats", "synchronize"):
         getattr(acc, name).assert_not_called()
 
 
