@@ -1832,6 +1832,17 @@ def test_configure_qwen3_moe_needs_the_tpu_converters():
         )
 
 
+def test_packed_document_budget_is_bucketed_for_dynamic_bsz():
+    """use_dynamic_bsz varies the sequences per micro-batch; the KDA budget only changes at powers of two (>= 16)."""
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_model_kernels import packed_document_budget
+
+    assert [packed_document_budget(n) for n in (1, 5, 7, 15)] == [16, 16, 16, 16]
+    assert [packed_document_budget(n) for n in (16, 20, 31, 32)] == [32, 32, 32, 64]
+    for n in range(1, 200):
+        budget = packed_document_budget(n)
+        assert budget >= n + 1 and budget & (budget - 1) == 0
+
+
 def test_packed_document_budget_keeps_every_rl_sequence_apart():
     """Two sequences packed into a 768-token row restart the KDA recurrence each (plus one padding segment)."""
     from verl_hardware_plugin.accelerators.tpu.engines.tpu_model_kernels import set_packed_document_budget

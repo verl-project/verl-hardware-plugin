@@ -28,6 +28,9 @@ for this backend):
    - a replicated weight is already full on every rank and is registered full, without further communication.
      Note that q/k/v_proj are replicated only because torchtitan's `FusedQKVLinear` `state_dict()` hook already
      all-gathers the FSDP-sharded `wqkv` before splitting it (TODO: split it locally);
+   - routed experts with `1 < expert_parallel_size < world size` (so `efsdp > 1`) are
+     `(_StridedShard(0, split_factor=ep), Shard(0))` on the `(efsdp, ep)` mesh: every rank still holds contiguous
+     whole experts, block `i_ep * efsdp + i_efsdp` of `efsdp * ep`, and is registered locally like an FSDP shard;
    - Qwen3 MoE expert stacks (torchtitan's `[E, I, H]` / `[E, H, I]` per projection) are sent as is, one 3-D
      tensor per projection and layer (`model.layers.N.mlp.experts.gate_proj.weight` `[E, I, H]`, likewise
      `up_proj`, and `down_proj` `[E, H, I]`, as Qwen3.5's expert pieces). An FSDP shard of whole experts is a dim-0

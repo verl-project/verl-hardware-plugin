@@ -301,6 +301,22 @@ def lce_block_sizes(kernels: frozenset[str], hidden_size: int, vocab_size: int) 
     return LceBlockSizes(**_LCE_BLOCK_SIZES)
 
 
+# MaxText's MAX_SEGMENTS_PER_PACKED_ROW: the smallest Tokamax KDA document budget the engine sets.
+MIN_PACKED_DOCUMENT_BUDGET = 16
+
+
+def packed_document_budget(max_sequences_per_micro_batch: int) -> int:
+    """The Tokamax KDA ``max_num_segments`` for micro-batches packing up to ``max_sequences_per_micro_batch`` sequences.
+
+    One document per sequence plus one for the bucket-padding tail, rounded up to a power of two and at least
+    ``MIN_PACKED_DOCUMENT_BUDGET``. ``max_num_segments`` is a static kernel shape: with ``use_dynamic_bsz`` the number
+    of sequences per token-budgeted micro-batch varies from step to step, and an exact budget would recompile every
+    GatedDeltaNet layer whenever it changes. A larger budget only adds empty segments.
+    """
+    raw = int(max_sequences_per_micro_batch) + 1
+    return max(MIN_PACKED_DOCUMENT_BUDGET, 1 << (raw - 1).bit_length())
+
+
 def set_packed_document_budget(modules: Any, num_documents: int) -> int:
     """Sets ``max_num_segments`` of every Tokamax GatedDeltaNet kernel in ``modules`` to ``num_documents``.
 
