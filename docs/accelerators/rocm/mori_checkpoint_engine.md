@@ -126,11 +126,11 @@ rollout side, median of 9 syncs after the first:
 
 | | seconds per sync |
 |---|---|
-| `nccl`, 2048 MB bucket | 1.293 |
-| `mori`, 2048 MB bucket, 4 slots | **0.663** |
-| `mori`, `export: shard`, 2048 MB bucket, 4 slots | **0.443** |
-| trainer export alone (iterating `get_per_tensor_param()`, sending nothing) | 0.63 |
-| trainer shard export alone (iterating `get_per_tensor_param_shard()`, sending nothing) | 0.29 |
+| `nccl`, 2048 MB bucket | 1.323 |
+| `mori`, 2048 MB bucket, 4 slots | **0.662** |
+| `mori`, `export: shard`, 2048 MB bucket, 4 slots | **0.451** |
+| trainer export alone (iterating `get_per_tensor_param()`, sending nothing) | 0.60 |
+| trainer shard export alone (iterating `get_per_tensor_param_shard()`, sending nothing) | 0.30 |
 
 The first two syncs of every configuration matched the HF checkpoint tensor by tensor on all 8 rollout workers. The
 sharded export ships bf16 (61 GB for this model, what the rollout loads); the full export ships the trainer's fp32
