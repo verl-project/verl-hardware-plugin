@@ -2018,3 +2018,180 @@ def test_torchtitan_head_compatibility_for_kda_multi_mesh_and_ep_simple_fsdp(mon
         compile_config=SimpleNamespace(enable=True, backend="tpu"),
     )
     assert compile_calls == [("head_moe", "tpu", False)]
+
+
+def _fp32_master_ckpt_worker(rank: int, world: int, init_file: str, ckpt_root: str, host_offload: bool) -> None:
+    import torch.distributed as dist
+    from torch.distributed.tensor import Replicate, Shard, distribute_tensor, init_device_mesh
+
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+    from verl_hardware_plugin.accelerators.tpu.options import TPUEngineOptions
+
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
+    try:
+        mesh = init_device_mesh("cpu", (world,))
+
+        def _make_engine(seed: int, offload: bool = host_offload):
+            gen = torch.Generator().manual_seed(seed)
+            mod = torch.nn.Module()
+            w_even = distribute_tensor(torch.randn(8, 4, generator=gen).to(torch.bfloat16), mesh, [Shard(0)])
+            w_uneven = distribute_tensor(torch.randn(5, 4, generator=gen).to(torch.bfloat16), mesh, [Shard(0)])
+            w_rep = distribute_tensor(torch.randn(4, generator=gen).to(torch.bfloat16), mesh, [Replicate()])
+            w_plain = torch.randn(3, 3, generator=gen).to(torch.bfloat16)
+            w_frozen = distribute_tensor(torch.randn(4, 2, generator=gen).to(torch.bfloat16), mesh, [Shard(0)])
+            mod.register_parameter("layers_0_wq", torch.nn.Parameter(w_even, requires_grad=True))
+            mod.register_parameter("layers_0_wo_uneven", torch.nn.Parameter(w_uneven, requires_grad=True))
+            mod.register_parameter("norm", torch.nn.Parameter(w_rep, requires_grad=True))
+            mod.register_parameter("plain", torch.nn.Parameter(w_plain, requires_grad=True))
+            mod.register_parameter("frozen", torch.nn.Parameter(w_frozen, requires_grad=False))
+            mod.register_buffer(
+                "expert_bias",
+                distribute_tensor(torch.zeros(4, dtype=torch.float32), mesh, [Shard(0)]),
+            )
+            dt_names = ["layers.0.wq.weight", "layers.0.wo.weight", "norm.weight"]
+            dt_params = [mod.layers_0_wq, mod.layers_0_wo_uneven, mod.norm]
+            stepped_params = [*dt_params, mod.plain]
+            opt = torch.optim.AdamW(
+                [
+                    {"params": dt_params, "param_names": dt_names, "lr": 1e-6, "foreach": True},
+                    {"params": [mod.plain], "param_names": ["plain.weight"], "lr": 1e-6, "foreach": True},
+                ]
+            )
+            sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda s: max(0.1, (s + 1) / 5.0))
+            eng = SimpleNamespace(
+                _is_offload_param=False,
+                _is_offload_optimizer=False,
+                _tpu_eager_mode=None,
+                _tpu_options=TPUEngineOptions(param_dtype="bfloat16", fp32_master=True, optimizer_host_offload=offload),
+                module=[mod],
+                optimizer=SimpleNamespace(optimizers=[opt], zero_grad=opt.zero_grad),
+                lr_scheduler=sched,
+                parallel_dims=SimpleNamespace(ep_enabled=False, get_optional_mesh=lambda _: None),
+                config=SimpleNamespace(training=SimpleNamespace(max_norm=0.0625)),
+            )
+            for helper in (
+                "_optimizer_param_chunks",
+                "_chunked_grad_norm",
+                "_chunked_clip_and_step",
+                "_save_fp32_master_checkpoint",
+                "_load_fp32_master_checkpoint",
+                "save_checkpoint",
+                "load_checkpoint",
+            ):
+                setattr(eng, helper, getattr(TorchTitanTPUEngine, helper).__get__(eng))
+            return eng, mod, stepped_params
+
+        def _apply_step_grads(mod, stepped_params, step_idx: int) -> None:
+            g_gen = torch.Generator().manual_seed(100 + step_idx)
+            full_grads = [
+                distribute_tensor(torch.randn(8, 4, generator=g_gen).to(torch.bfloat16), mesh, [Shard(0)]),
+                distribute_tensor(torch.randn(5, 4, generator=g_gen).to(torch.bfloat16), mesh, [Shard(0)]),
+                distribute_tensor(torch.randn(4, generator=g_gen).to(torch.bfloat16), mesh, [Replicate()]),
+                torch.randn(3, 3, generator=g_gen).to(torch.bfloat16),
+            ]
+            for p, g in zip(stepped_params, full_grads, strict=True):
+                p.grad = g
+            mod.expert_bias._local_tensor.add_(float(step_idx + 1 + rank))
+
+        eng_cont, mod_cont, params_cont = _make_engine(seed=7)
+        for s in range(1, 4):
+            _apply_step_grads(mod_cont, params_cont, s)
+            TorchTitanTPUEngine.optimizer_step(eng_cont)
+            eng_cont.lr_scheduler.step()
+            eng_cont.save_checkpoint(
+                local_path=os.path.join(ckpt_root, f"global_step_{s}", "actor"),
+                global_step=s,
+                max_ckpt_to_keep=2,
+            )
+
+        assert not os.path.exists(os.path.join(ckpt_root, "global_step_1"))
+        assert os.path.isdir(os.path.join(ckpt_root, "global_step_2", "actor"))
+        assert os.path.isdir(os.path.join(ckpt_root, "global_step_3", "actor"))
+
+        # Fresh engines (both same offload mode and opposite offload mode) resume from global_step_3/actor:
+        eng_res, mod_res, params_res = _make_engine(seed=999, offload=host_offload)
+        eng_cross, mod_cross, params_cross = _make_engine(seed=555, offload=not host_offload)
+        eng_res.load_checkpoint(local_path=os.path.join(ckpt_root, "global_step_3", "actor"))
+        eng_cross.load_checkpoint(local_path=os.path.join(ckpt_root, "global_step_3", "actor"))
+
+        for s in range(4, 6):
+            for eng, mod, ps in (
+                (eng_cont, mod_cont, params_cont),
+                (eng_res, mod_res, params_res),
+                (eng_cross, mod_cross, params_cross),
+            ):
+                _apply_step_grads(mod, ps, s)
+                TorchTitanTPUEngine.optimizer_step(eng)
+                eng.lr_scheduler.step()
+
+        # Same-mode resume is 0-ULP bitwise identical; cross-mode resume (CPU fused AVX-512 FMA vs foreach) matches
+        # bf16 weights & step counters bit-for-bit and FP32 masters/moments within 1 FP32 FMA ULP.
+        for is_same_mode, (other_eng, other_mod) in (
+            (True, (eng_res, mod_res)),
+            (False, (eng_cross, mod_cross)),
+        ):
+            for (_, p_c), (_, p_r) in zip(mod_cont.named_parameters(), other_mod.named_parameters(), strict=True):
+                loc_c = p_c._local_tensor if hasattr(p_c, "_local_tensor") else p_c.data
+                loc_r = p_r._local_tensor if hasattr(p_r, "_local_tensor") else p_r.data
+                assert torch.equal(loc_c, loc_r)
+                in_c = id(p_c) in eng_cont._fp32_master_store._entries
+                in_r = id(p_r) in other_eng._fp32_master_store._entries
+                assert in_c == in_r
+                if in_c:
+                    m_c, st_c = eng_cont._fp32_master_store._entries[id(p_c)]
+                    m_r, st_r = other_eng._fp32_master_store._entries[id(p_r)]
+                    ml_c = m_c._local_tensor if hasattr(m_c, "_local_tensor") else m_c
+                    ml_r = m_r._local_tensor if hasattr(m_r, "_local_tensor") else m_r
+                    if is_same_mode:
+                        assert torch.equal(ml_c, ml_r)
+                    else:
+                        torch.testing.assert_close(ml_c, ml_r, rtol=1e-6, atol=1e-7)
+                    assert set(st_c) == set(st_r)
+                    for k in st_c:
+                        vc = st_c[k]._local_tensor if hasattr(st_c[k], "_local_tensor") else st_c[k]
+                        vr = st_r[k]._local_tensor if hasattr(st_r[k], "_local_tensor") else st_r[k]
+                        if is_same_mode or k == "step":
+                            assert torch.equal(vc, vr), k
+                        else:
+                            torch.testing.assert_close(vc, vr, rtol=1e-6, atol=1e-7)
+
+            assert torch.equal(mod_cont.expert_bias._local_tensor, other_mod.expert_bias._local_tensor)
+            assert eng_cont.lr_scheduler.state_dict() == other_eng.lr_scheduler.state_dict()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("host_offload", [False, True])
+def test_fp32_master_checkpoint_save_load_lossless_dtensor_and_pruning(tmp_path, host_offload):
+    """Saving & resuming ``fp32_master=True`` across distributed DTensor shards is 0-ULP bitwise lossless."""
+    ckpt_root = tmp_path / f"ckpts_{host_offload}"
+    ckpt_root.mkdir()
+    torch.multiprocessing.start_processes(
+        _fp32_master_ckpt_worker,
+        args=(2, str(tmp_path / f"pg_{host_offload}"), str(ckpt_root), host_offload),
+        nprocs=2,
+        join=True,
+        start_method="fork",
+    )
+
+
+def test_gcs_ckpt_blob_target_resolution(monkeypatch):
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import _gcs_ckpt_blob_target
+
+    monkeypatch.delenv("VERL_GCS_CKPT_BUCKET", raising=False)
+    monkeypatch.delenv("VERL_GCS_CKPT_MOUNT", raising=False)
+    monkeypatch.delenv("VERL_GCS_CKPT_PREFIX", raising=False)
+
+    assert _gcs_ckpt_blob_target("/gcs_ckpt/exp/global_step_5/actor") is None
+    assert _gcs_ckpt_blob_target("gs://my-bucket/ckpts/global_step_5/actor/rank0.pt") == (
+        "my-bucket",
+        "ckpts/global_step_5/actor/rank0.pt",
+    )
+
+    monkeypatch.setenv("VERL_GCS_CKPT_BUCKET", "my-ckpt-bucket")
+    monkeypatch.setenv("VERL_GCS_CKPT_PREFIX", "verl/checkpoints")
+    assert _gcs_ckpt_blob_target("/gcs_ckpt/exp1/global_step_5/actor/shard.pt") == (
+        "my-ckpt-bucket",
+        "verl/checkpoints/exp1/global_step_5/actor/shard.pt",
+    )
+    assert _gcs_ckpt_blob_target("/tmp/local_ckpt/global_step_5/actor/shard.pt") is None
