@@ -189,6 +189,11 @@ class TPUEngineOptions:
             ``aten.topk`` assignments while recomputing all projections, norms, GatedDeltaNet recurrences and MoE
             collectives/matmuls (matching TorchTitan's ``tpu_selective`` ``("moe.routing",
             "attention.inner_attention")`` benchmark memory policy).
+        static_micro_batch_len: Pad every packed micro-batch to at least this many tokens (rounded up to the
+            sequence bucket), e.g. the ``use_dynamic_bsz`` token budget, so the trainer compiles one sequence shape
+            instead of one per length bucket it meets (default: unset, off).
+        static_max_response_len: Pad every micro-batch's response-length bucket to at least this many tokens (e.g.
+            ``max_response_length``), so response-shaped tensors also keep one shape (default: unset, off).
     """
 
     use_splash_attention: Optional[bool] = None
@@ -210,6 +215,8 @@ class TPUEngineOptions:
     ep_token_chunks: Optional[int] = None
     ep_paired_grouped_mm: Optional[bool] = None
     ac_save_splash_and_routing: Optional[bool] = None
+    static_micro_batch_len: Optional[int] = None
+    static_max_response_len: Optional[int] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -232,6 +239,8 @@ _ENGINE_KINDS: dict[str, type] = {
     "ep_token_chunks": int,
     "ep_paired_grouped_mm": bool,
     "ac_save_splash_and_routing": bool,
+    "static_micro_batch_len": int,
+    "static_max_response_len": int,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 

@@ -722,7 +722,12 @@ def compute_global_batch_num_tokens(data: TensorDict, dp_group: Any, tp_size: in
     return batch_num_tokens.item()
 
 
-def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], bucket_size: Optional[int] = None) -> None:
+def align_micro_batch_shapes_across_ranks(
+    micro_batches: list[TensorDict],
+    bucket_size: Optional[int] = None,
+    static_len: int = 0,
+    static_response_len: int = 0,
+) -> None:
     """Make every rank pad micro-batch ``i`` to the same packed length and response-length bucket.
 
     SimpleFSDP traces the all-gather/reduce-scatter into each compiled (``spmd_safe``) TransformerBlock, and
@@ -730,10 +735,21 @@ def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], bucke
     the TPU (``sync_flag_public_access_error``). One CPU all-reduce(MAX) over all micro-batches' buckets gives
     each micro-batch a common ``tpu_padded_seq_len`` / ``tpu_max_response_len`` that
     :func:`pad_packed_inputs_for_tpu` pads up to.
+
+    ``static_len`` / ``static_response_len`` (``engine_kwargs.tpu.static_micro_batch_len`` /
+    ``static_max_response_len``) raise every packed / response length to at least that many tokens (rounded up to
+    the bucket), so the trainer compiles one shape instead of one per bucket it meets.
     """
-    if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
-        return
     step = bucket_size if bucket_size is not None and bucket_size > 0 else get_tpu_seq_bucket_size()
+    static_padded = bucket_length(static_len, step) if static_len > 0 else 0
+    static_resp_padded = bucket_length(static_response_len, step) if static_response_len > 0 else 0
+    if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
+        for mb in micro_batches:
+            if static_padded:
+                tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", static_padded)
+            if static_resp_padded:
+                tu.assign_non_tensor_data(mb, "tpu_max_response_len", static_resp_padded)
+        return
     lens: list[int] = []
     for mb in micro_batches:
         ids = mb["input_ids"]
@@ -747,8 +763,9 @@ def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], bucke
     torch.distributed.all_reduce(lens_tensor, op=torch.distributed.ReduceOp.MAX)
     resolved_lens = lens_tensor.tolist()
     for i, mb in enumerate(micro_batches):
-        tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", int(resolved_lens[2 * i]))
-        tu.assign_non_tensor_data(mb, "tpu_max_response_len", int(resolved_lens[2 * i + 1]))
+        tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", max(int(resolved_lens[2 * i]), static_padded))
+        resp_len = int(resolved_lens[2 * i + 1])
+        tu.assign_non_tensor_data(mb, "tpu_max_response_len", max(resp_len, static_resp_padded) if resp_len else 0)
 
 
 def _wrap_routed_experts_on_edp_mesh(model: nn.Module, *, parallel_dims: Any, training: Any) -> None:

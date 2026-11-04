@@ -3054,3 +3054,44 @@ def test_splash_and_routing_selective_ac_and_trainer_xla_flags(monkeypatch):
         )
     assert env_vars["LIBTPU_INIT_ARGS"] == "--base_flag=1 --xla_tpu_scoped_vmem_limit_kib=65472"
     assert env_vars["XLA_FLAGS"] == "--base_xla=1 --xla_enable_hlo_sharding_v3=false"
+
+
+def test_align_micro_batch_shapes_static_len_and_response_len():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+
+    def mb(n, resp):
+        return TensorDict(
+            {
+                "input_ids": torch.nested.as_nested_tensor([torch.zeros(n, dtype=torch.int64)], layout=torch.jagged),
+                "responses": torch.nested.as_nested_tensor([torch.zeros(resp, dtype=torch.int64)], layout=torch.jagged),
+            },
+            batch_size=[1],
+        )
+
+    def padded(mbs, key):
+        return [tu.get_non_tensor_data(m, key, None) for m in mbs]
+
+    # Single process: only the static lengths are applied (rounded up to the bucket).
+    mbs = [mb(300, 100), mb(5000, 3000)]
+    tpu_utils.align_micro_batch_shapes_across_ranks(mbs, bucket_size=2048, static_len=16384, static_response_len=7680)
+    assert padded(mbs, "tpu_padded_seq_len") == [16384, 16384]
+    assert padded(mbs, "tpu_max_response_len") == [8192, 8192]
+    mbs = [mb(300, 100)]
+    tpu_utils.align_micro_batch_shapes_across_ranks(mbs, bucket_size=2048)
+    assert padded(mbs, "tpu_padded_seq_len") == [None]
+
+    # Several ranks: max over ranks, then at least the static lengths.
+    def fake_all_reduce(tensor, op=None):
+        tensor.copy_(torch.maximum(tensor, torch.tensor([18432, 2048, 2048, 2048])))
+
+    with (
+        mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+        mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+        mock.patch.object(torch.distributed, "all_reduce", side_effect=fake_all_reduce),
+    ):
+        mbs = [mb(300, 100), mb(5000, 3000)]
+        tpu_utils.align_micro_batch_shapes_across_ranks(
+            mbs, bucket_size=2048, static_len=16384, static_response_len=7680
+        )
+    assert padded(mbs, "tpu_padded_seq_len") == [18432, 16384]
+    assert padded(mbs, "tpu_max_response_len") == [8192, 8192]
