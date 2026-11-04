@@ -1,6 +1,6 @@
 # Intel XPU User Guide
 
-Last updated: 10/09/2026.
+Last updated: 10/30/2026.
 
 ## Introduction
 
@@ -17,6 +17,7 @@ verl_hardware_plugin/accelerators/xpu/
 ├── engines/fsdp_xpu.py              # FSDP/FSDP2 actor + critic engines
 ├── engines/megatron_xpu.py          # Megatron engine registration (Work in Progress — not yet validated end-to-end)
 ├── patches/reduce_avg_allreduce_patch.py  # xccl ReduceOp.AVG workaround
+├── patches/ray_device_pin_patch.py        # pins each Ray worker to its assigned device (otherwise every rank lands on xpu:0)
 ├── profilers/itt_profile_xpu.py     # ITT range markers + VtuneProfiler
 └── profilers/register_vtune.py      # claims `profiler.tool: vtune`
 ```
@@ -50,10 +51,15 @@ docs/accelerators/xpu/
 
 | Variable | Purpose |
 |----------|---------|
-| `VERL_PLATFORM` | Set to `intel` to force platform selection instead of relying on auto-detection |
+| `VERL_PLATFORM` | Optional. Auto-detection already selects `intel` once the plugin is installed and `torch.xpu` is available; set `intel` only to force the choice |
 | `VERL_USE_EXTERNAL_PLUGINS` | `auto` (default) discovers this plugin via entry_points; `none` disables discovery |
 | `ZE_AFFINITY_MASK` | Selects physical device indices visible to this process, e.g. `0,1` |
 | `ONEAPI_DEVICE_SELECTOR` | Must be left unset alongside `ZE_AFFINITY_MASK` — see [quick_start.md](./quick_start.md) |
+
+## Docker
+
+An Intel GPU image (verl + this plugin + vLLM) is built from `docker/xpu/` in verl-core. A system oneAPI install is
+not needed at runtime. Build and run commands are in the [installation guide](./install_guidance.md).
 
 ## Related Documentation
 
