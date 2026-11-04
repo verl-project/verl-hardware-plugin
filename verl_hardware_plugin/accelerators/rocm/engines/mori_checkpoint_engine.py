@@ -673,6 +673,13 @@ class MoriCheckpointEngine(CheckpointEngine):
             return "bucket with bad flags"
         if not all(msg.get(f) is None or _is_int(msg.get(f)) for f in ("uid", "global_steps")):
             return "bucket with a bad uid or step"
+        index = msg.get("index")  # export="shard"
+        if index is not None and not (
+            isinstance(index, list) and len(index) == len(metas) and all(i is None or _is_int(i) for i in index)
+        ):
+            return "bucket with a bad tensor index"
+        if not (msg.get("model_type") is None or isinstance(msg.get("model_type"), str)):
+            return "bucket with a bad model type"
         return None
 
     def _check_abort(self):

@@ -1012,6 +1012,8 @@ def test_control_inbox_drops_invalid_messages_of_the_current_sync(mori_env):
         {**bucket, "c": 0, "used": 8, "metas": [["w", [4], "float32", 0, 16, 0]]},  # entry beyond the bucket
         {**bucket, "c": 0, "is_last": "yes"},
         {**bucket, "c": 0, "uid": "x"},
+        {**bucket, "c": 0, "index": [1, 2]},  # export="shard": one index per entry
+        {**bucket, "c": 0, "model_type": 3},
     ]
     _push_raw([e._inbox_addr for e in actors + rollouts], [json.dumps(m).encode() for m in invalid])
 
