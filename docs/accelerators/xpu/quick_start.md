@@ -88,27 +88,11 @@ This is a smoke test: `total_training_steps=2` stops after two steps (without it
 batch 16 is about 467 steps). Raise it for a longer run. A `DataLoader worker ... is killed by signal` traceback
 printed at exit is shutdown noise after training has finished.
 
-Expected (Qwen2.5-0.5B-Instruct, GSM8K, batch 16, 1x Arc Pro B60). The first step includes warm-up; the second shows
-steady state:
-
-```text
-step 1:  timing_s/step: ~16-21   perf/throughput: ~190-235 tok/s
-step 2:  timing_s/step: ~8-8.5   perf/throughput: ~440-465 tok/s
-timing_per_token_ms/gen: ~1.0    perf/max_memory_allocated_gb: ~9.2
-```
-
-(Three runs on 2026-10-21 to 2026-10-23: vLLM 0.29.0+xpu, torch 2.13.0+xpu, this plugin at `e5ab532`, verl `main` at
-different commits; a 1-GPU rerun on vLLM 0.32.0+xpu, torch 2.14.0+xpu gave the same step times. Timings vary with the stack and the host.)
+Expected: two training steps are logged, each with metrics such as `timing_s/step` and `perf/throughput`, and the
+process exits. Step times and throughput depend on the GPU and the software stack, so none are listed here.
 
 Two GPUs: set `ZE_AFFINITY_MASK=0,1`, `trainer.n_gpus_per_node=2` and `+ray_kwargs.ray_init.num_gpus=2`, and keep
-everything else the same. At this small batch the step time does not drop, because fixed per-step overhead dominates.
-`perf/throughput` is reported per GPU, so it is about half of the 1-GPU value; use a larger batch to see scaling.
-
-```text
-step 1:  timing_s/step: ~16   perf/throughput: ~125 tok/s per GPU
-step 2:  timing_s/step: ~8    perf/throughput: ~235 tok/s per GPU
-perf/max_memory_allocated_gb: ~5.4 per GPU
-```
+everything else the same. `perf/throughput` is reported per GPU.
 
 ## 4. Run the Plugin Test Suite
 
@@ -127,8 +111,8 @@ Intel GPU attached.
 | Inference engine | vLLM validated | SGLang: `update_weights` — Work in Progress |
 | Trainer backend | FSDP, FSDP2 | Megatron — Work in Progress |
 | Algorithms | GRPO, PPO, SFT | Validated on GSM8K / Qwen2.5 |
-| Hardware (1-GPU) | Validated | Arc Pro B60: ~8 s/step steady state, ~450 tok/s (batch 16, Qwen2.5-0.5B, vLLM 0.29.0 and 0.32.0) |
-| Hardware (2-GPU) | Validated | Arc Pro B60 x2: ~8 s/step steady state at the same batch (~235 tok/s per GPU); FSDP2 and sleep mode also run |
+| Hardware (1-GPU) | Validated | Arc Pro B60 (the launch command above) |
+| Hardware (2-GPU) | Validated | Arc Pro B60 x2; FSDP2 and sleep mode also run |
 | Multi-node | Work in Progress | Two-node collectives work only with `CCL_ENABLE_SYCL_KERNELS=0` (then `ReduceOp.AVG` is unavailable); with oneCCL defaults a 64 MiB `all_reduce` across nodes hangs. A multi-node verl training run is not validated |
 | Profiler | Intel VTune (ITT) — Validated | `profiler_markers()` hook merged into verl-core `main` on 2026-10-08; VTune collector capture itself still untested, see [profiling.md](./profiling.md) |
 
