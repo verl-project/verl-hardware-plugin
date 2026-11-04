@@ -150,7 +150,7 @@ class TPUEngineOptions:
             ``pad_to_length`` is set, else 256).
         model_kernels: Optional torchtitan TPU kernels of the model (``engines.tpu_model_kernels``): ``auto``
             (default: what the installed torchtitan provides), ``none``, ``all``, or a comma-separated subset.
-        ep_capacity_factor: Per-destination-rank token capacity multiplier of ``TpuQwen35TokenDispatcher`` when
+        ep_capacity_factor: Per-destination-rank token capacity multiplier of the TPU EP token dispatcher when
             ``expert_parallel_size > 1`` (default: ``4.0``). torchtitan's pretraining default (``1.25``) drops
             skewed RL / math tokens across 32-64 EP ranks while vLLM rollout is dropless.
         rollout_expert_parallel: Export Qwen3.5 MoE experts in vLLM's expert-parallel layout so the rollout
@@ -169,6 +169,14 @@ class TPUEngineOptions:
             and casts the result into the bf16 parameters (default: ``False``). Without it, bf16 weights absorb no
             update smaller than half a bf16 ulp (lr 1e-6 updates mostly round to zero). With
             ``optimizer_host_offload`` the masters stay resident in host memory with the optimizer states.
+        ep_dispatcher: MoE expert-parallel token dispatcher mode when ``expert_parallel_size > 1``: ``auto``
+            (default: ``ragged`` when ``torch.ops.tpu._ragged_all_to_all`` is available and ``spmd_backend`` is not
+            ``spmd_types``, else ``static``), ``ragged`` (:class:`TpuRaggedEPTokenDispatcher` sending ``1.0x`` real
+            routed tokens + unpadded MegaBlox ``gmm``/``tgmm`` group counts), or ``static`` (uniform ``[ep * cap, D]``
+            ``TpuQwen35TokenDispatcher``).
+        enable_tpu_topo_mesh: Preserve physical 3D ICI torus ``(x, y, z)`` rank order on ``ParallelismConfig``
+            (``torch.tpu.topology_aware_mesh`` + ``DeviceMesh(preserve_rank_order=True)``). ``None`` (default) enables
+            it automatically whenever supported by the installed ``torchtitan`` and ``torch`` (``torch >= 2.15``).
     """
 
     use_splash_attention: Optional[bool] = None
@@ -185,6 +193,8 @@ class TPUEngineOptions:
     param_dtype: Optional[str] = None
     optimizer_host_offload: Optional[bool] = None
     fp32_master: Optional[bool] = None
+    ep_dispatcher: Optional[str] = None
+    enable_tpu_topo_mesh: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -202,6 +212,8 @@ _ENGINE_KINDS: dict[str, type] = {
     "param_dtype": str,
     "optimizer_host_offload": bool,
     "fp32_master": bool,
+    "ep_dispatcher": str,
+    "enable_tpu_topo_mesh": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
@@ -256,6 +268,14 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
         )
     if values.get("fp32_master") and values.get("param_dtype") != "bfloat16":
         raise ValueError(f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.fp32_master needs param_dtype=bfloat16")
+    if values.get("ep_dispatcher") is not None:
+        ep_disp = values["ep_dispatcher"].strip().lower()
+        if ep_disp not in ("auto", "ragged", "static"):
+            raise ValueError(
+                f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ep_dispatcher must be auto, ragged, or static, "
+                f"got {values['ep_dispatcher']!r}"
+            )
+        values["ep_dispatcher"] = ep_disp
     return TPUEngineOptions(**values)
 
 
