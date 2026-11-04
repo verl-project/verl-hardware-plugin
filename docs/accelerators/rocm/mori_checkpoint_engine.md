@@ -71,13 +71,14 @@ With `export: shard`, stripe r carries trainer rank r's own shards from the trai
 from the pieces of all stripes and split packed MoE experts into per-expert names, as the full export does; server
 adapters see the same `(name, full tensor)` stream.
 
-- Needs two verl hooks: the trainer worker hands its training engine to `send_weights` when the checkpoint engine
-  sets `consumes_training_engine`, and the training engine declares `per_tensor_param_shard_is_hf` (FSDP). With a
-  verl that lacks them, `export: shard` is refused.
+- Needs verl's `consumes_training_engine` hook: the trainer worker then hands its training engine to `send_weights`
+  instead of a generator of full tensors. With a verl that lacks it, `export: shard` is refused.
+- Only verl's FSDP training engines, whose shards are HF-named. VeOmni (fused expert stacks), Megatron (MCore-named
+  TP slices) and TorchTitan are refused.
 - Shards must be one flat range of the full tensor (FSDP2 `Shard(0)`); replicated tensors are sent once.
   `num_chains` must be >= the trainer world size.
-- Refused: LoRA, QAT, Megatron (its shards are MCore-named TP slices) and specs that need a to-HF conversion; use
-  `export: full`. A refusal fails the sync on every worker.
+- Also refused: LoRA, QAT and specs that need a to-HF conversion; use `export: full`. A refusal fails the sync on
+  every worker.
 - Rollout workers hold at most `num_slots * bucket size` plus the largest tensor of partly assembled tensors: a stripe
   starts a new tensor only if it fits that budget or is the next incomplete tensor in export order. A sync fails if
   any tensor is still incomplete when every stripe has ended.

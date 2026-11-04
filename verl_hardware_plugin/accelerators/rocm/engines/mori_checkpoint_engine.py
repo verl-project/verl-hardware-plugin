@@ -40,11 +40,10 @@ Args (engine_kwargs["mori"]):
     export (str): "full" (default): stripes come from the trainer's full-tensor generator (`get_per_tensor_param`).
         "shard": every trainer rank sends its own shards from `get_per_tensor_param_shard()` (bf16); needs
         num_chains >= trainer world size and shards that are one flat range of the full tensor (FSDP2 Shard(0)).
-        Only training engines that declare their shard export to be in HF layout (`per_tensor_param_shard_is_hf`,
-        FSDP); LoRA, QAT and specs that need a to-HF conversion are refused (use "full"). The trainer worker hands
-        its training engine to `send_weights` (`consumes_training_engine`); with a verl that lacks these two hooks,
-        export="shard" is refused. Receivers hold at most num_slots * bucket_size + the largest tensor of partly
-        assembled tensors.
+        Only verl's FSDP training engines, whose shards are HF-named (not VeOmni, Megatron or TorchTitan); LoRA, QAT
+        and specs that need a to-HF conversion are refused (use "full"). The trainer worker hands its training
+        engine to `send_weights` (`consumes_training_engine`); with a verl that lacks this hook, export="shard" is
+        refused. Receivers hold at most num_slots * bucket_size + the largest tensor of partly assembled tensors.
     intra_node (str): "xgmi" (default) copies within a node over XGMI; "rdma" keeps it on the NIC.
     node_id (str): Node identity used to group rollout workers. Default: the Ray node id.
     qp_per_transfer (int), num_nics_per_transfer (int), enable_chunking (bool): MoRI RDMA settings (4, 1, True).
@@ -61,6 +60,7 @@ import json
 import logging
 import os
 import socket
+import sys
 import time
 import uuid
 from types import SimpleNamespace
@@ -167,6 +167,27 @@ def _shard_flat_offset(spec) -> tuple[int, bool]:
             f"shape {place.local_shape} at offset {place.global_offset} of {place.full_shape}. Use export='full'."
         )
     return place.flat_offset, contributes
+
+
+# export="shard" sends raw shards, so only training engines whose get_per_tensor_param_shard() yields HF-named
+# parameters cut in HF coordinates: verl's FSDP engines, but not VeOmni (its fused expert stacks need converter specs).
+# Megatron (MCore-named local TP slices) and TorchTitan are not FSDP engines.
+_HF_SHARD_ENGINES = (("verl.workers.engine.fsdp.transformer_impl", "FSDPEngine"),)
+_NOT_HF_SHARD_ENGINES = (("verl.workers.engine.veomni.transformer_impl", "VeOmniEngine"),)
+
+
+def _shards_are_hf(engine) -> bool:
+    """Whether `engine` is one of _HF_SHARD_ENGINES and none of _NOT_HF_SHARD_ENGINES. Classes are looked up among
+    the loaded modules only (an engine's class is loaded wherever the engine exists), so nothing is imported."""
+
+    def isa(engine_classes):
+        for module, name in engine_classes:
+            cls = getattr(sys.modules.get(module), name, None)
+            if cls is not None and isinstance(engine, cls):
+                return True
+        return False
+
+    return isa(_HF_SHARD_ENGINES) and not isa(_NOT_HF_SHARD_ENGINES)
 
 
 def _node_ip() -> str:
@@ -785,20 +806,19 @@ class MoriCheckpointEngine(CheckpointEngine):
     @staticmethod
     def _shard_source(engine):
         """export="shard": (generator of (name, local shard, ShardSpec), HF model type) from a verl training engine.
-        Only for engines that declare their shards to be in HF layout (`per_tensor_param_shard_is_hf`, e.g. FSDP; a
-        Megatron shard is an MCore-named local TP slice) and only without the conversions the full export would apply
-        on top: LoRA (the full export merges or extracts adapters) and QAT (it quantizes) are refused, and so are
-        specs that need a to-HF conversion (`_shard_pieces`)."""
+        Only for engines whose shards are HF-named (`_shards_are_hf`: FSDP) and only without the conversions the full
+        export would apply on top: LoRA (the full export merges or extracts adapters) and QAT (it quantizes) are
+        refused, and so are specs that need a to-HF conversion (`_shard_pieces`)."""
         if not hasattr(engine, "get_per_tensor_param_shard"):
             raise TypeError(
                 f"mori export='shard' needs the training engine, got {type(engine).__name__}: this verl's trainer "
                 f"worker does not hand it over (CheckpointEngine.consumes_training_engine); use export='full'"
             )
-        if not getattr(engine, "per_tensor_param_shard_is_hf", False):
+        if not _shards_are_hf(engine):
             raise NotImplementedError(
-                f"mori export='shard' needs a training engine whose shard export is in HF layout "
-                f"(per_tensor_param_shard_is_hf, e.g. FSDP); {type(engine).__name__} does not declare it; "
-                f"use export='full'"
+                f"mori export='shard' supports verl's FSDP training engines only, whose shards are HF-named; "
+                f"{type(engine).__name__} is not one (e.g. VeOmni's fused experts and Megatron's MCore TP slices "
+                f"need a conversion first); use export='full'"
             )
         mc = getattr(engine, "model_config", None)
         module = getattr(engine, "module", None)

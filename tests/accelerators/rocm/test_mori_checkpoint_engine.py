@@ -366,11 +366,9 @@ def test_every_rollout_gets_every_tensor(mori_env, n_actors, nodes, num_chains, 
     asyncio.run(run())
 
 
-class _ShardedTrainerRank:
+class _ShardExport:
     """One rank of a trainer whose parameters are cut along dim 0 into `world` shards (torch.chunk, as FSDP2
     Shard(0)); exposes get_per_tensor_param_shard() like verl's training engines: (name, flat local shard, spec)."""
-
-    per_tensor_param_shard_is_hf = True  # as the FSDP engine declares
 
     def __init__(self, rank, world, weights, replicated=(), model_type=None, drop=()):
         self.rank, self.world, self.weights, self.replicated = rank, world, weights, set(replicated)
@@ -400,6 +398,19 @@ class _ShardedTrainerRank:
                 )
 
         return gen(), None
+
+
+def _fsdp_engine_cls():
+    """verl's FSDPEngine, the training engine whose shards export="shard" accepts."""
+    from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
+
+    return FSDPEngine
+
+
+def _sharded_rank(*args, base=None, **kwargs):
+    """A fake trainer rank that is an instance of verl's FSDPEngine (or of `base`), as shard export requires."""
+    cls = type("_ShardedTrainerRank", (_ShardExport, base or _fsdp_engine_cls()), {})
+    return cls(*args, **kwargs)
 
 
 def _moe_weights(seed):
@@ -449,7 +460,7 @@ def test_shard_export_assembles_full_tensors(mori_env, n_actors, nodes, num_slot
         for step in range(2):
             _wire(actors, rollouts, fab)
             ws = _moe_weights(step)
-            ranks = [_ShardedTrainerRank(i, n_actors, ws, ["embed"], "qwen3_moe") for i in range(n_actors)]
+            ranks = [_sharded_rank(i, n_actors, ws, ["embed"], "qwen3_moe") for i in range(n_actors)]
             fab["writes"].clear()
             res = await asyncio.gather(
                 *[a.send_weights(r, global_steps=step) for a, r in zip(actors, ranks, strict=True)],
@@ -484,7 +495,7 @@ def test_shard_assembly_is_bounded_when_stripes_run_apart(mori_env):
     ws = [(f"layer{i}.w", torch.randn(64, 64, generator=g)) for i in range(96)]  # 16 KiB each, 1.5 MiB in total
     actors = [_new(mod, 4, node="trainer", is_master=(i == 0), export="shard") for i in range(4)]
     rollouts = [_new(mod, 4, node="r0", export="shard") for _ in range(2)]
-    ranks = [_ShardedTrainerRank(i, 4, ws) for i in range(4)]
+    ranks = [_sharded_rank(i, 4, ws) for i in range(4)]
 
     async def run():
         _wire(actors, rollouts, fab)
@@ -512,7 +523,7 @@ def test_shard_assembly_bound_with_empty_shards_and_oversized_tensors(mori_env):
     ws = [(f"w{i}", torch.randn(rows, 196608 // 4 // rows, generator=g)) for i, rows in enumerate((2, 3, 4))]
     actors = [_new(mod, 4, node="trainer", is_master=(i == 0), export="shard") for i in range(4)]
     rollouts = [_new(mod, 4, node="r0", export="shard") for _ in range(2)]
-    ranks = [_ShardedTrainerRank(i, 4, ws) for i in range(4)]
+    ranks = [_sharded_rank(i, 4, ws) for i in range(4)]
 
     async def run():
         _wire(actors, rollouts, fab)
@@ -537,7 +548,7 @@ def test_shard_export_fails_if_a_tensor_stays_incomplete(mori_env):
     ws = [(f"layer{i}.w", torch.randn(16, 8, generator=g)) for i in range(8)]
     actors = [_new(mod, 2, node="trainer", is_master=(i == 0), export="shard") for i in range(2)]
     rollouts = [_new(mod, 2, node="r0", export="shard") for _ in range(2)]
-    ranks = [_ShardedTrainerRank(i, 2, ws, drop=["layer3.w"] if i == 1 else ()) for i in range(2)]
+    ranks = [_sharded_rank(i, 2, ws, drop=["layer3.w"] if i == 1 else ()) for i in range(2)]
 
     async def run():
         _wire(actors, rollouts, fab)
@@ -551,16 +562,21 @@ def test_shard_export_fails_if_a_tensor_stays_incomplete(mori_env):
     assert all(isinstance(x, RuntimeError) and "incomplete" in str(x) for x in res[2:]), res
 
 
-@pytest.mark.parametrize("case", ["not-an-engine", "not-hf-layout", "lora", "qat", "to-hf-spec"])
-def test_shard_export_refuses_what_it_cannot_reproduce(mori_env, case):
+@pytest.mark.parametrize("case", ["not-an-engine", "not-fsdp", "veomni", "lora", "qat", "to-hf-spec"])
+def test_shard_export_refuses_what_it_cannot_reproduce(mori_env, monkeypatch, case):
     """Shard export sends raw shards; it must refuse sources whose full export would convert them first."""
     mod, fab = mori_env
     ws = [("w", torch.randn(8, 4))]
-    rank = _ShardedTrainerRank(0, 1, ws, model_type="qwen3")
+    rank = _sharded_rank(0, 1, ws, model_type="qwen3")
     if case == "not-an-engine":
         rank = iter([("w", ws[0][1], types.SimpleNamespace(full_shape=(8, 4), place=0, contributes=True))])
-    elif case == "not-hf-layout":  # e.g. Megatron: MCore names, local TP slices with full_shape == local shape
-        rank.per_tensor_param_shard_is_hf = False
+    elif case == "not-fsdp":  # e.g. Megatron: MCore names, local TP slices with full_shape == local shape
+        rank = _sharded_rank(0, 1, ws, model_type="qwen3", base=object)
+    elif case == "veomni":  # an FSDP engine whose fused expert stacks need converter specs
+        veomni = types.ModuleType("verl.workers.engine.veomni.transformer_impl")
+        veomni.VeOmniEngine = type("VeOmniEngine", (_fsdp_engine_cls(),), {})
+        monkeypatch.setitem(sys.modules, veomni.__name__, veomni)
+        rank = _sharded_rank(0, 1, ws, model_type="qwen3", base=veomni.VeOmniEngine)
     elif case == "lora":
         rank.model_config.lora_rank = 8
     elif case == "qat":
