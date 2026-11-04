@@ -35,9 +35,9 @@ Code: `verl_hardware_plugin/accelerators/rocm/engines/mori_checkpoint_engine.py`
 - cupy, to allocate the region outside PyTorch's caching allocator: MoRI cannot register PyTorch expandable-segment
   (VMM) memory. Without cupy the region is allocated with expandable segments switched off for that allocation.
 - pyzmq (part of verl's ROCm images).
-- verl 0.9.1 or newer. A rollout worker whose server adapter fails before its first tensor tells its peers at once
-  only with a verl whose `CheckpointEngineWorker.update_weights` closes the receive stream on failure; with older
-  verl the peers stop when `timeout_s` expires.
+- verl 0.9.1 or newer. If a rollout worker's server adapter fails before its first tensor, the driver sees the error
+  at once (the manager's `ray.get` returns on the first error); the other workers stop when `timeout_s` expires, as
+  verl's `CheckpointEngineWorker.update_weights` does not close the receive stream.
 
 ## Configuration
 
