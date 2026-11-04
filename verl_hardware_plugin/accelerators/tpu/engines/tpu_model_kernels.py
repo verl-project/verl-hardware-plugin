@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import inspect
 import logging
 import os
 from types import SimpleNamespace
@@ -145,17 +146,30 @@ def configure_model_spec(
     kernels: frozenset[str],
     *,
     expert_parallel_degree: int = 1,
+    ep_token_chunks: Optional[int] = None,
+    ep_paired_grouped_mm: bool = False,
 ) -> None:
-    """Sets the model-config options of ``kernels`` on ``model_spec.model`` in place (``moe``: Pallas grouped mm)."""
+    """Sets the model-config options of ``kernels`` on ``model_spec.model`` in place (``moe``: Pallas grouped mm).
+
+    Under expert parallelism, ``ep_token_chunks`` / ``ep_paired_grouped_mm`` configure torchtitan's Qwen3.5 fast
+    dropless EP (``configure_qwen3_5_expert_parallel``) when the installed torchtitan provides it.
+    """
     if "moe" not in kernels:
         return
     from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
 
     _qwen3_5_config_registry()._use_tpu_moe_kernels(SimpleNamespace(model_spec=model_spec))
+    paired_under_ep = expert_parallel_degree > 1 and configure_qwen3_5_expert_parallel(
+        model_spec,
+        expert_parallel_degree=expert_parallel_degree,
+        num_token_chunks=ep_token_chunks,
+        paired_grouped_mm=ep_paired_grouped_mm,
+    )
     for _, experts, _, _ in model_spec.model.traverse(TpuGroupedExperts.Config):
-        # ExpertParallel shards expert weights on dim 0, which paired (w1 + w3) Pallas grouped matmul disallows.
-        # Turn it off here too so builds with #73 but without #6's TpuQwen35Model.Config do not fail at EP > 1.
-        if expert_parallel_degree > 1 and hasattr(experts, "use_pallas_paired_grouped_mm"):
+        # ExpertParallel shards expert weights on dim 0, which paired (w1 + w3) Pallas grouped matmul disallows on
+        # torchtitan builds without ``allow_ep_paired_grouped_mm``. Turn it off here too so builds with #73 but
+        # without #6's TpuQwen35Model.Config do not fail at EP > 1.
+        if expert_parallel_degree > 1 and not paired_under_ep and hasattr(experts, "use_pallas_paired_grouped_mm"):
             experts.use_pallas_paired_grouped_mm = False
         # The 512-row tiles were tuned for Qwen3.5-35B-A3B (hidden 2048). At hidden 4096 (Qwen3.5-397B-A17B) the
         # weight-gradient kernels do not fit in VMEM with full K/N tiles: tile K/N of the dWeight instead.
@@ -169,6 +183,58 @@ def configure_model_spec(
             experts.pallas_grouped_mm_tile_m = _MOE_GROUPED_MM_TILE_M
         if hasattr(experts, "pallas_grouped_mm_tgmm_tiling"):
             experts.pallas_grouped_mm_tgmm_tiling = _MOE_GROUPED_MM_TGMM_TILING
+
+
+def configure_qwen3_5_expert_parallel(
+    model_spec: Any,
+    *,
+    expert_parallel_degree: int,
+    num_token_chunks: Optional[int] = None,
+    paired_grouped_mm: bool = False,
+) -> bool:
+    """Configures torchtitan's Qwen3.5 fast dropless EP on ``model_spec`` when the installed torchtitan has it.
+
+    Calls the torchtitan recipe helper ``qwen3_5.config_registry._use_expert_parallel`` (fast dropless EP branch):
+    it switches the routed experts / dispatcher configs to ``TpuQwen35RoutedExperts`` /
+    ``TpuQwen35TokenDispatcher`` (``comm_mode="auto"``: Ring-of-Experts when ``ep <= top_k``, else
+    ``ragged_all_to_all``), sets ``num_token_chunks`` (``1`` when ``num_token_chunks`` is unset, i.e. no chunking)
+    and ``allow_ep_paired_grouped_mm``. Its SparseCore libtpu flags are left to the launcher (``LIBTPU_INIT_ARGS``),
+    since libtpu reads them before the model is built. Returns whether the paired grouped matmul stays enabled under
+    EP; ``False`` (nothing changed) on torchtitan builds without the helper.
+    """
+    try:
+        config_registry = _qwen3_5_config_registry()
+    except ImportError:
+        return False
+    use_expert_parallel = getattr(config_registry, "_use_expert_parallel", None)
+    if use_expert_parallel is None:
+        return False
+    params = inspect.signature(use_expert_parallel).parameters
+    if not {"num_token_chunks", "allow_ep_paired_grouped_mm"} <= set(params):
+        return False
+    kwargs: dict[str, Any] = {
+        "ep_degree": expert_parallel_degree,
+        "num_token_chunks": num_token_chunks or 1,
+        "allow_ep_paired_grouped_mm": bool(paired_grouped_mm),
+    }
+    if "enable_sparsecore_offload" in params:
+        kwargs["enable_sparsecore_offload"] = False
+    # The helper edits a trainer recipe; only ``model_spec`` matters here, the rest is a scratch namespace.
+    recipe = SimpleNamespace(
+        model_spec=model_spec,
+        parallelism=SimpleNamespace(expert_parallel_degree=expert_parallel_degree),
+        compile=SimpleNamespace(compile_grad_norm=False),
+        tpu_config=SimpleNamespace(eager_mode="DEFER_AND_FUSE"),
+        libtpu_init_flags={},
+    )
+    use_expert_parallel(recipe, **kwargs)
+    logger.info(
+        "torchtitan Qwen3.5 fast EP: ep=%d, num_token_chunks=%d, paired grouped mm under EP=%s",
+        expert_parallel_degree,
+        kwargs["num_token_chunks"],
+        kwargs["allow_ep_paired_grouped_mm"],
+    )
+    return bool(paired_grouped_mm)
 
 
 def is_qwen3_moe(torchtitan_name: str, hf_config: Any) -> bool:

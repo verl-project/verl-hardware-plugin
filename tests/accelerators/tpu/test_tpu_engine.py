@@ -1951,6 +1951,78 @@ def test_ep_capacity_factor_and_strided_pad_tokens():
     assert wide_exp.pallas_grouped_mm_w2_tgmm_tiling == (256, 1024, 1024)
 
 
+def test_configure_model_spec_qwen3_5_fast_ep_chunks_and_paired_gmm():
+    """With torchtitan's ``_use_expert_parallel`` (fast dropless EP): chunks + paired gmm under EP are forwarded."""
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels
+
+    class _FakeExpertsCfg:
+        dim = 4096
+        use_pallas_paired_grouped_mm = True
+        pallas_grouped_mm_tgmm_tiling = None
+        pallas_grouped_mm_w2_tgmm_tiling = None
+
+    class _FakeTpuGroupedExperts:
+        Config = _FakeExpertsCfg
+
+    exp = _FakeExpertsCfg()
+    fake_spec = SimpleNamespace(model=SimpleNamespace(traverse=lambda cls: [(None, exp, None, None)]))
+    fake_ge = types.ModuleType("torchtitan.experiments.tpu.grouped_experts")
+    fake_ge.TpuGroupedExperts = _FakeTpuGroupedExperts  # type: ignore[attr-defined]
+    calls: list[dict] = []
+
+    def _use_expert_parallel(
+        cfg,
+        *,
+        ep_degree,
+        comm_mode="auto",
+        num_token_chunks=None,
+        roe_use_pallas_tc=True,
+        allow_ep_paired_grouped_mm=True,
+        enable_sparsecore_offload=True,
+    ):
+        assert cfg.model_spec is fake_spec
+        calls.append(
+            dict(
+                ep=ep_degree,
+                chunks=num_token_chunks,
+                paired=allow_ep_paired_grouped_mm,
+                sparsecore=enable_sparsecore_offload,
+            )
+        )
+
+    fast_reg = SimpleNamespace(_use_tpu_moe_kernels=lambda _: None, _use_expert_parallel=_use_expert_parallel)
+    with (
+        mock.patch.dict(sys.modules, {"torchtitan.experiments.tpu.grouped_experts": fake_ge}),
+        mock.patch.object(tpu_model_kernels, "_qwen3_5_config_registry", return_value=fast_reg),
+    ):
+        tpu_model_kernels.configure_model_spec(
+            fake_spec, frozenset({"moe"}), expert_parallel_degree=8, ep_token_chunks=2, ep_paired_grouped_mm=True
+        )
+        assert exp.use_pallas_paired_grouped_mm is True  # kept under EP
+        tpu_model_kernels.configure_model_spec(fake_spec, frozenset({"moe"}), expert_parallel_degree=8)
+        assert exp.use_pallas_paired_grouped_mm is False  # default: unpaired under EP
+        exp.use_pallas_paired_grouped_mm = True
+        tpu_model_kernels.configure_model_spec(fake_spec, frozenset({"moe"}), expert_parallel_degree=1)
+        assert exp.use_pallas_paired_grouped_mm is True  # no EP: untouched, helper not called
+    # SparseCore libtpu flags are left to LIBTPU_INIT_ARGS; unset chunks means no chunking (1).
+    assert calls == [
+        dict(ep=8, chunks=2, paired=True, sparsecore=False),
+        dict(ep=8, chunks=1, paired=False, sparsecore=False),
+    ]
+
+    # torchtitan builds without the helper: unchanged behavior (paired gmm off under EP).
+    old_reg = SimpleNamespace(_use_tpu_moe_kernels=lambda _: None)
+    exp.use_pallas_paired_grouped_mm = True
+    with (
+        mock.patch.dict(sys.modules, {"torchtitan.experiments.tpu.grouped_experts": fake_ge}),
+        mock.patch.object(tpu_model_kernels, "_qwen3_5_config_registry", return_value=old_reg),
+    ):
+        tpu_model_kernels.configure_model_spec(
+            fake_spec, frozenset({"moe"}), expert_parallel_degree=8, ep_token_chunks=2, ep_paired_grouped_mm=True
+        )
+    assert exp.use_pallas_paired_grouped_mm is False
+
+
 def test_torchtitan_head_compatibility_for_kda_multi_mesh_and_ep_simple_fsdp(monkeypatch):
     """Compat with torchtitan HEAD before #73-#80/#6 land: tokamax kda probe, multi-mesh chunks, and EP SimpleFSDP."""
     from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu, tpu_model_kernels, tpu_utils

@@ -177,6 +177,13 @@ class TPUEngineOptions:
         enable_tpu_topo_mesh: Preserve physical 3D ICI torus ``(x, y, z)`` rank order on ``ParallelismConfig``
             (``torch.tpu.topology_aware_mesh`` + ``DeviceMesh(preserve_rank_order=True)``). ``None`` (default) enables
             it automatically whenever supported by the installed ``torchtitan`` and ``torch`` (``torch >= 2.15``).
+        ep_token_chunks: With ``expert_parallel_size > 1`` and a torchtitan that has ``TpuQwen35RoutedExperts``
+            (Qwen3.5 fast dropless EP), pipeline each MoE layer's dispatch -> experts -> combine over this many token
+            chunks, overlapping one chunk's expert matmuls with the next chunk's EP collectives (default: unset, no
+            chunking). Needs ``ep_dispatcher=static`` so torchtitan's ``TpuQwen35TokenDispatcher`` runs.
+        ep_paired_grouped_mm: With ``expert_parallel_size > 1`` and a torchtitan whose ``TpuGroupedExperts`` has
+            ``allow_ep_paired_grouped_mm``, keep the paired (w1 + w3) Pallas grouped matmul under EP (default:
+            ``False``: unpaired under EP, as torchtitan builds without it require).
     """
 
     use_splash_attention: Optional[bool] = None
@@ -195,6 +202,8 @@ class TPUEngineOptions:
     fp32_master: Optional[bool] = None
     ep_dispatcher: Optional[str] = None
     enable_tpu_topo_mesh: Optional[bool] = None
+    ep_token_chunks: Optional[int] = None
+    ep_paired_grouped_mm: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -214,6 +223,8 @@ _ENGINE_KINDS: dict[str, type] = {
     "fp32_master": bool,
     "ep_dispatcher": str,
     "enable_tpu_topo_mesh": bool,
+    "ep_token_chunks": int,
+    "ep_paired_grouped_mm": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
@@ -276,6 +287,10 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
                 f"got {values['ep_dispatcher']!r}"
             )
         values["ep_dispatcher"] = ep_disp
+    if values.get("ep_token_chunks") is not None and values["ep_token_chunks"] < 1:
+        raise ValueError(
+            f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ep_token_chunks must be >= 1, got {values['ep_token_chunks']!r}"
+        )
     return TPUEngineOptions(**values)
 
 

@@ -866,6 +866,8 @@ class TorchTitanTPUEngine(BaseEngine):
             model_spec,
             self._tpu_kernels,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
+            ep_token_chunks=tpu_options.ep_token_chunks,
+            ep_paired_grouped_mm=bool(tpu_options.ep_paired_grouped_mm),
         )
         if setup is not None and setup.configure is not None:
             setup.configure(
