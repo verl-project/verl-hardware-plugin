@@ -51,6 +51,7 @@ def test_engine_kwargs_are_parsed_and_typed():
                 "seq_bucket_size": "512",
                 "context_parallel_strategy": "ulysses",
                 "ep_capacity_factor": "4.0",
+                "rollout_expert_parallel": "true",
             }
         )
     )
@@ -63,6 +64,7 @@ def test_engine_kwargs_are_parsed_and_typed():
         seq_bucket_size=512,
         context_parallel_strategy="ulysses",
         ep_capacity_factor=4.0,
+        rollout_expert_parallel=True,
     )
     assert get_tpu_engine_options(_cfg()) == TPUEngineOptions()
     assert get_tpu_engine_options(None) == TPUEngineOptions()

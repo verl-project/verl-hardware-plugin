@@ -306,6 +306,7 @@ class TorchTitanTPUEngine(BaseEngine):
         self._torchtitan_name = torchtitan_name
 
         tpu_options = get_tpu_engine_options(self.engine_config)
+        self._tpu_options = tpu_options
 
         # Get ModelSpec from model registry
         model_module = importlib.import_module(get_torchtitan_model_module_name(torchtitan_name))
@@ -1177,7 +1178,10 @@ class TorchTitanTPUEngine(BaseEngine):
             from verl_hardware_plugin.accelerators.tpu.rollout.qwen3_5_layout import make_tpu_sync_local_layout
 
             hf_config = self.model_config.hf_config
-            local_transform = make_tpu_sync_local_layout(getattr(hf_config, "text_config", None) or hf_config)
+            local_transform = make_tpu_sync_local_layout(
+                getattr(hf_config, "text_config", None) or hf_config,
+                expert_parallel=bool(self._tpu_options.rollout_expert_parallel),
+            )
         elif getattr(self, "_torchtitan_name", None) == "qwen3":
             # Qwen3 MoE: tpu-sync sends each expert stack as one 3-D tensor, so that FSDP shards of whole experts are
             # sent without a gather and the rollout installs its slices straight into vLLM's w13 / w2

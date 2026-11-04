@@ -239,6 +239,17 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         # this worker's TP rank: a single rollout replica without pipeline parallelism, as the registration below
         # ("sampler/<rank>" on mesh [1, tp_size]) already assumes.
         num_kv_heads = worker.vllm_config.model_config.get_total_num_kv_heads()
+        # Tensors received straight into vLLM's weights instead of an HBM staging buffer (see
+        # DirectInstallLayout.zero_copy_targets).
+        zero_copy: dict[str, torch.Tensor] = {}
+        if layout is not None and layout.zero_copy_targets is not None:
+            init_sd = vllm_model.state_dict()
+
+            def _find_init_key(k: str) -> Optional[str]:
+                resolved = resolve_model_key(k, init_sd)
+                return resolved if resolved in init_sd else None
+
+            zero_copy = layout.zero_copy_targets(plan, init_sd, _find_init_key, global_shapes_map)
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
@@ -256,9 +267,18 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                 )
             replicas[name] = shard.replicas
 
-            # Allocate a local staging buffer with matching layout (the trainer sends bf16)
-            device = torch.device(tpu_sync_engine.TPU_SYNC_DEVICE)
-            t = torch.empty(shard.local_shape, dtype=torch.bfloat16, device=device)
+            # Allocate a local staging buffer with matching layout (the trainer sends bf16), or receive straight
+            # into the vLLM weight.
+            t = zero_copy.get(name)
+            if t is not None:
+                if list(t.shape) != list(shard.local_shape):
+                    raise RuntimeError(
+                        f"tpu-sync Sampler Rank {rank_val}: {name} slice {shard.local_shape} != vLLM weight "
+                        f"{list(t.shape)}"
+                    )
+            else:
+                device = torch.device(tpu_sync_engine.TPU_SYNC_DEVICE)
+                t = torch.empty(shard.local_shape, dtype=torch.bfloat16, device=device)
             staging_tensors[name] = t
             staging_sharded[name] = "tp" in shard.sharding_spec
             valid_params.append((name, t))
@@ -280,6 +300,12 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         self._tpu_sync_staging_sharded = staging_sharded
         self._sorted_vllm_params = valid_params
         self._tpu_sync_replicas = replicas
+        if zero_copy:
+            logger.info(
+                f"tpu-sync Sampler Rank {rank_val}: {len(zero_copy)} tensors "
+                f"({sum(t.numel() * t.element_size() for t in zero_copy.values()) / 2**30:.2f} GiB) are received "
+                "straight into vLLM's weights (no staging copy)"
+            )
 
         tpu_sync_engine.tpu_synchronize()
 
