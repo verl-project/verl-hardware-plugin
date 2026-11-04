@@ -32,6 +32,7 @@ verl_hardware_plugin/accelerators/tpu/
 ├── engines/                          # verl core: verl/workers/engine/
 │   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SimpleFSDP, SPMD)
 │   ├── tpu_utils.py                  # Attention, SimpleFSDP, compile and sequence-bucketing helpers; option resolvers
+│   ├── tied_embeddings.py            # One weight for the input embedding and the LM head (engine_kwargs.tpu.tie_embeddings)
 │   └── weight_export.py              # Exports the engine's weights as local FSDP shards or full tensors
 ├── losses/                           # verl core: verl/workers/utils/losses.py
 │   └── loss_inputs.py                # Static-shape inputs for verl's unmodified sft_loss / ppo_loss
@@ -64,6 +65,7 @@ tests/accelerators/tpu/
 ├── test_tpu_allreduce_patch.py       # patches/reduce_avg_allreduce_patch.py
 ├── test_tpu_engine.py                # platform_tpu.py and engines/ (torchtitan_tpu, tpu_utils, weight_export)
 ├── test_tpu_options.py               # options.py (engine_kwargs.tpu, engine_kwargs.tpu-sync, deprecated env vars)
+├── test_tied_embeddings.py           # engines/tied_embeddings.py and the tied weight's export
 ├── test_tpu_loss_inputs.py           # losses/loss_inputs.py
 ├── test_tpu_vllm_rollout.py          # rollout/tpu_vllm.py
 ├── test_tpu_vllm_patches.py          # rollout/tpu_vllm_patches.py

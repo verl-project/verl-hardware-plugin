@@ -125,7 +125,9 @@ class TrainerWeights:
     ``dense`` is a dict of HF-named parameters, or an iterable of such dicts that is consumed lazily during the export
     (``TorchTitanTPUEngine`` converts one transformer layer at a time, so that the tensors its state-dict adapter
     fuses, e.g. Qwen3.5's MoE ``gate_up_proj``, exist for one layer at a time). A parameter reachable under several
-    names (tied embeddings) must appear in one dict.
+    names (tied embeddings) must appear in one dict. It is exported once, and every name yields that same tensor
+    unless ``distinct_alias_buffers`` is set: then ``local_shards()`` yields a copy for every name after the first,
+    so that a receiver that binds each name to its own device buffer (``tpu-sync``) never binds one buffer twice.
 
     ``local_transform``, if given, rewrites each dense dict before ``local_shards()`` exports it: the layout that the
     ``tpu-sync`` receiver installs from (e.g. Qwen3.5's fused ``in_proj_qkv`` / ``conv1d`` / expert ``gate_up_proj``
@@ -145,8 +147,10 @@ class TrainerWeights:
         device: Any,
         local_transform: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
         expert_stack_wire: Optional[Callable[[list[tuple[str, tuple]], tuple[int, ...]], Optional[str]]] = None,
+        distinct_alias_buffers: bool = False,
     ) -> None:
         self._dense_chunks = iter([dense]) if isinstance(dense, dict) else iter(dense)
+        self._distinct_alias_buffers = distinct_alias_buffers
         self._local_transform = local_transform
         self._expert_stacks = expert_stacks
         self._expert_stack_wire = expert_stack_wire
@@ -189,6 +193,8 @@ class TrainerWeights:
             pid = id(param)
             if pid in exported:
                 tensor, shard, _ = exported[pid]
+                if local and self._distinct_alias_buffers:
+                    tensor = tensor.clone()
             else:
                 tensor, shard, kind = self._export_tensor(name, param, local)
                 if local:

@@ -67,7 +67,12 @@ from verl.workers.engine.utils import (
     postprocess_batch_func,
     prepare_micro_batches,
 )
-from verl_hardware_plugin.accelerators.tpu.engines import tpu_fixed_shapes, tpu_model_kernels, tpu_ragged_ep
+from verl_hardware_plugin.accelerators.tpu.engines import (
+    tied_embeddings,
+    tpu_fixed_shapes,
+    tpu_model_kernels,
+    tpu_ragged_ep,
+)
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
@@ -882,6 +887,10 @@ class TorchTitanTPUEngine(BaseEngine):
                 model_spec,
                 parallelize_fn=get_tpu_simple_fsdp_parallelize_fn(torchtitan_name),
             )
+        if tpu_options.tie_embeddings:
+            # One weight for the input embedding and the LM head (engines/tied_embeddings.py); wraps the final
+            # parallelize_fn, so the weights are re-tied after SimpleFSDP has split them.
+            model_spec = tied_embeddings.tie_model_spec(model_spec, get_text_config(self.model_config.hf_config))
 
         # torch_tpu's aten::_fused_adamw_ updates params, exp_avg and exp_avg_sq in place (buffer donation): no
         # param-sized temporary as in the foreach path (+4.2 GB/chip for Qwen3-4B at FSDP=4) and ~2x faster.
@@ -1019,6 +1028,8 @@ class TorchTitanTPUEngine(BaseEngine):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
         self.trainer = Trainer(self.config)
+        if tpu_options.tie_embeddings:
+            tied_embeddings.check_tied_embeddings(self.trainer.model_parts, self.trainer.optimizers)
         self.parallel_dims = self.trainer.parallel_dims
         self._dp_group = self._build_dp_gloo_group()
         # Like torchtitan's init_distributed (which verl bypasses): no autograd multithreading, so backward-thread
@@ -1990,6 +2001,8 @@ class TorchTitanTPUEngine(BaseEngine):
                 get_device_id(),
                 local_transform=local_transform,
                 expert_stack_wire=expert_stack_wire,
+                # The tied weight goes out as model.embed_tokens.weight and lm_head.weight (see _to_hf_named_params).
+                distinct_alias_buffers=bool(self._tpu_options.tie_embeddings),
             ),
             None,
         )

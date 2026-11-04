@@ -80,6 +80,13 @@ and the largest must hold the longest sequence. Fixed-shape micro-batches need p
 and no context or pipeline parallelism; otherwise the engine keeps verl's partition and logs a warning.
 `fixed_shape_prewarm=False` skips the compile-and-time pass and ranks layouts by their padded token count instead.
 
+`engine_kwargs.tpu.tie_embeddings=True` (off by default) trains one weight shared by the input embedding and the LM
+head, as checkpoints with `tie_word_embeddings=true` define the model, also where torchtitan's model config trains a
+separate LM head initialized from the embedding (e.g. Qwen3.5-0.8B). The engine re-ties the two after SimpleFSDP has
+sharded them and fails at start-up unless exactly one parameter backs both, held once by the optimizer
+(`engines/tied_embeddings.py`). The weight sync still sends `lm_head.weight`, from its own buffer, for a rollout that
+keeps a separate LM head; set `tpu-sync`'s `tie_word_embeddings=True` when the rollout model ties them itself.
+
 The rollout settings that matter on TPU (the recipes already set them):
 
 | Setting | Value on TPU |
