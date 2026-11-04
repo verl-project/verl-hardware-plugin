@@ -99,9 +99,9 @@ rollout side, median of 9 syncs after the first:
 
 | | seconds per sync |
 |---|---|
-| `nccl`, 2048 MB bucket | 1.293 |
-| `mori`, 2048 MB bucket, 4 slots | **0.663** |
-| trainer export alone (iterating `get_per_tensor_param()`, sending nothing) | 0.63 |
+| `nccl`, 2048 MB bucket | 1.323 |
+| `mori`, 2048 MB bucket, 4 slots | **0.662** |
+| trainer export alone (iterating `get_per_tensor_param()`, sending nothing) | 0.60 |
 
 The first two syncs of both backends matched the HF checkpoint tensor by tensor on all 8 rollout workers. Earlier
 runs (16 runs, 5 node pairs) gave medians of 1.28-1.46 s for `nccl` and 0.65-0.83 s for `mori`, 1.6-2.2x faster
