@@ -21,6 +21,7 @@ no memory functions.
 import logging
 import os
 import warnings
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
@@ -61,30 +62,52 @@ def current_device() -> int:
     return torch.accelerator.current_device_index() if accelerator_is_tpu() else 0
 
 
-def synchronize(target: Any = None, *, wait: bool = True, strict: bool = False) -> None:
-    """Materialize and synchronize pending TPU operations (blocking when ``wait=True``, async when ``False``).
+def synchronize(device: Any = None) -> None:
+    """Wait for all pending operations on ``device`` to complete (``torch.accelerator.synchronize``)."""
+    if accelerator_is_tpu() and _tpu_runtime_initialized():
+        torch.accelerator.synchronize(device)
 
-    Serves both ``get_torch_device().synchronize(device)`` and plugin-internal ``tpu_synchronize(tensors, ...)``:
-    ``wait=True`` calls ``torch.accelerator.synchronize``, while ``wait=False`` records a throwaway ``torch.Event``
-    so ``DEFER_AND_FUSE`` cuts and dispatches the active stream without blocking the host until completion.
+
+def tpu_synchronize(
+    tensors: Optional[torch.Tensor | Sequence[torch.Tensor]] = None,
+    *,
+    wait: bool = True,
+    strict: bool = False,
+) -> None:
+    """Materialize pending TPU operations (blocking when ``wait=True``, async stream dispatch when ``False``).
+
+    Unlike :func:`synchronize` (which implements the standard ``torch.accelerator.synchronize(device)`` contract for
+    ``get_torch_device()`` and propagates device errors), this helper accepts optional tensor(s) (no-oping when none
+    live on TPU), supports ``wait=False`` to cut and dispatch the active ``DEFER_AND_FUSE`` stream via
+    ``torch.Event.record`` without blocking the host until TPU completion, and supports ``strict`` vs warning error
+    handling.
     """
-    if isinstance(target, torch.Tensor):
-        if target.device.type != "tpu":
+    device: Any = None
+    if isinstance(tensors, torch.Tensor):
+        if tensors.device.type != "tpu":
             return
-        device: Any = target.device
-    else:
-        device = target
+        device = tensors.device
+    elif isinstance(tensors, Sequence):
+        tpu_tensors = [t for t in tensors if isinstance(t, torch.Tensor) and t.device.type == "tpu"]
+        if not tpu_tensors:
+            return
+        device = tpu_tensors[0].device
+
     if not accelerator_is_tpu():
         if strict:
             raise RuntimeError("TPU synchronization failed: TPU accelerator is not available")
         return
-    if not _tpu_runtime_initialized(default_when_absent=True):
+    if not _tpu_runtime_initialized():
         return
     try:
         if wait:
             torch.accelerator.synchronize(device)
+        elif device is None:
+            torch.Event().record()
         else:
-            (torch.Event() if device is None else torch.Event(device=device)).record()
+            # c10::Event stores only device_type (discarding device.index), so THPEvent_record() with no
+            # stream argument always records on the current device; pass current_stream(device) explicitly.
+            torch.Event().record(torch.accelerator.current_stream(device))
     except Exception as e:
         if strict:
             raise RuntimeError(f"TPU synchronization failed: {e}") from e
@@ -125,7 +148,7 @@ def initial_seed() -> int:
     return _default_generator().initial_seed()
 
 
-def _tpu_runtime_initialized(*, default_when_absent: bool = False) -> bool:
+def _tpu_runtime_initialized() -> bool:
     """Whether this process has started its TPU runtime (the PJRT client), cached per-PID once True."""
     global _tpu_runtime_up_pid
     pid = os.getpid()
@@ -133,7 +156,7 @@ def _tpu_runtime_initialized(*, default_when_absent: bool = False) -> bool:
         return True
     is_initialized = getattr(getattr(torch, "tpu", None), "is_initialized", None)
     if is_initialized is None:
-        return default_when_absent
+        return False
     try:
         # Experimental in torch_tpu 0.2.0; its one-time warning is noise in every worker's log.
         with warnings.catch_warnings():

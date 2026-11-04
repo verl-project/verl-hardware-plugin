@@ -15,7 +15,6 @@ import importlib
 import itertools
 import json
 import logging
-import os
 import sys
 import threading
 from collections import namedtuple
@@ -533,7 +532,8 @@ def fake_tpu_sync(monkeypatch):
     for name, module in world.modules().items():
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(device_api, "_accelerator_is_tpu_cache", None)
-    monkeypatch.setattr(device_api, "_tpu_runtime_up_pid", os.getpid())
+    monkeypatch.setattr(device_api, "_tpu_runtime_up_pid", None)
+    monkeypatch.setattr(torch, "tpu", SimpleNamespace(is_initialized=lambda: True), raising=False)
     monkeypatch.setattr(torch, "accelerator", world.accelerator())
     monkeypatch.setattr(tpu_sync_engine, "TPU_SYNC_DEVICE", "cpu")
     monkeypatch.setattr(tpu_sync_engine, "get_tpu_sync_rendezvous", world.get_rendezvous)
@@ -723,7 +723,7 @@ def test_tpu_synchronize_strict_and_lenient(fake_tpu_sync, caplog):
     fake_tpu_sync.fail_tpu_sync = True
     with pytest.raises(RuntimeError, match="TPU synchronization failed"):
         tpu_sync_engine.tpu_synchronize(strict=True)
-    with caplog.at_level(logging.WARNING, logger=tpu_sync_engine.__name__):
+    with caplog.at_level(logging.WARNING, logger=device_api.__name__):
         tpu_sync_engine.tpu_synchronize()
     assert "Could not synchronize TPU device" in caplog.text
 

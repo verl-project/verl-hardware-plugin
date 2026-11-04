@@ -42,7 +42,7 @@ import ray
 import torch
 
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
-from verl_hardware_plugin.accelerators.tpu.device_api import synchronize as tpu_synchronize
+from verl_hardware_plugin.accelerators.tpu.device_api import tpu_synchronize
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
 from verl_hardware_plugin.accelerators.tpu.options import TPU_SYNC_DEFAULT_PARALLELISM, get_tpu_sync_options
 from verl_hardware_plugin.accelerators.tpu.profilers import timeline

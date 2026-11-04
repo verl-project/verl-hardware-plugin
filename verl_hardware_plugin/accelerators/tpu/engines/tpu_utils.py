@@ -31,7 +31,7 @@ from torch.distributed.tensor import DTensor
 
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import TorchtitanEngineConfig
-from verl_hardware_plugin.accelerators.tpu.device_api import synchronize as tpu_synchronize
+from verl_hardware_plugin.accelerators.tpu.device_api import tpu_synchronize
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 
 logger = logging.getLogger(__name__)

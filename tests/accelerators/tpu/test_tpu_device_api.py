@@ -61,6 +61,7 @@ def test_uses_torch_accelerator_when_tpu_device_apis_are_internal():
             n: _internal(n)
             for n in ("is_available", "device_count", "current_device", "synchronize", "get_rng_state", "initial_seed")
         },
+        is_initialized=lambda: True,
         default_generators=[generator],
     )
     acc = _fake_accelerator()
@@ -193,8 +194,8 @@ def test_platform_leaves_torch_tpu_untouched():
         assert not hasattr(tpu, name)
 
 
-def test_consolidated_synchronize_wait_event_and_no_internal_imports(caplog):
-    """device_api.synchronize backs both get_torch_device().synchronize and tpu_synchronize with zero _internal deps."""
+def test_synchronize_and_tpu_synchronize_contracts_and_no_internal_imports(caplog, monkeypatch):
+    """synchronize() preserves PyTorch error semantics while tpu_synchronize() handles tensors and wait=False."""
     pkg_dir = Path(tpu_pkg.__file__).resolve().parent
     for py_file in sorted(pkg_dir.rglob("*.py")):
         for node in ast.walk(ast.parse(py_file.read_text(encoding="utf-8"))):
@@ -207,25 +208,54 @@ def test_consolidated_synchronize_wait_event_and_no_internal_imports(caplog):
     tpu_mod = types.SimpleNamespace(is_initialized=lambda: True)
     fake_event = mock.MagicMock()
     fake_event_cls = mock.MagicMock(return_value=fake_event)
+    fake_tpu_tensor = mock.MagicMock(spec=torch.Tensor)
+    fake_tpu_tensor.device = types.SimpleNamespace(type="tpu", index=1)
+
     with (
         mock.patch.object(torch, "accelerator", acc),
         mock.patch.object(torch, "tpu", tpu_mod, create=True),
         mock.patch.object(torch, "Event", fake_event_cls),
     ):
-        device_api.synchronize(torch.ones(4), wait=True, strict=True)  # CPU tensor fast-exit
-        acc.synchronize.assert_not_called()
-        device_api.synchronize(wait=True)
+        # 1. Standard device_api.synchronize(device) delegates to torch.accelerator.synchronize and propagates errors.
+        device_api.synchronize("tpu:0")
         assert device_api._tpu_runtime_up_pid == os.getpid()
-        acc.synchronize.assert_called_once_with(None)
-        device_api.synchronize(wait=False)
+        acc.synchronize.assert_called_once_with("tpu:0")
+        acc.synchronize.side_effect = RuntimeError("XLA sticky error")
+        with pytest.raises(RuntimeError, match="XLA sticky error"):
+            device_api.synchronize()
+        acc.synchronize.side_effect = None
+        acc.synchronize.reset_mock()
+
+        # 2. tpu_synchronize: CPU tensor & CPU tensor sequence fast-exit without touching accelerator.
+        device_api.tpu_synchronize(torch.ones(4), wait=True, strict=True)
+        device_api.tpu_synchronize([torch.ones(2), torch.zeros(2)], wait=False, strict=True)
+        acc.synchronize.assert_not_called()
+
+        # 3. tpu_synchronize(wait=False): None records on current stream; explicit TPU tensor passes current_stream(dev)
+        #    because c10::Event discards device.index when record() is called with no stream argument.
+        device_api.tpu_synchronize(wait=False)
         fake_event_cls.assert_called_once_with()
         fake_event.record.assert_called_once_with()
+        fake_event_cls.reset_mock()
+        fake_event.reset_mock()
 
+        device_api.tpu_synchronize([torch.ones(2), fake_tpu_tensor], wait=False)
+        acc.current_stream.assert_called_once_with(fake_tpu_tensor.device)
+        fake_event.record.assert_called_once_with("stream0")
+
+        # 4. Fork invalidation: a child PID does not inherit the parent's cached PJRT-initialized state.
+        tpu_mod.is_initialized = lambda: False
+        monkeypatch.setattr(os, "getpid", lambda: -99999)
+        device_api.tpu_synchronize(wait=True, strict=True)
+        acc.synchronize.assert_not_called()
+
+        # 5. strict vs lenient error handling on tpu_synchronize.
+        tpu_mod.is_initialized = lambda: True
         fake_event.record.side_effect = RuntimeError("stream dispatch failed")
         with pytest.raises(RuntimeError, match="TPU synchronization failed: stream dispatch failed"):
-            device_api.synchronize(wait=False, strict=True)
+            device_api.tpu_synchronize(wait=False, strict=True)
         with caplog.at_level(logging.WARNING, logger=device_api.__name__):
-            device_api.synchronize(wait=False, strict=False)
+            device_api.tpu_synchronize(wait=False, strict=False)
         assert "Could not synchronize TPU device" in caplog.text
 
 
