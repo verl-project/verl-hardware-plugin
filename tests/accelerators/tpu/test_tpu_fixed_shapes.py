@@ -161,7 +161,8 @@ def _random_lens(rng, n, cap=4352):
     return lens
 
 
-COSTS = {8192: 0.63, 12288: 1.16, 14336: 1.50, 16384: 1.885}
+# Synthetic per-row costs, super-linear in the row length: two short rows can be cheaper than one long row.
+COSTS = {8192: 1.0, 12288: 1.75, 14336: 2.25, 16384: 3.0}
 
 
 def test_pack_invariants_on_random_inputs():
