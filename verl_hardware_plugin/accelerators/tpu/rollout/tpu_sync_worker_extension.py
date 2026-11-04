@@ -377,6 +377,9 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         t_h2d_start = time.perf_counter()
         # h2d() applies the skip_tiling plan the listener received with this transfer (see
         # init_tpu_sync_on_worker); nothing must override it here.
+        # TODO(tpu): Remove the HBM staging buffers (see init_tpu_sync_on_worker): once the trainer sends every
+        # tensor in vLLM's layout and dtype, h2d() can write straight into vLLM's parameters and the install below
+        # goes away. That H2D must stay inside the rollout pause, as it is now.
         self._tpu_sync_ws.h2d()
         t_h2d = time.perf_counter() - t_h2d_start
 
