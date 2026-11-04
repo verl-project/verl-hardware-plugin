@@ -33,6 +33,7 @@ The platforms and engines in this repository are **reference implementations** �
 | Moore Threads | MUSA | MCCL | ✅ Supported | [User Guide](docs/accelerators/musa/README.md) |
 | Google TPU | v6e | tpu_dist | ✅ Supported | [User Guide](docs/accelerators/tpu/README.md), [GRPO example](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) |
 | Biren | SUPA (CUDA-compatible) | BCCL | ✅ Example (requires vendor support) | [User Guide](docs/accelerators/supa/README.md) |
+| AMD ROCm | MI300X / MI355X | RCCL; MoRI-IO weight sync | Platform built-in (verl core); `mori` checkpoint engine here | [User Guide](docs/accelerators/rocm/README.md) |
 
 
 ## Installation
@@ -70,6 +71,7 @@ verl_hardware_plugin/
 │   ├── metax/
 │   ├── mlu/
 │   ├── musa/
+│   ├── rocm/       # AMD ROCm (platform built into verl; checkpoint engine only)
 │   ├── supa/       # Biren SUPA
 │   ├── tpu/        # Google TPU
 │   ├── trainium/   # Reserved for a future AWS Trainium integration

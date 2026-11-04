@@ -53,6 +53,7 @@ ENGINES = {
     "musa": ("fsdp_musa", "megatron_musa"),
     "tpu": ("torchtitan_tpu", "weight_sync.ray_checkpoint_engine", "weight_sync.tpu_sync_checkpoint_engine"),
     "supa": ("fsdp_supa", "megatron_supa"),
+    "rocm": ("mori_checkpoint_engine",),
 }
 
 
@@ -197,6 +198,7 @@ def test_importing_backend_registration_loads_every_component(plugin, backend):
         ("accelerators.tpu.engines.torchtitan_tpu", ()),
         ("accelerators.tpu.weight_sync.ray_checkpoint_engine", ()),
         ("accelerators.tpu.weight_sync.tpu_sync_checkpoint_engine", ()),
+        ("accelerators.rocm.engines.mori_checkpoint_engine", ()),
         ("rollout:vllm", ()),
     ],
 )
