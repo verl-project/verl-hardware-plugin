@@ -8,6 +8,11 @@ Training and rollout run on separate TPU slices (a slice is a group of TPU hosts
 chip interconnect). One vLLM engine spans all chips of the rollout slice and receives the trainer's
 updated weights through the `ray-plasma-store` or `tpu-sync` checkpoint engine (see [Weight Sync](./weight_sync.md)).
 
+A rollout replica is laid out as upstream verl lays it out on GPU: one server actor per host, the first
+running the engine and the HTTP API, the others running vLLM headless. vLLM's `mp` executor starts one
+worker per chip (per TensorCore on TPU 7x) on each host, and vllm-torchtpu's `mp` multi-host backend
+(`TPU_MULTIHOST_BACKEND=mp`) joins the replica's hosts into one TPU mesh.
+
 ## Requirements
 
 - The prerequisites from the [Installation Guide](./install_guidance.md), plus vLLM `v0.32.0` and
@@ -49,6 +54,13 @@ per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
 deprecated and log a warning.
 
+Qwen3 MoE models (HF `qwen3_moe`, e.g. Qwen3-30B-A3B) need no extra option. The engine turns off torchtitan's
+expert-bias load balancing, so the trainer picks the same experts as vLLM, and runs the routed experts with torchtitan's
+TPU token dispatcher and Pallas grouped matmul (required: torchtitan's default `torch._grouped_mm` path has a wrong
+backward on TPU). This needs `expert_parallel_size=1` and a `seq_bucket_size` that times `num_experts_per_tok` is a
+multiple of 256 (the default 256 is); otherwise the engine raises. `use_dynamic_bsz=True` works on TPU: the plugin runs
+its int64 MAX / MIN all-reduces in int32, which `tpu_dist` supports.
+
 The rollout settings that matter on TPU (the recipes already set them):
 
 | Setting | Value on TPU |
@@ -71,11 +83,12 @@ On TPU, the job log contains
 
 ```text
 Registered rollout replica loader: vllm (TPU-aware)
-Reusing 2 verl placement group(s) for TPU rollout
+[TPU-SYNC CONTROLLER] All 8 Trainer and 16 Sampler units verified and registered.
 ```
 
-where the number is the number of rollout hosts, and the job ends with status `SUCCEEDED`. The rollout is
-tested with Qwen3-0.6B and Qwen3-4B on two v6e-4 slices and on two v6e-8 slices.
+where the sampler count is the number of rollout chips (with `tpu-sync`), and the job ends with status
+`SUCCEEDED`. The rollout is tested with Qwen3-4B on a v6e-8 trainer slice and two 2-host v6e-8 rollout
+slices (two replicas, each spanning two hosts).
 
 ## Related Documentation
 

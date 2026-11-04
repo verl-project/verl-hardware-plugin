@@ -136,3 +136,150 @@ def test_gloo_only_group_all_gather_into_tensor_stages_via_cpu():
         tpu_patch_mod.apply()
         assert dist.all_gather_into_tensor(out, inp, group="dp_gloo") == "ok"
     assert out._cpu.tolist() == [1.0, 2.0, 3.0, 6.0]
+
+
+class _FakeTPUScalar:
+    """A TPU tensor stand-in backed by a CPU tensor; records ``.cpu()`` staging and ``.copy_()`` write-backs."""
+
+    device = mock.Mock(type="tpu")
+
+    def __init__(self, val, dtype=torch.int64):
+        self._data = torch.tensor([val], dtype=dtype)
+        self.copied = None
+        self.staged_to_cpu = False
+
+    @property
+    def dtype(self):
+        return self._data.dtype
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        self.staged_to_cpu = True
+        return self._data.clone()
+
+    def to(self, dtype):
+        return _FakeTPUScalar(self._data.item(), dtype=dtype)
+
+    def item(self):
+        return self._data.item()
+
+    def fill_(self, val):
+        self._data.fill_(val)
+        return self
+
+    def copy_(self, src):
+        src_data = src._data if isinstance(src, _FakeTPUScalar) else src
+        self.copied = src_data.clone()
+        self._data.copy_(src_data)
+        return self
+
+
+@pytest.mark.parametrize(("op", "peer", "expected"), [(dist.ReduceOp.MAX, 7, 7), (dist.ReduceOp.MIN, 1, 1)])
+@pytest.mark.parametrize("backend", ["cpu:gloo,tpu:tpu_dist", "tpu_dist"])
+def test_int64_max_min_reduce_as_int32_on_tpu(op, peer, expected, backend):
+    """``use_dynamic_bsz``: verl's ``rearrange_micro_batches`` MAX / MIN-reduces int64 TPU tensors on the DP group.
+
+    XLA's 64-bit all-reduce lowers only SUM / AVG, while torch-tpu >= 0.2.0 runs 32-bit MAX / MIN on ``tpu_dist``. The
+    patch reduces an int32 copy on device (never via CPU / Gloo, so ``tpu_dist``-only mesh groups work too) and writes
+    the result back as int64.
+    """
+    seen = {}
+
+    def _fake_orig_all_reduce(t, op=None, group=None, async_op=False):
+        seen.update(device=t.device.type, dtype=t.dtype, op=op, group=group)
+        t.fill_(max(t.item(), peer) if op == dist.ReduceOp.MAX else min(t.item(), peer))
+        return "ok"
+
+    fake_tpu_tensor = _FakeTPUScalar(3)
+    with (
+        mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True),
+        mock.patch.object(dist, "all_reduce", side_effect=_fake_orig_all_reduce),
+        mock.patch.object(dist, "get_backend", return_value=backend),
+    ):
+        tpu_patch_mod.apply()
+        assert dist.all_reduce(fake_tpu_tensor, op=op, group="dp_group") == "ok"
+
+    assert seen == {"device": "tpu", "dtype": torch.int32, "op": op, "group": "dp_group"}
+    assert not fake_tpu_tensor.staged_to_cpu
+    assert fake_tpu_tensor.dtype == torch.int64
+    assert fake_tpu_tensor.copied.tolist() == [expected]
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("op", [dist.ReduceOp.MAX, dist.ReduceOp.MIN])
+def test_32bit_max_min_pass_through_to_tpu_dist(dtype, op):
+    """torch-tpu >= 0.2.0 runs 32-bit MAX / MIN natively on ``tpu_dist``: no cast, no CPU staging."""
+    fake_original = mock.MagicMock(return_value="ok")
+    fake_tpu_tensor = _FakeTPUScalar(3, dtype=dtype)
+    with (
+        mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True),
+        mock.patch.object(dist, "all_reduce", fake_original),
+        mock.patch.object(dist, "get_backend", return_value="cpu:gloo,tpu:tpu_dist"),
+    ):
+        tpu_patch_mod.apply()
+        dist.all_reduce(fake_tpu_tensor, op=op, group="dp_group")
+
+    fake_original.assert_called_once_with(fake_tpu_tensor, op=op, group="dp_group", async_op=False)
+    assert not fake_tpu_tensor.staged_to_cpu
+    assert fake_tpu_tensor.copied is None
+
+
+def test_sum_and_compiled_max_on_tpu_dist_group_pass_through():
+    """int64 Sum all-reduces of TPU tensors, and int64 MAX inside torch.compile, still run on ``tpu_dist`` unchanged."""
+    fake_original = mock.MagicMock(return_value="ok")
+    fake_tpu_tensor = _FakeTPUScalar(3)
+    with (
+        mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True),
+        mock.patch.object(dist, "all_reduce", fake_original),
+        mock.patch.object(dist, "get_backend", return_value="cpu:gloo,tpu:tpu_dist"),
+    ):
+        tpu_patch_mod.apply()
+        dist.all_reduce(fake_tpu_tensor, op=dist.ReduceOp.SUM, group="dp_group")
+        fake_original.assert_called_with(fake_tpu_tensor, op=dist.ReduceOp.SUM, group="dp_group", async_op=False)
+        dist.all_reduce(fake_tpu_tensor, group="dp_group")
+        fake_original.assert_called_with(fake_tpu_tensor, group="dp_group", async_op=False)
+        with mock.patch.object(torch.compiler, "is_compiling", return_value=True):
+            dist.all_reduce(fake_tpu_tensor, op=dist.ReduceOp.MAX, group="dp_group")
+        fake_original.assert_called_with(fake_tpu_tensor, op=dist.ReduceOp.MAX, group="dp_group", async_op=False)
+
+    assert fake_tpu_tensor.copied is None
+    assert not fake_tpu_tensor.staged_to_cpu
+
+
+def test_int64_max_on_cpu_tensor_passes_through():
+    """An int64 MAX of a CPU tensor is reduced by Gloo as is."""
+    fake_original = mock.MagicMock(return_value="ok")
+    cpu_tensor = torch.tensor([3])
+    with (
+        mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True),
+        mock.patch.object(dist, "all_reduce", fake_original),
+        mock.patch.object(dist, "get_backend", return_value="cpu:gloo,tpu:tpu_dist"),
+    ):
+        tpu_patch_mod.apply()
+        dist.all_reduce(cpu_tensor, op=dist.ReduceOp.MAX, group="dp_group")
+
+    fake_original.assert_called_once_with(cpu_tensor, op=dist.ReduceOp.MAX, group="dp_group", async_op=False)
+
+
+def test_int64_max_on_gloo_only_group_stages_via_cpu():
+    """A Gloo-only group cannot take TPU tensors at all, so even int64 MAX goes through the CPU staging path."""
+    seen = {}
+
+    def _fake_orig_all_reduce(t, op=None, group=None, async_op=False):
+        seen.update(device=t.device.type, dtype=t.dtype, op=op)
+        t.fill_(9)
+        return "ok"
+
+    fake_tpu_tensor = _FakeTPUScalar(3)
+    with (
+        mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True),
+        mock.patch.object(dist, "all_reduce", side_effect=_fake_orig_all_reduce),
+        mock.patch.object(dist, "get_backend", return_value="gloo"),
+    ):
+        tpu_patch_mod.apply()
+        assert dist.all_reduce(fake_tpu_tensor, op=dist.ReduceOp.MAX, group="dp_gloo") == "ok"
+
+    assert seen == {"device": "cpu", "dtype": torch.int64, "op": dist.ReduceOp.MAX}
+    assert fake_tpu_tensor.copied.tolist() == [9]

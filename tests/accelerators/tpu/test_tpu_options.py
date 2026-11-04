@@ -50,6 +50,11 @@ def test_engine_kwargs_are_parsed_and_typed():
                 "optim_impl": "for-loop",
                 "seq_bucket_size": "512",
                 "context_parallel_strategy": "ulysses",
+                "ep_capacity_factor": "4.0",
+                "rollout_expert_parallel": "true",
+                "param_dtype": "bfloat16",
+                "optimizer_host_offload": "true",
+                "fp32_master": "true",
             }
         )
     )
@@ -61,6 +66,11 @@ def test_engine_kwargs_are_parsed_and_typed():
         optim_impl="for-loop",
         seq_bucket_size=512,
         context_parallel_strategy="ulysses",
+        ep_capacity_factor=4.0,
+        rollout_expert_parallel=True,
+        param_dtype="bfloat16",
+        optimizer_host_offload=True,
+        fp32_master=True,
     )
     assert get_tpu_engine_options(_cfg()) == TPUEngineOptions()
     assert get_tpu_engine_options(None) == TPUEngineOptions()
@@ -72,6 +82,13 @@ def test_engine_kwargs_are_parsed_and_typed():
         ({"use_splash_attn": True}, "Unknown TPU engine option"),
         ({"use_simple_fsdp": "maybe"}, "Invalid TPU engine option use_simple_fsdp"),
         ({"seq_bucket_size": 0}, "Invalid TPU engine option seq_bucket_size"),
+        ({"seq_bucket_size": True}, "Invalid TPU engine option seq_bucket_size"),
+        ({"ep_capacity_factor": 0}, "Invalid TPU engine option ep_capacity_factor"),
+        ({"ep_capacity_factor": "nan"}, "Invalid TPU engine option ep_capacity_factor"),
+        ({"ep_capacity_factor": True}, "Invalid TPU engine option ep_capacity_factor"),
+        ({"param_dtype": "float16"}, "param_dtype must be float32 or bfloat16"),
+        ({"fp32_master": True}, "fp32_master needs param_dtype=bfloat16"),
+        ({"param_dtype": "float32", "fp32_master": True}, "fp32_master needs param_dtype=bfloat16"),
     ],
 )
 def test_bad_engine_kwargs_raise(tpu, match):
@@ -124,14 +141,25 @@ def test_engine_kwargs_survive_verl_config_conversion():
 def test_tpu_sync_options_are_parsed_and_typed():
     assert get_tpu_sync_options(None) == TPUSyncOptions()
     assert get_tpu_sync_options({}) == TPUSyncOptions(
-        parallelism=8, verify_parity="off", release_buffers_after_sync=True, tie_word_embeddings=None
+        parallelism=8,
+        verify_parity="off",
+        release_buffers_after_sync=True,
+        tie_word_embeddings=None,
     )
     # Command-line overrides may arrive as strings.
     options = get_tpu_sync_options(
-        {"parallelism": "4", "verify_parity": "true", "release_buffers_after_sync": "0", "tie_word_embeddings": 1}
+        {
+            "parallelism": "4",
+            "verify_parity": "true",
+            "release_buffers_after_sync": "0",
+            "tie_word_embeddings": 1,
+        }
     )
     assert options == TPUSyncOptions(
-        parallelism=4, verify_parity="norm", release_buffers_after_sync=False, tie_word_embeddings=True
+        parallelism=4,
+        verify_parity="norm",
+        release_buffers_after_sync=False,
+        tie_word_embeddings=True,
     )
 
 
@@ -194,3 +222,22 @@ def test_tpu_chips_per_host_override(monkeypatch):
     monkeypatch.setenv("VERL_TPU_CHIPS_PER_HOST", "four")
     with pytest.raises(ValueError, match="VERL_TPU_CHIPS_PER_HOST"):
         tpu_chips_per_host_override()
+
+
+def test_ep_dispatcher_and_topo_mesh_options():
+    from types import SimpleNamespace
+
+    opts = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": " RAGGED ", "enable_tpu_topo_mesh": True}})
+    )
+    assert opts.ep_dispatcher == "ragged"
+    assert opts.enable_tpu_topo_mesh is True
+
+    opts_static = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": "static", "enable_tpu_topo_mesh": False}})
+    )
+    assert opts_static.ep_dispatcher == "static"
+    assert opts_static.enable_tpu_topo_mesh is False
+
+    with pytest.raises(ValueError, match="engine_kwargs.tpu.ep_dispatcher"):
+        tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": "deepep"}}))

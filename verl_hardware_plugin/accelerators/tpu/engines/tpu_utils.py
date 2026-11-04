@@ -162,7 +162,15 @@ def derive_torchtitan_name_and_flavor(hf_config: Any) -> tuple[str, str]:
     # Import the model package and use model_registry to build each flavor's config.
     # model_registry has sensible defaults for all optional params (attn_backend, etc.).
     module_name = get_torchtitan_model_module_name(name)
-    model_module = importlib.import_module(module_name)
+    try:
+        model_module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if module_name.startswith("torchtitan.experiments.tpu."):
+            raise ImportError(
+                f"Model {name!r} on TPU requires {module_name!r} from https://github.com/google-pytorch/torchtitan "
+                "(upstream pytorch/torchtitan does not include torchtitan.experiments.tpu)."
+            ) from exc
+        raise
     model_registry = model_module.model_registry
 
     # The configs dict name isn't derivable from the model name
@@ -316,7 +324,7 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
     Each option comes from ``engine_kwargs.tpu`` (see ``get_tpu_engine_options``), else defaults from
     ``engine_config.use_torch_compile``: with ``use_torch_compile=True`` (splash also when
     ``context_parallel_size > 1``), enables torchtitan's TPU ``SplashAttention``, ``SimpleFSDP``
-    (for FSDP/HSDP with optional TP and CP where PP/EP == 1) and ``DEFER_AND_FUSE``.
+    (for FSDP/HSDP with optional TP, CP and EP where PP == 1) and ``DEFER_AND_FUSE``.
     """
     options = get_tpu_engine_options(engine_config)
     use_torch_compile = bool(getattr(engine_config, "use_torch_compile", False))
@@ -330,12 +338,12 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
             "use_torch_compile=False."
         )
 
-    simple_fsdp_compatible = all(
-        getattr(engine_config, f"{dim}_parallel_size", 1) == 1 for dim in ("pipeline", "expert")
-    )
+    # SimpleFSDP composes with TP, CP and EP (torchtitan's TPU Qwen3.5 wraps the routed experts on the expert-DP mesh
+    # under EP, google-pytorch/torchtitan#6), but not with PP.
+    simple_fsdp_compatible = getattr(engine_config, "pipeline_parallel_size", 1) == 1
     use_simple_fsdp = _or_default(options.use_simple_fsdp, use_torch_compile and simple_fsdp_compatible)
     if use_simple_fsdp and not simple_fsdp_compatible:
-        raise ValueError("use_simple_fsdp supports FSDP/HSDP (+ optional TP/CP) only (pipeline/expert parallel size 1)")
+        raise ValueError("use_simple_fsdp supports FSDP/HSDP (+ optional TP/CP/EP) only (pipeline parallel size 1)")
 
     if options.tpu_eager_mode is None:
         tpu_eager_mode = "DEFER_AND_FUSE" if use_torch_compile else None
@@ -363,72 +371,6 @@ def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any) -> bool:
         get_tpu_engine_options(engine_config).use_fused_linear_cross_entropy,
         bool(getattr(engine_config, "use_torch_compile", False)),
     )
-
-
-_PARALLEL_DIMS_CACHE: dict[tuple[Any, ...], Any] = {}
-_PARALLEL_DIMS_PATCHED = False
-
-
-def install_parallel_dims_cache_for_tpu() -> None:
-    """Reuse ``ParallelDims`` and its ``DeviceMesh`` objects across engines in the same process.
-
-    ``ActorRolloutRefWorker`` initializes both ``actor`` and ``ref`` ``TorchTitanTPUEngine`` instances
-    in the same worker process. TorchTitan's ``ParallelDims`` caches ``DeviceMesh`` instances on ``self``
-    because Dynamo traces ``DeviceMesh`` as a ``FakeScriptObject`` matched by object identity, whereas
-    ``DTensor``'s ``ShardingPropagator`` LRU cache hashes ``DeviceMesh`` by value. If ``actor`` and
-    ``ref`` construct separate ``ParallelDims`` objects with identical topology, ``ShardingPropagator``
-    returns cached ``DTensorSpec``s holding ``ref``'s ``DeviceMesh`` when ``actor`` compiles the same
-    sequence-length bucket, causing Dynamo to emit a non-placeholder ``_torchbind_obj0`` output that
-    ``torch_tpu`` rejects. Caching ``ParallelDims.from_config`` and making ``ParallelDims.build_mesh``
-    idempotent ensures ``actor`` and ``ref`` share the exact same ``DeviceMesh`` Python instances and
-    process groups.
-    """
-    global _PARALLEL_DIMS_PATCHED
-    if _PARALLEL_DIMS_PATCHED:
-        return
-    try:
-        from torchtitan.distributed.parallel_dims import ParallelDims
-    except ImportError:
-        return
-
-    orig_from_config = getattr(ParallelDims.from_config, "__func__", None)
-    orig_build_mesh = getattr(ParallelDims, "build_mesh", None)
-    if orig_from_config is None or orig_build_mesh is None:
-        return
-
-    @classmethod  # type: ignore[misc]
-    def _cached_from_config(cls, parallelism_config: Any, world_size: int) -> Any:
-        world_pg_id = (
-            id(torch.distributed.group.WORLD)
-            if torch.distributed.is_initialized() and torch.distributed.group.WORLD is not None
-            else None
-        )
-        key = (
-            world_pg_id,
-            getattr(parallelism_config, "data_parallel_replicate_degree", 1),
-            getattr(parallelism_config, "data_parallel_shard_degree", -1),
-            getattr(parallelism_config, "context_parallel_degree", 1),
-            getattr(parallelism_config, "tensor_parallel_degree", 1),
-            getattr(parallelism_config, "pipeline_parallel_degree", 1),
-            getattr(parallelism_config, "expert_parallel_degree", 1),
-            world_size,
-            getattr(parallelism_config, "spmd_backend", "partial_dtensor"),
-            getattr(parallelism_config, "enable_tpu_topo_mesh", False),
-        )
-        cached = _PARALLEL_DIMS_CACHE.get(key)
-        if cached is None:
-            cached = orig_from_config(cls, parallelism_config, world_size)
-            _PARALLEL_DIMS_CACHE[key] = cached
-        return cached
-
-    def _cached_build_mesh(self: Any) -> Any:
-        if getattr(self, "_world_mesh", None) is not None and getattr(self, "_single_axis_meshes", None):
-            return self._world_mesh
-        return orig_build_mesh(self)
-
-    ParallelDims.from_config = _cached_from_config
-    ParallelDims.build_mesh = _cached_build_mesh
-    _PARALLEL_DIMS_PATCHED = True
 
 
 _SYNC_DTENSOR_REDISTRIBUTE_PATCHED = False
@@ -835,6 +777,98 @@ def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], bucke
         tu.assign_non_tensor_data(mb, "tpu_max_response_len", int(resolved_lens[2 * i + 1]))
 
 
+def _wrap_routed_experts_on_edp_mesh(model: nn.Module, *, parallel_dims: Any, training: Any) -> None:
+    """Wrap ``MoE.routed_experts.inner_experts`` on ``edp_mesh`` before ``apply_simple_fsdp`` when needed.
+
+    Upstream ``apply_simple_fsdp`` checks ``isinstance(block, TransformerBlock)`` before wrapping ``inner_experts`` on
+    ``edp_mesh``. That skips ``Qwen35TransformerBlock`` (which subclasses ``Module``) on torchtitan builds without
+    ``apply_qwen3_5_simple_fsdp`` (google-pytorch/torchtitan#6), as well as blocks wrapped in ``CheckpointWrapper``
+    under activation checkpointing; ``data_parallel(model, dp_mesh)`` would then fail trying to shard EP-sharded expert
+    ``DTensor``s over ``dp_mesh``. ``data_parallel`` skips submodules it has already sharded.
+    """
+    if not getattr(parallel_dims, "ep_enabled", False):
+        return
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+    from torchtitan.config import TORCH_DTYPE_MAP
+    from torchtitan.distributed.utils import get_spmd_backend
+    from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
+    from torchtitan.models.common.moe import MoE
+
+    use_spmd_types = get_spmd_backend() == "spmd_types"
+    if parallel_dims.dp_replicate_enabled:
+        dp_mode = "hybrid_shard" if (parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled) else "replicate"
+        edp_mesh_names = ["dp_replicate", "efsdp"]
+    else:
+        dp_mode = "fully_shard"
+        edp_mesh_names = ["efsdp"]
+    edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+    if edp_mesh is None:
+        return
+    efsdp_degree = edp_mesh["efsdp"].size()
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+    )
+    non_dp_mesh = parallel_dims.get_optional_mesh("ep") if use_spmd_types else None
+
+    for module_fqn, moe in model.named_modules():
+        if not isinstance(moe, MoE):
+            continue
+        inner_experts = moe.routed_experts.inner_experts
+        if hasattr(inner_experts, "parametrizations"):
+            continue
+        if inner_experts.num_experts % (efsdp_degree * parallel_dims.ep) == 0:
+            experts_shard_dim = 0
+        else:
+            incompatible = [
+                f"{name}{tuple(parameter.shape)}"
+                for name, parameter in inner_experts.named_parameters(recurse=False)
+                if parameter.ndim != 3 or parameter.shape[1] % efsdp_degree != 0
+            ]
+            if incompatible:
+                raise ValueError(
+                    f"Cannot FSDP-shard {module_fqn}.routed_experts.inner_experts on dimension 1 over "
+                    f"{efsdp_degree} efsdp ranks; incompatible expert parameters: {incompatible}"
+                )
+            experts_shard_dim = 1
+        moe.routed_experts.inner_experts = data_parallel(
+            inner_experts,
+            edp_mesh,
+            dp_mode,
+            mp_policy=mp_policy,
+            shard_dim=experts_shard_dim,
+            non_dp_mesh=non_dp_mesh,
+        )
+
+
+def _relax_non_static_ep_moe_compile(model: nn.Module, *, parallel_dims: Any, compile_config: Any) -> None:
+    """Use ``fullgraph=False`` on compiled MoE blocks whose EP dispatcher performs host split syncs.
+
+    Without ``TpuQwen35TokenDispatcher`` (google-pytorch/torchtitan#6), ``AllToAllTokenDispatcher`` /
+    ``TpuAllToAllTokenDispatcher`` call ``.to("cpu")`` and ``.tolist()`` in ``_sync_token_count_exchange`` under
+    ``ep_enabled``, which raises a Dynamo graph-break error when ``apply_compile`` compiles the block with
+    ``fullgraph=True``.
+    """
+    if not getattr(parallel_dims, "ep_enabled", False) or not getattr(compile_config, "enable", False):
+        return
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        return
+    backend = getattr(compile_config, "backend", "tpu")
+    _static_dispatchers = ("TpuQwen35TokenDispatcher", "TpuRaggedEPTokenDispatcher")
+    for _, block in layers.named_children():
+        if getattr(block, "_compiled_call_impl", None) is None:
+            continue
+        needs_graph_break = any(
+            getattr(m, "token_dispatcher", None) is not None
+            and not any(c.__name__ in _static_dispatchers for c in type(m.token_dispatcher).__mro__)
+            for m in block.modules()
+        )
+        if needs_graph_break:
+            block.compile(backend=backend, fullgraph=False)
+            block._tpu_compile_relaxed = True  # type: ignore[attr-defined]
+
+
 def get_tpu_simple_fsdp_parallelize_fn(torchtitan_name: str) -> Callable[..., nn.Module]:
     """Return torchtitan's TPU recipe ``parallelize_fn`` for ``torchtitan_name``; it shards with SimpleFSDP.
 
@@ -851,10 +885,34 @@ def get_tpu_simple_fsdp_parallelize_fn(torchtitan_name: str) -> Callable[..., nn
             f"use_simple_fsdp=True needs a torchtitan TPU recipe, and there is none for {torchtitan_name!r} "
             f"(supported: {sorted(_TPU_SIMPLE_FSDP_RECIPES)}); set use_simple_fsdp=False"
         ) from None
-    recipe_parallelize_fn = getattr(importlib.import_module(module_name), fn_name)
+    recipe_module = importlib.import_module(module_name)
+    recipe_parallelize_fn = getattr(recipe_module, fn_name)
 
     def _parallelize(model: nn.Module, **kwargs: Any) -> nn.Module:
-        model = recipe_parallelize_fn(model, **kwargs)
+        parallel_dims = kwargs.get("parallel_dims")
+        ep_needs_edp_wrap = (
+            bool(getattr(parallel_dims, "ep_enabled", False))
+            and not hasattr(recipe_module, "apply_qwen3_5_simple_fsdp")
+            and hasattr(recipe_module, "apply_simple_fsdp")
+        )
+        orig_apply_simple_fsdp = getattr(recipe_module, "apply_simple_fsdp", None)
+        if ep_needs_edp_wrap and orig_apply_simple_fsdp is not None:
+
+            def _apply_simple_fsdp_with_ep(m: nn.Module, *, parallel_dims: Any, training: Any, **fsdp_kw: Any):
+                _wrap_routed_experts_on_edp_mesh(m, parallel_dims=parallel_dims, training=training)
+                return orig_apply_simple_fsdp(m, parallel_dims=parallel_dims, training=training, **fsdp_kw)
+
+            recipe_module.apply_simple_fsdp = _apply_simple_fsdp_with_ep  # type: ignore[attr-defined]
+        try:
+            model = recipe_parallelize_fn(model, **kwargs)
+        finally:
+            if ep_needs_edp_wrap and orig_apply_simple_fsdp is not None:
+                recipe_module.apply_simple_fsdp = orig_apply_simple_fsdp  # type: ignore[attr-defined]
+        _relax_non_static_ep_moe_compile(
+            model,
+            parallel_dims=parallel_dims,
+            compile_config=kwargs.get("compile_config"),
+        )
         init_states_without_simple_fsdp_parametrization(model)
         return model
 
@@ -1122,16 +1180,23 @@ def fused_linear_logprobs_tpu(
     return -nll
 
 
+_PAD_VOCAB_STRIDE = 9973  # prime stride: spreads packed-padding token IDs across vocab instead of 1 or math experts
+
+
 def pad_packed_inputs_for_tpu(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     micro_batch: TensorDict,
     device: Any,
     bucket_size: Optional[int] = None,
+    vocab_size: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Bucket-pad packed (nested) 1D sequences on CPU before the H2D copy.
 
     Pad tokens get position 0, so the attention treats each one as its own document (it only attends to itself).
+    Under expert parallelism (``TpuQwen35TokenDispatcher``), repeating token 0 sends every pad slot to the same 8
+    experts, and cycling the micro-batch's own tokens concentrates pad traffic onto the same domain/math experts as
+    real tokens; striding across ``vocab_size`` disperses pad slots across the full vocabulary and expert set.
     Returns ``(input_ids, position_ids, labels, orig_seq_len)``.
     """
     step = bucket_size if bucket_size is not None and bucket_size > 0 else get_tpu_seq_bucket_size()
@@ -1147,9 +1212,16 @@ def pad_packed_inputs_for_tpu(
     )
     pad_len = padded_seq_len - orig_seq_len
     if pad_len > 0:
-        input_ids_cpu, labels_cpu, position_ids_cpu = (
-            F.pad(t, (0, pad_len), value=0) for t in (input_ids_cpu, labels_cpu, position_ids_cpu)
-        )
+        if vocab_size is not None and int(vocab_size) > 1:
+            pad_ids = (torch.arange(pad_len, dtype=torch.int64) * _PAD_VOCAB_STRIDE) % int(vocab_size)
+            input_ids_cpu = torch.cat((input_ids_cpu, pad_ids.to(dtype=input_ids_cpu.dtype)), dim=-1)
+        elif orig_seq_len > 0:
+            pad_ids = input_ids_cpu[torch.arange(pad_len, dtype=torch.int64) % orig_seq_len]
+            input_ids_cpu = torch.cat((input_ids_cpu, pad_ids), dim=-1)
+        else:
+            input_ids_cpu = F.pad(input_ids_cpu, (0, pad_len), value=0)
+        labels_cpu = F.pad(labels_cpu, (0, pad_len), value=0)
+        position_ids_cpu = F.pad(position_ids_cpu, (0, pad_len), value=0)
 
     if "responses" in micro_batch.keys() and getattr(micro_batch["responses"], "is_nested", False):
         raw_max_resp = int(micro_batch["responses"].offsets().diff().max().item())

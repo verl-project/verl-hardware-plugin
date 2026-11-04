@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""TPU device queries that work with every ``torch_tpu`` release.
+"""TPU device queries via ``torch.accelerator`` (``torch_tpu`` >= 0.2.0).
 
 ``torch_tpu`` 0.2.0 makes the CUDA-style device functions on ``torch.tpu`` (``is_available``,
 ``device_count``, ``current_device``, ``set_device``, ``synchronize``, ``current_stream``,
@@ -9,8 +9,9 @@
 from outside ``torch`` / ``torch_tpu`` they raise ``RuntimeError: ... is internal to TorchTPU``. The
 public replacements are the device-generic ``torch.accelerator`` APIs.
 
-Each helper uses ``torch.accelerator`` when the current accelerator is the TPU, and otherwise falls
-back to the ``torch.tpu`` function, which older ``torch_tpu`` builds still expose publicly.
+On hosts without TPU devices (such as a CPU-only Ray head node), ``torch_tpu`` skips device backend
+registration so ``torch.accelerator.current_accelerator()`` is ``None``; device queries return
+``False``, ``0``, or no-op directly instead of falling back to internal ``torch.tpu`` functions.
 
 The memory statistics (``memory_allocated`` and the others below) exist only in ``torch.accelerator``:
 ``torch_tpu`` registers its PJRT allocator as the TPU's ``c10::DeviceAllocator``, and ``torch.tpu`` has
@@ -46,69 +47,34 @@ def accelerator_is_tpu() -> bool:
     return is_tpu
 
 
-def _legacy(name: str):
-    """The pre-0.2.0 ``torch.tpu.<name>`` function, or ``None``."""
-    return getattr(getattr(torch, "tpu", None), name, None)
-
-
 def is_available() -> bool:
-    if accelerator_is_tpu():
-        return bool(torch.accelerator.is_available())
-    fn = _legacy("is_available")
-    if fn is None:
-        return False
-    try:
-        # On torch_tpu >= 0.2.0 this raises (or, with TORCH_TPU_ALLOW_LEGACY_DEVICE_APIS=1, warns) in
-        # processes without a TPU, e.g. the Ray driver; the answer there is simply "no TPU".
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            return bool(fn())
-    except Exception as e:
-        logger.debug("torch.tpu.is_available() failed: %s", e)
-        return False
+    return accelerator_is_tpu() and bool(torch.accelerator.is_available())
 
 
 def device_count() -> int:
-    if accelerator_is_tpu():
-        return torch.accelerator.device_count()
-    fn = _legacy("device_count")
-    return fn() if fn is not None else 0
+    return torch.accelerator.device_count() if accelerator_is_tpu() else 0
 
 
 def current_device() -> int:
-    if accelerator_is_tpu():
-        return torch.accelerator.current_device_index()
-    fn = _legacy("current_device")
-    return fn() if fn is not None else 0
+    return torch.accelerator.current_device_index() if accelerator_is_tpu() else 0
 
 
 def synchronize(device: Any = None) -> None:
     if accelerator_is_tpu():
         torch.accelerator.synchronize(device)
-        return
-    fn = _legacy("synchronize")
-    if fn is not None:
-        fn()
 
 
 def current_stream(device: Any = None):
-    if accelerator_is_tpu():
-        return torch.accelerator.current_stream(device)
-    return torch.tpu.current_stream(device)
+    return torch.accelerator.current_stream(device)
 
 
 def set_stream(stream: Any) -> None:
-    if accelerator_is_tpu():
-        torch.accelerator.set_stream(stream)
-    else:
-        torch.tpu.set_stream(stream)
+    torch.accelerator.set_stream(stream)
 
 
 def device(device_index: Any):
     """Context manager that makes ``device_index`` the current device (``torch.cuda.device`` style)."""
-    if accelerator_is_tpu():
-        return torch.accelerator.device_index(device_index)
-    return torch.tpu.device(device_index)
+    return torch.accelerator.device_index(device_index)
 
 
 def _default_generator(device: Any = None) -> torch.Generator:
@@ -125,15 +91,11 @@ def _default_generator(device: Any = None) -> torch.Generator:
 def get_rng_state(device: Any = None) -> torch.Tensor:
     # torch.accelerator has no RNG API on PyTorch 2.13; the per-device default generator is the
     # public equivalent of torch.tpu.get_rng_state().
-    if accelerator_is_tpu():
-        return _default_generator(device).get_state()
-    return torch.tpu.get_rng_state(device) if device is not None else torch.tpu.get_rng_state()
+    return _default_generator(device).get_state()
 
 
 def initial_seed() -> int:
-    if accelerator_is_tpu():
-        return _default_generator().initial_seed()
-    return torch.tpu.initial_seed()
+    return _default_generator().initial_seed()
 
 
 def _tpu_runtime_initialized() -> bool:

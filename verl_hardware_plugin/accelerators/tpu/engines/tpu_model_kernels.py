@@ -21,18 +21,33 @@ The Pallas gated RMSNorm (https://github.com/google-pytorch/torchtitan/pull/80) 
 ``model_kernels``: ``auto`` (default) enables what the installed torchtitan exposes, so the same plugin runs both
 torchtitan ``main`` (nothing is enabled) and an optimized build (everything is enabled) with only the container
 image changed; ``none`` disables all; ``all`` enables every kernel of the model; or a comma-separated subset.
+
+Some models also need a mandatory TPU setup, independent of ``model_kernels``: ``model_setup`` looks it up in
+``_MODEL_SETUPS`` (today Qwen3 MoE). Add a ``ModelSetup`` entry there for a new model; the engine stays unchanged.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
+import logging
+import os
 from types import SimpleNamespace
-from typing import Any, Optional, TypedDict
+from typing import Any, Callable, Optional, TypedDict
 
 import torch
 
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
 # The optional kernels each torchtitan model supports.
 _SUPPORTED_KERNELS = {"qwen3_5": frozenset({"moe", "kda", "lce"})}
+
+# Not ``qwen2_moe``: torchtitan's qwen3 model has no Qwen2-MoE shared expert.
+_QWEN3_MOE_HF_MODEL_TYPES = frozenset({"qwen3_moe"})
+# Pallas grouped-matmul row tile and dWeight tiling; tokens * top_k must be a multiple of the row tile.
+_QWEN3_MOE_GROUPED_MM_TILE_M = 256
+_QWEN3_MOE_GROUPED_MM_TGMM_TILING = (256, 0, 0)
 
 
 class LceBlockSizes(TypedDict, total=False):
@@ -48,12 +63,30 @@ _LCE_BLOCK_SIZES = LceBlockSizes(b_block_size=1024, h_block_size=2048, v_block_s
 # Pallas grouped-matmul tiles of ``moe`` (google-pytorch/torchtitan#79).
 _MOE_GROUPED_MM_TILE_M = 512
 _MOE_GROUPED_MM_TGMM_TILING = (512, 0, 0)
+_MOE_GROUPED_MM_TILES_MAX_DIM = 2048  # the model width those tiles fit (VMEM)
+# dWeight (TGMM) tiles of wider models (Qwen3.5-397B-A17B: hidden 4096, expert hidden 1024). The full-K/N tiles of
+# ``_use_tpu_moe_kernels`` keep (K, N) FP32 accumulators in VMEM: 16 MB for the down projection and 2 x 16 MB for the
+# paired gate/up projection, past the scoped VMEM limit ("CompileTimeScopedVmemOom" in moe_tgmm_wgrad). 1024-wide
+# K/N slabs keep each accumulator at 4 MB. Paired gate/up needs a full N tile, so only K is tiled there.
+_MOE_WIDE_TGMM_TILING = (256, 1024, 0)
+_MOE_WIDE_W2_TGMM_TILING = (256, 1024, 1024)
+# Default ``TpuQwen35TokenDispatcher.capacity_factor`` under EP > 1. torchtitan's pretraining default (1.25) drops
+# skewed RL / math tokens at EP 32-64 while vLLM rollout is dropless, inflating logp_trainer - logp_vllm.
+DEFAULT_EP_CAPACITY_FACTOR = 4.0
 
 
 def _qwen3_5_config_registry() -> Any:
     from torchtitan.experiments.tpu.qwen3_5 import config_registry
 
     return config_registry
+
+
+def _has_tokamax_kda() -> bool:
+    """Whether an installed Tokamax build provides ``tokamax._src.ops.kda`` (PyPI 0.0.14 does not)."""
+    try:
+        return importlib.util.find_spec("tokamax._src.ops.kda") is not None
+    except (ImportError, ValueError, SyntaxError):
+        return False
 
 
 def _available_kernels(torchtitan_name: str) -> frozenset[str]:
@@ -67,7 +100,7 @@ def _available_kernels(torchtitan_name: str) -> frozenset[str]:
     kernels: set[str] = set()
     if hasattr(config_registry, "_use_tpu_moe_kernels"):  # google-pytorch/torchtitan#73
         kernels.update(("moe", "lce"))
-    if hasattr(config_registry, "TOKAMAX_GATED_DELTA_OVERRIDE") and importlib.util.find_spec("tokamax") is not None:
+    if hasattr(config_registry, "TOKAMAX_GATED_DELTA_OVERRIDE") and _has_tokamax_kda():
         kernels.add("kda")  # google-pytorch/torchtitan#74
     return frozenset(kernels)
 
@@ -107,7 +140,12 @@ def model_registry_kwargs(kernels: frozenset[str]) -> dict[str, Any]:
     return {"converters": list(_qwen3_5_config_registry()._TPU_MOE_CONVERTERS)}
 
 
-def configure_model_spec(model_spec: Any, kernels: frozenset[str]) -> None:
+def configure_model_spec(
+    model_spec: Any,
+    kernels: frozenset[str],
+    *,
+    expert_parallel_degree: int = 1,
+) -> None:
     """Sets the model-config options of ``kernels`` on ``model_spec.model`` in place (``moe``: Pallas grouped mm)."""
     if "moe" not in kernels:
         return
@@ -115,8 +153,134 @@ def configure_model_spec(model_spec: Any, kernels: frozenset[str]) -> None:
 
     _qwen3_5_config_registry()._use_tpu_moe_kernels(SimpleNamespace(model_spec=model_spec))
     for _, experts, _, _ in model_spec.model.traverse(TpuGroupedExperts.Config):
-        experts.pallas_grouped_mm_tile_m = _MOE_GROUPED_MM_TILE_M
-        experts.pallas_grouped_mm_tgmm_tiling = _MOE_GROUPED_MM_TGMM_TILING
+        # ExpertParallel shards expert weights on dim 0, which paired (w1 + w3) Pallas grouped matmul disallows.
+        # Turn it off here too so builds with #73 but without #6's TpuQwen35Model.Config do not fail at EP > 1.
+        if expert_parallel_degree > 1 and hasattr(experts, "use_pallas_paired_grouped_mm"):
+            experts.use_pallas_paired_grouped_mm = False
+        # The 512-row tiles were tuned for Qwen3.5-35B-A3B (hidden 2048). At hidden 4096 (Qwen3.5-397B-A17B) the
+        # weight-gradient kernels do not fit in VMEM with full K/N tiles: tile K/N of the dWeight instead.
+        if (getattr(experts, "dim", None) or 0) > _MOE_GROUPED_MM_TILES_MAX_DIM:
+            if hasattr(experts, "pallas_grouped_mm_tgmm_tiling"):
+                experts.pallas_grouped_mm_tgmm_tiling = _MOE_WIDE_TGMM_TILING
+            if hasattr(experts, "pallas_grouped_mm_w2_tgmm_tiling"):
+                experts.pallas_grouped_mm_w2_tgmm_tiling = _MOE_WIDE_W2_TGMM_TILING
+            continue
+        if hasattr(experts, "pallas_grouped_mm_tile_m"):
+            experts.pallas_grouped_mm_tile_m = _MOE_GROUPED_MM_TILE_M
+        if hasattr(experts, "pallas_grouped_mm_tgmm_tiling"):
+            experts.pallas_grouped_mm_tgmm_tiling = _MOE_GROUPED_MM_TGMM_TILING
+
+
+def is_qwen3_moe(torchtitan_name: str, hf_config: Any) -> bool:
+    """Whether ``configure_qwen3_moe`` applies (Qwen3 MoE, not dense Qwen3/Qwen2 or Qwen3.5)."""
+    return torchtitan_name == "qwen3" and getattr(hf_config, "model_type", None) in _QWEN3_MOE_HF_MODEL_TYPES
+
+
+def qwen3_moe_model_registry_kwargs() -> dict[str, Any]:
+    """``model_registry`` kwargs for Qwen3 MoE: torchtitan's TPU token dispatcher and grouped-experts converters.
+
+    Same order as torchtitan's Qwen3-30B-A3B TPU recipe. The default dispatcher's backward is ~5x slower on TPU.
+    """
+    from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
+    from torchtitan.experiments.tpu.token_dispatcher import TpuTokenDispatcherConverter
+
+    return {"converters": [TpuTokenDispatcherConverter.Config(), TpuGroupedExpertsConverter.Config()]}
+
+
+def configure_qwen3_moe(model_spec: Any, *, expert_parallel_size: int, seq_bucket_size: int) -> None:
+    """Sets up a Qwen3 MoE ``model_spec.model`` for RL on TPU, in place.
+
+    - Turns off torchtitan's expert-bias load balancing: vLLM and the HF checkpoint have no expert bias, so with it
+      the trainer would pick different experts than the rollout. The aux loss keeps torchtitan's default (off).
+    - Runs the routed experts on torchtitan's Pallas grouped matmul (``TpuGroupedExperts``), unpaired and in the
+      canonical w1/w2/w3 layout that the weight export expects. Pallas is required: torchtitan's default
+      ``torch._grouped_mm`` path has a wrong backward on TPU (torch_tpu#2668).
+
+    Raises:
+        ValueError: if ``expert_parallel_size > 1``, or if ``seq_bucket_size * top_k`` is not a multiple of the
+            256-row tile.
+    """
+    from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+    from torchtitan.models.common.moe import MoE
+
+    if expert_parallel_size > 1:
+        raise ValueError(
+            f"expert_parallel_size={expert_parallel_size} is not supported for Qwen3 MoE on TPU yet: the Pallas "
+            "grouped matmul setup here is validated only at EP=1 (as in torchtitan's Qwen3 TPU recipe). Use "
+            "expert_parallel_size=1 with FSDP (data_parallel_shard_size) instead."
+        )
+    model_config = model_spec.model
+    moe_configs = [moe for _, moe, _, _ in model_config.traverse(MoE.Config)]
+    if not moe_configs:
+        raise ValueError("Qwen3 MoE: the torchtitan model config has no MoE layer")
+    tile_m = _QWEN3_MOE_GROUPED_MM_TILE_M
+    token_multiple = max(int(seq_bucket_size), 1)  # bucket sizes <= 1 disable bucketing
+    for moe in moe_configs:
+        top_k = moe.router.top_k
+        if (token_multiple * top_k) % tile_m:
+            raise ValueError(
+                f"Qwen3 MoE on TPU: the Pallas grouped matmul needs tokens * top_k to be a multiple of {tile_m}, but "
+                f"token counts are only guaranteed to be multiples of the sequence bucket {token_multiple} "
+                f"(top_k={top_k}). Set engine_kwargs.tpu.seq_bucket_size so that it times top_k is a multiple of "
+                f"{tile_m} (the default 256 is)."
+            )
+        # TODO: pass load_balance_coeff=None to torchtitan's model_registry once it accepts it, and remove this line.
+        moe.load_balance_coeff = None
+    experts_configs = [experts for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config)]
+    if len(experts_configs) != len(moe_configs):
+        raise ValueError(
+            f"Qwen3 MoE: {len(experts_configs)} of {len(moe_configs)} MoE layers use TpuGroupedExperts; build the "
+            "model with qwen3_moe_model_registry_kwargs()"
+        )
+    # Same values as torchtitan's Qwen3-30B-A3B TPU recipe, except unpaired and the canonical layout.
+    # TODO: call torchtitan's _use_tpu_moe_kernels (as for Qwen3.5) once the pinned torchtitan has it.
+    for experts in experts_configs:
+        experts.use_pallas_grouped_mm = True
+        experts.use_pallas_paired_grouped_mm = False
+        experts.use_kernel_native_weight_layout = False  # keep the canonical parameter names and layout
+        experts.pallas_grouped_mm_tile_m = tile_m
+        experts.pallas_grouped_mm_tgmm_tiling = _QWEN3_MOE_GROUPED_MM_TGMM_TILING
+    logger.info(
+        "Qwen3 MoE: %d layers route without expert bias; TPU token dispatcher and Pallas grouped matmul experts "
+        "(tile_m=%d)",
+        len(moe_configs),
+        tile_m,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelSetupContext:
+    """Engine settings a ``ModelSetup.configure`` may need."""
+
+    expert_parallel_size: int
+    seq_bucket_size: int
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelSetup:
+    """Mandatory TPU setup of one model family (not an optional ``model_kernels`` entry)."""
+
+    name: str
+    matches: Callable[[str, Any], bool]  # (torchtitan model name, HF config) -> bool
+    registry_kwargs: Callable[[], dict[str, Any]] = dict  # extra ``model_registry`` kwargs
+    configure: Optional[Callable[[Any, ModelSetupContext], None]] = None  # in-place ``model_spec`` fix-ups
+
+
+_MODEL_SETUPS: tuple[ModelSetup, ...] = (
+    ModelSetup(
+        name="qwen3_moe",
+        matches=is_qwen3_moe,
+        registry_kwargs=qwen3_moe_model_registry_kwargs,
+        configure=lambda spec, ctx: configure_qwen3_moe(
+            spec, expert_parallel_size=ctx.expert_parallel_size, seq_bucket_size=ctx.seq_bucket_size
+        ),
+    ),
+)
+
+
+def model_setup(torchtitan_name: str, hf_config: Any) -> Optional[ModelSetup]:
+    """The mandatory TPU setup of the model, or ``None`` if it needs none."""
+    return next((setup for setup in _MODEL_SETUPS if setup.matches(torchtitan_name, hf_config)), None)
 
 
 def override_imports(kernels: frozenset[str]) -> list[str]:
@@ -161,4 +325,32 @@ def set_packed_document_budget(modules: Any, num_documents: int) -> int:
             if is_kernel and hasattr(module, "max_num_segments") and module.max_num_segments != num_documents:
                 module.max_num_segments = int(num_documents)
                 updated += 1
+    return updated
+
+
+def set_ep_capacity_factor(modules: Any, capacity_factor: float) -> int:
+    """Sets ``capacity_factor`` of every ``TpuQwen35TokenDispatcher`` in ``modules``.
+
+    torchtitan's ``TpuQwen35Model`` switches MoE layers to ``TpuQwen35TokenDispatcher(capacity_factor=1.25)`` when
+    ``expert_parallel_degree > 1``. ``RoutedExperts`` holds ``token_dispatcher`` as a ``Configurable`` object
+    attribute (not an ``nn.Module``), so inspect both each submodule and its ``token_dispatcher`` attribute. On skewed
+    RL / math batches at EP 32-64, a 1.25 per-rank cap drops real tokens while vLLM rollout is dropless, corrupting
+    ``logp_trainer - logp_vllm``. Must be called before the first compiled forward pass traces ``dispatch``.
+    """
+    model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
+    cap = float(capacity_factor)
+    seen: set[int] = set()
+    updated = 0
+    for model in model_list:
+        if not isinstance(model, torch.nn.Module):
+            continue
+        for module in model.modules():
+            for candidate in (module, getattr(module, "token_dispatcher", None)):
+                if candidate is None or id(candidate) in seen:
+                    continue
+                seen.add(id(candidate))
+                is_dispatcher = any(c.__name__ == "TpuQwen35TokenDispatcher" for c in type(candidate).__mro__)
+                if is_dispatcher and hasattr(candidate, "capacity_factor") and candidate.capacity_factor != cap:
+                    candidate.capacity_factor = cap
+                    updated += 1
     return updated

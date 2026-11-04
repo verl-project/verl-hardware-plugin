@@ -22,6 +22,7 @@ _original_post_init = None
 
 def _patch_tool_config():
     """Add 'mlu' to allowed contents in TorchProfilerToolConfig."""
+    import verl.utils.profiler.config as profiler_config
     from verl.utils.profiler.config import TorchProfilerToolConfig
 
     global _original_post_init
@@ -30,18 +31,30 @@ def _patch_tool_config():
 
     _original_post_init = TorchProfilerToolConfig.__post_init__
 
+    mlu_activity = getattr(torch.profiler.ProfilerActivity, "MLU", None)
+    # Both tables must exist: touching a missing DEVICE_CONTENTS below would
+    # raise inside registration (swallowed at debug level by register_all_profiles),
+    # silently unregistering the whole MLU profiler. A verl carrying only one of
+    # the tables gets the fallback patch instead.
+    if (
+        mlu_activity is not None
+        and hasattr(profiler_config, "DEVICE_ACTIVITIES")
+        and hasattr(profiler_config, "DEVICE_CONTENTS")
+    ):
+        if "mlu" not in profiler_config.DEVICE_ACTIVITIES:
+            profiler_config.DEVICE_ACTIVITIES["mlu"] = mlu_activity
+            profiler_config.DEVICE_CONTENTS = frozenset(profiler_config.DEVICE_CONTENTS | {"mlu"})
+            import verl.utils.profiler.torch_profile as tp
+
+            tp.DEVICE_ACTIVITIES = profiler_config.DEVICE_ACTIVITIES
+            tp.DEVICE_CONTENTS = profiler_config.DEVICE_CONTENTS
+        logger.info("[verl_hardware_plugin] Registered mlu in verl DEVICE_ACTIVITIES")
+        return
+
     @functools.wraps(_original_post_init)
     def _patched_post_init(self):
         if not isinstance(self.contents, list):
             raise AssertionError(f"Profiler contents must be of type list, got {type(self.contents)}")
-
-        # contents is a frozen-dataclass field -- direct assignment raises
-        # FrozenInstanceError even from the class's own __post_init__. Delegate
-        # to the saved original (with "mlu" filtered out) instead of
-        # reimplementing its whitelist/token-range checks here, so any other
-        # platform's contribution to the real __post_init__ (e.g. a plugin's
-        # torch_profiler_content_name()) still takes effect instead of being
-        # silently discarded.
         saved_contents = self.contents
         object.__setattr__(self, "contents", [c for c in saved_contents if c != "mlu"])
         try:
@@ -73,6 +86,8 @@ def _patch_get_torch_profiler():
         schedule=None,
         name_mini_batch_window=False,
     ):
+        os.makedirs(save_path, exist_ok=True)
+
         if hasattr(tp, "build_trace_basename"):
             base_file_name = tp.build_trace_basename(
                 rank=rank, role=role, save_file_prefix=save_file_prefix, profile_step=profile_step

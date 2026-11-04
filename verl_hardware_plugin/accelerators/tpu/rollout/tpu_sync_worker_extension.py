@@ -23,15 +23,14 @@ import os
 import time
 from typing import Any, NamedTuple, Optional
 
-import ray
 import torch
+from vllm.utils.network_utils import get_ip
 
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
-from verl_hardware_plugin.accelerators.tpu.rollout import qwen3_5_layout
+from verl_hardware_plugin.accelerators.tpu.rollout import direct_install
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_api
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_checkpoint_engine as tpu_sync_engine
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import ExactParityCheck, compute_tensor_stats
-from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous import get_tpu_sync_rendezvous
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import (
     get_parent_module,
     resolve_model_key,
@@ -41,9 +40,6 @@ from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends impo
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-# How long a rollout worker waits for the controller address and the trainer's tensor shapes.
-_REGISTRY_POLL_ATTEMPTS = 30
-_REGISTRY_POLL_INTERVAL_S = 0.5
 # Row-parallel layers: vLLM shards their input dimension (dim 1) across TP ranks; every other 2-D weight
 # whose output dimension divides evenly is sharded on dim 0.
 _ROW_PARALLEL_SUFFIXES = (".o_proj.weight", ".down_proj.weight")
@@ -153,39 +149,21 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         worker: Any = getattr(self, "worker", self)
         return worker.model_runner.model
 
-    def _wait_for_tpu_sync_rendezvous(
-        self, rank_val: int, rendezvous_name: Optional[str] = None
-    ) -> tuple[str, dict[str, list[int]]]:
-        """Returns the controller address and the trainer's global tensor shapes from the job's rendezvous actor."""
-        for _ in range(_REGISTRY_POLL_ATTEMPTS):
-            try:
-                rendezvous = get_tpu_sync_rendezvous(rendezvous_name)
-                addr, shapes = ray.get(
-                    [rendezvous.get_controller_address.remote(), rendezvous.get_global_shapes.remote()]
-                )
-                if addr and shapes:
-                    return addr, shapes
-            except Exception as e:
-                logger.debug(f"tpu-sync Sampler Rank {rank_val}: registry lookup failed: {e}")
-            time.sleep(_REGISTRY_POLL_INTERVAL_S)
-        raise RuntimeError(
-            f"tpu-sync Sampler Rank {rank_val}: No tpu-sync controller address or "
-            f"global shapes found in the tpu-sync rendezvous {rendezvous_name!r} after timeout"
-        )
-
     def init_tpu_sync_on_worker(
         self,
+        controller_address: str,
+        global_shapes: dict[str, list[int]],
         parallelism: int = tpu_sync_engine.TPU_SYNC_DEFAULT_PARALLELISM,
         job_name: str = "sampler0",
-        rendezvous_name: Optional[str] = None,
     ) -> bool:
         """Initialize tpu-sync WeightSynchronizer listener and register with the central tpu-sync controller.
 
-        ``job_name`` is the tpu-sync job this worker's replica registers under (the driver names every rollout
-        replica after its ``replica_rank``), so the ranks ``0..TP-1`` of several replicas do not collide on
-        the controller. ``rendezvous_name`` is the job's ``TpuSyncRendezvous`` actor, which the driver names.
-        Only the first call does work: the receive buffers, the synchronizer and the
-        registration are reused by every later sync.
+        ``controller_address`` is the ``host:port`` of the driver's tpu-sync controller and ``global_shapes`` the
+        full shape of every tensor the trainer sends; the driver passes both, because vLLM's ``mp`` workers are
+        not Ray processes. ``job_name`` is the tpu-sync job this worker's replica registers under (the driver
+        names every rollout replica after its ``replica_rank``), so the ranks ``0..TP-1`` of several replicas do
+        not collide on the controller. Only the first call does work: the receive buffers, the synchronizer and
+        the registration are reused by every later sync.
         """
         if getattr(self, "_tpu_sync_ws", None) is not None:
             return True
@@ -195,14 +173,18 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             logger.warning("tpu-sync Sampler: could not locate vllm_model to bind parameters.")
             return False
 
-        bind_ip = ray.util.get_node_ip_address().strip("[]")
+        bind_ip = get_ip().strip("[]")
         rank_val = getattr(self, "rank", 0)
         # The listener port is assigned by the OS, as on the trainer side, and registered with the controller
         # below; fixed ``base + rank`` ports collided when two replicas shared a host.
         listener_port = 0
 
-        # 1. Fetch tpu-sync controller address and un-fused global shapes from the job's rendezvous
-        controller_addr, global_shapes_map = self._wait_for_tpu_sync_rendezvous(rank_val, rendezvous_name)
+        controller_addr, global_shapes_map = controller_address, global_shapes
+        if not controller_addr or not global_shapes_map:
+            raise RuntimeError(
+                f"tpu-sync Sampler Rank {rank_val}: the driver passed no tpu-sync controller address "
+                f"({controller_addr!r}) or no trainer tensor shapes ({len(global_shapes_map or {})} entries)"
+            )
 
         # 2. Determine tensor parallel size from vLLM V1 config
         worker: Any = getattr(self, "worker", self)
@@ -214,22 +196,31 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                 f"from worker.vllm_config.parallel_config!"
             )
 
-        # Qwen3.5 installs each rank's slices straight into vLLM's parameters (qwen3_5_layout); other hybrid or
-        # MoE models go through vLLM's loaders, which needs every tensor whole on every rank.
+        # Models with a direct-install layout (``direct_install``: e.g. Qwen3.5, Qwen3 MoE) install each rank's slices
+        # straight into vLLM's parameters; other hybrid or MoE models go through vLLM's loaders, which needs every
+        # tensor whole on every rank.
         hf_text_config = getattr(worker.vllm_config.model_config, "hf_text_config", None)
-        qwen3_5_plan, no_plan_reason = qwen3_5_layout.plan_direct_install(
+        layout, plan, no_plan_reasons = direct_install.select_layout(
             vllm_model, global_shapes_map, hf_text_config, tp_size, rank_val
         )
-        use_vllm_loaders = qwen3_5_plan is None and _uses_vllm_weight_loader(vllm_model, global_shapes_map)
-        self._tpu_sync_qwen3_5_plan = qwen3_5_plan
+        use_vllm_loaders = layout is None and _uses_vllm_weight_loader(vllm_model, global_shapes_map)
+        self._tpu_sync_layout = layout
+        self._tpu_sync_plan = plan
         self._tpu_sync_use_vllm_loaders = use_vllm_loaders
-        install_mode = "qwen3_5 direct" if qwen3_5_plan else "vllm loaders" if use_vllm_loaders else "direct"
+        # The loaders need the trainer's tensors back in HF's layout (``DirectInstallLayout.loader_weights``).
+        self._tpu_sync_hf_text_config = hf_text_config
+        loader_error = direct_install.loader_error(global_shapes_map, hf_text_config) if layout is None else ""
+        if loader_error:
+            raise RuntimeError(f"tpu-sync Sampler Rank {rank_val}: {loader_error}")
+        install_mode = (
+            f"{layout.name} direct" if layout is not None else "vllm loaders" if use_vllm_loaders else "direct"
+        )
         logger.info(f"tpu-sync Sampler Rank {rank_val}: install mode {install_mode}")
         if use_vllm_loaders:
             # Every sync then all-gathers the whole model on every rank and re-runs vLLM's loaders (slow).
             logger.warning(
                 f"tpu-sync Sampler Rank {rank_val}: installing through vLLM's checkpoint loaders (TP all-gather of "
-                f"every tensor); no direct install: {no_plan_reason}"
+                f"every tensor); no direct install: {'; '.join(no_plan_reasons)}"
             )
 
         # 3. Allocate local TPU staging buffers matching Trainer un-fused layout and sharding specs
@@ -248,10 +239,21 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         # this worker's TP rank: a single rollout replica without pipeline parallelism, as the registration below
         # ("sampler/<rank>" on mesh [1, tp_size]) already assumes.
         num_kv_heads = worker.vllm_config.model_config.get_total_num_kv_heads()
+        # Tensors received straight into vLLM's weights instead of an HBM staging buffer (see
+        # DirectInstallLayout.zero_copy_targets).
+        zero_copy: dict[str, torch.Tensor] = {}
+        if layout is not None and layout.zero_copy_targets is not None:
+            init_sd = vllm_model.state_dict()
+
+            def _find_init_key(k: str) -> Optional[str]:
+                resolved = resolve_model_key(k, init_sd)
+                return resolved if resolved in init_sd else None
+
+            zero_copy = layout.zero_copy_targets(plan, init_sd, _find_init_key, global_shapes_map)
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
-            rule = qwen3_5_layout.sampler_sharding_rule(name, g_shape, tp_size) if qwen3_5_plan else None
+            rule = layout.sharding_rule(name, g_shape, tp_size, plan) if layout is not None else None
             if rule is not None:
                 shard = _slice_from_spec(*rule, tp_size)
             else:
@@ -265,9 +267,18 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                 )
             replicas[name] = shard.replicas
 
-            # Allocate a local staging buffer with matching layout (the trainer sends bf16)
-            device = torch.device(tpu_sync_engine.TPU_SYNC_DEVICE)
-            t = torch.empty(shard.local_shape, dtype=torch.bfloat16, device=device)
+            # Allocate a local staging buffer with matching layout (the trainer sends bf16), or receive straight
+            # into the vLLM weight.
+            t = zero_copy.get(name)
+            if t is not None:
+                if list(t.shape) != list(shard.local_shape):
+                    raise RuntimeError(
+                        f"tpu-sync Sampler Rank {rank_val}: {name} slice {shard.local_shape} != vLLM weight "
+                        f"{list(t.shape)}"
+                    )
+            else:
+                device = torch.device(tpu_sync_engine.TPU_SYNC_DEVICE)
+                t = torch.empty(shard.local_shape, dtype=torch.bfloat16, device=device)
             staging_tensors[name] = t
             staging_sharded[name] = "tp" in shard.sharding_spec
             valid_params.append((name, t))
@@ -289,6 +300,12 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         self._tpu_sync_staging_sharded = staging_sharded
         self._sorted_vllm_params = valid_params
         self._tpu_sync_replicas = replicas
+        if zero_copy:
+            logger.info(
+                f"tpu-sync Sampler Rank {rank_val}: {len(zero_copy)} tensors "
+                f"({sum(t.numel() * t.element_size() for t in zero_copy.values()) / 2**30:.2f} GiB) are received "
+                "straight into vLLM's weights (no staging copy)"
+            )
 
         tpu_sync_engine.tpu_synchronize()
 
@@ -401,14 +418,15 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             target_local.copy_(adapted)
 
         consumed_staging = set()
-        qwen3_5_plan = getattr(self, "_tpu_sync_qwen3_5_plan", None)
+        parity_check = parity.check if parity is not None else None
+        layout: Optional[direct_install.DirectInstallLayout] = getattr(self, "_tpu_sync_layout", None)
         fused_targets: tuple[tuple[str, tuple[str, ...]], ...] = _FUSED_TARGETS
-        if qwen3_5_plan is not None:
-            # GatedDeltaNet projections, conv, A_log / dt_bias and the stacked experts (see qwen3_5_layout).
-            consumed_staging |= qwen3_5_layout.install(
-                self._tpu_sync_staging, model_sd, find_model_key, copy_into, qwen3_5_plan
+        if layout is not None:
+            # The model-specific tensors (e.g. GatedDeltaNet projections, expert stacks); see ``direct_install``.
+            consumed_staging |= layout.install(
+                self._tpu_sync_staging, model_sd, find_model_key, copy_into, self._tpu_sync_plan, parity_check
             )
-            fused_targets = _FUSED_TARGETS + qwen3_5_layout.FUSED_TARGETS
+            fused_targets = _FUSED_TARGETS + layout.fused_targets
 
         # 1. Handle fused projections (QKV and Gate-Up)
         for target_suffix, src_suffixes in fused_targets:
@@ -434,7 +452,7 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                 copy_into(resolved_key, src_t)
             else:
                 unresolved.append(name)
-        if qwen3_5_plan is not None and unresolved:
+        if layout is not None and unresolved:
             raise RuntimeError(f"tpu-sync direct install: no vLLM parameter for {len(unresolved)}: {unresolved[:8]}")
 
         # 3. Handle tied word embeddings. Only when the trainer did not send lm_head itself: for untied
@@ -453,6 +471,10 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             if vllm_model.lm_head.weight.data_ptr() != vllm_model.embed_tokens.weight.data_ptr():
                 vllm_model.lm_head.weight.copy_(vllm_model.embed_tokens.weight)
 
+        # TODO(tpu): fail the first sync if some vLLM parameter received no weights (it would keep the checkpoint's
+        #   value for the whole run), for every direct install; Qwen3.5 first needs to confirm which vLLM parameters
+        #   the text-only trainer never sends (e.g. a vision tower).
+
         t_sync_start = time.perf_counter()
         tpu_sync_engine.tpu_synchronize()
         t_sync = time.perf_counter() - t_sync_start
@@ -465,8 +487,8 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         # Returned through collective_rpc so the orchestrator can log them as step metrics.
         result = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
         if parity is not None:
-            # Covers every tensor written through copy_into; Qwen3.5's stacked experts are written directly
-            # (qwen3_5_layout._write_w13 / _write_w2) and are not compared.
+            # Covers every tensor written through copy_into, and the regions that a direct-install layout writes
+            # itself (e.g. the experts' w13 / w2), through the ``check`` passed to its install.
             result["exact_parity"] = parity.result(rank, unresolved)
         return result
 
@@ -510,6 +532,10 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                     t_gather += time.perf_counter() - t0
                 yield name, t
 
+        def _checkpoint_weights():
+            # Back to HF's layout (e.g. Qwen3.5's split tensors re-fused, Qwen3 MoE's expert stacks split per expert).
+            return direct_install.loader_weights(_weights(), getattr(self, "_tpu_sync_hf_text_config", None))
+
         worker: Any = getattr(self, "worker", self)
         model_runner = worker.model_runner
         if hasattr(model_runner, "reload_weights"):
@@ -519,11 +545,9 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             for module in self._get_vllm_model().modules():
                 if getattr(module, "_tpu_weight_flipped", False):
                     module._tpu_weight_flipped = False
-            model_runner.reload_weights(
-                weights_iterator=qwen3_5_layout.refuse_split_tensors(_weights()), is_checkpoint_format=True
-            )
+            model_runner.reload_weights(weights_iterator=_checkpoint_weights(), is_checkpoint_format=True)
         else:
-            self._get_vllm_model().load_weights(qwen3_5_layout.refuse_split_tensors(_weights()))
+            self._get_vllm_model().load_weights(_checkpoint_weights())
         logger.info(f"Sampler Rank {getattr(self, 'rank', 0)}: TP all-gathers of the received tensors: {t_gather:.2f}s")
 
     def get_model_weights_stats(self) -> dict:
