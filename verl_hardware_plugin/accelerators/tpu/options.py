@@ -184,6 +184,11 @@ class TPUEngineOptions:
         ep_paired_grouped_mm: With ``expert_parallel_size > 1`` and a torchtitan whose ``TpuGroupedExperts`` has
             ``allow_ep_paired_grouped_mm``, keep the paired (w1 + w3) Pallas grouped matmul under EP (default:
             ``False``: unpaired under EP, as torchtitan builds without it require).
+        ac_save_splash_and_routing: When ``True`` and activation checkpointing is enabled, use a TPU ``SelectiveAC``
+            policy that saves only Pallas ``SplashAttention`` forward outputs (``(out, lse)``) and MoE router
+            ``aten.topk`` assignments while recomputing all projections, norms, GatedDeltaNet recurrences and MoE
+            collectives/matmuls (matching TorchTitan's ``tpu_selective`` ``("moe.routing",
+            "attention.inner_attention")`` benchmark memory policy).
     """
 
     use_splash_attention: Optional[bool] = None
@@ -204,6 +209,7 @@ class TPUEngineOptions:
     enable_tpu_topo_mesh: Optional[bool] = None
     ep_token_chunks: Optional[int] = None
     ep_paired_grouped_mm: Optional[bool] = None
+    ac_save_splash_and_routing: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -225,6 +231,7 @@ _ENGINE_KINDS: dict[str, type] = {
     "enable_tpu_topo_mesh": bool,
     "ep_token_chunks": int,
     "ep_paired_grouped_mm": bool,
+    "ac_save_splash_and_routing": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
