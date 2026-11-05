@@ -777,7 +777,7 @@ class TPUEngineTrainModeCtx(BaseEngineCtx):
         super().__exit__(exc_type, exc_value, traceback)
 
 
-_SPLASH_ROUTING_SELECTIVE_AC_CLS: Optional[type] = None
+_SPLASH_ROUTING_SELECTIVE_AC_CLS: Any = None
 _PALLAS_SPLASH_FWD_OP_MARKER = "splash_attn_fwd"
 
 

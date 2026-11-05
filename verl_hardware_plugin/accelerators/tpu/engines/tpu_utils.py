@@ -1025,7 +1025,7 @@ _SPLASH_1024_SUBCLASSES: dict[type, type] = {}
 
 def _splash_accepts_block_kwargs(splash_cls: type) -> bool:
     try:
-        params = inspect.signature(splash_cls.__init__).parameters
+        params = inspect.signature(splash_cls).parameters
     except (TypeError, ValueError):
         return False
     return "block_q" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())

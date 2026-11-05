@@ -668,7 +668,7 @@ def _get_barrier_routed_experts_cls(cls: type) -> type:
     cached = _BARRIER_ROUTED_EXPERTS_SUBCLASSES.get(cls)
     if cached is not None:
         return cached
-    base_cls = next((c for c in cls.__mro__ if c.__name__ == "TpuQwen35RoutedExperts"), cls)
+    base_cls: type = next((c for c in cls.__mro__ if c.__name__ == "TpuQwen35RoutedExperts"), cls)
     mod = sys.modules.get(base_cls.__module__)
     maybe_set_sparse_mesh = getattr(mod, "maybe_set_sparse_mesh", contextlib.nullcontext)
     tokens_per_expert = getattr(mod, "_tokens_per_expert", _default_tokens_per_expert)
@@ -700,7 +700,7 @@ def _get_barrier_routed_experts_cls(cls: type) -> type:
             or x_TD.shape[0] == 0
             or x_TD.shape[0] % num_chunks != 0
         ):
-            return super(base_cls, self).forward(
+            return super(base_cls, self).forward(  # type: ignore[arg-type]
                 x_TD,
                 topk_scores_TK,
                 topk_expert_ids_TK,
