@@ -31,6 +31,7 @@ from torch.distributed.tensor import DTensor
 
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import TorchtitanEngineConfig
+from verl_hardware_plugin.accelerators.tpu.device_api import tpu_synchronize
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 
 logger = logging.getLogger(__name__)
@@ -639,35 +640,6 @@ def unwrap_metadata(val: Any) -> Any:
     if isinstance(val, torch.Tensor):
         return val.item() if val.numel() == 1 else val
     return val
-
-
-def tpu_synchronize(
-    tensors: Optional[torch.Tensor] = None,
-    *,
-    wait: bool = True,
-    strict: bool = False,
-) -> None:
-    """Materialize and synchronize pending TPU operations (for ``tensors`` or the whole device).
-
-    Args:
-        tensors: Optional tensor (e.g. ``loss``) to materialize; ``None`` synchronizes the whole TPU device.
-        wait: Wait for device execution to complete when ``True``; dispatch asynchronously when ``False``.
-        strict: Raise ``RuntimeError`` if ``torch_tpu`` cannot synchronize instead of logging a warning.
-    """
-    if isinstance(tensors, torch.Tensor) and tensors.device.type != "tpu":
-        return
-    try:
-        from torch_tpu._internal import sync
-
-        if tensors is None:
-            sync.synchronize(wait=wait)
-        else:
-            sync.synchronize(tensors, wait=wait)
-    except Exception as e:  # ImportError on hosts without torch_tpu (CPU tests) included
-        if strict:
-            raise RuntimeError(f"TPU synchronization failed: {e}") from e
-        if not isinstance(e, ImportError):
-            logger.warning("Could not synchronize via torch_tpu: %s", e)
 
 
 def tpu_eager_mode_context(mode: Optional[str]):

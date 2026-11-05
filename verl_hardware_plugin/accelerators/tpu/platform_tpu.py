@@ -401,10 +401,7 @@ class TPUDeviceModuleProxy:
             return 0
 
     def synchronize(self, device_index: Optional[int] = None) -> None:
-        try:
-            tpu_device_api.synchronize()
-        except Exception as e:
-            logger.warning(f"TPU synchronize() failed: {e}")
+        tpu_device_api.synchronize(device_index)
 
     # torch_tpu >= 0.2.0 makes these torch.tpu functions internal (they raise when called from
     # outside torch / torch_tpu), so they are served through torch.accelerator instead of being
@@ -568,7 +565,7 @@ class PlatformTPU(PlatformBase):
         self.device_module.set_device(device_index)
 
     def synchronize(self, device_index: Optional[int] = None) -> None:
-        self.device_module.synchronize()
+        self.device_module.synchronize(device_index)
 
     def manual_seed(self, seed: int) -> None:
         torch.manual_seed(seed)
