@@ -755,7 +755,7 @@ def test_cancelled_sync_is_fail_stop(mori_env):
 
 
 def test_retry_after_first_error_is_refused_while_workers_unwind(mori_env):
-    """ray.get raises on the first failed worker without waiting for the others: a retry must not get hold of a
+    """The manager raises on the first failed worker without waiting for the others: a retry must not get hold of a
     worker whose sync is still running (it refuses prepare), and no worker that failed is reusable afterwards."""
     mod, fab = mori_env
     actors = [_new(mod, 2, node="trainer", is_master=(i == 0)) for i in range(2)]
