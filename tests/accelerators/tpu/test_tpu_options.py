@@ -55,6 +55,8 @@ def test_engine_kwargs_are_parsed_and_typed():
                 "param_dtype": "bfloat16",
                 "optimizer_host_offload": "true",
                 "fp32_master": "true",
+                "ep_token_chunks": "2",
+                "ep_paired_grouped_mm": "true",
             }
         )
     )
@@ -71,6 +73,8 @@ def test_engine_kwargs_are_parsed_and_typed():
         param_dtype="bfloat16",
         optimizer_host_offload=True,
         fp32_master=True,
+        ep_token_chunks=2,
+        ep_paired_grouped_mm=True,
     )
     assert get_tpu_engine_options(_cfg()) == TPUEngineOptions()
     assert get_tpu_engine_options(None) == TPUEngineOptions()
@@ -241,3 +245,16 @@ def test_ep_dispatcher_and_topo_mesh_options():
 
     with pytest.raises(ValueError, match="engine_kwargs.tpu.ep_dispatcher"):
         tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": "deepep"}}))
+
+
+def test_ac_save_splash_and_routing_option():
+    from types import SimpleNamespace
+
+    opts = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(engine_kwargs={"tpu": {"ac_save_splash_and_routing": "true"}})
+    )
+    assert opts.ac_save_splash_and_routing is True
+    opts_off = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(engine_kwargs={"tpu": {"ac_save_splash_and_routing": False}})
+    )
+    assert opts_off.ac_save_splash_and_routing is False

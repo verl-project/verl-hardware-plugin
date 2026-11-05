@@ -489,3 +489,55 @@ def test_weight_export_owned_and_size1_mesh_dims():
     dt._tpu_sync_owned = True  # type: ignore[attr-defined]
     [(name, exported, shard)] = list(TrainerWeights({"w": dt}, [], "cpu").local_shards())
     assert name == "w" and shard == (4, 2) and exported.data_ptr() == local_exp.data_ptr()
+
+
+def test_fsdp_dim0_shard_efsdp_times_ep_whole_experts():
+    """SimpleFSDP + EP with efsdp > 1: (_StridedShard(0, ep), Shard(0)) holds block i_ep * efsdp + i_efsdp.
+
+    Matches torchtitan's layout as observed on an 8-rank (efsdp=2, ep=4) Gloo mesh with 16 experts: rank
+    (i_efsdp, i_ep) = (0, 1) holds experts 4-5 (block 2 of 8) and (1, 0) holds experts 2-3 (block 1 of 8).
+    """
+    from torch.distributed.tensor import DTensor, Replicate, Shard
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+    from torch.distributed.tensor.placement_types import _StridedShard
+
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights, fsdp_dim0_shard
+
+    efsdp, ep, num_experts = 2, 4, 16
+
+    def _dt(coord, placements, local_rows=num_experts // (efsdp * ep), sizes=(efsdp, ep)):
+        class _FakeMesh:
+            ndim = 2
+            device_type = "cpu"
+
+            def size(self, d: int) -> int:
+                return sizes[d]
+
+            def get_coordinate(self):
+                return list(coord)
+
+        local = torch.randn(local_rows, 4, 8, dtype=torch.bfloat16)
+        spec = DTensorSpec(
+            _FakeMesh(),  # type: ignore[arg-type]
+            placements,
+            tensor_meta=TensorMeta(torch.Size([num_experts, 4, 8]), (32, 8, 1), torch.bfloat16),
+        )
+        return DTensor(local.view_as(local), spec, requires_grad=False), local
+
+    strided = (_StridedShard(0, split_factor=ep), Shard(0))
+    # Expected blocks from the live 8-rank (efsdp=2, ep=4) torchtitan run: experts held = [2 * block, 2 * block + 1].
+    observed_first_expert = {(0, 0): 0, (0, 1): 4, (0, 2): 8, (0, 3): 12, (1, 0): 2, (1, 1): 6, (1, 2): 10, (1, 3): 14}
+    for coord, first_expert in observed_first_expert.items():
+        dt, _ = _dt(coord, strided)
+        assert fsdp_dim0_shard(dt) == (efsdp * ep, first_expert // 2), coord
+
+    # Wrong split factor, swapped placements, or a non-whole-expert local block are not this layout: gathered.
+    assert fsdp_dim0_shard(_dt((1, 2), (_StridedShard(0, split_factor=2), Shard(0)))[0]) is None
+    assert fsdp_dim0_shard(_dt((1, 2), (Shard(0), _StridedShard(0, split_factor=ep)))[0]) is None
+    assert fsdp_dim0_shard(_dt((1, 2), (Replicate(), Shard(0)))[0]) is None
+    assert fsdp_dim0_shard(_dt((1, 2), strided, local_rows=3)[0]) is None
+
+    dt, local = _dt((1, 3), strided)
+    dt._tpu_sync_owned = True  # type: ignore[attr-defined]
+    [(name, exported, shard)] = list(TrainerWeights({"w13_ep": dt}, [], "cpu").local_shards())
+    assert name == "w13_ep" and shard == (8, 7) and exported.data_ptr() == local.data_ptr()
