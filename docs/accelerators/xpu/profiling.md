@@ -1,6 +1,6 @@
 # Intel VTune Profiling Guide
 
-Last updated: 10/09/2026.
+Last updated: 10/30/2026.
 
 This guide describes Intel VTune (ITT) profiling support in `verl-hardware-plugin`
 for Intel XPU. There is no PyTorch-native profiler activity for Intel XPU, so
@@ -31,15 +31,10 @@ needing to know about ITT or XPU itself, while `VtuneProfiler` is registered for
   (`hotspots` reads `perf_event_open`, so a container typically needs
   `kernel.perf_event_paranoid <= 2` or `CAP_PERFMON`).
 - Install `verl` (`main` includes `profiler_markers()` as of 2026-10-08) and
-  `verl-hardware-plugin` in editable mode, and enable the plugin in Ray
-  runtime:
-
-  ```yaml
-  working_dir: ./
-  excludes: ["/.git/"]
-  env_vars:
-    VERL_USE_EXTERNAL_MODULES: "verl_hardware_plugin"
-  ```
+  `verl-hardware-plugin` (see [install_guidance.md](./install_guidance.md)). The plugin is auto-discovered in
+  every process, including Ray workers, through its `verl.plugins` entry point, so no Ray `runtime_env` setting is
+  needed. (`VERL_USE_EXTERNAL_MODULES: "verl_hardware_plugin"` is an equivalent explicit way to load it, and is
+  only useful if entry-point discovery is disabled.)
 
 ## Enabling VTune
 

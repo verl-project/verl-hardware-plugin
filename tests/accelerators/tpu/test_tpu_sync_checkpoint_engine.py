@@ -59,6 +59,7 @@ TIMING_KEYS = {
         "p2p_transfer",
         "sampler_h2d",
         "sampler_resume",
+        "rollout_paused",
         "trainer_release",
         "total_sync",
         "sampler_h2d_pure",
@@ -989,12 +990,13 @@ def test_update_tpu_sync_weights_end_to_end(fake_tpu_sync, worker_ext, caplog, t
     events.clear()
     with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
         metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
-    # The pause runs concurrently with the trainer send, which is requested first.
+    # The rollout keeps generating through the trainer send, the rollout init and the transfer, and is paused only
+    # for the install (whose H2D may write vLLM's parameters).
     assert events == [
         "update_weights",
-        "abort",
         "init_tpu_sync_on_worker",
         "release_sync_buffers",
+        "abort",
         "install_tpu_sync_weights",
         "set_global_steps",
         "get_model_weights_stats",
@@ -1243,10 +1245,11 @@ def test_update_tpu_sync_weights_returns_phase_timings_and_slowest_worker_h2d(fa
     assert set(metrics) == TIMING_KEYS - {"timing_s/tpu-sync/sampler_h2d_pure"}
 
 
-def test_update_tpu_sync_weights_pauses_concurrently_and_resumes_before_the_release(
+def test_update_tpu_sync_weights_pauses_after_the_transfer_and_resumes_before_the_release(
     fake_tpu_sync, worker_ext, monkeypatch
 ):
-    """The pause overlaps the trainer send, and generation resumes before the trainer frees its send buffers."""
+    """The rollout is paused after the transfer, right before the install, and generation resumes before the
+    trainer frees its send buffers."""
     tp = 2
     weights = _trainer_weights()
     samplers = [_make_sampler(worker_ext, rank, tp, _FakeVllmModel(tp)) for rank in range(tp)]
@@ -1254,7 +1257,15 @@ def test_update_tpu_sync_weights_pauses_concurrently_and_resumes_before_the_rele
     manager, _ = _make_manager(
         [_trainer_engine(rank) for rank in range(2)], lambda rank: iter(weights.items()), samplers, events
     )
-    # Record when the trainer's buffer release completes (ray.get on its refs), not only when it is requested.
+    # Record when the transfer finishes and when the trainer's buffer release completes (ray.get on its refs).
+    real_transfer = fake_tpu_sync.transfer
+
+    def transfer(*args, **kwargs):
+        result = real_transfer(*args, **kwargs)
+        events.append("transfer_done")
+        return result
+
+    monkeypatch.setattr(fake_tpu_sync, "transfer", transfer)
     real_get = tpu_sync_engine.ray.get
 
     def get(refs, timeout=None):
@@ -1266,10 +1277,23 @@ def test_update_tpu_sync_weights_pauses_concurrently_and_resumes_before_the_rele
         return result
 
     monkeypatch.setattr(tpu_sync_engine.ray, "get", get)
-    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
-    # update_weights is requested before the pause task first runs: the two overlap.
-    assert events.index("update_weights") < events.index("abort") < events.index("init_tpu_sync_on_worker")
+    metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert events.index("transfer_done") < events.index("abort") < events.index("install_tpu_sync_weights")
     assert events.index("resume") < events.index("release_done")
+    assert metrics["timing_s/tpu-sync/rollout_paused"] > 0
+
+
+def test_update_tpu_sync_weights_step_0_does_not_pause(fake_tpu_sync, worker_ext):
+    tp = 2
+    weights = _trainer_weights()
+    samplers = [_make_sampler(worker_ext, rank, tp, _FakeVllmModel(tp)) for rank in range(tp)]
+    events: list = []
+    manager, _ = _make_manager(
+        [_trainer_engine(rank) for rank in range(2)], lambda rank: iter(weights.items()), samplers, events
+    )
+    metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    assert "abort" not in events
+    assert metrics["timing_s/tpu-sync/rollout_paused"] == 0.0
 
 
 def _exact_parity_setup(worker_ext, weights, tp, verify_parity, flip_o_proj=False, loaded=True):

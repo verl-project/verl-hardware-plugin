@@ -2564,7 +2564,9 @@ def _ragged_ep_dist_worker(rank: int, world: int, init_file: str) -> None:
             assert w_rag.grad is not None and not torch.isnan(w_rag.grad).any()
             torch.testing.assert_close(out_rag, out_ref, rtol=1e-6, atol=1e-6)
             torch.testing.assert_close(x_rag.grad, x_ref.grad, rtol=1e-6, atol=1e-6)
-            torch.testing.assert_close(scores_rag.grad, scores_ref.grad, rtol=1e-6, atol=1e-6)
+            # scores grad reduces over D in a different order than the dense reference; fp32 reassociation
+            # noise can reach ~4e-6 (observed flaking at 1e-6 on CPU CI).
+            torch.testing.assert_close(scores_rag.grad, scores_ref.grad, rtol=5e-6, atol=5e-6)
             torch.testing.assert_close(w_rag.grad, w_ref.grad, rtol=1e-6, atol=1e-6)
     finally:
         dist.destroy_process_group()
