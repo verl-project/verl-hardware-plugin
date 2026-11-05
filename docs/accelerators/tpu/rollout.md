@@ -61,6 +61,12 @@ backward on TPU). This needs `expert_parallel_size=1` and a `seq_bucket_size` th
 multiple of 256 (the default 256 is); otherwise the engine raises. `use_dynamic_bsz=True` works on TPU: the plugin runs
 its int64 MAX / MIN all-reduces in int32, which `tpu_dist` supports.
 
+For long packed micro-batches (e.g. Qwen3.5 multi-turn agent RL), `splash_max_block_size: 1024` raises the Splash
+attention block cap (torchtitan's default 512), and `gdn_row_slot_len: <max_model_len>` starts every sequence at a
+multiple of that length so the Qwen3.5 GatedDeltaNet runs one sequence per row (torchtitan's `set_unflatten_seq_len`)
+instead of restarting at packed documents through Tokamax `segment_ids`. It needs `use_dynamic_bsz=False`, a fixed
+`ppo_micro_batch_size_per_gpu`, `static_micro_batch_len` = that size x `gdn_row_slot_len`, and the fused log-prob.
+
 The rollout settings that matter on TPU (the recipes already set them):
 
 | Setting | Value on TPU |

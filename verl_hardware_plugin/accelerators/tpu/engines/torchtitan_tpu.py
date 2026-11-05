@@ -90,6 +90,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     pad_packed_inputs_for_tpu,
     resolve_tpu_torchtitan_options,
     resolve_tpu_use_fused_linear_cross_entropy,
+    row_slot_permutation,
     spmd_no_typecheck_context,
     torchtitan_model_attn_backend,
     tpu_eager_mode_context,
@@ -1063,6 +1064,12 @@ class TorchTitanTPUEngine(BaseEngine):
             else:
                 if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
                     self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+        self._gdn_row_slot_len = int(tpu_options.gdn_row_slot_len or 0)
+        if self._gdn_row_slot_len:
+            # Rows of gdn_row_slot_len tokens hold one sequence each, so the GatedDeltaNet needs no document resets.
+            self.config.override.imports.append(
+                ("torchtitan.experiments.tpu.qwen3_5.gated_delta.gated_delta_document_resets", {"enabled": False})
+            )
         for override_import in tpu_model_kernels.override_imports(self._tpu_kernels):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
@@ -1084,6 +1091,12 @@ class TorchTitanTPUEngine(BaseEngine):
             for model_part in model_parts:
                 enable_fsdp_gradient_division(model_part, dp_size)
 
+        if tpu_options.splash_max_block_size:
+            from torchtitan.experiments.tpu.kernels import splash_attention
+
+            splash_attention.splash_block_size_for = functools.partial(
+                splash_attention.splash_block_size_for, max_block_size=tpu_options.splash_max_block_size
+            )
         install_tpu_attention(model_parts, use_splash=self._use_splash_attention)
         if self.parallel_dims.ep_enabled:
             ep_cap = (
@@ -1407,7 +1420,7 @@ class TorchTitanTPUEngine(BaseEngine):
                 static_response_len=static_response_len,
             )
 
-        if "kda" in getattr(self, "_tpu_kernels", ()):
+        if "kda" in getattr(self, "_tpu_kernels", ()) and not getattr(self, "_gdn_row_slot_len", 0):
             # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
             # micro-batch is one packed document, plus the bucket-padding tail; bucketed so that use_dynamic_bsz's
             # varying sequence counts do not recompile the kernels (see packed_document_budget).
@@ -1430,7 +1443,13 @@ class TorchTitanTPUEngine(BaseEngine):
             else nullcontext()
         )
 
-        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode):
+        if getattr(self, "_gdn_row_slot_len", 0):
+            from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+
+            row_ctx = set_unflatten_seq_len(self._gdn_row_slot_len)
+        else:
+            row_ctx = nullcontext()
+        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), row_ctx:
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                     loss, output = self.forward_step(
@@ -2044,6 +2063,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         bucket_size = get_tpu_seq_bucket_size(self.engine_config)
         if use_remove_padding:
             vocab_size = getattr(get_text_config(self.model_config.hf_config), "vocab_size", None)
+            cu_seqlens = input_ids.offsets()
             input_ids, position_ids, labels, orig_seq_len = pad_packed_inputs_for_tpu(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -2053,6 +2073,12 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                 vocab_size=vocab_size,
             )
             output_args["orig_seq_len"] = orig_seq_len
+            if getattr(self, "_gdn_row_slot_len", 0):
+                # One sequence per GatedDeltaNet row; prepare_model_outputs restores the packed order.
+                slot_src, contig_src = row_slot_permutation(cu_seqlens, input_ids.shape[-1], self._gdn_row_slot_len)
+                input_ids = input_ids[..., slot_src.to(input_ids.device)]
+                position_ids = position_ids[..., slot_src.to(input_ids.device)]
+                output_args["gdn_contig_src"] = contig_src.to(input_ids.device)
         else:
             pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
             batch_size = micro_batch.batch_size[0]
@@ -2148,6 +2174,12 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         input_ids = micro_batch["input_ids"]
         cu_seqlens = input_ids.offsets()
         fused_log_probs = None
+        if "gdn_contig_src" in output_args:
+            hidden_states, lm_head_weight_t = logits  # gdn_row_slot_len needs the fused log-prob path
+            logits = (
+                hidden_states.index_select(hidden_states.dim() - 2, output_args["gdn_contig_src"]),
+                lm_head_weight_t,
+            )
         if isinstance(logits, tuple):
             hidden_states, lm_head_weight_t = logits
             if use_remove_padding and not self.parallel_dims.tp_enabled:

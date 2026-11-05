@@ -3095,3 +3095,18 @@ def test_align_micro_batch_shapes_static_len_and_response_len():
         )
     assert padded(mbs, "tpu_padded_seq_len") == [18432, 16384]
     assert padded(mbs, "tpu_max_response_len") == [8192, 8192]
+
+
+def test_row_slot_permutation():
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import row_slot_permutation
+
+    slot_src, contig_src = row_slot_permutation(torch.tensor([0, 5, 12, 13]), padded_len=32, slot_len=8)
+    slots = torch.arange(32)[slot_src]
+    assert torch.equal(slots[contig_src], torch.arange(32))
+    # Sequence i starts at token i * slot_len; padding tokens (>= 13) fill the rest.
+    assert torch.equal(slots[0:5], torch.arange(0, 5))
+    assert torch.equal(slots[8:15], torch.arange(5, 12))
+    assert torch.equal(slots[16:17], torch.arange(12, 13))
+    for cu_seqlens, padded_len in (([0, 9], 32), ([0, 1, 2, 3, 4, 5], 32), ([0, 5], 30)):
+        with pytest.raises(ValueError, match="gdn_row_slot_len"):
+            row_slot_permutation(torch.tensor(cu_seqlens), padded_len, slot_len=8)
