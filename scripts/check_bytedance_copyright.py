@@ -24,9 +24,10 @@ BYTEDANCE_MARKERS = [
 
 BAAI_MARKER = "Copyright (c) 2026 BAAI. All rights reserved."
 GOOGLE_MARKER = "Copyright (c) 2026 Google LLC. All rights reserved."
+META_MARKER = "Copyright (c) Meta Platforms, Inc. and affiliates."
 
 # A file is valid if it has at least one recognized copyright header.
-# Bytedance, BAAI and Google copyrights are acceptable independently or together.
+# Each recognized holder line above is acceptable on its own or together with the others.
 
 
 def _git_tracked_py_files() -> set[Path]:
@@ -69,9 +70,10 @@ def main():
         has_bytedance = any(marker in content for marker in BYTEDANCE_MARKERS)
         has_baai = BAAI_MARKER in content
         has_google = GOOGLE_MARKER in content
+        has_meta = META_MARKER in content
 
         # File must have at least one recognized copyright header
-        if not has_bytedance and not has_baai and not has_google:
+        if not has_bytedance and not has_baai and not has_google and not has_meta:
             failures.append(str(path))
 
     if failures:
@@ -82,6 +84,7 @@ def main():
         print("Please add one of:")
         print(f"  # {BAAI_MARKER}")
         print(f"  # {GOOGLE_MARKER}")
+        print(f"  # {META_MARKER}")
         print("  # Copyright 2024 Bytedance Ltd. and/or its affiliates")
         sys.exit(1)
 

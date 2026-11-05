@@ -31,6 +31,7 @@ license_headers = [
     "Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.",
     "Copyright (c) 2026 BAAI. All rights reserved.",
     "Copyright (c) 2026 Google LLC. All rights reserved.",
+    "Copyright (c) Meta Platforms, Inc. and affiliates.",
 ]
 
 
