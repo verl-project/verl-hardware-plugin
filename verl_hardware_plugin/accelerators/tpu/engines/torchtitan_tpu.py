@@ -118,6 +118,27 @@ def _to_jagged(padded: torch.Tensor, cu_seqlens: torch.Tensor, orig_seq_len: Opt
     return jagged
 
 
+def _entropy_from_hidden_chunked(
+    hidden: torch.Tensor, lm_head_weight_t: torch.Tensor, temperature: float, chunk_size: int
+) -> torch.Tensor:
+    """Per-token fp32 entropy of ``hidden @ lm_head_weight_t / temperature``, ``chunk_size`` tokens at a time.
+
+    Only one chunk of [chunk_size, vocab] logits exists at a time, so long micro-batches never materialize their full
+    logits. Without autograd each chunk is dispatched as its own small program.
+    """
+    if isinstance(lm_head_weight_t, DTensor):
+        lm_head_weight_t = lm_head_weight_t.full_tensor()
+    sync = not torch.is_grad_enabled()
+    chunks = []
+    for start in range(0, hidden.shape[0], chunk_size):
+        logits = (hidden[start : start + chunk_size] @ lm_head_weight_t).float() / temperature
+        chunk = torch.logsumexp(logits, dim=-1) - (torch.softmax(logits, dim=-1) * logits).sum(dim=-1)
+        if sync:
+            tpu_synchronize(chunk, wait=False)
+        chunks.append(chunk)
+    return torch.cat(chunks)
+
+
 _LAYER_FQN_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 # FQN prefix of one transformer layer (e.g. ``layers.3`` or ``vision_encoder.layers.3``).
 _LAYER_PREFIX_RE = re.compile(r"^(.*?(?:^|\.)layers\.\d+)\.")
@@ -1322,6 +1343,12 @@ class TorchTitanTPUEngine(BaseEngine):
         if not self.engine_config.forward_only:
             self.optimizer = self.trainer.optimizers
             self.lr_scheduler = self.trainer.lr_schedulers
+            frozen_regex = getattr(getattr(self, "_tpu_options", None), "frozen_param_regex", None)
+            if frozen_regex:
+                pattern = re.compile(frozen_regex)
+                frozen = [(n, p) for m in self.module for n, p in m.named_parameters() if pattern.search(n)]
+                self._frozen_params = [p for _, p in frozen]
+                logger.info("frozen_param_regex=%r freezes %d parameters", frozen_regex, len(frozen))
         else:
             self.optimizer = None
             self.lr_scheduler = None
@@ -1528,6 +1555,8 @@ class TorchTitanTPUEngine(BaseEngine):
             timeline.span("optimizer_step", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()),
             tpu_eager_mode_context(self._tpu_eager_mode),
         ):
+            for p in getattr(self, "_frozen_params", ()):
+                p.grad = None  # frozen: out of the gradient norm, and AdamW skips parameters without a gradient
             param_chunks = self._optimizer_param_chunks()
             grad_norm = self._chunked_grad_norm(param_chunks)
             tpu_synchronize(grad_norm, wait=True)
@@ -2201,6 +2230,18 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                 if not calculate_entropy:
                     fused_log_probs = self._maybe_gather_context_parallel(fused_log_probs, output_args)
                     model_output["log_probs"] = _to_jagged(fused_log_probs, cu_seqlens, output_args.get("orig_seq_len"))
+                    return model_output
+                if "gdn_contig_src" in output_args:
+                    # A row-slot micro-batch is long (e.g. 65536 tokens): its full fp32 [tokens, vocab] logits do
+                    # not fit in HBM, so take the entropy a token chunk at a time from the hidden states.
+                    entropy_rmpad = _entropy_from_hidden_chunked(
+                        hidden_rmpad, lm_head_weight_t, temperature, get_tpu_seq_bucket_size(self.engine_config)
+                    )
+                    orig_seq_len = output_args.get("orig_seq_len")
+                    fused_log_probs = self._maybe_gather_context_parallel(fused_log_probs, output_args)
+                    entropy_rmpad = self._maybe_gather_context_parallel(entropy_rmpad, output_args)
+                    model_output["log_probs"] = _to_jagged(fused_log_probs, cu_seqlens, orig_seq_len)
+                    model_output["entropy"] = _to_jagged(entropy_rmpad, cu_seqlens, orig_seq_len)
                     return model_output
             # Entropy needs the logits. The log-probs still come from the fused kernel, so the reference, old-log-prob
             # and update passes all compute them the same way (an on-policy PPO ratio is exactly 1).
