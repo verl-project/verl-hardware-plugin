@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Google LLC. All rights reserved.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # Licensed under the Apache License, Version 2.0.
 
 """CPU tests for ``engines/tied_embeddings.py`` (``engine_kwargs.tpu.tie_embeddings``) and the tied weight's export.

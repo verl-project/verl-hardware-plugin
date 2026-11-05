@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Google LLC. All rights reserved.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # Licensed under the Apache License, Version 2.0.
 
 """Training with a tied input embedding and LM head (``engine_kwargs.tpu.tie_embeddings``).
