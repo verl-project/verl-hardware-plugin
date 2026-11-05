@@ -277,3 +277,28 @@ def test_placement_group_claims_tpu_slices_in_numeric_order():
         claimed = [platform.auto_assign_accelerator_type(f"pool_{k}", None) for k in range(6)]
     assert claimed == ["tpu-group-0", "tpu-group-1", "tpu-group-2", "tpu-group-9", "tpu-group-10", "tpu-group-10"]
     assert platform_tpu_mod is not None
+
+
+def test_get_worker_env_vars_merges_trainer_extra_libtpu_init_args(monkeypatch):
+    """Trainer-only libtpu flags append onto LIBTPU_INIT_ARGS for RayWorkerGroup actors without touching rollout."""
+    from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
+
+    pool = mock.MagicMock()
+    pool.get_placement_groups.return_value = []
+    platform = PlatformTPU()
+    monkeypatch.setattr(platform, "get_tpu_env_vars", lambda **kwargs: {"TORCH_TPU_TOPOLOGY": "2,2,1,2"})
+
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_tpu_use_enhanced_launch_barrier=false")
+    monkeypatch.delenv("VERL_TPU_TRAINER_LIBTPU_INIT_ARGS", raising=False)
+    env_plain = platform.get_worker_env_vars(pool, 0, 8, 0, 8, "actor", "TPU")
+    assert "LIBTPU_INIT_ARGS" not in env_plain
+
+    monkeypatch.setenv(
+        "VERL_TPU_TRAINER_LIBTPU_INIT_ARGS",
+        "--xla_tpu_scoped_vmem_limit_kib=65472 --xla_tpu_enable_sparse_core_collective_aggregator=true",
+    )
+    env_trainer = platform.get_worker_env_vars(pool, 0, 8, 0, 8, "actor", "TPU")
+    assert env_trainer["LIBTPU_INIT_ARGS"] == (
+        "--xla_tpu_use_enhanced_launch_barrier=false "
+        "--xla_tpu_scoped_vmem_limit_kib=65472 --xla_tpu_enable_sparse_core_collective_aggregator=true"
+    )
