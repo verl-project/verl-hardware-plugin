@@ -194,6 +194,15 @@ class TPUEngineOptions:
             instead of one per length bucket it meets (default: unset, off).
         static_max_response_len: Pad every micro-batch's response-length bucket to at least this many tokens (e.g.
             ``max_response_length``), so response-shaped tensors also keep one shape (default: unset, off).
+        splash_max_block_size: Largest Splash attention block size (default: torchtitan's 512); long packed
+            micro-batches run faster with 1024.
+        gdn_row_slot_len: Qwen3.5: start every sequence of a packed micro-batch at a multiple of this many tokens
+            and run the GatedDeltaNet over rows of this length (one sequence per row) instead of restarting it at
+            packed documents through Tokamax ``segment_ids`` (default: unset, off). Needs every sequence <= this
+            length and ``static_micro_batch_len`` = sequences per micro-batch x this.
+        frozen_param_regex: Parameters whose FQN matches this regex (``re.search``) are not trained: their
+            gradients are dropped before the gradient norm and the optimizer step, e.g. ``moe.router.gate`` freezes
+            the MoE router (default: unset, train every parameter).
     """
 
     use_splash_attention: Optional[bool] = None
@@ -217,6 +226,9 @@ class TPUEngineOptions:
     ac_save_splash_and_routing: Optional[bool] = None
     static_micro_batch_len: Optional[int] = None
     static_max_response_len: Optional[int] = None
+    splash_max_block_size: Optional[int] = None
+    gdn_row_slot_len: Optional[int] = None
+    frozen_param_regex: Optional[str] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -241,6 +253,9 @@ _ENGINE_KINDS: dict[str, type] = {
     "ac_save_splash_and_routing": bool,
     "static_micro_batch_len": int,
     "static_max_response_len": int,
+    "splash_max_block_size": int,
+    "gdn_row_slot_len": int,
+    "frozen_param_regex": str,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 

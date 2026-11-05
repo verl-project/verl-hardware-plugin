@@ -90,6 +90,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     pad_packed_inputs_for_tpu,
     resolve_tpu_torchtitan_options,
     resolve_tpu_use_fused_linear_cross_entropy,
+    row_slot_permutation,
     spmd_no_typecheck_context,
     torchtitan_model_attn_backend,
     tpu_eager_mode_context,
@@ -115,6 +116,27 @@ def _to_jagged(padded: torch.Tensor, cu_seqlens: torch.Tensor, orig_seq_len: Opt
     jagged = torch.nested.nested_tensor_from_jagged(padded.detach().cpu()[:orig_seq_len], cu_seqlens.detach().cpu())
     setattr(jagged, TPU_PADDED_VALUES_ATTR, padded)
     return jagged
+
+
+def _entropy_from_hidden_chunked(
+    hidden: torch.Tensor, lm_head_weight_t: torch.Tensor, temperature: float, chunk_size: int
+) -> torch.Tensor:
+    """Per-token fp32 entropy of ``hidden @ lm_head_weight_t / temperature``, ``chunk_size`` tokens at a time.
+
+    Only one chunk of [chunk_size, vocab] logits exists at a time, so long micro-batches never materialize their full
+    logits. Without autograd each chunk is dispatched as its own small program.
+    """
+    if isinstance(lm_head_weight_t, DTensor):
+        lm_head_weight_t = lm_head_weight_t.full_tensor()
+    sync = not torch.is_grad_enabled()
+    chunks = []
+    for start in range(0, hidden.shape[0], chunk_size):
+        logits = (hidden[start : start + chunk_size] @ lm_head_weight_t).float() / temperature
+        chunk = torch.logsumexp(logits, dim=-1) - (torch.softmax(logits, dim=-1) * logits).sum(dim=-1)
+        if sync:
+            tpu_synchronize(chunk, wait=False)
+        chunks.append(chunk)
+    return torch.cat(chunks)
 
 
 _LAYER_FQN_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
@@ -1063,6 +1085,12 @@ class TorchTitanTPUEngine(BaseEngine):
             else:
                 if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
                     self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+        self._gdn_row_slot_len = int(tpu_options.gdn_row_slot_len or 0)
+        if self._gdn_row_slot_len:
+            # Rows of gdn_row_slot_len tokens hold one sequence each, so the GatedDeltaNet needs no document resets.
+            self.config.override.imports.append(
+                ("torchtitan.experiments.tpu.qwen3_5.gated_delta.gated_delta_document_resets", {"enabled": False})
+            )
         for override_import in tpu_model_kernels.override_imports(self._tpu_kernels):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
@@ -1084,6 +1112,12 @@ class TorchTitanTPUEngine(BaseEngine):
             for model_part in model_parts:
                 enable_fsdp_gradient_division(model_part, dp_size)
 
+        if tpu_options.splash_max_block_size:
+            from torchtitan.experiments.tpu.kernels import splash_attention
+
+            splash_attention.splash_block_size_for = functools.partial(
+                splash_attention.splash_block_size_for, max_block_size=tpu_options.splash_max_block_size
+            )
         install_tpu_attention(model_parts, use_splash=self._use_splash_attention)
         if self.parallel_dims.ep_enabled:
             ep_cap = (
@@ -1309,6 +1343,12 @@ class TorchTitanTPUEngine(BaseEngine):
         if not self.engine_config.forward_only:
             self.optimizer = self.trainer.optimizers
             self.lr_scheduler = self.trainer.lr_schedulers
+            frozen_regex = getattr(getattr(self, "_tpu_options", None), "frozen_param_regex", None)
+            if frozen_regex:
+                pattern = re.compile(frozen_regex)
+                frozen = [(n, p) for m in self.module for n, p in m.named_parameters() if pattern.search(n)]
+                self._frozen_params = [p for _, p in frozen]
+                logger.info("frozen_param_regex=%r freezes %d parameters", frozen_regex, len(frozen))
         else:
             self.optimizer = None
             self.lr_scheduler = None
@@ -1407,7 +1447,7 @@ class TorchTitanTPUEngine(BaseEngine):
                 static_response_len=static_response_len,
             )
 
-        if "kda" in getattr(self, "_tpu_kernels", ()):
+        if "kda" in getattr(self, "_tpu_kernels", ()) and not getattr(self, "_gdn_row_slot_len", 0):
             # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
             # micro-batch is one packed document, plus the bucket-padding tail; bucketed so that use_dynamic_bsz's
             # varying sequence counts do not recompile the kernels (see packed_document_budget).
@@ -1430,7 +1470,13 @@ class TorchTitanTPUEngine(BaseEngine):
             else nullcontext()
         )
 
-        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode):
+        if getattr(self, "_gdn_row_slot_len", 0):
+            from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+
+            row_ctx = set_unflatten_seq_len(self._gdn_row_slot_len)
+        else:
+            row_ctx = nullcontext()
+        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), row_ctx:
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                     loss, output = self.forward_step(
@@ -1509,6 +1555,8 @@ class TorchTitanTPUEngine(BaseEngine):
             timeline.span("optimizer_step", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()),
             tpu_eager_mode_context(self._tpu_eager_mode),
         ):
+            for p in getattr(self, "_frozen_params", ()):
+                p.grad = None  # frozen: out of the gradient norm, and AdamW skips parameters without a gradient
             param_chunks = self._optimizer_param_chunks()
             grad_norm = self._chunked_grad_norm(param_chunks)
             tpu_synchronize(grad_norm, wait=True)
@@ -2044,6 +2092,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         bucket_size = get_tpu_seq_bucket_size(self.engine_config)
         if use_remove_padding:
             vocab_size = getattr(get_text_config(self.model_config.hf_config), "vocab_size", None)
+            cu_seqlens = input_ids.offsets()
             input_ids, position_ids, labels, orig_seq_len = pad_packed_inputs_for_tpu(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -2053,6 +2102,12 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                 vocab_size=vocab_size,
             )
             output_args["orig_seq_len"] = orig_seq_len
+            if getattr(self, "_gdn_row_slot_len", 0):
+                # One sequence per GatedDeltaNet row; prepare_model_outputs restores the packed order.
+                slot_src, contig_src = row_slot_permutation(cu_seqlens, input_ids.shape[-1], self._gdn_row_slot_len)
+                input_ids = input_ids[..., slot_src.to(input_ids.device)]
+                position_ids = position_ids[..., slot_src.to(input_ids.device)]
+                output_args["gdn_contig_src"] = contig_src.to(input_ids.device)
         else:
             pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
             batch_size = micro_batch.batch_size[0]
@@ -2148,6 +2203,12 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         input_ids = micro_batch["input_ids"]
         cu_seqlens = input_ids.offsets()
         fused_log_probs = None
+        if "gdn_contig_src" in output_args:
+            hidden_states, lm_head_weight_t = logits  # gdn_row_slot_len needs the fused log-prob path
+            logits = (
+                hidden_states.index_select(hidden_states.dim() - 2, output_args["gdn_contig_src"]),
+                lm_head_weight_t,
+            )
         if isinstance(logits, tuple):
             hidden_states, lm_head_weight_t = logits
             if use_remove_padding and not self.parallel_dims.tp_enabled:
@@ -2169,6 +2230,18 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                 if not calculate_entropy:
                     fused_log_probs = self._maybe_gather_context_parallel(fused_log_probs, output_args)
                     model_output["log_probs"] = _to_jagged(fused_log_probs, cu_seqlens, output_args.get("orig_seq_len"))
+                    return model_output
+                if "gdn_contig_src" in output_args:
+                    # A row-slot micro-batch is long (e.g. 65536 tokens): its full fp32 [tokens, vocab] logits do
+                    # not fit in HBM, so take the entropy a token chunk at a time from the hidden states.
+                    entropy_rmpad = _entropy_from_hidden_chunked(
+                        hidden_rmpad, lm_head_weight_t, temperature, get_tpu_seq_bucket_size(self.engine_config)
+                    )
+                    orig_seq_len = output_args.get("orig_seq_len")
+                    fused_log_probs = self._maybe_gather_context_parallel(fused_log_probs, output_args)
+                    entropy_rmpad = self._maybe_gather_context_parallel(entropy_rmpad, output_args)
+                    model_output["log_probs"] = _to_jagged(fused_log_probs, cu_seqlens, orig_seq_len)
+                    model_output["entropy"] = _to_jagged(entropy_rmpad, cu_seqlens, orig_seq_len)
                     return model_output
             # Entropy needs the logits. The log-probs still come from the fused kernel, so the reference, old-log-prob
             # and update passes all compute them the same way (an on-policy PPO ratio is exactly 1).

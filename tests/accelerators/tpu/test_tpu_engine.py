@@ -1349,6 +1349,42 @@ def test_chunked_optimizer_step_matches_unchunked_adamw():
     assert opt_a.param_groups[0]["params"] == params_a
 
 
+def test_optimizer_step_skips_frozen_params():
+    """``frozen_param_regex`` parameters stay unchanged and are left out of the gradient norm."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    gen = torch.Generator().manual_seed(0)
+    names = [f"layers.{i}.moe.router.gate.weight" for i in range(2)] + [f"layers.{i}.wq.weight" for i in range(2)]
+    params_a = [torch.nn.Parameter(torch.randn(4, 4, generator=gen)) for _ in names]
+    params_b = [torch.nn.Parameter(p.detach().clone()) for p in params_a[2:]]
+    for i, pa in enumerate(params_a):
+        pa.grad = torch.randn(4, 4, generator=gen)
+        if i >= 2:
+            params_b[i - 2].grad = pa.grad.clone()
+    frozen_before = [p.detach().clone() for p in params_a[:2]]
+
+    opt_a = torch.optim.AdamW([{"params": params_a, "param_names": names, "lr": 1e-2}])
+    opt_b = torch.optim.AdamW([{"params": params_b, "lr": 1e-2}])
+    ref_norm = torch.nn.utils.clip_grad_norm_(params_b, max_norm=1.0, foreach=False).item()
+    opt_b.step()
+
+    fake_engine = SimpleNamespace(
+        _tpu_eager_mode=None,
+        _frozen_params=params_a[:2],
+        module=[SimpleNamespace(named_parameters=lambda: list(zip(names, params_a, strict=True)))],
+        optimizer=SimpleNamespace(optimizers=[opt_a], zero_grad=opt_a.zero_grad),
+        parallel_dims=SimpleNamespace(ep_enabled=False, get_optional_mesh=lambda _: None),
+        config=SimpleNamespace(training=SimpleNamespace(max_norm=1.0)),
+    )
+    for helper in ("_optimizer_param_chunks", "_chunked_grad_norm", "_chunked_clip_and_step"):
+        setattr(fake_engine, helper, getattr(TorchTitanTPUEngine, helper).__get__(fake_engine))
+    assert TorchTitanTPUEngine.optimizer_step(fake_engine) == pytest.approx(ref_norm, rel=1e-6)
+    for p, before in zip(params_a[:2], frozen_before, strict=True):
+        torch.testing.assert_close(p.detach(), before, rtol=0, atol=0)
+    for pa, pb in zip(params_a[2:], params_b, strict=True):
+        torch.testing.assert_close(pa, pb, rtol=1e-6, atol=1e-6)
+
+
 @pytest.mark.parametrize("host_offload", [False, True])
 def test_chunked_optimizer_step_fp32_master(host_offload):
     """``fp32_master``: bf16 params follow an FP32 AdamW run (cast to bf16) and keep tiny updates bf16 alone loses."""
@@ -3095,3 +3131,29 @@ def test_align_micro_batch_shapes_static_len_and_response_len():
         )
     assert padded(mbs, "tpu_padded_seq_len") == [18432, 16384]
     assert padded(mbs, "tpu_max_response_len") == [8192, 8192]
+
+
+def test_entropy_from_hidden_chunked_matches_full_logits():
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import _entropy_from_hidden_chunked
+
+    gen = torch.Generator().manual_seed(0)
+    hidden, weight_t = torch.randn(10, 8, generator=gen), torch.randn(8, 32, generator=gen)
+    logits = hidden @ weight_t / 0.7
+    expected = torch.logsumexp(logits, -1) - (torch.softmax(logits, -1) * logits).sum(-1)
+    with torch.no_grad():
+        torch.testing.assert_close(_entropy_from_hidden_chunked(hidden, weight_t, 0.7, chunk_size=4), expected)
+
+
+def test_row_slot_permutation():
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import row_slot_permutation
+
+    slot_src, contig_src = row_slot_permutation(torch.tensor([0, 5, 12, 13]), padded_len=32, slot_len=8)
+    slots = torch.arange(32)[slot_src]
+    assert torch.equal(slots[contig_src], torch.arange(32))
+    # Sequence i starts at token i * slot_len; padding tokens (>= 13) fill the rest.
+    assert torch.equal(slots[0:5], torch.arange(0, 5))
+    assert torch.equal(slots[8:15], torch.arange(5, 12))
+    assert torch.equal(slots[16:17], torch.arange(12, 13))
+    for cu_seqlens, padded_len in (([0, 9], 32), ([0, 1, 2, 3, 4, 5], 32), ([0, 5], 30)):
+        with pytest.raises(ValueError, match="gdn_row_slot_len"):
+            row_slot_permutation(torch.tensor(cu_seqlens), padded_len, slot_len=8)
