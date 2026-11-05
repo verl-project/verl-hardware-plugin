@@ -777,6 +777,51 @@ class TPUEngineTrainModeCtx(BaseEngineCtx):
         super().__exit__(exc_type, exc_value, traceback)
 
 
+_SPLASH_ROUTING_SELECTIVE_AC_CLS: Any = None
+_PALLAS_SPLASH_FWD_OP_MARKER = "splash_attn_fwd"
+
+
+def _op_qualified_name(op: Any) -> str:
+    name_fn = getattr(op, "name", None)
+    if callable(name_fn):
+        try:
+            return str(name_fn())
+        except Exception:
+            pass
+    return str(op)
+
+
+class _SplashAndRoutingSaveOps(set):
+    """Selective-AC save set keeping only Pallas ``SplashAttention`` forward outputs and MoE router ``aten.topk``."""
+
+    def __contains__(self, op: Any) -> bool:
+        try:
+            if super().__contains__(op):
+                return True
+        except TypeError:
+            pass
+        return _PALLAS_SPLASH_FWD_OP_MARKER in _op_qualified_name(op)
+
+
+def _splash_and_routing_selective_ac_config() -> Any:
+    """Builds a ``SelectiveAC.Config`` saving only ``SplashAttention`` forward ``(out, lse)`` and ``aten.topk``."""
+    global _SPLASH_ROUTING_SELECTIVE_AC_CLS
+    if _SPLASH_ROUTING_SELECTIVE_AC_CLS is None:
+        from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+        class _SplashAndRoutingSelectiveAC(SelectiveAC):
+            @dataclasses.dataclass(kw_only=True, slots=True)
+            class Config(SelectiveAC.Config):
+                preserve_rng_state: bool = False
+                force_recompute_mm_shapes_by_fqns: list[str] = dataclasses.field(default_factory=list)
+
+            def get_save_ops(self) -> set:
+                return _SplashAndRoutingSaveOps({torch.ops.aten.topk.default})
+
+        _SPLASH_ROUTING_SELECTIVE_AC_CLS = _SplashAndRoutingSelectiveAC
+    return _SPLASH_ROUTING_SELECTIVE_AC_CLS.Config()
+
+
 class TorchTitanTPUEngine(BaseEngine):
     """Standalone TorchTitan engine for Google TPU with ``tpu_dist`` / PJRT SPMD execution."""
 
@@ -826,6 +871,7 @@ class TorchTitanTPUEngine(BaseEngine):
 
         if engine_config.use_torch_compile:
             configure_torch_compile_for_tpu()
+            tpu_model_kernels.patch_torchtitan_tpu_dynamo_caches()
 
         # Derive torchtitan model name and flavor from HF config
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
@@ -866,6 +912,8 @@ class TorchTitanTPUEngine(BaseEngine):
             model_spec,
             self._tpu_kernels,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
+            ep_token_chunks=tpu_options.ep_token_chunks,
+            ep_paired_grouped_mm=bool(tpu_options.ep_paired_grouped_mm),
         )
         if setup is not None and setup.configure is not None:
             setup.configure(
@@ -975,6 +1023,8 @@ class TorchTitanTPUEngine(BaseEngine):
             ac_mode = "none"
         if self.engine_config.forward_only:
             activation_checkpoint = None
+        elif tpu_options.ac_save_splash_and_routing and ac_mode != "none":
+            activation_checkpoint = _splash_and_routing_selective_ac_config()
         else:
             activation_checkpoint = {
                 # torchtitan's TPUSelectiveAC drops collectives from the selective-AC save set so backward
@@ -1017,6 +1067,8 @@ class TorchTitanTPUEngine(BaseEngine):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
         self.trainer = Trainer(self.config)
+        if engine_config.use_torch_compile:
+            tpu_model_kernels.patch_torchtitan_tpu_dynamo_caches()
         self.parallel_dims = self.trainer.parallel_dims
         self._dp_group = self._build_dp_gloo_group()
         # Like torchtitan's init_distributed (which verl bypasses): no autograd multithreading, so backward-thread
@@ -1053,6 +1105,10 @@ class TorchTitanTPUEngine(BaseEngine):
                     ep_cap,
                     n_ep,
                 )
+            if engine_config.use_torch_compile and ep_mode == "static":
+                n_barriers = tpu_model_kernels.install_ep_chunk_barriers(model_parts)
+                if n_barriers:
+                    logger.info("Installed EP chunk window barriers on %d routed-experts modules", n_barriers)
 
         if engine_config.use_torch_compile:
             n_compiled = sum(
@@ -1340,15 +1396,22 @@ class TorchTitanTPUEngine(BaseEngine):
             dp_group=dp_group,
             same_micro_num_in_dp=True,
         )
-        if self._use_simple_fsdp or self.parallel_dims.cp_enabled:
+        tpu_options = get_tpu_engine_options(self.engine_config)
+        static_len = int(tpu_options.static_micro_batch_len or 0)
+        static_response_len = int(tpu_options.static_max_response_len or 0)
+        if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len:
             align_micro_batch_shapes_across_ranks(
-                micro_batches, bucket_size=get_tpu_seq_bucket_size(self.engine_config)
+                micro_batches,
+                bucket_size=get_tpu_seq_bucket_size(self.engine_config),
+                static_len=static_len,
+                static_response_len=static_response_len,
             )
 
         if "kda" in getattr(self, "_tpu_kernels", ()):
             # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
-            # micro-batch is one packed document, plus the bucket-padding tail.
-            budget = max(int(mb.batch_size[0]) for mb in micro_batches) + 1
+            # micro-batch is one packed document, plus the bucket-padding tail; bucketed so that use_dynamic_bsz's
+            # varying sequence counts do not recompile the kernels (see packed_document_budget).
+            budget = tpu_model_kernels.packed_document_budget(max(int(mb.batch_size[0]) for mb in micro_batches))
             updated = tpu_model_kernels.set_packed_document_budget(self.module, budget)
             if updated:
                 logger.info("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)

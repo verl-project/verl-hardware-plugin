@@ -19,7 +19,9 @@ no memory functions.
 """
 
 import logging
+import os
 import warnings
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
@@ -27,6 +29,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 _accelerator_is_tpu_cache: Optional[bool] = None
+_tpu_runtime_up_pid: Optional[int] = None
 
 
 def accelerator_is_tpu() -> bool:
@@ -60,8 +63,55 @@ def current_device() -> int:
 
 
 def synchronize(device: Any = None) -> None:
-    if accelerator_is_tpu():
+    """Wait for all pending operations on ``device`` to complete (``torch.accelerator.synchronize``)."""
+    if accelerator_is_tpu() and _tpu_runtime_initialized():
         torch.accelerator.synchronize(device)
+
+
+def tpu_synchronize(
+    tensors: Optional[torch.Tensor | Sequence[torch.Tensor]] = None,
+    *,
+    wait: bool = True,
+    strict: bool = False,
+) -> None:
+    """Materialize pending TPU operations (blocking when ``wait=True``, async stream dispatch when ``False``).
+
+    Unlike :func:`synchronize` (which implements the standard ``torch.accelerator.synchronize(device)`` contract for
+    ``get_torch_device()`` and propagates device errors), this helper accepts optional tensor(s) (no-oping when none
+    live on TPU), supports ``wait=False`` to cut and dispatch the active ``DEFER_AND_FUSE`` stream via
+    ``torch.Event.record`` without blocking the host until TPU completion, and supports ``strict`` vs warning error
+    handling.
+    """
+    device: Any = None
+    if isinstance(tensors, torch.Tensor):
+        if tensors.device.type != "tpu":
+            return
+        device = tensors.device
+    elif isinstance(tensors, Sequence):
+        tpu_tensors = [t for t in tensors if isinstance(t, torch.Tensor) and t.device.type == "tpu"]
+        if not tpu_tensors:
+            return
+        device = tpu_tensors[0].device
+
+    if not accelerator_is_tpu():
+        if strict:
+            raise RuntimeError("TPU synchronization failed: TPU accelerator is not available")
+        return
+    if not _tpu_runtime_initialized():
+        return
+    try:
+        if wait:
+            torch.accelerator.synchronize(device)
+        elif device is None:
+            torch.Event().record()
+        else:
+            # c10::Event stores only device_type (discarding device.index), so THPEvent_record() with no
+            # stream argument always records on the current device; pass current_stream(device) explicitly.
+            torch.Event().record(torch.accelerator.current_stream(device))
+    except Exception as e:
+        if strict:
+            raise RuntimeError(f"TPU synchronization failed: {e}") from e
+        logger.warning("Could not synchronize TPU device: %s", e)
 
 
 def current_stream(device: Any = None):
@@ -99,7 +149,11 @@ def initial_seed() -> int:
 
 
 def _tpu_runtime_initialized() -> bool:
-    """Whether this process has started its TPU runtime (the PJRT client)."""
+    """Whether this process has started its TPU runtime (the PJRT client), cached per-PID once True."""
+    global _tpu_runtime_up_pid
+    pid = os.getpid()
+    if _tpu_runtime_up_pid == pid:
+        return True
     is_initialized = getattr(getattr(torch, "tpu", None), "is_initialized", None)
     if is_initialized is None:
         return False
@@ -107,10 +161,13 @@ def _tpu_runtime_initialized() -> bool:
         # Experimental in torch_tpu 0.2.0; its one-time warning is noise in every worker's log.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            return bool(is_initialized())
+            up = bool(is_initialized())
     except Exception as e:
         logger.debug("torch.tpu.is_initialized() failed: %s", e)
         return False
+    if up:
+        _tpu_runtime_up_pid = pid
+    return up
 
 
 def _memory_fn(name: str):

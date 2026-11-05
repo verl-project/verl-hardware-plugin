@@ -24,7 +24,7 @@ The platforms and engines in this repository are **reference implementations** �
 | Platform | Device | Communication | Status | Doc |
 |----------|--------|---------------|--------|-----|
 | FlagOS | NVIDIA GPU (verified) | FlagCX / NCCL | ✅ Supported | [User Guide](docs/integrations/flagos/nvidia/README.md) |
-| Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Example (requires vendor support) | [User Guide](docs/accelerators/xpu/README.md) |
+| Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Supported | [User Guide](docs/accelerators/xpu/README.md) |
 | Cambricon MLU | MLU | CNCL | ✅ Supported | [User Guide](docs/accelerators/mlu/README.md) |
 | MetaX | MetaX GPUs (CUDA-compatible) | NCCL API / MCCL | ✅ Supported | [User Guide](docs/accelerators/metax/README.md) |
 | Enflame GCU | GCU | ECCL / FlagCX | ✅ Example (requires vendor support) | [User Guide](docs/accelerators/enflame/README.md) |

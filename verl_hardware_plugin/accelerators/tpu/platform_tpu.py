@@ -58,6 +58,11 @@ _ensure_torch_tpu()  # Attempt at module load time so availability checks are fa
 # runtime_env for them to reach the trainer workers, the rollout servers and vLLM's engine workers.
 TPU_FORWARDED_ENV_VARS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS")
 TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_",)
+# Extra ``LIBTPU_INIT_ARGS`` / ``XLA_FLAGS`` appended only on ``RayWorkerGroup`` trainer/reference workers (never on
+# vLLM rollout servers), e.g. ``--xla_tpu_scoped_vmem_limit_kib=65472``, TorchTitan's MoE SparseCore collective-offload
+# flags, and ``--xla_enable_hlo_sharding_v3=false``.
+TRAINER_EXTRA_LIBTPU_INIT_ARGS_ENV = "VERL_TPU_TRAINER_LIBTPU_INIT_ARGS"
+TRAINER_EXTRA_XLA_FLAGS_ENV = "VERL_TPU_TRAINER_XLA_FLAGS"
 
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471
@@ -401,10 +406,7 @@ class TPUDeviceModuleProxy:
             return 0
 
     def synchronize(self, device_index: Optional[int] = None) -> None:
-        try:
-            tpu_device_api.synchronize()
-        except Exception as e:
-            logger.warning(f"TPU synchronize() failed: {e}")
+        tpu_device_api.synchronize(device_index)
 
     # torch_tpu >= 0.2.0 makes these torch.tpu functions internal (they raise when called from
     # outside torch / torch_tpu), so they are served through torch.accelerator instead of being
@@ -568,7 +570,7 @@ class PlatformTPU(PlatformBase):
         self.device_module.set_device(device_index)
 
     def synchronize(self, device_index: Optional[int] = None) -> None:
-        self.device_module.synchronize()
+        self.device_module.synchronize(device_index)
 
     def manual_seed(self, seed: int) -> None:
         torch.manual_seed(seed)
@@ -804,6 +806,14 @@ class PlatformTPU(PlatformBase):
         env_vars = {}
         if "VERL_PLATFORM" in os.environ:
             env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
+        trainer_libtpu = os.environ.get(TRAINER_EXTRA_LIBTPU_INIT_ARGS_ENV, "").strip()
+        if trainer_libtpu:
+            base_libtpu = os.environ.get("LIBTPU_INIT_ARGS", "").strip()
+            env_vars["LIBTPU_INIT_ARGS"] = f"{base_libtpu} {trainer_libtpu}".strip()
+        trainer_xla = os.environ.get(TRAINER_EXTRA_XLA_FLAGS_ENV, "").strip()
+        if trainer_xla:
+            base_xla = os.environ.get("XLA_FLAGS", "").strip()
+            env_vars["XLA_FLAGS"] = f"{base_xla} {trainer_xla}".strip()
         for var in self.ray_noset_envvars():
             env_vars[var] = "1"
         pgs = resource_pool.get_placement_groups(device_name=device_name)

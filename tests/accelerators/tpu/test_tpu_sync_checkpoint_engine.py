@@ -39,6 +39,7 @@ for _mod_name in ("uvicorn", "fastapi"):
 # Imported up front, so that no test imports (and registers) them a second time. Importing
 # tpu_sync_checkpoint_engine also installs the CheckpointEngineManager hook that routes backend=tpu-sync.
 import verl.checkpoint_engine.base as ckpt_base  # noqa: E402
+from verl_hardware_plugin.accelerators.tpu import device_api  # noqa: E402
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights  # noqa: E402
 from verl_hardware_plugin.accelerators.tpu.weight_sync import (  # noqa: E402
     tpu_sync_checkpoint_engine as tpu_sync_engine,
@@ -59,6 +60,7 @@ TIMING_KEYS = {
         "p2p_transfer",
         "sampler_h2d",
         "sampler_resume",
+        "rollout_paused",
         "trainer_release",
         "total_sync",
         "sampler_h2d_pure",
@@ -288,11 +290,6 @@ class _FakeTpuSync:
                     with world.controller._lock:
                         world.controller._registered_shards[unit_id] = registration
 
-        def synchronize(wait=False):
-            if world.fail_tpu_sync:
-                raise RuntimeError("TPU runtime unavailable")
-            world.tpu_syncs += 1
-
         names = (
             "tpu_sync",
             "tpu_sync.api",
@@ -303,8 +300,6 @@ class _FakeTpuSync:
             "tpu_sync.rpc.raiden_controller",  # the tpu-sync library's own module names
             "tpu_sync.rpc.raiden_service_pb2",
             "torch_tpu",
-            "torch_tpu._internal",
-            "torch_tpu._internal.sync",
         )
         mods = {name: ModuleType(name) for name in names}
         attrs: dict[str, dict[str, object]] = {
@@ -318,7 +313,6 @@ class _FakeTpuSync:
                 "RaidenMemoryType": SimpleNamespace(DRAM="DRAM"),
             },
             "tpu_sync.rpc.raiden_service_pb2": {"VariableMetadataProto": lambda **fields: SimpleNamespace(**fields)},
-            "torch_tpu._internal.sync": {"synchronize": synchronize},
         }
         for name, module in mods.items():
             vars(module).update(attrs.get(name, {}))
@@ -326,6 +320,22 @@ class _FakeTpuSync:
             if parent:
                 setattr(mods[parent], child, module)
         return mods
+
+    def accelerator(self):
+        world = self
+
+        def synchronize(device=None):
+            if world.fail_tpu_sync:
+                raise RuntimeError("TPU runtime unavailable")
+            world.tpu_syncs += 1
+
+        return SimpleNamespace(
+            current_accelerator=lambda: SimpleNamespace(type="tpu"),
+            is_available=lambda: True,
+            device_count=lambda: 1,
+            current_device_index=lambda: 0,
+            synchronize=synchronize,
+        )
 
 
 class _FakeActorWorkerGroup:
@@ -522,6 +532,10 @@ def fake_tpu_sync(monkeypatch):
     world = _FakeTpuSync()
     for name, module in world.modules().items():
         monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(device_api, "_accelerator_is_tpu_cache", None)
+    monkeypatch.setattr(device_api, "_tpu_runtime_up_pid", None)
+    monkeypatch.setattr(torch, "tpu", SimpleNamespace(is_initialized=lambda: True), raising=False)
+    monkeypatch.setattr(torch, "accelerator", world.accelerator())
     monkeypatch.setattr(tpu_sync_engine, "TPU_SYNC_DEVICE", "cpu")
     monkeypatch.setattr(tpu_sync_engine, "get_tpu_sync_rendezvous", world.get_rendezvous)
     monkeypatch.setattr(tpu_sync_engine, "create_tpu_sync_rendezvous", world.create_rendezvous)
@@ -710,9 +724,9 @@ def test_tpu_synchronize_strict_and_lenient(fake_tpu_sync, caplog):
     fake_tpu_sync.fail_tpu_sync = True
     with pytest.raises(RuntimeError, match="TPU synchronization failed"):
         tpu_sync_engine.tpu_synchronize(strict=True)
-    with caplog.at_level(logging.WARNING, logger=tpu_sync_engine.__name__):
+    with caplog.at_level(logging.WARNING, logger=device_api.__name__):
         tpu_sync_engine.tpu_synchronize()
-    assert "Could not synchronize via torch_tpu" in caplog.text
+    assert "Could not synchronize TPU device" in caplog.text
 
 
 def test_setup_tpu_sync_controller_publishes_address(fake_tpu_sync):
@@ -989,12 +1003,13 @@ def test_update_tpu_sync_weights_end_to_end(fake_tpu_sync, worker_ext, caplog, t
     events.clear()
     with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
         metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
-    # The pause runs concurrently with the trainer send, which is requested first.
+    # The rollout keeps generating through the trainer send, the rollout init and the transfer, and is paused only
+    # for the install (whose H2D may write vLLM's parameters).
     assert events == [
         "update_weights",
-        "abort",
         "init_tpu_sync_on_worker",
         "release_sync_buffers",
+        "abort",
         "install_tpu_sync_weights",
         "set_global_steps",
         "get_model_weights_stats",
@@ -1243,10 +1258,11 @@ def test_update_tpu_sync_weights_returns_phase_timings_and_slowest_worker_h2d(fa
     assert set(metrics) == TIMING_KEYS - {"timing_s/tpu-sync/sampler_h2d_pure"}
 
 
-def test_update_tpu_sync_weights_pauses_concurrently_and_resumes_before_the_release(
+def test_update_tpu_sync_weights_pauses_after_the_transfer_and_resumes_before_the_release(
     fake_tpu_sync, worker_ext, monkeypatch
 ):
-    """The pause overlaps the trainer send, and generation resumes before the trainer frees its send buffers."""
+    """The rollout is paused after the transfer, right before the install, and generation resumes before the
+    trainer frees its send buffers."""
     tp = 2
     weights = _trainer_weights()
     samplers = [_make_sampler(worker_ext, rank, tp, _FakeVllmModel(tp)) for rank in range(tp)]
@@ -1254,7 +1270,15 @@ def test_update_tpu_sync_weights_pauses_concurrently_and_resumes_before_the_rele
     manager, _ = _make_manager(
         [_trainer_engine(rank) for rank in range(2)], lambda rank: iter(weights.items()), samplers, events
     )
-    # Record when the trainer's buffer release completes (ray.get on its refs), not only when it is requested.
+    # Record when the transfer finishes and when the trainer's buffer release completes (ray.get on its refs).
+    real_transfer = fake_tpu_sync.transfer
+
+    def transfer(*args, **kwargs):
+        result = real_transfer(*args, **kwargs)
+        events.append("transfer_done")
+        return result
+
+    monkeypatch.setattr(fake_tpu_sync, "transfer", transfer)
     real_get = tpu_sync_engine.ray.get
 
     def get(refs, timeout=None):
@@ -1266,10 +1290,23 @@ def test_update_tpu_sync_weights_pauses_concurrently_and_resumes_before_the_rele
         return result
 
     monkeypatch.setattr(tpu_sync_engine.ray, "get", get)
-    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
-    # update_weights is requested before the pause task first runs: the two overlap.
-    assert events.index("update_weights") < events.index("abort") < events.index("init_tpu_sync_on_worker")
+    metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert events.index("transfer_done") < events.index("abort") < events.index("install_tpu_sync_weights")
     assert events.index("resume") < events.index("release_done")
+    assert metrics["timing_s/tpu-sync/rollout_paused"] > 0
+
+
+def test_update_tpu_sync_weights_step_0_does_not_pause(fake_tpu_sync, worker_ext):
+    tp = 2
+    weights = _trainer_weights()
+    samplers = [_make_sampler(worker_ext, rank, tp, _FakeVllmModel(tp)) for rank in range(tp)]
+    events: list = []
+    manager, _ = _make_manager(
+        [_trainer_engine(rank) for rank in range(2)], lambda rank: iter(weights.items()), samplers, events
+    )
+    metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    assert "abort" not in events
+    assert metrics["timing_s/tpu-sync/rollout_paused"] == 0.0
 
 
 def _exact_parity_setup(worker_ext, weights, tp, verify_parity, flip_o_proj=False, loaded=True):

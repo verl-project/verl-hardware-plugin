@@ -12,6 +12,7 @@ eager-mode contexts for ``torch_tpu`` training.
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import math
 import os
@@ -31,6 +32,8 @@ from torch.distributed.tensor import DTensor
 
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import TorchtitanEngineConfig
+from verl_hardware_plugin.accelerators.tpu.device_api import tpu_synchronize
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_model_kernels import has_64mib_scoped_vmem
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 
 logger = logging.getLogger(__name__)
@@ -641,35 +644,6 @@ def unwrap_metadata(val: Any) -> Any:
     return val
 
 
-def tpu_synchronize(
-    tensors: Optional[torch.Tensor] = None,
-    *,
-    wait: bool = True,
-    strict: bool = False,
-) -> None:
-    """Materialize and synchronize pending TPU operations (for ``tensors`` or the whole device).
-
-    Args:
-        tensors: Optional tensor (e.g. ``loss``) to materialize; ``None`` synchronizes the whole TPU device.
-        wait: Wait for device execution to complete when ``True``; dispatch asynchronously when ``False``.
-        strict: Raise ``RuntimeError`` if ``torch_tpu`` cannot synchronize instead of logging a warning.
-    """
-    if isinstance(tensors, torch.Tensor) and tensors.device.type != "tpu":
-        return
-    try:
-        from torch_tpu._internal import sync
-
-        if tensors is None:
-            sync.synchronize(wait=wait)
-        else:
-            sync.synchronize(tensors, wait=wait)
-    except Exception as e:  # ImportError on hosts without torch_tpu (CPU tests) included
-        if strict:
-            raise RuntimeError(f"TPU synchronization failed: {e}") from e
-        if not isinstance(e, ImportError):
-            logger.warning("Could not synchronize via torch_tpu: %s", e)
-
-
 def tpu_eager_mode_context(mode: Optional[str]):
     """Context manager running the enclosed ops under the ``torch_tpu`` eager ``mode`` (no-op for ``None``).
 
@@ -748,7 +722,12 @@ def compute_global_batch_num_tokens(data: TensorDict, dp_group: Any, tp_size: in
     return batch_num_tokens.item()
 
 
-def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], bucket_size: Optional[int] = None) -> None:
+def align_micro_batch_shapes_across_ranks(
+    micro_batches: list[TensorDict],
+    bucket_size: Optional[int] = None,
+    static_len: int = 0,
+    static_response_len: int = 0,
+) -> None:
     """Make every rank pad micro-batch ``i`` to the same packed length and response-length bucket.
 
     SimpleFSDP traces the all-gather/reduce-scatter into each compiled (``spmd_safe``) TransformerBlock, and
@@ -756,10 +735,21 @@ def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], bucke
     the TPU (``sync_flag_public_access_error``). One CPU all-reduce(MAX) over all micro-batches' buckets gives
     each micro-batch a common ``tpu_padded_seq_len`` / ``tpu_max_response_len`` that
     :func:`pad_packed_inputs_for_tpu` pads up to.
+
+    ``static_len`` / ``static_response_len`` (``engine_kwargs.tpu.static_micro_batch_len`` /
+    ``static_max_response_len``) raise every packed / response length to at least that many tokens (rounded up to
+    the bucket), so the trainer compiles one shape instead of one per bucket it meets.
     """
-    if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
-        return
     step = bucket_size if bucket_size is not None and bucket_size > 0 else get_tpu_seq_bucket_size()
+    static_padded = bucket_length(static_len, step) if static_len > 0 else 0
+    static_resp_padded = bucket_length(static_response_len, step) if static_response_len > 0 else 0
+    if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
+        for mb in micro_batches:
+            if static_padded:
+                tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", static_padded)
+            if static_resp_padded:
+                tu.assign_non_tensor_data(mb, "tpu_max_response_len", static_resp_padded)
+        return
     lens: list[int] = []
     for mb in micro_batches:
         ids = mb["input_ids"]
@@ -773,8 +763,9 @@ def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], bucke
     torch.distributed.all_reduce(lens_tensor, op=torch.distributed.ReduceOp.MAX)
     resolved_lens = lens_tensor.tolist()
     for i, mb in enumerate(micro_batches):
-        tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", int(resolved_lens[2 * i]))
-        tu.assign_non_tensor_data(mb, "tpu_max_response_len", int(resolved_lens[2 * i + 1]))
+        tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", max(int(resolved_lens[2 * i]), static_padded))
+        resp_len = int(resolved_lens[2 * i + 1])
+        tu.assign_non_tensor_data(mb, "tpu_max_response_len", max(resp_len, static_resp_padded) if resp_len else 0)
 
 
 def _wrap_routed_experts_on_edp_mesh(model: nn.Module, *, parallel_dims: Any, training: Any) -> None:
@@ -1018,6 +1009,67 @@ def _splash_attention_cls() -> type:
     return SplashAttention
 
 
+_SPLASH_64M_VMEM_BLOCK_KWARGS: dict[str, int] = {
+    "block_q": 1024,
+    "block_kv": 1024,
+    "block_dkv": 1024,
+    "block_kv_compute": 512,
+    "block_q_dkv": 1024,
+    "block_kv_dkv": 1024,
+    "block_kv_dkv_compute": 512,
+    "block_q_dq": 1024,
+    "block_kv_dq": 1024,
+}
+_SPLASH_1024_SUBCLASSES: dict[type, type] = {}
+
+
+def _splash_accepts_block_kwargs(splash_cls: type) -> bool:
+    try:
+        params = inspect.signature(splash_cls).parameters
+    except (TypeError, ValueError):
+        return False
+    return "block_q" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _get_splash_1024_auto_cls(splash_cls: type) -> type:
+    cached = _SPLASH_1024_SUBCLASSES.get(splash_cls)
+    if cached is not None:
+        return cached
+
+    class _Splash1024AutoAttention(splash_cls):  # type: ignore[valid-type,misc]
+        """Uses TorchTitan's 1024 Splash tiles on 1024-divisible TPU rows under >=60 MiB scoped VMEM, else auto-512."""
+
+        def __init__(
+            self,
+            *,
+            is_causal: bool = True,
+            local_window_size: Optional[int] = None,
+            original_module: Optional[nn.Module] = None,
+        ) -> None:
+            super().__init__(
+                is_causal=is_causal,
+                local_window_size=local_window_size,
+                original_module=original_module,
+                auto_block_size=True,
+            )
+            self._splash_1024 = splash_cls(
+                is_causal=is_causal,
+                local_window_size=local_window_size,
+                original_module=original_module,
+                auto_block_size=False,
+                **_SPLASH_64M_VMEM_BLOCK_KWARGS,
+            )
+
+        def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+            seq_len = q.shape[0] if q.dim() == 3 else q.shape[1]
+            if q.device.type != "cpu" and seq_len >= 1024 and seq_len % 1024 == 0:
+                return self._splash_1024(q, k, v, *args, **kwargs)
+            return super().forward(q, k, v, *args, **kwargs)
+
+    _SPLASH_1024_SUBCLASSES[splash_cls] = _Splash1024AutoAttention
+    return _Splash1024AutoAttention
+
+
 def _tpu_attention(inner: torch.nn.Module, use_splash: bool, local_window_size: Optional[int]) -> Any:
     """The TPU attention to run in place of ``inner`` (or as its CP local attention).
 
@@ -1025,12 +1077,21 @@ def _tpu_attention(inner: torch.nn.Module, use_splash: bool, local_window_size: 
     ``TPUVarlenAttention`` otherwise, since torchtitan's ``VarlenInnerAttention`` needs CUDA flash-attention and
     ``FlexInnerAttention`` a ``BlockMask``. With ``use_splash`` it becomes the fallback of torchtitan's
     ``SplashAttention`` (CPU, or lengths no splash block divides); ``auto_block_size`` picks block sizes per
-    call because verl's bucketed lengths (e.g. 768) do not always divide the default 512.
+    call because verl's bucketed lengths (e.g. 768) do not always divide the default 512. When >=60 MiB scoped
+    VMEM is configured, 1024-divisible TPU rows dispatch to TorchTitan's 1024 Splash tiles (``block_kv_compute=512``,
+    ``block_kv_dkv_compute=512``).
     """
     reference = inner.local_forward if _is_kv_all_gather_cp(inner) else TPUVarlenAttention(local_window_size)
     if not use_splash:
         return reference
-    return _splash_attention_cls()(
+    splash_cls = _splash_attention_cls()
+    if has_64mib_scoped_vmem() and _splash_accepts_block_kwargs(splash_cls):
+        return _get_splash_1024_auto_cls(splash_cls)(
+            is_causal=True,
+            local_window_size=local_window_size,
+            original_module=reference,
+        )
+    return splash_cls(
         is_causal=True,
         local_window_size=local_window_size,
         original_module=reference,
