@@ -946,17 +946,7 @@ def test_control_inbox_drops_foreign_messages(mori_env):
         b'{"t": "free", "seq": ["another-sync", 1], "c": 0, "slot": 0, "from": "x"}',
         b"[1, 2]",
     ]
-    ctx = zmq.Context()
-    try:
-        for e in (actors[0], rollouts[0]):
-            sock = ctx.socket(zmq.PUSH)
-            sock.setsockopt(zmq.LINGER, 1000)
-            sock.connect(e._inbox_addr)
-            for raw in foreign:
-                sock.send(raw)
-            sock.close()  # lingers until delivered; the pump reads them first when the sync starts
-    finally:
-        ctx.term()
+    _push_raw([actors[0]._inbox_addr, rollouts[0]._inbox_addr], foreign)  # the pump reads them when the sync starts
 
     async def run():
         ws = _make_weights(5)
