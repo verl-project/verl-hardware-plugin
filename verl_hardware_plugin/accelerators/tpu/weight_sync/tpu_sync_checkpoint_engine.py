@@ -69,6 +69,16 @@ TPU_SYNC_REGISTRATION_TIMEOUT_S = 60.0
 # tpu-sync reads and writes device buffers in place, so the tensors it is given must live on this device.
 TPU_SYNC_DEVICE = "tpu"
 
+# Row-parallel projections. vLLM-TPU stores dense linear weights transposed, (k, n) = (in, out), and a rollout TP
+# rank's slice of a row-parallel weight is then a dim-0 block of the transposed tensor: exactly its vLLM weight. With
+# ``bind_vllm_weights`` the trainer sends these transposed and the rollout receives them straight into vLLM's weights.
+VLLM_TRANSPOSED_SUFFIXES = (".self_attn.o_proj.weight", ".mlp.down_proj.weight")
+
+
+def sent_transposed(name: str, ndim: int) -> bool:
+    """Whether ``bind_vllm_weights`` sends the 2-D tensor ``name`` transposed (see ``VLLM_TRANSPOSED_SUFFIXES``)."""
+    return ndim == 2 and name.endswith(VLLM_TRANSPOSED_SUFFIXES)
+
 
 def create_torch_weight_synchronizer(
     device_tensors: list[list[torch.Tensor]],
@@ -236,6 +246,9 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         # dropping the Python references alone frees nothing. On by default so the trainer keeps that HBM headroom
         # between syncs; opt out with engine_kwargs.tpu-sync.release_buffers_after_sync=False.
         self.release_buffers_after_sync = options.release_buffers_after_sync
+        self.bind_vllm_weights = options.bind_vllm_weights
+        # Names sent transposed (``sent_transposed``); their FSDP shards are then blocks along dim 1.
+        self._transposed: set[str] = set()
         if torch.distributed.is_initialized():
             self.rank = torch.distributed.get_rank()
         else:
@@ -324,6 +337,11 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         sorted_weights = sorted(unfused_weights.items(), key=lambda x: x[0])
         valid_weights = validate_and_sanitize_tensors(sorted_weights, device=torch.device(TPU_SYNC_DEVICE))
         self._shard_info = {name: shard_info[name] for name, _ in valid_weights if name in shard_info}
+        if self.bind_vllm_weights:
+            # vLLM-TPU's layout for the row-parallel projections (see VLLM_TRANSPOSED_SUFFIXES). A local FSDP shard
+            # (a dim-0 block) becomes a dim-1 block of the transposed tensor.
+            self._transposed = {name for name, t in valid_weights if sent_transposed(name, t.dim())}
+            valid_weights = [(name, t.t().contiguous() if name in self._transposed else t) for name, t in valid_weights]
 
         tpu_synchronize(strict=True)
         t_gathered = time.time()
@@ -393,10 +411,14 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
             bind_ip=bind_ip,
         )
 
+        def shard_dim(name: str) -> int:
+            # A local FSDP shard is a dim-0 block of the trainer's tensor, so a dim-1 block once sent transposed.
+            return 1 if name in self._transposed else 0
+
         def full_shape(name: str, p: torch.Tensor) -> list[int]:
             shape = list(p.shape)
             if name in self._shard_info:
-                shape[0] *= self._shard_info[name][0]
+                shape[shard_dim(name)] *= self._shard_info[name][0]
             return shape
 
         # Record global shapes in the rendezvous so the sampler can size its receive buffers.
@@ -410,8 +432,9 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
             logger.warning(f"Could not record global shapes in the tpu-sync rendezvous: {e}")
 
         # Build variable metadata protos for each dynamic tensor. Every variable carries its full shape:
-        # - a local FSDP shard is block `shard_index` of `num_shards` dim-0 blocks: mesh_shape=[num_shards, 1, ...]
-        #   and global_shard_indices=[shard_index], and tpu-sync reshards the blocks of all ranks for the rollout;
+        # - a local FSDP shard is block `shard_index` of `num_shards` blocks along its shard dim (dim 0, or dim 1 when
+        #   sent transposed): mesh_shape has `num_shards` on that dim and global_shard_indices=[shard_index], and
+        #   tpu-sync reshards the blocks of all ranks for the rollout;
         # - a full tensor (the same on every rank) is unsharded: mesh_shape=[1] * rank.
         variable_protos = []
         max_shards = 1
@@ -420,9 +443,11 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
             if name in self._shard_info:
                 num_shards, shard_index = self._shard_info[name]
                 max_shards = max(max_shards, num_shards)
+                mesh_shape, spec = [1] * len(shape), [""] * len(shape)
+                mesh_shape[shard_dim(name)], spec[shard_dim(name)] = num_shards, "fsdp"
                 sharding: dict[str, Any] = {
-                    "mesh_shape": [num_shards] + [1] * (len(shape) - 1),
-                    "sharding_spec": ["fsdp"] + [""] * (len(shape) - 1),
+                    "mesh_shape": mesh_shape,
+                    "sharding_spec": spec,
                     "global_shard_indices": [shard_index],
                 }
             else:
@@ -669,6 +694,7 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
                     "global_shapes": global_shapes,
                     "parallelism": parallelism,
                     "job_name": _sampler_job_name(replica, replica_idx),
+                    "bind_vllm_weights": options.bind_vllm_weights,
                 },
             )
             for replica_idx, replica in enumerate(manager.replicas)

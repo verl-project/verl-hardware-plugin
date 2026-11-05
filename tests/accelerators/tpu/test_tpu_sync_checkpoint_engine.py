@@ -167,23 +167,28 @@ class _FakeTpuSync:
         return next(ws for ws in reversed(self.synchronizers) if ws.local_port == port)
 
     def transfer(self, src_units, dst_units):
-        """Copies the trainer units' tensors into the rollout units' buffers, resharded per their metadata."""
+        """Reshards the trainer units' tensors for the rollout units per their metadata, into each rollout
+        synchronizer's host buffers; its ``h2d()`` writes them to the bound device tensors, as in tpu-sync."""
         full = {}
-        blocks: dict[str, tuple[int, dict[int, torch.Tensor]]] = {}
+        blocks: dict[str, tuple[int, int, dict[int, torch.Tensor]]] = {}
         for unit in src_units:
             registration = self.registrations[unit]
             ws = self.synchronizer_at(registration.data_addresses[0])
             for var, tensor in zip(registration.variables, ws.tensors, strict=True):
-                rest = len(var.shape) - 1
                 indices = getattr(var, "global_shard_indices", None)
                 if indices:
-                    # A local FSDP shard: block `index` of `mesh_shape[0]` equal dim-0 blocks of the full tensor.
-                    num_shards = var.mesh_shape[0]
-                    assert var.mesh_shape[1:] == [1] * rest and var.sharding_spec == ["fsdp"] + [""] * rest, var.name
+                    # A local FSDP shard: block `index` of `num_shards` equal blocks of the full tensor along the
+                    # one "fsdp" dim (dim 0, or dim 1 for a tensor sent transposed).
+                    (dim,) = [d for d, axis in enumerate(var.sharding_spec) if axis == "fsdp"]
+                    num_shards = var.mesh_shape[dim]
+                    assert [m for d, m in enumerate(var.mesh_shape) if d != dim] == [1] * (len(var.shape) - 1)
+                    assert var.sharding_spec.count("") == len(var.shape) - 1, var.name
                     assert registration.mesh_shape[0] >= num_shards, var.name
-                    assert list(tensor.shape) == [var.shape[0] // num_shards] + var.shape[1:], var.name
+                    expected = list(var.shape)
+                    expected[dim] //= num_shards
+                    assert list(tensor.shape) == expected, var.name
                     (index,) = indices
-                    shards = blocks.setdefault(var.name, (num_shards, {}))[1]
+                    shards = blocks.setdefault(var.name, (dim, num_shards, {}))[2]
                     assert index not in shards, f"two units registered block {index} of {var.name}"
                     shards[index] = tensor
                 else:
@@ -192,13 +197,14 @@ class _FakeTpuSync:
                     assert var.sharding_spec == [""] * len(var.shape), var.name
                     assert list(tensor.shape) == list(var.shape), var.name
                     full[var.name] = tensor
-        for name, (num_shards, shards) in blocks.items():
+        for name, (dim, num_shards, shards) in blocks.items():
             assert sorted(shards) == list(range(num_shards)), f"missing blocks of {name}"
-            full[name] = torch.cat([shards[i] for i in range(num_shards)])
+            full[name] = torch.cat([shards[i] for i in range(num_shards)], dim=dim)
         for unit in dst_units:
             registration = self.registrations[unit]
             ws = self.synchronizer_at(registration.data_addresses[0])
             tp_rank = int(unit.job_replica_id)
+            ws.host = []
             for var, buffer in zip(registration.variables, ws.tensors, strict=True):
                 src = full[var.name]
                 assert list(src.shape) == list(var.shape), var.name
@@ -209,7 +215,8 @@ class _FakeTpuSync:
                         indices = getattr(var, "global_shard_indices", None)
                         index = indices[0] if indices else tp_rank
                         src = src.narrow(dim, index * size, size)
-                buffer.copy_(src)
+                assert list(src.shape) == list(buffer.shape), var.name
+                ws.host.append(src.clone())
 
     def modules(self) -> dict[str, ModuleType]:
         world = self
@@ -228,6 +235,7 @@ class _FakeTpuSync:
                 self.unbind_calls = 0
                 self.bound = True
                 self.skip_tiling = None
+                self.host = None  # what the last transfer received, written to `tensors` by h2d()
                 world.synchronizers.append(self)
 
             def test_only_set_skip_tiling(self, plan):
@@ -249,6 +257,11 @@ class _FakeTpuSync:
 
             def h2d(self):
                 self.h2d_calls += 1
+                if self.host is None:
+                    return
+                for buffer, received in zip(self.tensors, self.host, strict=True):
+                    buffer.copy_(received)
+                self.host = None
 
         class FakeController:
             def __init__(self, port=0):
@@ -451,14 +464,19 @@ class _FakeVllmModel(nn.Module):
     With ``tp > KV_HEADS`` every rank holds one whole KV head (replicated on ``tp // KV_HEADS`` ranks).
     """
 
-    def __init__(self, tp, flip_o_proj=False):
+    def __init__(self, tp, flip_o_proj=False, flip_row_parallel=False):
         super().__init__()
+        flip_o_proj = flip_o_proj or flip_row_parallel
         attn = nn.Module()
         attn.qkv_proj = _Linear(Q_ROWS // tp + 2 * KV_ROWS // min(tp, KV_HEADS), HIDDEN)
         attn.o_proj = _Linear(Q_ROWS // tp, HIDDEN, flipped=True) if flip_o_proj else _Linear(HIDDEN, Q_ROWS // tp)
         mlp = nn.Module()
         mlp.gate_up_proj = _Linear(2 * INTERMEDIATE // tp, HIDDEN)
-        mlp.down_proj = _Linear(HIDDEN, INTERMEDIATE // tp)
+        mlp.down_proj = (
+            _Linear(INTERMEDIATE // tp, HIDDEN, flipped=True)
+            if flip_row_parallel
+            else _Linear(HIDDEN, INTERMEDIATE // tp)
+        )
         layer = nn.Module()
         layer.self_attn = attn
         layer.mlp = mlp
@@ -471,8 +489,9 @@ class _FakeVllmModel(nn.Module):
         self.lm_head = _Linear(VOCAB // tp, HIDDEN)
 
 
-def _expected_vllm_state(weights, rank, tp, lm_head_from_embed=False, flip_o_proj=False):
+def _expected_vllm_state(weights, rank, tp, lm_head_from_embed=False, flip_o_proj=False, flip_row_parallel=False):
     """The state dict that rank ``rank`` of a TP=``tp`` vLLM model must hold after a sync of ``weights``."""
+    flip_o_proj = flip_o_proj or flip_row_parallel
 
     def rows(name):
         return weights[name].chunk(tp, dim=0)[rank]
@@ -488,6 +507,7 @@ def _expected_vllm_state(weights, rank, tp, lm_head_from_embed=False, flip_o_pro
 
     q_name, k_name, v_name = QKV
     o_proj = cols(LAYER + "self_attn.o_proj.weight")
+    down_proj = cols(LAYER + "mlp.down_proj.weight")
     return {
         "model.embed_tokens.weight": rows("model.embed_tokens.weight"),
         "model.norm.weight": weights["model.norm.weight"],
@@ -498,7 +518,7 @@ def _expected_vllm_state(weights, rank, tp, lm_head_from_embed=False, flip_o_pro
         LAYER + "mlp.gate_up_proj.weight": torch.cat(
             [rows(LAYER + "mlp.gate_proj.weight"), rows(LAYER + "mlp.up_proj.weight")]
         ),
-        LAYER + "mlp.down_proj.weight": cols(LAYER + "mlp.down_proj.weight"),
+        LAYER + "mlp.down_proj.weight": down_proj.T if flip_row_parallel else down_proj,
         "lm_head.weight": rows("model.embed_tokens.weight" if lm_head_from_embed else "lm_head.weight"),
     }
 
@@ -1100,6 +1120,99 @@ def test_update_tpu_sync_weights_from_local_shards(
     sampler_synchronizers = [sampler._tpu_sync_ws for sampler in samplers]
     trainer_synchronizers = [ws for ws in fake_tpu_sync.synchronizers if ws not in sampler_synchronizers]
     assert [ws.bind_calls for ws in trainer_synchronizers] == [1] * trainer_ranks  # registered once, then rebound
+
+
+ROW_PARALLEL = (LAYER + "mlp.down_proj.weight", LAYER + "self_attn.o_proj.weight")
+
+
+@pytest.mark.parametrize(("trainer_ranks", "tp"), [(2, 2), (4, 2), (2, 4)])
+@pytest.mark.parametrize("local_shards", [False, True])
+def test_bind_vllm_weights_receives_row_parallel_straight_into_vllm_weights(
+    fake_tpu_sync, worker_ext, caplog, trainer_ranks, tp, local_shards
+):
+    """The trainer sends o_proj / down_proj transposed; each rollout rank's dim-0 slice lands in its flipped vLLM
+    weight with no staging buffer and no install copy, and the result matches the staged path."""
+    weights = {"current": _trainer_weights(seed=0)}
+    engines = [_trainer_engine(rank, verify_parity=True, bind_vllm_weights=True) for rank in range(trainer_ranks)]
+    models = [_FakeVllmModel(tp, flip_row_parallel=True) for _ in range(tp)]
+    samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+    if local_shards:
+        weights_for_rank = lambda rank: _LocalShardWeights(weights["current"], rank, trainer_ranks)  # noqa: E731
+    else:
+        weights_for_rank = lambda rank: iter(weights["current"].items())  # noqa: E731
+    manager, _ = _make_manager(engines, weights_for_rank, samplers, [], verify_parity=True, bind_vllm_weights=True)
+
+    for step in (1, 2):
+        weights["current"] = _trainer_weights(seed=step)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+            asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=step))
+        for rank, model in enumerate(models):
+            _assert_state(model, _expected_vllm_state(weights["current"], rank, tp, flip_row_parallel=True))
+        assert f"TPU-SYNC PARITY VERIFIED | Step {step}" in caplog.text
+
+    for sampler, model in zip(samplers, models, strict=True):
+        assert sampler._tpu_sync_bound_names == set(ROW_PARALLEL)
+        assert not sampler._tpu_sync_transposed_staged
+        layer = model.model.layers[0]
+        bound = {t.data_ptr() for t in sampler._tpu_sync_ws.tensors}
+        assert layer.self_attn.o_proj.weight.data_ptr() in bound
+        assert layer.mlp.down_proj.weight.data_ptr() in bound
+    trainer_vars = {v.name: v for v in fake_tpu_sync.registrations[TpuSyncId("trainer", "0", "weights")].variables}
+    for name in ROW_PARALLEL:
+        assert trainer_vars[name].shape == list(reversed(TRAINER_SHAPES[name]))
+        assert trainer_vars[name].sharding_spec == (["", "fsdp"] if local_shards else ["", ""])
+
+
+def test_bind_vllm_weights_stages_and_transposes_back_when_vllm_did_not_flip(fake_tpu_sync, worker_ext):
+    """A vLLM weight that is not in the transposed (k, n) layout cannot take the slice directly: it is staged."""
+    tp = 2
+    weights = _trainer_weights()
+    models = [_FakeVllmModel(tp) for _ in range(tp)]
+    samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+    manager, _ = _make_manager(
+        [_trainer_engine(rank, bind_vllm_weights=True) for rank in range(2)],
+        lambda rank: _LocalShardWeights(weights, rank, 2),
+        samplers,
+        [],
+        bind_vllm_weights=True,
+    )
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights, rank, tp))
+    for sampler in samplers:
+        assert not sampler._tpu_sync_bound_names
+        assert sampler._tpu_sync_transposed_staged == set(ROW_PARALLEL)
+
+
+def test_bind_vllm_weights_exact_parity_compares_bound_weights_with_what_vllm_loaded(fake_tpu_sync, worker_ext):
+    """The H2D overwrites the bound vLLM weights itself, so the step-0 exact check compares them with a copy taken
+    before it; a mismatch there is reported like any other."""
+    tp = 2
+    weights = _trainer_weights()
+    models = [_FakeVllmModel(tp, flip_row_parallel=True) for _ in range(tp)]
+    for rank, model in enumerate(models):
+        model.load_state_dict(_expected_vllm_state(weights, rank, tp, flip_row_parallel=True))
+    with torch.no_grad():
+        models[1].model.layers[0].self_attn.o_proj.weight.add_(1)
+    samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+    events: list = []
+    manager, _ = _make_manager(
+        [_trainer_engine(rank, bind_vllm_weights=True) for rank in range(2)],
+        lambda rank: _LocalShardWeights(weights, rank, 2),
+        samplers,
+        events,
+        verify_parity="exact",
+        bind_vllm_weights=True,
+    )
+    with pytest.raises(parity.TPUSyncParityError) as excinfo:
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    message = str(excinfo.value)
+    assert "2 rollout ranks, [9] tensors checked per rank, 1 mismatched" in message
+    assert "rank 1: model.layers.0.self_attn.o_proj.weight: max|diff|=1" in message
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights, rank, tp, flip_row_parallel=True))
+    assert "resume" not in events
 
 
 def test_parity_check_with_local_shards_waits_for_every_rank_and_reports_mismatch(
@@ -1894,6 +2007,10 @@ def test_qwen3_moe_with_unsupported_expert_placement_falls_back_to_vllm_loaders(
         )
 
     def all_gather(t, dim=0):  # the TP group: every rank's slice of the same staging tensor
+        # The ranks run their H2D concurrently before this collective; here they install one after the other.
+        for sampler in samplers:
+            if sampler._tpu_sync_ws.host is not None:
+                sampler._tpu_sync_ws.h2d()
         for sampler in samplers:
             for name, staged in sampler._tpu_sync_staging.items():
                 if staged is t:

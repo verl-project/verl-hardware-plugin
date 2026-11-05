@@ -127,6 +127,31 @@ def _slice_from_spec(spec: list[str], local_shape: list[int], tp_size: int) -> _
     return _SamplerSlice(spec, local_shape, mesh_shape, [], tp_size // math.prod(mesh_shape))
 
 
+def _bindable_vllm_weight(
+    name: str, local_shape: list[int], model_sd: dict[str, torch.Tensor], modules: dict[str, Any]
+) -> Optional[torch.Tensor]:
+    """vLLM's weight for the transposed tensor ``name`` if tpu-sync can receive straight into it, else ``None``.
+
+    It must be the flipped (k, n) weight with this rank's slice shape, in bfloat16 (the trainer sends bf16), and a
+    whole contiguous buffer: tpu-sync's H2D writes complete device buffers.
+    """
+    key = resolve_model_key(name, model_sd)
+    if key not in model_sd:
+        return None
+    weight = model_sd[key]
+    weight = weight.to_local() if hasattr(weight, "to_local") else weight
+    flipped = bool(getattr(get_parent_module(key, modules), "_tpu_weight_flipped", False))
+    if (
+        flipped
+        and list(weight.shape) == list(local_shape)
+        and weight.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and weight.storage_offset() == 0
+    ):
+        return weight
+    return None
+
+
 def _uses_vllm_weight_loader(vllm_model: Any, global_shapes: dict[str, list[int]]) -> bool:
     """Whether to install received weights via vLLM's own checkpoint loaders (hybrid linear-attn or MoE models)."""
     return (
@@ -155,6 +180,7 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         global_shapes: dict[str, list[int]],
         parallelism: int = tpu_sync_engine.TPU_SYNC_DEFAULT_PARALLELISM,
         job_name: str = "sampler0",
+        bind_vllm_weights: bool = False,
     ) -> bool:
         """Initialize tpu-sync WeightSynchronizer listener and register with the central tpu-sync controller.
 
@@ -162,8 +188,10 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         full shape of every tensor the trainer sends; the driver passes both, because vLLM's ``mp`` workers are
         not Ray processes. ``job_name`` is the tpu-sync job this worker's replica registers under (the driver
         names every rollout replica after its ``replica_rank``), so the ranks ``0..TP-1`` of several replicas do
-        not collide on the controller. Only the first call does work: the receive buffers, the synchronizer and
-        the registration are reused by every later sync.
+        not collide on the controller. ``bind_vllm_weights`` (engine option): the trainer sends the row-parallel
+        projections transposed, and this worker receives them straight into vLLM's weights where their layout
+        matches (see ``tpu_sync_engine.VLLM_TRANSPOSED_SUFFIXES``). Only the first call does work: the receive
+        buffers, the synchronizer and the registration are reused by every later sync.
         """
         if getattr(self, "_tpu_sync_ws", None) is not None:
             return True
@@ -216,6 +244,11 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             f"{layout.name} direct" if layout is not None else "vllm loaders" if use_vllm_loaders else "direct"
         )
         logger.info(f"tpu-sync Sampler Rank {rank_val}: install mode {install_mode}")
+        if bind_vllm_weights and (layout is not None or use_vllm_loaders):
+            raise RuntimeError(
+                f"tpu-sync Sampler Rank {rank_val}: engine_kwargs.tpu-sync.bind_vllm_weights supports the dense "
+                f"direct install only, not {install_mode}"
+            )
         if use_vllm_loaders:
             # Every sync then all-gathers the whole model on every rank and re-runs vLLM's loaders (slow).
             logger.warning(
@@ -227,9 +260,8 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         # TODO(tpu): Copy the received weights straight into vLLM's parameters, with no staging copy. The
         # staging tensors are a second full copy of this rank's TP shard (~1.9 GiB per chip for Qwen3-8B,
         # ~7.6 GiB for Qwen3-32B at TP=8) that must fit next to vLLM's preallocated weights and KV cache on
-        # every sync. Unfused tensors (o_proj, down_proj, norms, embed_tokens, lm_head) could bind the vLLM
-        # parameter buffers directly; fused qkv_proj / gate_up_proj and transposed (_tpu_weight_flipped)
-        # weights need tpu_sync to write into a slice or layout of the target tensor.
+        # every sync. bind_vllm_weights already receives the row-parallel o_proj / down_proj into vLLM's weights;
+        # fused qkv_proj / gate_up_proj need tpu-sync to place several trainer tensors into one destination.
         staging_tensors = {}
         staging_sharded = {}
         variable_protos = []
@@ -251,10 +283,32 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
 
             zero_copy = layout.zero_copy_targets(plan, init_sd, _find_init_key, global_shapes_map)
 
+        # bind_vllm_weights: the row-parallel projections arrive transposed, in vLLM-TPU's (k, n) layout, so this rank's
+        # dim-0 slice is exactly its vLLM weight; receive it there when vLLM flipped that weight and it matches.
+        # Otherwise stage it (transposed) and transpose it back at install.
+        transposed_staged: set[str] = set()
+        bound_sd: dict[str, torch.Tensor] = {}
+        bound_modules: dict[str, Any] = {}
+        if bind_vllm_weights:
+            bound_sd = vllm_model.state_dict()
+            bound_modules = dict(vllm_model.named_modules())
+
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
             rule = layout.sharding_rule(name, g_shape, tp_size, plan) if layout is not None else None
-            if rule is not None:
+            if bind_vllm_weights and tpu_sync_engine.sent_transposed(name, len(g_shape)):
+                if g_shape[0] % tp_size:
+                    raise RuntimeError(
+                        f"tpu-sync Sampler Rank {rank_val}: transposed {name} {g_shape} does not split over "
+                        f"TP={tp_size}"
+                    )
+                shard = _slice_from_spec(["tp", ""], [g_shape[0] // tp_size, g_shape[1]], tp_size)
+                target = _bindable_vllm_weight(name, shard.local_shape, bound_sd, bound_modules)
+                if target is not None:
+                    zero_copy[name] = target
+                else:
+                    transposed_staged.add(name)
+            elif rule is not None:
                 shard = _slice_from_spec(*rule, tp_size)
             else:
                 shard = _sampler_sharding(
@@ -300,6 +354,15 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         self._tpu_sync_staging_sharded = staging_sharded
         self._sorted_vllm_params = valid_params
         self._tpu_sync_replicas = replicas
+        # bind_vllm_weights: tensors received into vLLM's weights (nothing to install) and transposed ones staged.
+        self._tpu_sync_bound_names = set(zero_copy) if bind_vllm_weights else set()
+        self._tpu_sync_transposed_staged = transposed_staged
+        if transposed_staged:
+            logger.warning(
+                f"tpu-sync Sampler Rank {rank_val}: bind_vllm_weights stages {len(transposed_staged)} transposed "
+                "tensors whose vLLM weight is not a flipped bf16 buffer of the slice shape "
+                f"(e.g. {sorted(transposed_staged)[:2]})"
+            )
         if zero_copy:
             logger.info(
                 f"tpu-sync Sampler Rank {rank_val}: {len(zero_copy)} tensors "
@@ -374,6 +437,14 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
 
         rank = getattr(self, "rank", 0)
         t_start = time.perf_counter()
+        # Tensors received into vLLM's weights (bind_vllm_weights) are overwritten by the H2D itself, so the step-0
+        # exact check compares them with a host copy taken before it.
+        bound_names = getattr(self, "_tpu_sync_bound_names", set())
+        bound_before = (
+            {name: self._tpu_sync_staging[name].detach().to("cpu", copy=True) for name in sorted(bound_names)}
+            if exact_parity and bound_names
+            else {}
+        )
         t_h2d_start = time.perf_counter()
         # h2d() applies the skip_tiling plan the listener received with this transfer (see
         # init_tpu_sync_on_worker); nothing must override it here.
@@ -420,7 +491,10 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                 parity.check(resolved_key, target_local, adapted)
             target_local.copy_(adapted)
 
-        consumed_staging = set()
+        consumed_staging = set(bound_names)
+        if parity is not None:
+            for name, before in bound_before.items():
+                parity.check(name, before, self._tpu_sync_staging[name].detach().cpu())
         parity_check = parity.check if parity is not None else None
         layout: Optional[direct_install.DirectInstallLayout] = getattr(self, "_tpu_sync_layout", None)
         fused_targets: tuple[tuple[str, tuple[str, ...]], ...] = _FUSED_TARGETS
@@ -446,13 +520,15 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                             consumed_staging.update(layer_src_keys)
 
         # 2. Handle all remaining non-fused parameters (o_proj, down_proj, layernorms, embeddings)
+        transposed_staged = getattr(self, "_tpu_sync_transposed_staged", set())
         unresolved = []
         for name, src_t in self._tpu_sync_staging.items():
             if name in consumed_staging:
                 continue
             resolved_key = find_model_key(name)
             if resolved_key is not None:
-                copy_into(resolved_key, src_t)
+                # Staged in the transposed wire layout (bind_vllm_weights): back to the trainer's layout first.
+                copy_into(resolved_key, src_t.t() if name in transposed_staged else src_t)
             else:
                 unresolved.append(name)
         if layout is not None and unresolved:

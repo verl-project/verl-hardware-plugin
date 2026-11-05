@@ -90,6 +90,24 @@ actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 | `parallelism` | `8` | Parallel transfer streams per worker. |
 | `verify_parity` | `off` | Weight-sync check: `off`, `norm`, `exact` or `all` (`True` means `norm`). See [Parity checks](#parity-checks). A failed check stops the run. Meant for bring-up and after changing sharding or upgrading tpu-sync. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The deprecated environment variable `VERL_TPU_SYNC_RELEASE_BUFFERS` still overrides the option on the trainer workers and logs a deprecation warning. |
+| `bind_vllm_weights` | `False` | Receive `o_proj` and `down_proj` straight into vLLM's weights instead of the rollout's HBM staging buffers. The trainer sends them transposed, which is vLLM-TPU's `(k, n)` layout. Dense `direct` install only. See [Receiving into vLLM's weights](#receiving-into-vllms-weights). |
+
+## Receiving into vLLM's weights
+
+The rollout normally receives every tensor into an HBM staging buffer in the trainer's layout, then copies it into
+vLLM's (fused, transposed) parameters at install. The staging buffers are a second copy of each rank's TP shard.
+
+vllm-torchtpu stores dense linear weights transposed, `(k, n)`. For the row-parallel projections (`o_proj`,
+`down_proj`), a TP rank's slice of the transposed tensor is a dim-0 block, which is exactly its vLLM weight. With
+`bind_vllm_weights`, the trainer sends these two transposed (its FSDP shards become dim-1 blocks), and each rollout
+rank binds its vLLM weight as the tpu-sync receive buffer: no staging buffer and no install copy for them. The H2D then
+writes vLLM's weights, inside the rollout pause. If a vLLM weight is not a flipped bf16 buffer of the slice shape, that
+tensor is staged and transposed back at install (logged as a warning). The step-0 `exact` check compares these weights
+with a host copy taken before the H2D.
+
+Qwen3-8B on 2 × v6e-8 (TP8): 0.56 GiB of HBM per rollout chip is no longer staged. The fused `qkv_proj` and
+`gate_up_proj` are still staged: each is built from several trainer tensors, which tpu-sync cannot write into one
+receive buffer yet.
 
 ## Rollout install
 

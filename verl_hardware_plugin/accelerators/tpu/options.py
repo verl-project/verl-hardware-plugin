@@ -355,12 +355,18 @@ class TPUSyncOptions:
             transfer, so training gets that HBM back between syncs.
         tie_word_embeddings: Whether ``lm_head`` is tied to the input embedding, so it need not be sent.
             ``None`` sends ``lm_head``, which is correct for tied and untied models alike.
+        bind_vllm_weights: Receive the row-parallel projections (``o_proj``, ``down_proj``) straight into vLLM's
+            weights instead of the rollout's HBM staging buffers. The trainer sends them transposed, which is
+            vLLM-TPU's (k, n) layout, so each rollout rank's slice is its vLLM weight. Saves that part of the staging
+            HBM and its install copy; the H2D writes vLLM's weights inside the rollout pause. Dense models with the
+            direct install only.
     """
 
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM
     verify_parity: str = "off"
     release_buffers_after_sync: bool = True
     tie_word_embeddings: Optional[bool] = None
+    bind_vllm_weights: bool = False
 
     @property
     def verify_norms(self) -> bool:
@@ -378,6 +384,7 @@ _SYNC_KINDS: dict[str, type] = {
     "verify_parity": ParityMode,
     "release_buffers_after_sync": bool,
     "tie_word_embeddings": bool,
+    "bind_vllm_weights": bool,
 }
 assert set(_SYNC_KINDS) == {f.name for f in dataclasses.fields(TPUSyncOptions)}
 
