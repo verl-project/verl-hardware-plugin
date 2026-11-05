@@ -73,13 +73,13 @@ MoRI engine, region and transfer statuses alive for the rest of the process and 
 the rollout and trainer workers to continue.
 
 - A worker refuses `prepare`, `init_process_group` and a new sync while its previous sync is still running.
-  `CheckpointEngineManager` waits with `ray.get`, which returns on the first error, so a retry could otherwise reach
-  a worker that is still unwinding.
+  `CheckpointEngineManager` raises on the first worker error without waiting for the others (`ray.get`, or
+  `asyncio.gather` since verl#8542), so a retry could otherwise reach a worker that is still unwinding.
 - A receiver's sync starts when `receive_weights` is called, not at its first iteration; closing the stream before
   the first tensor fails the sync too.
 - A server adapter that raises while consuming the stream does not close it: verl's
   `CheckpointEngineWorker.update_weights` passes the error on and leaves the stream to garbage collection. The driver
-  sees the error at once (`ray.get` returns on the first error). The engine sees it only when an unfinished stream is
+  sees the error at once (the manager raises on the first worker error). The engine sees it only when an unfinished stream is
   finalized, and not at all if the adapter failed before its first tensor; until then that receiver stays busy and
   refuses new syncs, and its peers stop when `timeout_s` expires.
 
