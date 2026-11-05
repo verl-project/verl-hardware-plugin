@@ -3,12 +3,14 @@
 
 """TPU device queries go through torch.accelerator (torch_tpu >= 0.2.0)."""
 
+import math
 import types
 from unittest import mock
 
 import pytest
 import torch
 
+from verl.utils.flops_counter import get_device_flops
 from verl_hardware_plugin.accelerators.tpu import device_api
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import TPUDeviceModuleProxy
 
@@ -203,3 +205,26 @@ def test_placement_group_claims_tpu_slices_in_numeric_order():
         claimed = [platform.auto_assign_accelerator_type(f"pool_{k}", None) for k in range(6)]
     assert claimed == ["tpu-group-0", "tpu-group-1", "tpu-group-2", "tpu-group-9", "tpu-group-10", "tpu-group-10"]
     assert platform_tpu_mod is not None
+
+
+@pytest.mark.parametrize(
+    "device_name,expected_tflops",
+    [
+        ("TPU v7", 1153.5),
+        ("TPU v7x", 1153.5),
+        ("TPU7x", 1153.5),
+        ("tpu7x", 1153.5),
+        ("v7x", 1153.5),
+        ("TPU v6 lite", 918.0),
+        ("TPU v6e", 918.0),
+        ("v6e", 918.0),
+        ("TPU v5p", 459.0),
+        ("v5p", 459.0),
+        ("TPU v5 lite", 197.0),
+        ("TPU v5e", 197.0),
+        ("v5e", 197.0),
+    ],
+)
+def test_tpu_device_flops_registered(device_name: str, expected_tflops: float):
+    """TPU libtpu device_kind strings and GKE accelerator names resolve in verl's _DEVICE_FLOPS."""
+    assert math.isclose(get_device_flops(unit="T", device_name=device_name), expected_tflops)
