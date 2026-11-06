@@ -337,6 +337,21 @@ def test_resolve_tpu_topology_bounds_multi_host():
     assert resolve_tpu_topology_bounds(total_chips=16, num_nodes=4)[:2] == ("4,4,1", "4,4,1")
 
 
+def test_single_host_tpu_topology_for_one_host_replicas():
+    from verl_hardware_plugin.accelerators.tpu.platform_tpu import single_host_tpu_topology
+
+    with mock.patch.dict(os.environ, {"TPU_ACCELERATOR_TYPE": "v5p", "TORCH_TPU_TOPOLOGY": "2,2,4"}):
+        # The slice's TORCH_TPU_TOPOLOGY does not leak into a replica on one host.
+        assert single_host_tpu_topology(4) == "2,2,1"
+        assert single_host_tpu_topology(8) == "2,4,1"  # v6e-8 host
+        assert single_host_tpu_topology(3) == ""  # unknown size: the caller keeps the inherited environment
+    with mock.patch.dict(os.environ, {"TPU_ACCELERATOR_TYPE": "tpu7x"}):
+        assert single_host_tpu_topology(8) == "2,2,1,2"  # 4 chips x 2 TensorCores
+        # TP=2 / TP=4 replicas: no validated sub-host 7x mesh, so no override (no error either).
+        assert single_host_tpu_topology(2) == ""
+        assert single_host_tpu_topology(4) == ""
+
+
 def test_resolve_tpu_topology_bounds_single_host():
     # A 4-chip slice on one host is addressed inside the host, not across hosts.
     assert resolve_tpu_topology_bounds(total_chips=4, num_nodes=1) == ("2,2,1", "1,1,1", "2,2,1", "4")
@@ -486,18 +501,21 @@ def test_ray_tpu_accelerator_name_prefers_the_pools_own_nodes(caplog):
         {
             "Alive": True,
             "Resources": {"TPU": 4.0},
+            "NodeID": "node-1",
             "NodeManagerAddress": "10.0.0.1",
             "Labels": {"ray.io/tpu-pod-type": "v6e-4"},
         },
         {
             "Alive": True,
             "Resources": {"TPU": 8.0},
+            "NodeID": "node-2",
             "NodeManagerAddress": "10.0.0.2",
             "Labels": {"ray.io/accelerator-type": "TPU7X"},
         },
         {
             "Alive": False,
             "Resources": {"TPU": 8.0},
+            "NodeID": "node-3",
             "NodeManagerAddress": "10.0.0.3",
             "Labels": {"ray.io/tpu-pod-type": "dead"},
         },
@@ -505,6 +523,8 @@ def test_ray_tpu_accelerator_name_prefers_the_pools_own_nodes(caplog):
     with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
         assert ray_tpu_accelerator_name() == "v6e-4"
         assert ray_tpu_accelerator_name(node_ips=["10.0.0.2"]) == "TPU7X"
+        assert ray_tpu_accelerator_name(node_ids=["node-2"]) == "TPU7X"
+        assert ray_tpu_accelerator_name(node_ids=["node-3"]) == ""  # dead node: not counted
         assert ray_tpu_accelerator_name(node_ips=["10.0.0.9"]) == ""  # unknown hosts: no guess from another node
     assert "None of the pool's hosts ['10.0.0.9']" in caplog.text
     with mock.patch("ray.is_initialized", return_value=False):
@@ -731,10 +751,9 @@ def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
 
 
 def test_fused_linear_cross_entropy_tpu_and_logprobs():
-    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
-        fused_linear_logprobs_tpu,
-        resolve_tpu_use_fused_linear_cross_entropy,
-    )
+    from verl_hardware_plugin.accelerators.tpu.engines import fused_logprob
+    from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import resolve_tpu_use_fused_linear_cross_entropy
 
     class _FakeFusedLossLinearWrapper(torch.nn.Linear):
         def forward(self, x: torch.Tensor):
@@ -742,54 +761,122 @@ def test_fused_linear_cross_entropy_tpu_and_logprobs():
 
     seen_calls = []
 
-    def _fake_kernel(hidden_2d, labels_1d, weight_hv, *, reduction="sum", **kwargs):
-        seen_calls.append((hidden_2d.shape, labels_1d.shape, weight_hv.shape, reduction))
-        return torch.full((hidden_2d.shape[0],), 0.5, dtype=torch.float32)
+    def _fake_forward_op(b_block, h_block, v_block):
+        def op(x, labels, weight_t):
+            seen_calls.append((x.shape, labels.shape, labels.dtype, weight_t.shape, (b_block, h_block, v_block)))
+            return torch.full((x.shape[0],), 0.5), torch.zeros(x.shape[0])
 
-    fake_loss_mod = types.ModuleType("torchtitan.experiments.tpu.kernels.linear_softmax_cross_entropy_loss")
-    fake_loss_mod.linear_softmax_cross_entropy_loss = _fake_kernel
-    fake_loss_mod._verl_reduction_none_patched = True
-    fake_sys_modules = {
-        "torchtitan": types.ModuleType("torchtitan"),
-        "torchtitan.experiments": types.ModuleType("torchtitan.experiments"),
-        "torchtitan.experiments.tpu": types.ModuleType("torchtitan.experiments.tpu"),
-        "torchtitan.experiments.tpu.kernels": types.ModuleType("torchtitan.experiments.tpu.kernels"),
-        "torchtitan.experiments.tpu.kernels.linear_softmax_cross_entropy_loss": fake_loss_mod,
-    }
-    fake_sys_modules["torchtitan"].experiments = fake_sys_modules["torchtitan.experiments"]  # type: ignore[attr-defined]
-    fake_sys_modules["torchtitan.experiments"].tpu = fake_sys_modules["torchtitan.experiments.tpu"]  # type: ignore[attr-defined]
-    fake_sys_modules["torchtitan.experiments.tpu"].kernels = fake_sys_modules["torchtitan.experiments.tpu.kernels"]  # type: ignore[attr-defined]
-    fake_sys_modules["torchtitan.experiments.tpu"].kernels.linear_softmax_cross_entropy_loss = fake_loss_mod  # type: ignore[attr-defined]
+        return op
 
-    with mock.patch.dict(sys.modules, fake_sys_modules):
-        lm_head = _FakeFusedLossLinearWrapper(16, 32, bias=False)
-        x = torch.randn(2, 5, 16)
-        out_fused = lm_head(x)
-        assert isinstance(out_fused, tuple) and len(out_fused) == 2
-        assert out_fused[0] is x
-        assert out_fused[1].shape == (16, 32)
-        assert (
-            resolve_tpu_use_fused_linear_cross_entropy(
-                SimpleNamespace(use_fused_linear_cross_entropy=None, use_torch_compile=True)
-            )
-            is True
+    lm_head = _FakeFusedLossLinearWrapper(16, 32, bias=False)
+    x = torch.randn(2, 5, 16)
+    out_fused = lm_head(x)
+    assert isinstance(out_fused, tuple) and len(out_fused) == 2
+    assert out_fused[0] is x
+    assert out_fused[1].shape == (16, 32)
+    assert (
+        resolve_tpu_use_fused_linear_cross_entropy(
+            SimpleNamespace(use_fused_linear_cross_entropy=None, use_torch_compile=True)
         )
-        assert (
-            resolve_tpu_use_fused_linear_cross_entropy(
-                SimpleNamespace(use_fused_linear_cross_entropy=False, use_torch_compile=True)
-            )
-            is False
+        is True
+    )
+    assert (
+        resolve_tpu_use_fused_linear_cross_entropy(
+            SimpleNamespace(use_fused_linear_cross_entropy=False, use_torch_compile=True)
         )
-        labels = torch.randint(0, 32, (2, 5))
+        is False
+    )
+    labels = torch.randint(0, 32, (2, 5))
+    with mock.patch.object(fused_logprob, "_forward_op", _fake_forward_op):
         logprobs = fused_linear_logprobs_tpu(out_fused[0], labels, out_fused[1])
-        assert logprobs.shape == (10,)
-        assert torch.allclose(logprobs, torch.full((10,), -0.5))
-        # Kernel receives B padded to a multiple of 1024 with reduction="none"
-        assert seen_calls == [(torch.Size([1024, 16]), torch.Size([1024]), torch.Size([16, 32]), "none")]
+    assert logprobs.shape == (10,)
+    assert torch.allclose(logprobs, torch.full((10,), -0.5))
+    # torchtitan's forward op gets T padded to a multiple of 1024, int32 labels and the (H, V) weight_t as is.
+    assert seen_calls == [
+        (torch.Size([1024, 16]), torch.Size([1024]), torch.int32, torch.Size([16, 32]), (1024, 512, 2048))
+    ]
 
 
+def test_fused_logprob_chunked_backward_matches_autograd():
+    """The chunked backward of the fused log-prob gives the gradients of log_softmax(x @ W / t)[label]."""
+    from verl_hardware_plugin.accelerators.tpu.engines import fused_logprob
+
+    torch.manual_seed(0)
+    x = torch.randn(10, 8)
+    weight_t = torch.randn(8, 30) * 0.3
+    labels = torch.randint(0, 30, (10,))
+    cotangent = torch.randn(10)
+
+    def _forward_op(b_block, h_block, v_block):
+        def op(x, labels, weight_t):
+            logits = x.float() @ weight_t.float()
+            lse = torch.logsumexp(logits, -1)
+            return lse - logits.gather(-1, labels.long().unsqueeze(-1)).squeeze(-1), lse
+
+        return op
+
+    for temperature in (1.0, 2.0):
+        xr, wr = x.clone().requires_grad_(), weight_t.clone().requires_grad_()
+        expected = torch.log_softmax(xr @ wr / temperature, -1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+        (expected * cotangent).sum().backward()
+
+        xk, wk = x.clone().requires_grad_(), weight_t.clone().requires_grad_()
+        with (
+            mock.patch.object(fused_logprob, "_forward_op", _forward_op),
+            mock.patch.object(fused_logprob, "BACKWARD_CHUNK", 4),  # several chunks, the last one ragged
+        ):
+            logp = fused_logprob.fused_linear_logprobs_tpu(xk, labels, wk, temperature=temperature, b_block_size=16)
+        (logp * cotangent).sum().backward()
+        torch.testing.assert_close(logp, expected.detach())
+        torch.testing.assert_close(xk.grad, xr.grad, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(wk.grad, wr.grad, rtol=1e-4, atol=1e-5)
+
+
+def test_fused_log_prob_is_required_for_moe():
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import resolve_tpu_use_fused_linear_cross_entropy
+
+    def cfg(tp=1, compile_=False, **tpu):
+        return SimpleNamespace(
+            tensor_parallel_size=tp, use_torch_compile=compile_, engine_kwargs={"tpu": tpu} if tpu else {}
+        )
+
+    # Required: on without torch.compile; an explicit False still turns it off.
+    assert resolve_tpu_use_fused_linear_cross_entropy(cfg(), required=True) is True
+    assert resolve_tpu_use_fused_linear_cross_entropy(cfg(use_fused_linear_cross_entropy=False), required=True) is False
+    # Required with TP > 1 raises instead of silently materializing the logits.
+    with pytest.raises(ValueError, match="tensor_parallel_size=2"):
+        resolve_tpu_use_fused_linear_cross_entropy(cfg(tp=2), required=True)
+    assert (
+        resolve_tpu_use_fused_linear_cross_entropy(cfg(tp=2, use_fused_linear_cross_entropy=False), required=True)
+        is False
+    )
+    # Not required: the previous defaults (torch.compile and TP 1).
+    assert resolve_tpu_use_fused_linear_cross_entropy(cfg()) is False
+    assert resolve_tpu_use_fused_linear_cross_entropy(cfg(compile_=True)) is True
+    assert resolve_tpu_use_fused_linear_cross_entropy(cfg(tp=2, compile_=True)) is False
+
+
+def test_chunked_entropy_from_hidden_matches_full_logits():
+    import verl.utils.torch_functional as verl_F
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+        chunked_entropy_from_hidden_tpu,
+        fused_entropy_chunk_size,
+    )
+
+    hidden = torch.randn(1, 768, 8)
+    weight_t = torch.randn(8, 50)
+    expected = verl_F.entropy_from_logits(((hidden.squeeze(0) @ weight_t) / 0.7).float())
+    torch.testing.assert_close(chunked_entropy_from_hidden_tpu(hidden, weight_t, 0.7, chunk_size=256), expected)
+    torch.testing.assert_close(chunked_entropy_from_hidden_tpu(hidden, weight_t, 0.7), expected)
+    assert fused_entropy_chunk_size(768) == 768
+    assert fused_entropy_chunk_size(24576) == 4096
+    assert fused_entropy_chunk_size(5120) == 2560
+    assert fused_entropy_chunk_size(4100) == 4100  # no 256-aligned divisor <= 4096: one chunk
+
+
+@pytest.mark.parametrize("grad_enabled", [True, False])
 @pytest.mark.parametrize("calculate_entropy", [False, True])
-def test_prepare_model_outputs_takes_log_probs_from_the_fused_kernel_on_every_pass(calculate_entropy):
+def test_prepare_model_outputs_takes_log_probs_from_the_fused_kernel_on_every_pass(calculate_entropy, grad_enabled):
     """With the fused LM head, log-probs come from the fused kernel also when entropy is requested.
 
     The reference, old-log-prob (entropy) and update passes then compute log-probs the same way, so an on-policy
@@ -820,10 +907,18 @@ def test_prepare_model_outputs_takes_log_probs_from_the_fused_kernel_on_every_pa
     )
     tu.assign_non_tensor(micro_batch, use_remove_padding=True, calculate_entropy=calculate_entropy, temperature=1.0)
 
-    with mock.patch.object(torchtitan_tpu, "fused_linear_logprobs_tpu", return_value=fused_values) as fused:
+    with (
+        mock.patch.object(torchtitan_tpu, "fused_linear_logprobs_tpu", return_value=fused_values) as fused,
+        mock.patch.object(
+            torchtitan_tpu, "chunked_entropy_from_hidden_tpu", wraps=torchtitan_tpu.chunked_entropy_from_hidden_tpu
+        ) as chunked_entropy,
+        torch.set_grad_enabled(grad_enabled),
+    ):
         output = engine.prepare_model_outputs((hidden, weight_t), {"labels": labels}, micro_batch)
 
     fused.assert_called_once()
+    # Without gradient (old log-probs) the entropy is computed in token chunks, never from the full logits.
+    assert chunked_entropy.called == (calculate_entropy and not grad_enabled)
     torch.testing.assert_close(output["log_probs"].values(), fused_values)
     if calculate_entropy:
         expected_entropy = verl_F.entropy_from_logits((hidden.squeeze(0) @ weight_t).float())
@@ -1780,7 +1875,22 @@ def test_model_setup_table_selects_qwen3_moe_only():
     calls = []
     with mock.patch.object(kernels_mod, "configure_qwen3_moe", lambda spec, **kw: calls.append((spec, kw))):
         setup.configure("spec", kernels_mod.ModelSetupContext(expert_parallel_size=1, seq_bucket_size=1024))
-    assert calls == [("spec", {"expert_parallel_size": 1, "seq_bucket_size": 1024})]
+        setup.configure(
+            "spec",
+            kernels_mod.ModelSetupContext(
+                expert_parallel_size=1,
+                seq_bucket_size=1024,
+                moe_paired_grouped_mm=True,
+                moe_native_weight_layout=True,
+            ),
+        )
+    base = {"expert_parallel_size": 1, "seq_bucket_size": 1024}
+    assert calls == [
+        ("spec", {**base, "paired_grouped_mm": False, "native_weight_layout": False}),
+        ("spec", {**base, "paired_grouped_mm": True, "native_weight_layout": True}),
+    ]
+    # Qwen3 MoE requires the fused LM-head log-prob.
+    assert setup.requires_fused_logprob is True
 
 
 def test_configure_qwen3_moe_routes_like_hf_with_tpu_grouped_experts():
@@ -1800,6 +1910,78 @@ def test_configure_qwen3_moe_routes_like_hf_with_tpu_grouped_experts():
         assert not e.use_kernel_native_weight_layout  # canonical w1/w2/w3 layout, which the weight export assumes
         assert e.pallas_grouped_mm_tile_m == 256
         assert e.pallas_grouped_mm_tgmm_tiling == (256, 0, 0)  # full K/N dWeight tiles
+
+
+def test_configure_qwen3_moe_paired_and_native_layout_options():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels as kernels_mod
+
+    modules = _fake_torchtitan_moe_modules()
+    spec = _fake_qwen3_moe_model_spec(modules)
+    with mock.patch.dict(sys.modules, modules):
+        kernels_mod.configure_qwen3_moe(
+            spec, expert_parallel_size=1, seq_bucket_size=1024, paired_grouped_mm=True, native_weight_layout=True
+        )
+    for e in spec.nodes[1::2]:
+        assert e.use_pallas_grouped_mm and e.use_pallas_paired_grouped_mm and e.use_kernel_native_weight_layout
+        # The paired kernel needs a full-N dWeight tile.
+        assert e.pallas_grouped_mm_tgmm_tiling == (256, 0, 0)
+
+
+def test_tpu_perf_option_resolvers():
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+        resolve_tpu_mixed_precision_reduce,
+        resolve_tpu_splash_max_block_size,
+    )
+
+    def cfg(**tpu):
+        return SimpleNamespace(engine_kwargs={"tpu": tpu})
+
+    assert resolve_tpu_splash_max_block_size(cfg()) == 512
+    assert resolve_tpu_splash_max_block_size(cfg(splash_max_block_size=1024)) == 1024
+    for bad in (768, 64):
+        with pytest.raises(ValueError, match="power of two"):
+            resolve_tpu_splash_max_block_size(cfg(splash_max_block_size=bad))
+    assert resolve_tpu_mixed_precision_reduce(cfg()) is None
+    assert resolve_tpu_mixed_precision_reduce(cfg(mixed_precision_reduce="BFloat16")) == "bfloat16"
+    with pytest.raises(ValueError, match="mixed_precision_reduce"):
+        resolve_tpu_mixed_precision_reduce(cfg(mixed_precision_reduce="float16"))
+    with pytest.raises(ValueError, match="Unknown TPU engine option"):
+        resolve_tpu_mixed_precision_reduce(cfg(static_microbatch_len=1))
+
+
+def test_set_splash_max_block_size_rebinds_torchtitan_block_picker():
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import set_splash_max_block_size
+
+    def splash_block_size_for(seq_len, max_block_size=512, min_block_size=128):
+        block = max_block_size
+        while block >= min_block_size:
+            if seq_len % block == 0:
+                return block
+            block //= 2
+        return 0
+
+    splash_module = types.ModuleType("torchtitan.experiments.tpu.kernels.splash_attention")
+    splash_module.splash_block_size_for = splash_block_size_for
+    kernels_module = types.ModuleType("torchtitan.experiments.tpu.kernels")
+    kernels_module.splash_attention = splash_module
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "torchtitan": types.ModuleType("torchtitan"),
+            "torchtitan.experiments": types.ModuleType("torchtitan.experiments"),
+            "torchtitan.experiments.tpu": types.ModuleType("torchtitan.experiments.tpu"),
+            "torchtitan.experiments.tpu.kernels": kernels_module,
+            "torchtitan.experiments.tpu.kernels.splash_attention": splash_module,
+        },
+    ):
+        assert splash_module.splash_block_size_for(24576) == 512
+        set_splash_max_block_size(1024)
+        assert splash_module.splash_block_size_for(24576) == 1024
+        assert splash_module.splash_block_size_for(1536) == 512  # falls back to a block that divides the length
+        set_splash_max_block_size(1024)  # idempotent: wraps the original, not the previous override
+        assert splash_module.splash_block_size_for(24576) == 1024
+        set_splash_max_block_size(512)
+        assert splash_module.splash_block_size_for is splash_block_size_for
 
 
 @pytest.mark.parametrize(

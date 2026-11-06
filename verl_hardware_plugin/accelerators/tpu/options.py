@@ -137,8 +137,9 @@ class TPUEngineOptions:
         use_splash_attention: Use the Pallas splash attention kernel (default: ``use_torch_compile`` or
             ``context_parallel_size > 1``).
         use_simple_fsdp: Shard with SimpleFSDP (default: ``use_torch_compile`` when PP is 1).
-        use_fused_linear_cross_entropy: Use the Pallas fused linear + cross-entropy kernel for log-probs
-            (default: ``use_torch_compile`` when TP is 1).
+        use_fused_linear_cross_entropy: Compute log-probs with Tokamax's fused linear + softmax + cross-entropy
+            Pallas kernel, without materializing the ``[tokens, vocab]`` logits (default: on for MoE models, where
+            it is required and the engine raises if it cannot be used; else ``use_torch_compile`` when TP is 1).
         fuse_qkv: Fuse attention Q/K/V projections in the model (default: ``True``; ``False`` avoids
             the FSDP all-gather inside ``FusedQKVLinear._split_qkv_on_save`` during ``state_dict()``).
         tpu_eager_mode: ``torch_tpu`` eager mode, ``DEFER_AND_FUSE`` or ``DEFER_NEVER``
@@ -194,6 +195,14 @@ class TPUEngineOptions:
             instead of one per length bucket it meets (default: unset, off).
         static_max_response_len: Pad every micro-batch's response-length bucket to at least this many tokens (e.g.
             ``max_response_length``), so response-shaped tensors also keep one shape (default: unset, off).
+        splash_max_block_size: Largest Splash attention block size, a power of two >= 128 (default: ``512``,
+            torchtitan's). Long packed micro-batches run faster with ``1024``.
+        mixed_precision_reduce: dtype of the FSDP gradient reduce-scatter, ``float32`` (default, torchtitan's) or
+            ``bfloat16`` (half the traffic; a performance A/B option).
+        moe_paired_grouped_mm: Qwen3 MoE: run the W1/W3 expert projections with torchtitan's paired Pallas grouped
+            matmul, sharing the routed-token loads (default: ``False``).
+        moe_native_weight_layout: Qwen3 MoE: store the expert weights in the kernel-native ``(E, K, N)`` layout;
+            ``state_dict()`` / ``load_state_dict()`` still use the canonical layout and names (default: ``False``).
     """
 
     use_splash_attention: Optional[bool] = None
@@ -217,6 +226,10 @@ class TPUEngineOptions:
     ac_save_splash_and_routing: Optional[bool] = None
     static_micro_batch_len: Optional[int] = None
     static_max_response_len: Optional[int] = None
+    splash_max_block_size: Optional[int] = None
+    mixed_precision_reduce: Optional[str] = None
+    moe_paired_grouped_mm: Optional[bool] = None
+    moe_native_weight_layout: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -241,6 +254,10 @@ _ENGINE_KINDS: dict[str, type] = {
     "ac_save_splash_and_routing": bool,
     "static_micro_batch_len": int,
     "static_max_response_len": int,
+    "splash_max_block_size": int,
+    "mixed_precision_reduce": str,
+    "moe_paired_grouped_mm": bool,
+    "moe_native_weight_layout": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 

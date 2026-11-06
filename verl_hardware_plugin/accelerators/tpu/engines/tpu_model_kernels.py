@@ -286,14 +286,27 @@ def qwen3_moe_model_registry_kwargs() -> dict[str, Any]:
     return {"converters": [TpuTokenDispatcherConverter.Config(), TpuGroupedExpertsConverter.Config()]}
 
 
-def configure_qwen3_moe(model_spec: Any, *, expert_parallel_size: int, seq_bucket_size: int) -> None:
+def configure_qwen3_moe(
+    model_spec: Any,
+    *,
+    expert_parallel_size: int,
+    seq_bucket_size: int,
+    paired_grouped_mm: bool = False,
+    native_weight_layout: bool = False,
+) -> None:
     """Sets up a Qwen3 MoE ``model_spec.model`` for RL on TPU, in place.
 
     - Turns off torchtitan's expert-bias load balancing: vLLM and the HF checkpoint have no expert bias, so with it
       the trainer would pick different experts than the rollout. The aux loss keeps torchtitan's default (off).
-    - Runs the routed experts on torchtitan's Pallas grouped matmul (``TpuGroupedExperts``), unpaired and in the
-      canonical w1/w2/w3 layout that the weight export expects. Pallas is required: torchtitan's default
-      ``torch._grouped_mm`` path has a wrong backward on TPU (torch_tpu#2668).
+    - Runs the routed experts on torchtitan's Pallas grouped matmul (``TpuGroupedExperts``): torchtitan's default
+      ``torch._grouped_mm`` path has a wrong backward on TPU (torch_tpu#2668). By default unpaired and in the
+      canonical w1/w2/w3 layout that the weight export expects. Optional speedups (``engine_kwargs.tpu``), from
+      torchtitan's Qwen3-30B-A3B TPU recipe:
+
+      - ``moe_paired_grouped_mm``: runs W1 and W3 in one kernel that loads the routed tokens once.
+      - ``moe_native_weight_layout``: stores the expert weights in the kernel's ``(E, K, N)`` layout.
+        ``state_dict()`` keeps the canonical layout, so checkpoint loading and tpu-sync export are unchanged
+        (each export costs one extra transpose).
 
     Raises:
         ValueError: if ``expert_parallel_size > 1``, or if ``seq_bucket_size * top_k`` is not a multiple of the
@@ -331,19 +344,23 @@ def configure_qwen3_moe(model_spec: Any, *, expert_parallel_size: int, seq_bucke
             f"Qwen3 MoE: {len(experts_configs)} of {len(moe_configs)} MoE layers use TpuGroupedExperts; build the "
             "model with qwen3_moe_model_registry_kwargs()"
         )
-    # Same values as torchtitan's Qwen3-30B-A3B TPU recipe, except unpaired and the canonical layout.
-    # TODO: call torchtitan's _use_tpu_moe_kernels (as for Qwen3.5) once the pinned torchtitan has it.
+    # Same values as torchtitan's Qwen3-30B-A3B TPU recipe; unpaired and the canonical layout unless the options say so.
+    # TODO(torchtitan): upstream a shared use_tpu_moe_kernels helper in torchtitan (shared across qwen3 and qwen3_5,
+    # with paired_grouped_mm / native_weight_layout options) and call it here instead of configuring TpuGroupedExperts
+    # fields manually.
     for experts in experts_configs:
         experts.use_pallas_grouped_mm = True
-        experts.use_pallas_paired_grouped_mm = False
-        experts.use_kernel_native_weight_layout = False  # keep the canonical parameter names and layout
+        experts.use_pallas_paired_grouped_mm = paired_grouped_mm
+        experts.use_kernel_native_weight_layout = native_weight_layout
         experts.pallas_grouped_mm_tile_m = tile_m
         experts.pallas_grouped_mm_tgmm_tiling = _QWEN3_MOE_GROUPED_MM_TGMM_TILING
     logger.info(
         "Qwen3 MoE: %d layers route without expert bias; TPU token dispatcher and Pallas grouped matmul experts "
-        "(tile_m=%d)",
+        "(tile_m=%d, paired=%s, native_layout=%s)",
         len(moe_configs),
         tile_m,
+        paired_grouped_mm,
+        native_weight_layout,
     )
 
 
@@ -353,6 +370,8 @@ class ModelSetupContext:
 
     expert_parallel_size: int
     seq_bucket_size: int
+    moe_paired_grouped_mm: bool = False
+    moe_native_weight_layout: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -363,6 +382,8 @@ class ModelSetup:
     matches: Callable[[str, Any], bool]  # (torchtitan model name, HF config) -> bool
     registry_kwargs: Callable[[], dict[str, Any]] = dict  # extra ``model_registry`` kwargs
     configure: Optional[Callable[[Any, ModelSetupContext], None]] = None  # in-place ``model_spec`` fix-ups
+    # The fused LM-head log-prob is required (MoE: large per-chip token budgets do not fit with the logits).
+    requires_fused_logprob: bool = False
 
 
 _MODEL_SETUPS: tuple[ModelSetup, ...] = (
@@ -371,8 +392,13 @@ _MODEL_SETUPS: tuple[ModelSetup, ...] = (
         matches=is_qwen3_moe,
         registry_kwargs=qwen3_moe_model_registry_kwargs,
         configure=lambda spec, ctx: configure_qwen3_moe(
-            spec, expert_parallel_size=ctx.expert_parallel_size, seq_bucket_size=ctx.seq_bucket_size
+            spec,
+            expert_parallel_size=ctx.expert_parallel_size,
+            seq_bucket_size=ctx.seq_bucket_size,
+            paired_grouped_mm=ctx.moe_paired_grouped_mm,
+            native_weight_layout=ctx.moe_native_weight_layout,
         ),
+        requires_fused_logprob=True,
     ),
 )
 
