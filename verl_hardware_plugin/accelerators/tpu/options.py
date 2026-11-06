@@ -355,12 +355,18 @@ class TPUSyncOptions:
             transfer, so training gets that HBM back between syncs.
         tie_word_embeddings: Whether ``lm_head`` is tied to the input embedding, so it need not be sent.
             ``None`` sends ``lm_head``, which is correct for tied and untied models alike.
+        return_after_d2h: Return to the trainer as soon as its weights are copied to host memory, and finish the sync
+            (the transfer to the rollout hosts, the install and the resume) in the background while training goes on.
+            The next sync waits for it first. Applies from the second sync on and needs a ``tpu-sync-torch`` whose
+            ``WeightSynchronizer.d2h()`` returns a future. Off by default: it relies on verl waiting for a pending
+            update (``CheckpointEngineManager.wait_for_weight_update``) before validation and at the end of training.
     """
 
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM
     verify_parity: str = "off"
     release_buffers_after_sync: bool = True
     tie_word_embeddings: Optional[bool] = None
+    return_after_d2h: bool = False
 
     @property
     def verify_norms(self) -> bool:
@@ -378,6 +384,7 @@ _SYNC_KINDS: dict[str, type] = {
     "verify_parity": ParityMode,
     "release_buffers_after_sync": bool,
     "tie_word_embeddings": bool,
+    "return_after_d2h": bool,
 }
 assert set(_SYNC_KINDS) == {f.name for f in dataclasses.fields(TPUSyncOptions)}
 

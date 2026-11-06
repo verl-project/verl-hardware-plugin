@@ -31,9 +31,11 @@ carry model weights in the clear. Run them only on a trusted cluster network.
 """
 
 import asyncio
+import concurrent.futures
 import gc
 import logging
 import os
+import threading
 import time
 from collections.abc import Iterable
 from typing import Any, Optional
@@ -68,6 +70,10 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 TPU_SYNC_REGISTRATION_TIMEOUT_S = 60.0
 # tpu-sync reads and writes device buffers in place, so the tensors it is given must live on this device.
 TPU_SYNC_DEVICE = "tpu"
+# Set in the metrics a trainer rank returns from send_weights when it staged its weights in host memory itself
+# (set_stage_d2h) and unbound them, so the transfer must not read them from the device (skip_d2h).
+STAGED_D2H_METRIC = "tpu-sync/trainer_staged_d2h"
+TRAINER_D2H_METRIC = "timing_s/tpu-sync/trainer_d2h"
 
 
 def create_torch_weight_synchronizer(
@@ -89,6 +95,18 @@ def create_torch_weight_synchronizer(
         unsafe_skip_buffer_lock=True,
         auto_h2d=False,
     )
+
+
+def _d2h_returns_future() -> bool:
+    """Whether the installed ``tpu-sync-torch`` returns a future from ``WeightSynchronizer.d2h()``.
+
+    Only then can ``send_weights`` wait for its own D2H and unbind the weights while the transfer reads host memory.
+    """
+    try:
+        from tpu_sync.api.torch import weight_synchronizer
+    except ImportError:
+        return False
+    return hasattr(weight_synchronizer, "RaidenFuture")
 
 
 def _unwrap_tensor(t: Any) -> Any:
@@ -253,6 +271,17 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         # them after send_weights returns).
         self._bound_tensors: Optional[list[torch.Tensor]] = None
         self._warned_no_unbind = False
+        # Set by the driver (set_stage_d2h) when the next transfers may read this rank's weights from host memory.
+        self._stage_d2h = False
+
+    def set_stage_d2h(self, enabled: bool) -> None:
+        """Whether ``send_weights`` copies the weights to host memory itself and unbinds them before returning.
+
+        The driver enables it with ``return_after_d2h`` once a transfer to the current rollout topology has
+        completed: from then on the transfer reads this rank's host staging buffers (``skip_d2h``), so the
+        device buffers are free (and training can go on) as soon as the device-to-host copy is done.
+        """
+        self._stage_d2h = bool(enabled)
 
     @property
     def registry(self) -> Any:
@@ -285,7 +314,7 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
             except Exception as e:
                 logger.debug(f"Trainer Rank {self.rank}: closing the WeightSynchronizer failed: {e}")
 
-    async def send_weights(self, weights: Any, global_steps: Optional[int] = None) -> None:
+    async def send_weights(self, weights: Any, global_steps: Optional[int] = None) -> dict[str, float]:
         """Bind this rank's weights to its WeightSynchronizer and register them with the controller.
 
         Args:
@@ -299,7 +328,12 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         The transfer itself, including the device-to-host copy, is driven by the controller after this returns,
         so the bound tensors are kept until ``release_sync_buffers``. The synchronizer is created and registered
         on the first sync and reused (rebound through ``bind_weights``) afterwards as long as the tensor names,
-        shapes, dtypes and shard layout do not change.
+        shapes, dtypes and shard layout do not change. With ``set_stage_d2h`` and a reused synchronizer, this
+        rank copies its weights to host memory itself and unbinds them before returning instead.
+
+        Returns:
+            ``{STAGED_D2H_METRIC: 1.0, TRAINER_D2H_METRIC: seconds}`` when this rank staged its weights in host
+            memory and unbound them, else ``{}``.
         """
         step_key = global_steps if global_steps is not None else 0
         timeline_lane = timeline.trainer_lane()
@@ -333,7 +367,8 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         # from (release_sync_buffers unbinds them between syncs). Re-creating it every sync re-allocates, pins
         # and first-touches a model-sized host buffer per rank and re-registers with the controller.
         signature = [(name, tuple(t.shape), t.dtype, self._shard_info.get(name)) for name, t in valid_weights]
-        if self._trainer_tpu_sync_ws is not None and signature == self._registered_signature:
+        rebound = self._trainer_tpu_sync_ws is not None and signature == self._registered_signature
+        if rebound:
             logger.info(f"Trainer Rank {self.rank}: rebinding {len(valid_weights)} tensors to the WeightSynchronizer")
             self._trainer_tpu_sync_ws.bind_weights([[t] for _, t in valid_weights])
         else:
@@ -369,15 +404,34 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
                 step=step_key,
             )
 
-        # No explicit d2h() here: the controller-driven push (PushWeightsResharded, started by start_transfer)
-        # performs a pipelined D2H overlapped with the host-to-host transfer, using the per-transfer skip_tiling
-        # plan. An explicit d2h() before the first transfer has no plan yet and stages the wrong (de-tiled)
-        # layout, and on every sync it copies the whole model to host memory a second time; it was only ever
-        # masked by the push's own D2H.
+        # By default no explicit d2h() here: the controller-driven push (PushWeightsResharded, started by
+        # start_transfer) performs a pipelined D2H overlapped with the host-to-host transfer, using the
+        # per-transfer skip_tiling plan. An explicit d2h() before the first transfer has no plan yet and stages
+        # the wrong (de-tiled) layout. With set_stage_d2h (return_after_d2h) the driver only asks for it once a
+        # transfer to the current topology has completed and the synchronizer was reused (so it holds that
+        # plan); the transfer then skips its own D2H.
+        metrics: dict[str, float] = {}
+        if self._stage_d2h and rebound and _d2h_returns_future():
+            t_d2h_start = time.time()
+            future = self._trainer_tpu_sync_ws.d2h()
+            await asyncio.to_thread(future.wait)
+            if not future.ok():
+                raise RuntimeError(f"Trainer Rank {self.rank}: tpu-sync D2H failed: {future.error_message()}")
+            t_d2h = time.time() - t_d2h_start
+            metrics = {STAGED_D2H_METRIC: 1.0, TRAINER_D2H_METRIC: t_d2h}
+            if timeline_lane is not None:
+                timeline.emit(
+                    "d2h", t_d2h_start, t_d2h, group=timeline.TRAINER_WORKERS, lane=timeline_lane, step=step_key
+                )
 
-        if not self.verify_parity:
-            return
-        post_trainer_stats(self.registry, step_key, self.rank, self.is_master, valid_weights, self._shard_info)
+        if self.verify_parity:
+            post_trainer_stats(self.registry, step_key, self.rank, self.is_master, valid_weights, self._shard_info)
+        if metrics:
+            # The transfer reads the host staging buffers from here on: give the device buffers back now, so
+            # training can go on while it runs.
+            self._trainer_tpu_sync_ws.unbind_weights()
+            self._bound_tensors = None
+        return metrics
 
     async def _create_and_register(self, valid_weights: list[tuple[str, torch.Tensor]]) -> None:
         """(Re)creates the WeightSynchronizer over ``valid_weights`` and registers it with the controller."""
@@ -604,6 +658,50 @@ async def _wait_for_registration(controller: Any, src_units: list, dst_units: li
         await asyncio.sleep(0.1)
 
 
+class _BackgroundSync:
+    """Runs the tail of a ``return_after_d2h`` sync on its own event loop thread, while training goes on.
+
+    verl calls ``CheckpointEngineManager.update_weights`` through ``auto_await``, which runs every call in a fresh
+    ``asyncio.run`` loop and closes it on return, so the tail cannot be a task of the caller's loop.
+    """
+
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, name="tpu-sync-background", daemon=True)
+        self._thread.start()
+        self._future: Optional[concurrent.futures.Future] = None
+
+    def submit(self, coro: Any) -> None:
+        assert self._future is None, "the previous background sync was not joined"
+        self._future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    async def join(self) -> dict[str, float]:
+        """Waits for the pending tail; returns its metrics or re-raises its error (once). ``{}`` when none."""
+        future, self._future = self._future, None
+        if future is None:
+            return {}
+        return await asyncio.wrap_future(future)
+
+
+async def wait_for_tpu_sync_update(manager: Any) -> dict[str, float]:
+    """Waits until the rollout holds the weights of the last sync (``return_after_d2h`` finishes it in the background).
+
+    ``CheckpointEngineManager.wait_for_weight_update`` calls this for ``backend=tpu-sync`` (see
+    ``apply_checkpoint_engine_manager_hooks``), so trainers that wait there (before validation and before the
+    training loop exits) see the new weights installed.
+
+    Returns:
+        The metrics of the background part of that sync (``{}`` when nothing was pending).
+
+    Raises:
+        Whatever the background part raised (e.g. ``TPUSyncParityError``).
+    """
+    background = getattr(manager, "_tpu_sync_background", None)
+    if background is None:
+        return {}
+    return await background.join()
+
+
 async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = None) -> dict[str, float]:
     """Sync the trainer's weights to the vLLM rollout over tpu-sync, coordinated by a controller on the driver.
 
@@ -611,49 +709,152 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     replicas (``tensor_model_parallel_size`` smaller than the number of rollout chips): every replica registers
     under its own tpu-sync job name, all of them receive in one transfer, and the parity check runs per replica.
 
+    With ``return_after_d2h`` (from the second sync on), this returns once the trainer ranks have copied their
+    weights to host memory and unbound them; the transfer, install and resume run in the background (see
+    ``_BackgroundSync``) and the next sync, or ``wait_for_tpu_sync_update``, waits for them.
+
     Args:
         manager: The ``CheckpointEngineManager`` (trainer worker group, rollout replicas and config).
         global_steps: Trainer step of the weights; the rollout tags new generations with it.
 
     Returns:
-        Per-phase timings in seconds, logged as step metrics by trainers that record sync metrics.
+        Per-phase timings in seconds, logged as step metrics by trainers that record sync metrics. With
+        ``return_after_d2h`` the phases after the trainer's D2H belong to the previous sync, whose background part
+        this one waited for.
 
     Raises:
-        TPUSyncParityError: An enabled parity check (``verify_parity``) failed; generation is not resumed.
+        TPUSyncParityError: An enabled parity check (``verify_parity``) failed; generation is not resumed. With
+            ``return_after_d2h`` the next sync (or ``wait_for_tpu_sync_update``) raises it.
     """
     backend = manager.backend or TPU_SYNC_BACKEND
     options = get_tpu_sync_options(_tpu_sync_engine_kwargs(manager.config, backend), backend)
+    controller = _get_or_start_controller(manager)
+
+    # A sync finishing in the background must be done before this one binds new weights: the trainer's host
+    # staging buffers are single-buffered, and the rollout must not install two syncs at once.
+    t_wait_previous_start = time.perf_counter()
+    previous_metrics = await wait_for_tpu_sync_update(manager)
+    t_wait_previous = time.perf_counter() - t_wait_previous_start
+
+    t_sync_wall = time.time()
+    t_total_start = time.perf_counter()
+
+    src_units = [tpu_sync_api.unit_id("trainer", str(rank)) for rank in range(manager.actor_wg.world_size)]
+    # Every replica registers its TP workers as ranks '0'..'TP-1' under its own job name, and all of them go
+    # into ONE transfer: tpu-sync shards a transfer across the units that share a job name and broadcasts across
+    # job names, so its planner puts rank k of every replica into one broadcast tree, seeds a few of them from
+    # the trainer and relays between the rollout hosts. One transfer per replica would make the trainer push
+    # every byte once per replica instead.
+    dst_units = [
+        tpu_sync_api.unit_id(_sampler_job_name(replica, replica_idx), str(rank))
+        for replica_idx, replica in enumerate(manager.replicas)
+        for rank in range(_rollout_world_size(replica))
+    ]
+
+    # With return_after_d2h the trainer ranks stage their weights in host memory themselves, which needs the
+    # transfer plan of a completed transfer to these same rollout units (tpu-sync keeps the weights bound across
+    # the first transfer to a new topology, to re-stage them on a tiling mismatch).
+    transferred_before = getattr(manager, "_tpu_sync_transferred_dst_units", None) == dst_units
+    stage_d2h = options.return_after_d2h and transferred_before
+    if stage_d2h != getattr(manager, "_tpu_sync_stage_d2h", False):
+        refs = manager.actor_wg.execute_checkpoint_engine(
+            ["set_stage_d2h"] * manager.actor_wg.world_size, [stage_d2h] * manager.actor_wg.world_size
+        )
+        if refs is not None:
+            await asyncio.to_thread(ray.get, refs)
+        manager._tpu_sync_stage_d2h = stage_d2h
+
+    # 1. Every trainer rank binds its tensors to its synchronizer, registers them with the controller and records
+    #    the global shapes (and, with stage_d2h, copies them to host memory and unbinds them). ray.get blocks until
+    #    all ranks finish, so run it in a thread to keep the event loop free.
+    t_init_trainer_start = time.perf_counter()
+    actor_refs = manager.actor_wg.update_weights(global_steps=global_steps, mode=manager.backend)
+    trainer_results = await asyncio.to_thread(ray.get, actor_refs) if actor_refs is not None else None
+    t_init_trainer = time.perf_counter() - t_init_trainer_start
+
+    trainer_metrics = [r for r in (trainer_results or []) if isinstance(r, dict)]
+    staged_ranks = sum(1 for r in trainer_metrics if r.get(STAGED_D2H_METRIC))
+    if staged_ranks and staged_ranks != manager.actor_wg.world_size:
+        raise RuntimeError(
+            f"Only {staged_ranks} of {manager.actor_wg.world_size} trainer ranks staged their weights in host memory; "
+            "the transfer must read all of them from the same place"
+        )
+    staged = staged_ranks > 0
+    t_trainer_d2h = max((r.get(TRAINER_D2H_METRIC, 0.0) for r in trainer_metrics), default=0.0)
+
+    tail = _finish_tpu_sync(
+        manager,
+        global_steps,
+        options,
+        controller,
+        src_units,
+        dst_units,
+        staged=staged,
+        t_sync_wall=t_sync_wall,
+        t_total_start=t_total_start,
+        t_init_trainer=t_init_trainer,
+    )
+    if not staged:
+        return await tail
+
+    # The trainer's weights are in its host staging buffers and its device buffers are free: train on while the
+    # rest of the sync runs.
+    background = getattr(manager, "_tpu_sync_background", None)
+    if background is None:
+        background = manager._tpu_sync_background = _BackgroundSync()
+    background.submit(tail)
+    logger.info(
+        f"[TPU-SYNC TELEMETRY | Orchestrator] Step {global_steps}: returned after the trainer D2H "
+        f"({t_init_trainer:.4f}s, D2H {t_trainer_d2h:.4f}s); finishing the sync in the background"
+    )
+    return {
+        **previous_metrics,
+        "timing_s/tpu-sync/wait_previous_sync": t_wait_previous,
+        "timing_s/tpu-sync/trainer_init": t_init_trainer,
+        TRAINER_D2H_METRIC: t_trainer_d2h,
+        "tpu-sync/returned_after_d2h": 1.0,
+    }
+
+
+async def _quiesce_rollout(manager: Any, global_steps: Optional[int]) -> float:
+    """Aborts the rollout's requests (from step 1 on); returns how long it took."""
+    t0 = time.perf_counter()
+    if global_steps and global_steps > 0:
+        try:
+            await manager.abort_replicas()
+        except Exception as e:
+            logger.warning(f"Failed to abort replicas at step {global_steps}: {e}")
+    return time.perf_counter() - t0
+
+
+async def _finish_tpu_sync(
+    manager: Any,
+    global_steps: Optional[int],
+    options: Any,
+    controller: Any,
+    src_units: list,
+    dst_units: list,
+    *,
+    staged: bool,
+    t_sync_wall: float,
+    t_total_start: float,
+    t_init_trainer: float,
+) -> dict[str, float]:
+    """Steps 2-8 of ``update_tpu_sync_weights``: the transfer, the pause, the install and the resume.
+
+    The rollout keeps generating (its requests are not aborted) through the trainer export (step 1), the rollout
+    init (step 2) and the transfer (step 4), none of which writes vLLM's parameters: the transfer only writes the
+    rollout hosts' DRAM. It is paused right before the install (step 5), whose H2D may write vLLM's parameters
+    directly (tensors received zero-copy). The step-0 sync does not pause it.
+
+    ``staged``: the trainer ranks already copied their weights to host memory and unbound them, so the transfer
+    reads the host staging buffers (``skip_d2h``) and there is nothing to release afterwards.
+    """
     verify_parity = options.verify_norms
     # The exact check needs the rollout to still hold the checkpoint vLLM loaded, which is only true for the step-0
     # sync of a fresh run: later syncs (and the first one after resuming from a checkpoint) carry trained weights.
     exact_install_kwargs = {"exact_parity": True} if options.verify_exact and not global_steps else {}
     parallelism = options.parallelism
-    controller = _get_or_start_controller(manager)
-
-    t_sync_wall = time.time()
-
-    # The rollout keeps generating (its requests are not aborted) through the trainer export (step 1), the rollout
-    # init (step 2) and the transfer (step 4), none of which writes vLLM's parameters: the transfer only writes the
-    # rollout hosts' DRAM. It is paused right before the install (step 5), whose H2D may write vLLM's parameters
-    # directly (tensors received zero-copy). The step-0 sync does not pause it.
-    async def _quiesce_rollout() -> float:
-        t0 = time.perf_counter()
-        if global_steps and global_steps > 0:
-            try:
-                await manager.abort_replicas()
-            except Exception as e:
-                logger.warning(f"Failed to abort replicas at step {global_steps}: {e}")
-        return time.perf_counter() - t0
-
-    t_total_start = time.perf_counter()
-
-    # 1. Every trainer rank binds its tensors to its synchronizer, registers them with the controller and records
-    #    the global shapes. ray.get blocks until all ranks finish, so run it in a thread to keep the event loop free.
-    t_init_trainer_start = time.perf_counter()
-    actor_refs = manager.actor_wg.update_weights(global_steps=global_steps, mode=manager.backend)
-    if actor_refs is not None:
-        await asyncio.to_thread(ray.get, actor_refs)
-    t_init_trainer = time.perf_counter() - t_init_trainer_start
 
     # 2. Every rollout worker allocates its receive buffers and registers them with the controller under
     #    its replica's job name (a no-op after the first sync).
@@ -681,23 +882,14 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     # initialization (e.g. in prepare/build_process_group), since shard registration is persistent on the
     # controller and does not need to be repeated on every weight sync iteration.
     t_barrier_start = time.perf_counter()
-    src_units = [tpu_sync_api.unit_id("trainer", str(rank)) for rank in range(manager.actor_wg.world_size)]
-    # Every replica registers its TP workers as ranks '0'..'TP-1' under its own job name, and all of them go
-    # into ONE transfer: tpu-sync shards a transfer across the units that share a job name and broadcasts across
-    # job names, so its planner puts rank k of every replica into one broadcast tree, seeds a few of them from
-    # the trainer and relays between the rollout hosts. One transfer per replica would make the trainer push
-    # every byte once per replica instead.
-    dst_units = [
-        tpu_sync_api.unit_id(_sampler_job_name(replica, replica_idx), str(rank))
-        for replica_idx, replica in enumerate(manager.replicas)
-        for rank in range(_rollout_world_size(replica))
-    ]
     await _wait_for_registration(controller, src_units, dst_units, timeout_s=TPU_SYNC_REGISTRATION_TIMEOUT_S)
     t_barrier = time.perf_counter() - t_barrier_start
 
     # 4. Controller-driven P2P transfer: trainer device -> trainer host -> rollout host(s), resharded; one
-    #    transfer whose destination holds the units of every replica (see dst_units).
+    #    transfer whose destination holds the units of every replica (see dst_units). With staged, the trainer
+    #    ranks already did the device -> host copy.
     t_transfer_start = time.perf_counter()
+    transfer_kwargs = {"skip_d2h": True} if staged else {}
     transfer_future = controller.start_transfer(
         src_units=src_units,
         dst_units=dst_units,
@@ -707,17 +899,24 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
         expected_block_count=0,
         parallelism=parallelism,
         req_id=f"verl_step_{global_steps or 0}",
+        **transfer_kwargs,
     )
     await transfer_future.wait()
     t_transfer = time.perf_counter() - t_transfer_start
+    # The plan of a transfer to these rollout units is cached now, so the trainer may stage the next syncs itself.
+    manager._tpu_sync_transferred_dst_units = list(dst_units)
 
     # The trainer buffers are no longer read once the transfer is done; free them while the samplers install,
-    # so the HBM is back before the next training step.
-    release_refs = manager.actor_wg.execute_checkpoint_engine(["release_sync_buffers"] * manager.actor_wg.world_size)
+    # so the HBM is back before the next training step. Staged ranks unbound theirs already.
+    release_refs = None
+    if not staged:
+        release_refs = manager.actor_wg.execute_checkpoint_engine(
+            ["release_sync_buffers"] * manager.actor_wg.world_size
+        )
 
     # Pause the rollout for the install: the weights are on the rollout hosts now.
     t_paused_start = time.perf_counter()
-    t_abort = await _quiesce_rollout()
+    t_abort = await _quiesce_rollout(manager, global_steps)
 
     # 5. Rollout workers copy the received weights to TPU HBM and fuse them into vLLM's parameters.
     t_install_start = time.perf_counter()
@@ -774,7 +973,8 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     t_total = time.perf_counter() - t_total_start
 
     logger.info(
-        f"[TPU-SYNC TELEMETRY | Orchestrator] Step {global_steps} Completed in {t_total:.4f}s:\n"
+        f"[TPU-SYNC TELEMETRY | Orchestrator] Step {global_steps} Completed in {t_total:.4f}s"
+        f"{' (in the background after the trainer D2H)' if staged else ''}:\n"
         f"  * Trainer Init           : {t_init_trainer:.4f}s\n"
         f"  * Sampler Init           : {t_init_sampler:.4f}s\n"
         f"  * Barrier Check          : {t_barrier:.4f}s\n"
