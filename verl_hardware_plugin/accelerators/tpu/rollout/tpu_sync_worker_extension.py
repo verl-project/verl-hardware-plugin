@@ -31,6 +31,7 @@ from verl_hardware_plugin.accelerators.tpu.rollout import direct_install
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_api
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_checkpoint_engine as tpu_sync_engine
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import ExactParityCheck, compute_tensor_stats
+from verl_hardware_plugin.accelerators.tpu.weight_sync.vllm_layout import VllmParam
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import (
     get_parent_module,
     resolve_model_key,
@@ -155,6 +156,7 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         global_shapes: dict[str, list[int]],
         parallelism: int = tpu_sync_engine.TPU_SYNC_DEFAULT_PARALLELISM,
         job_name: str = "sampler0",
+        receive_into_vllm: bool = False,
     ) -> bool:
         """Initialize tpu-sync WeightSynchronizer listener and register with the central tpu-sync controller.
 
@@ -162,8 +164,10 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         full shape of every tensor the trainer sends; the driver passes both, because vLLM's ``mp`` workers are
         not Ray processes. ``job_name`` is the tpu-sync job this worker's replica registers under (the driver
         names every rollout replica after its ``replica_rank``), so the ranks ``0..TP-1`` of several replicas do
-        not collide on the controller. Only the first call does work: the receive buffers, the synchronizer and
-        the registration are reused by every later sync.
+        not collide on the controller. With ``receive_into_vllm`` the trainer sends every tensor in vLLM's layout
+        (named after vLLM's parameters, see ``weight_sync/vllm_layout.py``) and this worker binds those parameters
+        as the receive buffers: no staging buffers and nothing to install. Only the first call does work: the
+        receive buffers, the synchronizer and the registration are reused by every later sync.
         """
         if getattr(self, "_tpu_sync_ws", None) is not None:
             return True
@@ -196,6 +200,11 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
                 f"from worker.vllm_config.parallel_config!"
             )
 
+        if receive_into_vllm:
+            return self._init_receive_into_vllm(
+                vllm_model, controller_addr, global_shapes_map, tp_size, parallelism, job_name, bind_ip, listener_port
+            )
+
         # Models with a direct-install layout (``direct_install``: e.g. Qwen3.5, Qwen3 MoE) install each rank's slices
         # straight into vLLM's parameters; other hybrid or MoE models go through vLLM's loaders, which needs every
         # tensor whole on every rank.
@@ -224,12 +233,10 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
             )
 
         # 3. Allocate local TPU staging buffers matching Trainer un-fused layout and sharding specs
-        # TODO(tpu): Copy the received weights straight into vLLM's parameters, with no staging copy. The
-        # staging tensors are a second full copy of this rank's TP shard (~1.9 GiB per chip for Qwen3-8B,
-        # ~7.6 GiB for Qwen3-32B at TP=8) that must fit next to vLLM's preallocated weights and KV cache on
-        # every sync. Unfused tensors (o_proj, down_proj, norms, embed_tokens, lm_head) could bind the vLLM
-        # parameter buffers directly; fused qkv_proj / gate_up_proj and transposed (_tpu_weight_flipped)
-        # weights need tpu_sync to write into a slice or layout of the target tensor.
+        # TODO(tpu): engine_kwargs.tpu-sync.receive_into_vllm binds vLLM's parameters directly instead (the trainer
+        # exports in vLLM's layout, weight_sync/vllm_layout.py); dense models with FSDP == TP for now. The staging
+        # tensors are a second full copy of this rank's TP shard (~1.9 GiB per chip for Qwen3-8B, ~7.6 GiB for
+        # Qwen3-32B at TP=8) that must fit next to vLLM's preallocated weights and KV cache on every sync.
         staging_tensors = {}
         staging_sharded = {}
         variable_protos = []
@@ -355,6 +362,129 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
         return True
 
     @torch.no_grad()
+    def describe_vllm_params(self) -> dict:
+        """vLLM's parameters as this rank holds them, for the trainer's export in vLLM's layout (``receive_into_vllm``).
+
+        Returns ``{"tp_size": TP, "params": {name: {"local_shape", "dtype", "flipped"}}}`` over
+        ``vllm_model.state_dict()``; ``flipped`` is vllm-torchtpu's ``_tpu_weight_flipped`` on the owning module (the
+        weight is stored transposed, ``(in, out)``). Parameters that share storage (a tied ``lm_head``) are listed once.
+        """
+        vllm_model = self._get_vllm_model()
+        worker: Any = getattr(self, "worker", self)
+        tp_size = int(worker.vllm_config.parallel_config.tensor_parallel_size)
+        model_sd = vllm_model.state_dict()
+        modules = dict(vllm_model.named_modules())
+        params: dict[str, dict] = {}
+        seen_storage: set[int] = set()
+        for key in sorted(model_sd):
+            t = model_sd[key]
+            t = t.to_local() if hasattr(t, "to_local") else t
+            if t.data_ptr() in seen_storage:
+                continue
+            seen_storage.add(t.data_ptr())
+            flipped = bool(getattr(get_parent_module(key, modules), "_tpu_weight_flipped", False))
+            params[key] = VllmParam(tuple(t.shape), str(t.dtype), flipped).to_dict()
+        return {"tp_size": tp_size, "params": params}
+
+    def _init_receive_into_vllm(
+        self,
+        vllm_model: Any,
+        controller_addr: str,
+        global_shapes: dict[str, list[int]],
+        tp_size: int,
+        parallelism: int,
+        job_name: str,
+        bind_ip: str,
+        listener_port: int,
+    ) -> bool:
+        """``init_tpu_sync_on_worker`` for ``receive_into_vllm``: bind vLLM's parameters as the receive buffers.
+
+        ``global_shapes`` is keyed by vLLM parameter name and holds the trainer's virtual global shape of each (the
+        rollout ranks' local weights concatenated along the TP dim). A dim whose global size is ``tp_size`` times
+        the local size is the TP dim; equal sizes are replicated. No model knowledge is needed here.
+        """
+        rank_val = getattr(self, "rank", 0)
+        model_sd = vllm_model.state_dict()
+        bound: dict[str, torch.Tensor] = {}
+        replicas: dict[str, int] = {}
+        variable_protos = []
+        problems = []
+        for idx, (name, g_shape) in enumerate(sorted(global_shapes.items(), key=lambda x: x[0])):
+            key = resolve_model_key(name, model_sd)
+            if key not in model_sd:
+                problems.append(f"{name}: no vLLM parameter")
+                continue
+            t = model_sd[key]
+            t = t.to_local() if hasattr(t, "to_local") else t
+            if not (t.is_contiguous() and t.storage_offset() == 0 and t.dim() == len(g_shape)):
+                problems.append(f"{name}: vLLM weight is not a contiguous whole buffer of rank {len(g_shape)}")
+                continue
+            spec, mesh = [""] * len(g_shape), [1] * len(g_shape)
+            for d, (g, l_) in enumerate(zip(g_shape, t.shape, strict=True)):
+                if g == l_ * tp_size and tp_size > 1:
+                    spec[d], mesh[d] = "tp", tp_size
+                elif g != l_:
+                    problems.append(f"{name}: global {list(g_shape)} vs vLLM local {list(t.shape)} at TP={tp_size}")
+                    break
+            else:
+                if spec.count("tp") > 1:
+                    problems.append(f"{name}: more than one TP dim in {list(g_shape)} vs {list(t.shape)}")
+                    continue
+                bound[name] = t
+                replicas[name] = tp_size // math.prod(mesh)
+                variable_protos.append(
+                    tpu_sync_api.variable_metadata(
+                        name=name,
+                        shape=list(g_shape),
+                        mesh_shape=mesh,
+                        layout=list(range(len(g_shape) - 1, -1, -1)),
+                        item_size=t.element_size(),
+                        layer_idx=idx,
+                        sharding_spec=spec,
+                        global_shard_indices=[],
+                    )
+                )
+        if problems:
+            raise RuntimeError(
+                f"tpu-sync Sampler Rank {rank_val}: receive_into_vllm cannot bind {len(problems)} tensors: "
+                + "; ".join(problems[:8])
+            )
+
+        valid_params = list(bound.items())
+        self._tpu_sync_staging = dict(bound)  # the parity and install paths read the received tensors from here
+        self._tpu_sync_staging_sharded = {
+            n: "tp" in v.sharding_spec for n, v in zip(bound, variable_protos, strict=True)
+        }
+        self._sorted_vllm_params = valid_params
+        self._tpu_sync_replicas = replicas
+        self._tpu_sync_bound_names = set(bound)
+        self._tpu_sync_layout = None
+        self._tpu_sync_plan = None
+        self._tpu_sync_use_vllm_loaders = False
+        tpu_sync_engine.tpu_synchronize()
+        logger.info(
+            f"tpu-sync Sampler Rank {rank_val}: receive_into_vllm binds {len(bound)} vLLM parameters "
+            f"({sum(t.numel() * t.element_size() for t in bound.values()) / 2**30:.2f} GiB) as the receive buffers"
+        )
+
+        self._tpu_sync_ws = tpu_sync_engine.create_torch_weight_synchronizer(
+            [[t] for _, t in valid_params],
+            local_port=0,
+            parallelism=parallelism,
+            listener_port=listener_port,
+            bind_ip=bind_ip,
+        )
+        ctrl_client = tpu_sync_api.controller_client(controller_addr)
+        ctrl_client.register_work_unit(
+            tpu_sync_api.unit_id(job_name, str(rank_val)),
+            [f"{bind_ip}:{self._tpu_sync_ws.local_port}"],
+            f"{bind_ip}:{self._tpu_sync_ws.listener_port}",
+            mesh_shape=[1, tp_size],
+            variables=variable_protos,
+            mesh_axes=["fsdp", "tp"],
+        )
+        return True
+
     def install_tpu_sync_weights(self, exact_parity: bool = False) -> dict:
         """Install received weights from host staging buffer into TPU HBM via zero-copy H2D DMA
         and fuse/transpose them directly into vLLM model parameters.
@@ -374,14 +504,39 @@ class vLLMTPUSyncWorkerExtension(vLLMColocateWorkerExtension):
 
         rank = getattr(self, "rank", 0)
         t_start = time.perf_counter()
+        # receive_into_vllm: the H2D writes vLLM's parameters itself, so the step-0 exact check compares them with a
+        # host copy taken before it (the checkpoint vLLM loaded).
+        bound_names: set[str] = getattr(self, "_tpu_sync_bound_names", set())
+        bound_before = (
+            {name: self._tpu_sync_staging[name].detach().to("cpu", copy=True) for name in sorted(bound_names)}
+            if exact_parity and bound_names
+            else {}
+        )
         t_h2d_start = time.perf_counter()
         # h2d() applies the skip_tiling plan the listener received with this transfer (see
-        # init_tpu_sync_on_worker); nothing must override it here.
-        # TODO(tpu): Remove the HBM staging buffers (see init_tpu_sync_on_worker): once the trainer sends every
-        # tensor in vLLM's layout and dtype, h2d() can write straight into vLLM's parameters and the install below
-        # goes away. That H2D must stay inside the rollout pause, as it is now.
+        # init_tpu_sync_on_worker); nothing must override it here. With receive_into_vllm it writes vLLM's
+        # parameters directly and nothing is installed below; it must stay inside the rollout pause.
         self._tpu_sync_ws.h2d()
         t_h2d = time.perf_counter() - t_h2d_start
+
+        if bound_names:
+            parity = ExactParityCheck() if exact_parity else None
+            if parity is not None:
+                for name, before in bound_before.items():
+                    parity.check(name, before, self._tpu_sync_staging[name].detach().to("cpu", copy=True))
+            t_sync_start = time.perf_counter()
+            tpu_sync_engine.tpu_synchronize()
+            t_sync = time.perf_counter() - t_sync_start
+            t_total = time.perf_counter() - t_start
+            logger.info(
+                f"[TPU-SYNC TELEMETRY | Sampler Worker] Sampler Rank {rank}: install_tpu_sync_weights "
+                f"(receive_into_vllm, nothing to install) completed in {t_total:.4f}s "
+                f"(H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
+            )
+            result = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+            if parity is not None:
+                result["exact_parity"] = parity.result(rank, [])
+            return result
 
         if getattr(self, "_tpu_sync_use_vllm_loaders", False):
             self._install_with_vllm_loaders()

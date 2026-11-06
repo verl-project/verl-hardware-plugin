@@ -377,6 +377,10 @@ class TPUSyncOptions:
             The next sync waits for it first. Applies from the second sync on and needs a ``tpu-sync-torch`` whose
             ``WeightSynchronizer.d2h()`` returns a future. Off by default: it relies on verl waiting for a pending
             update (``CheckpointEngineManager.wait_for_weight_update``) before validation and at the end of training.
+        receive_into_vllm: The rollout receives every tensor straight into vLLM's parameters, with no HBM staging
+            copy. The trainer exports its weights in vLLM's layout (fused, transposed, one virtual tensor per vLLM
+            parameter), so each rollout rank's TP slice is its vLLM weight. Dense models with FSDP degree equal to
+            the rollout TP degree only, for now (see ``weight_sync/vllm_layout.py``).
     """
 
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM
@@ -384,6 +388,7 @@ class TPUSyncOptions:
     release_buffers_after_sync: bool = True
     tie_word_embeddings: Optional[bool] = None
     return_after_d2h: bool = False
+    receive_into_vllm: bool = False
 
     @property
     def verify_norms(self) -> bool:
@@ -401,6 +406,7 @@ _SYNC_KINDS: dict[str, type] = {
     "verify_parity": ParityMode,
     "release_buffers_after_sync": bool,
     "tie_word_embeddings": bool,
+    "receive_into_vllm": bool,
     "return_after_d2h": bool,
 }
 assert set(_SYNC_KINDS) == {f.name for f in dataclasses.fields(TPUSyncOptions)}
