@@ -98,11 +98,14 @@ def implementation_stubs(*, failures=(), real_profiler=False):
             raise ImportError(f"Optional dependency unavailable: {name}")
 
     class RolloutRegistry:
-        _registry = {"vllm": mock.Mock(return_value=type("OriginalReplica", (), {}))}
+        _registry = {
+            "vllm": mock.Mock(return_value=type("OriginalReplica", (), {})),
+            "sglang": mock.Mock(return_value=type("OriginalSGLangReplica", (), {})),
+        }
 
         @classmethod
         def register(cls, name, loader):
-            record("rollout:vllm")
+            record(f"rollout:{name}")
             cls._registry[name] = loader
 
     modules = fake_packages(
@@ -163,6 +166,7 @@ def test_all_platforms_are_registered_before_any_engine(plugin):
         assert state.events.count("profiler:config") == 1
         assert state.events.count("profiler:torch") == 1
         assert state.events.count("rollout:vllm") == 1
+        assert state.events.count("rollout:sglang") == 1
         assert all(f"{package}.registration" in sys.modules for package in plugin.BACKEND_MODULES)
         assert not any("trainium" in name for name in plugin.BACKEND_MODULES)
         assert not any(name.startswith("verl_hardware_plugin.accelerators.trainium") for name in sys.modules)
@@ -181,7 +185,7 @@ def test_importing_backend_registration_loads_every_component(plugin, backend):
                 [f"{backend_package(backend)}.profilers.torch_profile_mlu", "profiler:config", "profiler:torch"]
             )
         if backend == "tpu":
-            expected.append("rollout:vllm")
+            expected.extend(["rollout:vllm", "rollout:sglang"])
         assert state.events == expected
 
 
@@ -200,6 +204,7 @@ def test_importing_backend_registration_loads_every_component(plugin, backend):
         ("accelerators.tpu.weight_sync.tpu_sync_checkpoint_engine", ()),
         ("accelerators.rocm.engines.mori_checkpoint_engine", ()),
         ("rollout:vllm", ()),
+        ("rollout:sglang", ()),
     ],
 )
 def test_optional_component_failure_does_not_stop_other_registration(plugin, failure, skipped):
@@ -208,7 +213,13 @@ def test_optional_component_failure_does_not_stop_other_registration(plugin, fai
     expected = {f"{backend_package(name)}.{module}" for name, module in PLATFORMS.items()}
     expected.update(ENGINE_MODULES)
     expected.update(
-        (f"{backend_package('mlu')}.profilers.torch_profile_mlu", "profiler:config", "profiler:torch", "rollout:vllm")
+        (
+            f"{backend_package('mlu')}.profilers.torch_profile_mlu",
+            "profiler:config",
+            "profiler:torch",
+            "rollout:vllm",
+            "rollout:sglang",
+        )
     )
     with implementation_stubs(failures=(failure,)) as state:
         plugin.load_backends()
@@ -275,21 +286,29 @@ def test_mlu_profiler_patches_remain_idempotent(plugin):
 def test_rollout_hook_is_lazy_and_preserves_non_tpu_loader(plugin):
     fake_tpu = ModuleType("verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm")
     fake_tpu.TPUvLLMReplica = type("TPUReplica", (), {})
+    fake_tpu_sglang = ModuleType("verl_hardware_plugin.accelerators.tpu.rollout.tpu_sglang")
+    fake_tpu_sglang.TPUSGLangReplica = type("TPUSGLangReplica", (), {})
     with implementation_stubs() as state:
         original = state.registry._registry["vllm"]
+        original_sglang = state.registry._registry["sglang"]
         guarded_import = builtins.__import__
 
-        def reject_vllm(name, *args, **kwargs):
-            assert "vllm" not in name, "rollout registration eagerly imported vLLM"
+        def reject_rollout_engines(name, *args, **kwargs):
+            assert "vllm" not in name and "sglang" not in name, "rollout registration eagerly imported engine"
             return guarded_import(name, *args, **kwargs)
 
-        with mock.patch.object(builtins, "__import__", side_effect=reject_vllm):
+        with mock.patch.object(builtins, "__import__", side_effect=reject_rollout_engines):
             importlib.import_module(f"{backend_package('tpu')}.registration")
             original.assert_not_called()
+            original_sglang.assert_not_called()
             assert state.registry._registry["vllm"]() is original.return_value
+            assert state.registry._registry["sglang"]() is original_sglang.return_value
         original.assert_called_once_with()
+        original_sglang.assert_called_once_with()
 
         state.device.get_resource_name.return_value = "TPU"
-        with mock.patch.dict(sys.modules, {fake_tpu.__name__: fake_tpu}):
+        with mock.patch.dict(sys.modules, {fake_tpu.__name__: fake_tpu, fake_tpu_sglang.__name__: fake_tpu_sglang}):
             assert state.registry._registry["vllm"]() is fake_tpu.TPUvLLMReplica
+            assert state.registry._registry["sglang"]() is fake_tpu_sglang.TPUSGLangReplica
         original.assert_called_once_with()
+        assert original_sglang.call_count == 2
