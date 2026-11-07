@@ -1,23 +1,31 @@
-# Google TPU vLLM Rollout
+# Google TPU Rollout (vLLM & SGLang)
 
-The plugin runs verl's vLLM rollout on TPU. With `VERL_PLATFORM=tpu`, the usual
-`actor_rollout_ref.rollout.name=vllm` setting selects the TPU rollout; other platforms keep verl's
-stock vLLM rollout.
+The plugin runs verl's **vLLM** and **SGLang** rollouts on TPU. With `VERL_PLATFORM=tpu`, setting
+`actor_rollout_ref.rollout.name=vllm` or `actor_rollout_ref.rollout.name=sglang` selects the corresponding
+TPU rollout (`TPUvLLMReplica` or `TPUSGLangReplica`); other platforms keep verl's stock GPU rollouts.
 
 Training and rollout run on separate TPU slices (a slice is a group of TPU hosts joined by a fast
-chip interconnect). One vLLM engine spans all chips of the rollout slice and receives the trainer's
+chip interconnect). One vLLM or SGLang engine spans all chips of the rollout slice and receives the trainer's
 updated weights through the `ray-plasma-store` or `tpu-sync` checkpoint engine (see [Weight Sync](./weight_sync.md)).
 
-A rollout replica is laid out as upstream verl lays it out on GPU: one server actor per host, the first
-running the engine and the HTTP API, the others running vLLM headless. vLLM's `mp` executor starts one
-worker per chip (per TensorCore on TPU 7x) on each host, and vllm-torchtpu's `mp` multi-host backend
-(`TPU_MULTIHOST_BACKEND=mp`) joins the replica's hosts into one TPU mesh.
+A rollout replica is laid out as upstream verl lays it out on GPU: one server actor per host, the leader
+running the HTTP API and engine coordinator, and follower hosts running worker processes headless:
+
+- **vLLM (`actor_rollout_ref.rollout.name=vllm`)**: vLLM's `mp` executor starts one worker per chip
+  (per TensorCore on TPU 7x) on each host, and `vllm-torchtpu`'s `mp` multi-host backend
+  (`TPU_MULTIHOST_BACKEND=mp`) joins the replica's hosts into one TPU mesh.
+- **SGLang (`actor_rollout_ref.rollout.name=sglang`)**: `Engine._launch_subprocesses` spawns one TP
+  scheduler process per local chip on each host via [sglang-torchtpu](https://github.com/sgl-project/sglang-torchtpu)
+  (`SGLANG_PLATFORM=tpu`), joining multi-host slices via `dist_init_addr` and TPU topology normalization,
+  and servicing `tpu-sync` / `ray-plasma-store` weight sync RPCs over SGLang's internal ZMQ RPC channel and
+  `tp_group.cpu_group`.
 
 ## Requirements
 
-- The prerequisites from the [Installation Guide](./install_guidance.md), plus vLLM `v0.32.0` and
-  [vllm-torchtpu](https://github.com/vllm-project/vllm-torchtpu) `732c4346`, the versions the rollout is tested with (see the `Dockerfile` in verl's
-  [`examples/tpu/grpo`](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo)).
+- The prerequisites from the [Installation Guide](./install_guidance.md), plus either:
+  - **vLLM**: vLLM `v0.32.0` and [vllm-torchtpu](https://github.com/vllm-project/vllm-torchtpu) `732c4346`
+    (see the `Dockerfile` in verl's [`examples/tpu/grpo`](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo)), or
+  - **SGLang**: [sglang-torchtpu](https://github.com/sgl-project/sglang-torchtpu) (`SGLANG_BUILD_RUST_EXTS=none` with `python/pyproject_tpu.toml` and `-e .`).
 - A verl checkout with the TPU GRPO examples in `examples/tpu/grpo`.
 - At least two TPU slices, one for training and one for rollout. A TPU chip belongs to a single
   process, so training and rollout cannot share chips.
@@ -86,7 +94,7 @@ The rollout settings that matter on TPU (the recipes already set them):
 
 | Setting | Value on TPU |
 |---------|--------------|
-| `actor_rollout_ref.rollout.name` | `vllm` |
+| `actor_rollout_ref.rollout.name` | `vllm` or `sglang` |
 | `actor_rollout_ref.rollout.tensor_model_parallel_size` | All chips of the rollout slice, e.g. `4` on v6e-4, for one replica; the chips of one host for one replica per host (see [Weight Sync](./weight_sync.md#several-rollout-replicas)) |
 | `actor_rollout_ref.rollout.data_parallel_size` | `1` (the default); larger values are rejected |
 | `actor_rollout_ref.rollout.checkpoint_engine.backend` | `ray-plasma-store`, or `tpu-sync` (see [Weight Sync](./weight_sync.md)) |
@@ -94,17 +102,18 @@ The rollout settings that matter on TPU (the recipes already set them):
 
 ## Verify
 
-On any host, without vLLM or a TPU:
+On any host, without vLLM, SGLang, or a TPU:
 
 ```bash
-pytest tests/accelerators/tpu/test_tpu_vllm_rollout.py -v
+pytest tests/accelerators/tpu/test_tpu_vllm_rollout.py tests/accelerators/tpu/test_tpu_sglang_rollout.py -v
 ```
 
 On TPU, the job log contains
 
 ```text
 Registered rollout replica loader: vllm (TPU-aware)
-[TPU-SYNC CONTROLLER] All 8 Trainer and 16 Sampler units verified and registered.
+Registered rollout replica loader: sglang (TPU-aware)
+[TPU-SYNC CONTROLLER] All 8 Trainer and 8 Sampler units verified and registered.
 ```
 
 where the sampler count is the number of rollout chips (with `tpu-sync`), and the job ends with status
