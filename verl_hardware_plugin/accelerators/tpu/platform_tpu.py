@@ -450,6 +450,30 @@ class TPUDeviceModuleProxy:
         """Nothing to release; see the class docstring (never ``torch.tpu._clear_cache()``)."""
 
 
+# libtpu flags for the trainer's processes only (the rollout's vLLM processes keep the job's LIBTPU_INIT_ARGS).
+TRAINER_LIBTPU_ENV = "VERL_TPU_TRAINER_LIBTPU_INIT_ARGS"
+_trainer_libtpu_logged: set[str] = set()
+
+
+def trainer_libtpu_init_args(name_prefix: str) -> Optional[str]:
+    """This process's ``LIBTPU_INIT_ARGS`` with the ``--flag=value`` entries of ``VERL_TPU_TRAINER_LIBTPU_INIT_ARGS``
+    merged in, for the workers of every group but verl's rollout groups; None keeps the job's value."""
+    extra = os.environ.get(TRAINER_LIBTPU_ENV, "").replace(",", " ").split()
+    if not extra or name_prefix.startswith("rollout"):
+        return None
+    ok = set("abcdefghijklmnopqrstuvwxyz0123456789_")
+    bad = [f for f in extra if not (f[:2] == "--" and "=" in f and set(f[2:].split("=", 1)[0]) <= ok)]
+    if bad:
+        raise ValueError(f"{TRAINER_LIBTPU_ENV}: entries must be --flag=value, got {bad}")
+    names = {f.split("=", 1)[0] for f in extra}
+    base = [f for f in os.environ.get("LIBTPU_INIT_ARGS", "").split() if f.split("=", 1)[0] not in names]
+    args = " ".join(base + extra)
+    if name_prefix not in _trainer_libtpu_logged:
+        _trainer_libtpu_logged.add(name_prefix)
+        print(f"[TPU] worker group {name_prefix}: trainer LIBTPU_INIT_ARGS={args}", flush=True)
+    return args
+
+
 def driver_tpu_env_for_workers() -> dict[str, str]:
     """The forwarded variables (``TPU_FORWARDED_ENV_VARS`` and ``*_PREFIXES``) that are set and not empty."""
     return {
@@ -816,4 +840,8 @@ class PlatformTPU(PlatformBase):
             pgs=pgs,
         )
         env_vars.update(tpu_env)
+        # The trainer workers' own LIBTPU_INIT_ARGS wins over the job's.
+        trainer_args = trainer_libtpu_init_args(name_prefix)
+        if trainer_args is not None:
+            env_vars["LIBTPU_INIT_ARGS"] = trainer_args
         return env_vars
