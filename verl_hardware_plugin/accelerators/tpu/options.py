@@ -203,6 +203,13 @@ class TPUEngineOptions:
             matmul, sharing the routed-token loads (default: ``False``).
         moe_native_weight_layout: Qwen3 MoE: store the expert weights in the kernel-native ``(E, K, N)`` layout;
             ``state_dict()`` / ``load_state_dict()`` still use the canonical layout and names (default: ``False``).
+        gdn_row_slot_len: Qwen3.5: start every sequence of a packed micro-batch at a multiple of this many tokens
+            and run the GatedDeltaNet over rows of this length (one sequence per row) instead of restarting it at
+            packed documents through Tokamax ``segment_ids`` (default: unset, off). Needs every sequence <= this
+            length and ``static_micro_batch_len`` = sequences per micro-batch x this.
+        frozen_param_regex: Parameters whose FQN matches this regex (``re.search``) are not trained: their
+            gradients are dropped before the gradient norm and the optimizer step, e.g. ``moe.router.gate`` freezes
+            the MoE router (default: unset, train every parameter).
     """
 
     use_splash_attention: Optional[bool] = None
@@ -230,6 +237,8 @@ class TPUEngineOptions:
     mixed_precision_reduce: Optional[str] = None
     moe_paired_grouped_mm: Optional[bool] = None
     moe_native_weight_layout: Optional[bool] = None
+    gdn_row_slot_len: Optional[int] = None
+    frozen_param_regex: Optional[str] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -258,6 +267,8 @@ _ENGINE_KINDS: dict[str, type] = {
     "mixed_precision_reduce": str,
     "moe_paired_grouped_mm": bool,
     "moe_native_weight_layout": bool,
+    "gdn_row_slot_len": int,
+    "frozen_param_regex": str,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
