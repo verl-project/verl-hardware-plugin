@@ -30,17 +30,19 @@ import gc
 import importlib
 import inspect
 import io
+import json
 import logging
 import math
 import os
 import re
 import shutil
-from collections.abc import Mapping
+from collections.abc import Collection, Iterable, Mapping
 from contextlib import nullcontext
 from typing import Any, Callable, Iterator, Optional
 
 import torch
 import torch.distributed
+from safetensors.torch import save_file
 from tensordict import TensorDict
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
@@ -126,6 +128,63 @@ _LAYER_FQN_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 _LAYER_PREFIX_RE = re.compile(r"^(.*?(?:^|\.)layers\.\d+)\.")
 _OPTIMIZER_STEP_LAYERS_PER_CHUNK = 4
 _OPTIMIZER_STEP_MAX_PARAMS_PER_CHUNK = 64
+
+# ``checkpoint.save_contents`` entries stored in the TorchTitan DCP checkpoint (TorchTitan writes them together).
+_DCP_CHECKPOINT_CONTENTS = frozenset({"model", "optimizer", "extra"})
+
+# Size cap of one safetensors shard in the ``hf_model`` export, as in verl's FSDP ``hf_model`` export.
+_HF_MAX_SHARD_BYTES = 5 * 1024**3
+
+
+def write_hf_safetensors(
+    named_tensors: Iterable[tuple[str, torch.Tensor]],
+    out_dir: str,
+    is_writer: bool,
+    skip_names: Collection[str] = (),
+    max_shard_bytes: int = _HF_MAX_SHARD_BYTES,
+) -> Optional[dict[str, str]]:
+    """Stream ``(hf_name, tensor)`` pairs into safetensors shards plus ``model.safetensors.index.json``.
+
+    Every rank must drain ``named_tensors``: producing a tensor may run collectives (``TrainerWeights`` all-gathers
+    each FSDP shard). Only ``is_writer`` copies the tensors to host memory and writes files, so host memory peaks at
+    about one shard. ``skip_names`` drops tensors that HF re-creates on load, such as a tied ``lm_head.weight``.
+    """
+    shard: dict[str, torch.Tensor] = {}
+    shard_bytes = total_bytes = 0
+    tmp_shards: list[tuple[str, list[str]]] = []
+
+    def flush_shard() -> None:
+        nonlocal shard, shard_bytes
+        tmp_path = os.path.join(out_dir, f"model-{len(tmp_shards) + 1:05d}.safetensors.tmp")
+        save_file(shard, tmp_path, metadata={"format": "pt"})
+        tmp_shards.append((tmp_path, list(shard)))
+        shard, shard_bytes = {}, 0
+
+    if is_writer:
+        os.makedirs(out_dir, exist_ok=True)
+    for name, tensor in named_tensors:
+        if not is_writer or name in skip_names:
+            tpu_synchronize(tensor, wait=True)
+            continue
+        nbytes = tensor.numel() * tensor.element_size()
+        if shard and shard_bytes + nbytes > max_shard_bytes:
+            flush_shard()
+        shard[name] = tensor.detach().contiguous().to("cpu", copy=True)
+        shard_bytes += nbytes
+        total_bytes += nbytes
+    if not is_writer:
+        return None
+    if shard:
+        flush_shard()
+
+    weight_map: dict[str, str] = {}
+    for i, (tmp_path, names) in enumerate(tmp_shards, start=1):
+        file_name = f"model-{i:05d}-of-{len(tmp_shards):05d}.safetensors"
+        os.replace(tmp_path, os.path.join(out_dir, file_name))
+        weight_map.update(dict.fromkeys(names, file_name))
+    with open(os.path.join(out_dir, "model.safetensors.index.json"), "w", encoding="utf-8") as f:
+        json.dump({"metadata": {"total_size": total_bytes}, "weight_map": weight_map}, f, indent=2)
+    return weight_map
 
 
 # TODO: Upstream ``hf_range_reader`` into ``torchtitan`` (``StateDictAdapter.get_hf_storage_reader``) and remove
@@ -989,9 +1048,17 @@ class TorchTitanTPUEngine(BaseEngine):
         parallelism = ParallelismConfig(**parallelism_kwargs)
         if parallelism.context_parallel_degree > 1:
             self._enable_context_parallel(parallelism, model_spec.model)
+        async_save = not self.engine_config.forward_only and (
+            bool(getattr(self.checkpoint_config, "async_save", False))
+            or os.environ.get("VERL_TORCHTITAN_ASYNC_CHECKPOINT", "0") == "1"
+        )
         # interval=1: save whenever verl calls save_checkpoint (TorchTitan's default 500 skips the other steps).
         checkpoint = CheckpointManager.Config(
-            enable=True, interval=1, initial_load_in_hf=True, initial_load_path=model_config.path
+            enable=True,
+            interval=1,
+            initial_load_in_hf=True,
+            initial_load_path=model_config.path,
+            async_mode="async" if async_save else "disabled",
         )
         compile_config = CompileConfig(enable=self.engine_config.use_torch_compile, backend="tpu")
 
@@ -1304,10 +1371,9 @@ class TorchTitanTPUEngine(BaseEngine):
         return my_group
 
     def _drop_checkpoint_state_dict_cache(self) -> None:
-        """Free torchtitan ``ModelWrapper.cached_state_dict`` after the initial HF load."""
-        from torchtitan.components.checkpointer import MODEL
-
-        self.checkpointer.states[MODEL].cached_state_dict = {}
+        """Free torchtitan ``ModelWrapper.cached_state_dict`` after checkpoint load or save."""
+        for wrapper in self.checkpointer.states.values():
+            wrapper.cached_state_dict = {}
 
     def initialize(self):
         """Initialize model/checkpointer and release unused optimizer state on forward-only reference workers."""
@@ -1846,30 +1912,80 @@ class TorchTitanTPUEngine(BaseEngine):
         max_ckpt_to_keep: Optional[int] = None,
         **kwargs,
     ) -> None:
-        """Save checkpoint."""
+        """Save checkpoint according to ``checkpoint.save_contents``."""
         with timeline.span(
             "save_checkpoint", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane(), step=global_step
         ):
-            masters = _fp32_masters_of(self)
-            if masters is not None:
-                self._save_fp32_master_checkpoint(masters, local_path, global_step, max_ckpt_to_keep)
-                return
-
+            save_contents = self._checkpoint_save_contents()
             if self._is_offload_param:
                 self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
 
-            # Override TorchTitan's folder to use verl's path
-            parent_dir = os.path.dirname(local_path)
-            self.checkpointer.folder = parent_dir
+            if "hf_model" in save_contents:
+                self._save_hf_model(os.path.join(local_path, "huggingface"))
 
-            if max_ckpt_to_keep is not None:
-                self.checkpointer.keep_latest_k = max_ckpt_to_keep
-
-            self.checkpointer.save(curr_step=global_step)
+            if save_contents & _DCP_CHECKPOINT_CONTENTS:
+                self._save_dcp_checkpoint(local_path, global_step, max_ckpt_to_keep)
 
             torch.distributed.barrier()
             if self._is_offload_param:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
+
+    def _checkpoint_save_contents(self) -> set[str]:
+        """``checkpoint.save_contents`` as a set; defaults to the DCP contents when unset."""
+        checkpoint_config = getattr(self, "checkpoint_config", None)
+        contents = getattr(checkpoint_config, "save_contents", None)
+        return set(contents) if contents is not None else set(_DCP_CHECKPOINT_CONTENTS)
+
+    def _save_dcp_checkpoint(self, local_path: str, global_step: int, max_ckpt_to_keep: Optional[int]) -> None:
+        """Save the TorchTitan DCP checkpoint (or FP32 master shards when ``fp32_master=True``)."""
+        masters = _fp32_masters_of(self)
+        if masters is not None:
+            self._save_fp32_master_checkpoint(masters, local_path, global_step, max_ckpt_to_keep)
+            return
+
+        parent_dir = os.path.dirname(local_path)
+        self.checkpointer.folder = parent_dir
+        if max_ckpt_to_keep is not None:
+            self.checkpointer.keep_latest_k = max_ckpt_to_keep
+
+        self.checkpointer.save(curr_step=global_step)
+        self._drop_checkpoint_state_dict_cache()
+
+        save_future = getattr(self.checkpointer, "save_future", None)
+        if save_future is not None and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+            tracker_file = os.path.join(os.path.dirname(parent_dir), "latest_checkpointed_iteration.txt")
+
+            def _write_latest_tracker(fut, path=tracker_file, step=global_step):
+                if fut.exception() is None:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(str(step))
+
+            save_future.add_done_callback(_write_latest_tracker)
+
+    def _save_hf_model(self, hf_dir: str) -> None:
+        """Write the full model in HF format (bf16 safetensors shards, config, tokenizer) to ``hf_dir``."""
+        is_writer = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        hf_config = self.model_config.hf_config
+        skip_names = {"lm_head.weight"} if getattr(hf_config, "tie_word_embeddings", False) else set()
+        if is_writer:
+            os.makedirs(hf_dir, exist_ok=True)
+            hf_config.save_pretrained(hf_dir)
+            if self.model_config.generation_config is not None:
+                self.model_config.generation_config.save_pretrained(hf_dir)
+            processing_class = self.model_config.processor or self.model_config.tokenizer
+            if processing_class is not None:
+                processing_class.save_pretrained(hf_dir)
+
+        weights, _ = self.get_per_tensor_param()
+        weight_map = write_hf_safetensors(weights, hf_dir, is_writer=is_writer, skip_names=skip_names)
+        if weight_map is not None:
+            logger.warning(
+                "Saved hf_model (%d tensors in %d shards) to %s",
+                len(weight_map),
+                len(set(weight_map.values())),
+                hf_dir,
+            )
 
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs

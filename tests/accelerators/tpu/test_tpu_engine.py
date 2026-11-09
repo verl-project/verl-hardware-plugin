@@ -6,9 +6,11 @@
 import ast
 import dataclasses
 import functools
+import json
 import os
 import sys
 import types
+from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -17,10 +19,13 @@ from unittest import mock
 import pytest
 import torch
 import torch._dynamo
+from safetensors.torch import load_file as load_safetensors_file
 from tensordict import TensorDict
 
+from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import TorchtitanEngineConfig
+from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine, write_hf_safetensors
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPUVarlenAttention,
     bucket_length,
@@ -2339,6 +2344,8 @@ def _fp32_master_ckpt_worker(rank: int, world: int, init_file: str, ckpt_root: s
                 "_optimizer_param_chunks",
                 "_chunked_grad_norm",
                 "_chunked_clip_and_step",
+                "_checkpoint_save_contents",
+                "_save_dcp_checkpoint",
                 "_save_fp32_master_checkpoint",
                 "_load_fp32_master_checkpoint",
                 "save_checkpoint",
@@ -3277,3 +3284,130 @@ def test_align_micro_batch_shapes_static_len_and_response_len():
         )
     assert padded(mbs, "tpu_padded_seq_len") == [18432, 16384]
     assert padded(mbs, "tpu_max_response_len") == [8192, 8192]
+
+
+def _hf_export_tensors() -> dict[str, torch.Tensor]:
+    generator = torch.Generator().manual_seed(0)
+    return {
+        "model.embed_tokens.weight": torch.randn(4, 4, generator=generator).to(torch.bfloat16),  # 32 bytes
+        "model.norm.weight": torch.randn(10, generator=generator),  # fp32, 40 bytes
+        "model.layers.0.mlp.down_proj.weight": torch.randn(8, 8, generator=generator).to(torch.bfloat16).t(),  # 128 B
+    }
+
+
+def test_write_hf_safetensors_shards_index_and_skips(tmp_path):
+    """Shards close before exceeding the cap, the index maps every tensor, skipped names and .tmp files are gone."""
+    tensors = _hf_export_tensors()
+    named = [*tensors.items(), ("lm_head.weight", tensors["model.embed_tokens.weight"])]
+    out_dir = tmp_path / "huggingface"
+    weight_map = write_hf_safetensors(
+        iter(named), str(out_dir), is_writer=True, skip_names={"lm_head.weight"}, max_shard_bytes=64
+    )
+
+    files = [f"model-0000{i}-of-00003.safetensors" for i in (1, 2, 3)]
+    assert weight_map == dict(zip(tensors, files, strict=True))
+    assert sorted(p.name for p in out_dir.iterdir()) == sorted([*files, "model.safetensors.index.json"])
+    with open(out_dir / "model.safetensors.index.json", encoding="utf-8") as f:
+        index = json.load(f)
+    assert index == {"metadata": {"total_size": 32 + 40 + 128}, "weight_map": weight_map}
+    for name, tensor in tensors.items():
+        loaded = load_safetensors_file(str(out_dir / weight_map[name]))
+        assert list(loaded) == [name]
+        assert torch.equal(loaded[name], tensor), name
+
+
+def test_write_hf_safetensors_non_writer_drains_without_writing(tmp_path):
+    """Ranks other than the writer still consume every tensor (the producer runs collectives) but write nothing."""
+    consumed = []
+
+    def produce():
+        for name, tensor in _hf_export_tensors().items():
+            consumed.append(name)
+            yield name, tensor
+
+    out_dir = tmp_path / "huggingface"
+    assert write_hf_safetensors(produce(), str(out_dir), is_writer=False) is None
+    assert consumed == list(_hf_export_tensors())
+    assert not out_dir.exists()
+
+
+class _FakeHFArtifact:
+    """Stands in for an HF config / tokenizer: ``save_pretrained`` writes one marker file."""
+
+    def __init__(self, file_name: str, **attrs):
+        self.file_name = file_name
+        self.__dict__.update(attrs)
+
+    def save_pretrained(self, path: str) -> None:
+        with open(os.path.join(path, self.file_name), "w", encoding="utf-8") as f:
+            f.write("{}")
+
+
+@pytest.mark.parametrize(
+    "save_contents, async_save, expect_dcp, expect_hf",
+    [
+        (["model", "optimizer", "extra"], False, True, False),
+        (["hf_model"], False, False, True),
+        (["model", "optimizer", "extra", "hf_model"], True, True, True),
+    ],
+)
+def test_save_checkpoint_honors_save_contents_and_async_save(
+    tmp_path, save_contents, async_save, expect_dcp, expect_hf
+):
+    """Verify ``save_contents`` gating, ``hf_model`` export without tied head, and ``async_save`` tracker callback."""
+    dcp_future: Future = Future()
+    dcp_future.set_result(None)
+    wrapper = SimpleNamespace(cached_state_dict={"dummy": torch.zeros(1)})
+
+    engine = object.__new__(TorchTitanTPUEngine)
+    engine._is_offload_param = False
+    engine._tpu_options = None
+    engine.checkpointer = mock.Mock(
+        states={"model": wrapper},
+        save_future=dcp_future if async_save else None,
+    )
+    engine.checkpoint_config = CheckpointConfig(save_contents=save_contents, async_save=async_save)
+    engine.model_config = SimpleNamespace(
+        hf_config=_FakeHFArtifact("config.json", tie_word_embeddings=True),
+        generation_config=_FakeHFArtifact("generation_config.json"),
+        processor=None,
+        tokenizer=_FakeHFArtifact("tokenizer.json"),
+    )
+    tensors = _hf_export_tensors()
+    exported = [*tensors.items(), ("lm_head.weight", tensors["model.embed_tokens.weight"])]
+    engine.get_per_tensor_param = mock.Mock(side_effect=lambda **kwargs: (iter(exported), None))
+
+    step_dir = tmp_path / "ckpts" / "global_step_7" / "actor"
+    with (
+        mock.patch("torch.distributed.barrier") as barrier,
+        mock.patch("torch.distributed.is_initialized", return_value=False),
+        mock.patch("torch.distributed.get_rank", return_value=0),
+    ):
+        engine.save_checkpoint(local_path=str(step_dir), global_step=7, max_ckpt_to_keep=2)
+
+    barrier.assert_called_once()
+    if expect_dcp:
+        engine.checkpointer.save.assert_called_once_with(curr_step=7)
+        assert wrapper.cached_state_dict == {}
+    else:
+        engine.checkpointer.save.assert_not_called()
+
+    hf_dir = step_dir / "huggingface"
+    assert hf_dir.exists() == expect_hf
+    if expect_hf:
+        engine.get_per_tensor_param.assert_called_once()
+        assert {p.name for p in hf_dir.iterdir()} == {
+            "config.json",
+            "generation_config.json",
+            "tokenizer.json",
+            "model-00001-of-00001.safetensors",
+            "model.safetensors.index.json",
+        }
+        with open(hf_dir / "model.safetensors.index.json", encoding="utf-8") as f:
+            assert set(json.load(f)["weight_map"]) == set(tensors)
+    else:
+        engine.get_per_tensor_param.assert_not_called()
+
+    if async_save:
+        tracker_file = tmp_path / "ckpts" / "latest_checkpointed_iteration.txt"
+        assert tracker_file.read_text(encoding="utf-8") == "7"
