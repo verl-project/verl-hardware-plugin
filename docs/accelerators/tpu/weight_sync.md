@@ -28,6 +28,9 @@ for this backend):
    - a replicated weight is already full on every rank and is registered full, without further communication.
      Note that q/k/v_proj are replicated only because torchtitan's `FusedQKVLinear` `state_dict()` hook already
      all-gathers the FSDP-sharded `wqkv` before splitting it (TODO: split it locally);
+   - routed experts with `1 < expert_parallel_size < world size` (so `efsdp > 1`) are
+     `(_StridedShard(0, split_factor=ep), Shard(0))` on the `(efsdp, ep)` mesh: every rank still holds contiguous
+     whole experts, block `i_ep * efsdp + i_efsdp` of `efsdp * ep`, and is registered locally like an FSDP shard;
    - Qwen3 MoE expert stacks (torchtitan's `[E, I, H]` / `[E, H, I]` per projection) are sent as is, one 3-D
      tensor per projection and layer (`model.layers.N.mlp.experts.gate_proj.weight` `[E, I, H]`, likewise
      `up_proj`, and `down_proj` `[E, H, I]`, as Qwen3.5's expert pieces). An FSDP shard of whole experts is a dim-0
@@ -87,6 +90,7 @@ actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 | `parallelism` | `8` | Parallel transfer streams per worker. |
 | `verify_parity` | `off` | Weight-sync check: `off`, `norm`, `exact` or `all` (`True` means `norm`). See [Parity checks](#parity-checks). A failed check stops the run. Meant for bring-up and after changing sharding or upgrading tpu-sync. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The deprecated environment variable `VERL_TPU_SYNC_RELEASE_BUFFERS` still overrides the option on the trainer workers and logs a deprecation warning. |
+| `return_after_d2h` | `False` | Return to the trainer as soon as its ranks have copied their weights to host memory and freed the device buffers, and finish the sync (transfer, pause, install, resume) in the background while training goes on. The next sync waits for it first and raises its error, if any. Applies from the second sync on (tpu-sync keeps the weights bound across the first transfer to a rollout topology) and needs a `tpu-sync-torch` whose `WeightSynchronizer.d2h()` returns a future; otherwise the sync runs to the end as before. See [Returning after the D2H](#returning-after-the-d2h). |
 
 ## Rollout install
 
@@ -166,6 +170,9 @@ trainer, log them with the step metrics:
 | `timing_s/tpu-sync/rollout_paused` | From the pause (abort) to the resume: the quiesce, the install, the parity checks and the resume |
 | `timing_s/tpu-sync/trainer_release` | Waiting for the trainer to free its send buffers; generation has already resumed |
 | `timing_s/tpu-sync/total_sync` | The whole sync |
+| `timing_s/tpu-sync/trainer_d2h` | With `return_after_d2h`: the trainer ranks' own device-to-host copy, on the slowest rank |
+| `timing_s/tpu-sync/wait_previous_sync` | With `return_after_d2h`: waiting for the background part of the previous sync |
+| `tpu-sync/returned_after_d2h` | With `return_after_d2h`: 1 when the sync returned after the trainer's D2H |
 
 `sampler_h2d_pure` and the `verify_parity` checks read the rollout workers' return values, which verl's vLLM server
 passes back from `collective_rpc` (since verl-project/verl#8155). With an older verl, the sync still works, but
@@ -180,6 +187,18 @@ transfer shares the rollout hosts with generation, which makes its time vary mor
 FSDP8, rollout TP8, `verify_parity=norm`, steps 2–10), the rollout was paused for 0.73 s per sync instead of the whole
 sync (2.1 s), and `update_weights` took 2.71 s instead of 2.11 s. The transfer took 0.94–1.01 s with the rollout
 paused and 0.89–1.83 s with it generating; the receiving hosts show TCP receive-queue pruning and drops in both cases.
+
+## Returning after the D2H
+
+With `return_after_d2h`, a sync returns to the trainer after `trainer_init` (which then includes the ranks' own D2H,
+reported as `trainer_d2h`), and the transfer reads the trainer's host staging buffers (`skip_d2h`). The other phases run
+in the background and are reported by the next sync, together with `wait_previous_sync`: the step metrics of a sync
+show the background phases of the sync before it.
+
+The plugin routes verl's `CheckpointEngineManager.wait_for_weight_update` to the pending background sync, so a trainer
+that calls it before validation and before its training loop exits sees the new weights installed. With a verl whose
+trainer does not call it yet, a validation right after a sync can run on the previous weights, and the background part
+of the last sync may not finish before the process exits; keep `return_after_d2h` off there.
 
 ## Verify
 

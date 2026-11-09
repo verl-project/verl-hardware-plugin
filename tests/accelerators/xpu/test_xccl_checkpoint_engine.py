@@ -16,6 +16,7 @@ import pytest
 engine = pytest.importorskip(
     "verl_hardware_plugin.accelerators.xpu.engines.xccl_checkpoint_engine",
     reason="needs a torch build with XPU and ProcessGroupXCCL",
+    exc_type=ImportError,  # with pyzmq installed, the import fails on ProcessGroupXCCL, not on a missing module
 )
 
 MASTER = engine.MasterMetadata(zmq_ip="10.0.0.1", zmq_port=5555, store_port=6666, group_id="g", multi_sender=False)

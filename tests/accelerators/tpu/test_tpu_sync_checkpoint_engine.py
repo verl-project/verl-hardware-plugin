@@ -39,6 +39,7 @@ for _mod_name in ("uvicorn", "fastapi"):
 # Imported up front, so that no test imports (and registers) them a second time. Importing
 # tpu_sync_checkpoint_engine also installs the CheckpointEngineManager hook that routes backend=tpu-sync.
 import verl.checkpoint_engine.base as ckpt_base  # noqa: E402
+from verl_hardware_plugin.accelerators.tpu import device_api  # noqa: E402
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights  # noqa: E402
 from verl_hardware_plugin.accelerators.tpu.weight_sync import (  # noqa: E402
     tpu_sync_checkpoint_engine as tpu_sync_engine,
@@ -150,6 +151,16 @@ class _FakeTpuSync:
         self.registry = _FakeActorHandle(self.registry_state)
         self.rendezvous_creations = 0
         self.rendezvous_lookups = []
+        # enable_d2h_future(): WeightSynchronizer.d2h() returns a future and stages the bound tensors in host memory.
+        self.d2h_future = False
+        # When set, every transfer waits for it before it copies anything.
+        self.transfer_gate: threading.Event | None = None
+
+    def enable_d2h_future(self, monkeypatch):
+        """Makes the fake ``tpu-sync-torch`` a build whose ``WeightSynchronizer.d2h()`` returns a future."""
+        self.d2h_future = True
+        module = sys.modules["tpu_sync.api.torch.weight_synchronizer"]
+        monkeypatch.setattr(module, "RaidenFuture", SimpleNamespace, raising=False)
 
     def create_rendezvous(self):
         """Stands in for ``create_tpu_sync_rendezvous``: this job's rendezvous actor and its name."""
@@ -165,14 +176,24 @@ class _FakeTpuSync:
         port = int(address.rsplit(":", 1)[1])
         return next(ws for ws in reversed(self.synchronizers) if ws.local_port == port)
 
-    def transfer(self, src_units, dst_units):
-        """Copies the trainer units' tensors into the rollout units' buffers, resharded per their metadata."""
+    def transfer(self, src_units, dst_units, skip_d2h=False):
+        """Copies the trainer units' tensors into the rollout units' buffers, resharded per their metadata.
+
+        With ``skip_d2h`` the trainer tensors come from the host copies of the last ``d2h()``, else from the bound
+        device tensors.
+        """
         full = {}
         blocks: dict[str, tuple[int, dict[int, torch.Tensor]]] = {}
         for unit in src_units:
             registration = self.registrations[unit]
             ws = self.synchronizer_at(registration.data_addresses[0])
-            for var, tensor in zip(registration.variables, ws.tensors, strict=True):
+            if skip_d2h:
+                assert ws.host is not None, "skip_d2h transfer without a D2H"
+                sources = ws.host
+            else:
+                assert ws.bound, "transfer from an unbound WeightSynchronizer"
+                sources = ws.tensors
+            for var, tensor in zip(registration.variables, sources, strict=True):
                 rest = len(var.shape) - 1
                 indices = getattr(var, "global_shard_indices", None)
                 if indices:
@@ -227,6 +248,7 @@ class _FakeTpuSync:
                 self.unbind_calls = 0
                 self.bound = True
                 self.skip_tiling = None
+                self.host = None
                 world.synchronizers.append(self)
 
             def test_only_set_skip_tiling(self, plan):
@@ -245,6 +267,9 @@ class _FakeTpuSync:
             def d2h(self):
                 assert self.bound, "D2H on an unbound WeightSynchronizer"
                 self.d2h_calls += 1
+                if world.d2h_future:
+                    self.host = [t.clone() for t in self.tensors]
+                    return SimpleNamespace(wait=lambda: None, ok=lambda: True, error_message=lambda: "")
 
             def h2d(self):
                 self.h2d_calls += 1
@@ -258,7 +283,9 @@ class _FakeTpuSync:
                 world.transfers.append(kwargs)
 
                 async def wait():
-                    world.transfer(kwargs["src_units"], kwargs["dst_units"])
+                    if world.transfer_gate is not None:
+                        await asyncio.to_thread(world.transfer_gate.wait)
+                    world.transfer(kwargs["src_units"], kwargs["dst_units"], skip_d2h=kwargs.get("skip_d2h", False))
 
                 return SimpleNamespace(wait=wait)
 
@@ -289,11 +316,6 @@ class _FakeTpuSync:
                     with world.controller._lock:
                         world.controller._registered_shards[unit_id] = registration
 
-        def synchronize(wait=False):
-            if world.fail_tpu_sync:
-                raise RuntimeError("TPU runtime unavailable")
-            world.tpu_syncs += 1
-
         names = (
             "tpu_sync",
             "tpu_sync.api",
@@ -304,8 +326,6 @@ class _FakeTpuSync:
             "tpu_sync.rpc.raiden_controller",  # the tpu-sync library's own module names
             "tpu_sync.rpc.raiden_service_pb2",
             "torch_tpu",
-            "torch_tpu._internal",
-            "torch_tpu._internal.sync",
         )
         mods = {name: ModuleType(name) for name in names}
         attrs: dict[str, dict[str, object]] = {
@@ -319,7 +339,6 @@ class _FakeTpuSync:
                 "RaidenMemoryType": SimpleNamespace(DRAM="DRAM"),
             },
             "tpu_sync.rpc.raiden_service_pb2": {"VariableMetadataProto": lambda **fields: SimpleNamespace(**fields)},
-            "torch_tpu._internal.sync": {"synchronize": synchronize},
         }
         for name, module in mods.items():
             vars(module).update(attrs.get(name, {}))
@@ -327,6 +346,22 @@ class _FakeTpuSync:
             if parent:
                 setattr(mods[parent], child, module)
         return mods
+
+    def accelerator(self):
+        world = self
+
+        def synchronize(device=None):
+            if world.fail_tpu_sync:
+                raise RuntimeError("TPU runtime unavailable")
+            world.tpu_syncs += 1
+
+        return SimpleNamespace(
+            current_accelerator=lambda: SimpleNamespace(type="tpu"),
+            is_available=lambda: True,
+            device_count=lambda: 1,
+            current_device_index=lambda: 0,
+            synchronize=synchronize,
+        )
 
 
 class _FakeActorWorkerGroup:
@@ -346,10 +381,16 @@ class _FakeActorWorkerGroup:
 
         return [_Ref(fn=lambda e=engine, r=rank: send(e, r)) for rank, engine in enumerate(self.engines)]
 
-    def execute_checkpoint_engine(self, methods):
+    def execute_checkpoint_engine(self, methods, *args):
+        """Like verl's DP_COMPUTE dispatch: rank ``r`` runs ``methods[r](*(arg[r] for arg in args))``."""
         (method,) = set(methods)
         self.events.append(method)
-        return [_Ref(fn=getattr(engine, method)) for engine in self.engines]
+        if not args:
+            return [_Ref(fn=getattr(engine, method)) for engine in self.engines]
+        return [
+            _Ref(fn=lambda e=engine, r=rank: getattr(e, method)(*(arg[r] for arg in args)))
+            for rank, engine in enumerate(self.engines)
+        ]
 
 
 class _FakeServer:
@@ -523,6 +564,10 @@ def fake_tpu_sync(monkeypatch):
     world = _FakeTpuSync()
     for name, module in world.modules().items():
         monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(device_api, "_accelerator_is_tpu_cache", None)
+    monkeypatch.setattr(device_api, "_tpu_runtime_up_pid", None)
+    monkeypatch.setattr(torch, "tpu", SimpleNamespace(is_initialized=lambda: True), raising=False)
+    monkeypatch.setattr(torch, "accelerator", world.accelerator())
     monkeypatch.setattr(tpu_sync_engine, "TPU_SYNC_DEVICE", "cpu")
     monkeypatch.setattr(tpu_sync_engine, "get_tpu_sync_rendezvous", world.get_rendezvous)
     monkeypatch.setattr(tpu_sync_engine, "create_tpu_sync_rendezvous", world.create_rendezvous)
@@ -711,9 +756,9 @@ def test_tpu_synchronize_strict_and_lenient(fake_tpu_sync, caplog):
     fake_tpu_sync.fail_tpu_sync = True
     with pytest.raises(RuntimeError, match="TPU synchronization failed"):
         tpu_sync_engine.tpu_synchronize(strict=True)
-    with caplog.at_level(logging.WARNING, logger=tpu_sync_engine.__name__):
+    with caplog.at_level(logging.WARNING, logger=device_api.__name__):
         tpu_sync_engine.tpu_synchronize()
-    assert "Could not synchronize via torch_tpu" in caplog.text
+    assert "Could not synchronize TPU device" in caplog.text
 
 
 def test_setup_tpu_sync_controller_publishes_address(fake_tpu_sync):
@@ -1294,6 +1339,131 @@ def test_update_tpu_sync_weights_step_0_does_not_pause(fake_tpu_sync, worker_ext
     metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
     assert "abort" not in events
     assert metrics["timing_s/tpu-sync/rollout_paused"] == 0.0
+
+
+def _return_after_d2h_setup(worker_ext, **engine_kwargs):
+    tp = trainer_ranks = 2
+    weights = {"current": _trainer_weights(seed=0)}
+    engines = [_trainer_engine(rank) for rank in range(trainer_ranks)]
+    models = [_FakeVllmModel(tp) for _ in range(tp)]
+    samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+    events: list = []
+    manager, server = _make_manager(
+        engines, lambda rank: iter(weights["current"].items()), samplers, events, **engine_kwargs
+    )
+    return weights, engines, models, events, manager, server, tp
+
+
+def test_return_after_d2h_finishes_the_sync_in_the_background(fake_tpu_sync, worker_ext, monkeypatch):
+    fake_tpu_sync.enable_d2h_future(monkeypatch)
+    weights, engines, models, events, manager, server, tp = _return_after_d2h_setup(worker_ext, return_after_d2h=True)
+
+    # Step 0: the first transfer to this rollout keeps the trainer weights bound (tpu-sync may re-stage them).
+    metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    assert set(metrics) == TIMING_KEYS and "set_stage_d2h" not in events
+    assert fake_tpu_sync.transfers[-1].get("skip_d2h") is None
+
+    try:
+        for step in (1, 2):
+            sent = _trainer_weights(seed=step)
+            weights["current"] = sent
+            expected = {name: t.clone() for name, t in sent.items()}
+            events.clear()
+            fake_tpu_sync.transfer_gate = threading.Event()  # hold the background transfer until training "runs"
+            metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=step))
+
+            # Returned once every rank copied its weights to host memory and unbound them; nothing has reached the
+            # rollout yet, and the rollout was not paused.
+            assert metrics["tpu-sync/returned_after_d2h"] == 1.0
+            assert metrics[tpu_sync_engine.TRAINER_D2H_METRIC] >= 0
+            assert events[: 2 if step == 1 else 1] == (["set_stage_d2h"] if step == 1 else []) + ["update_weights"]
+            assert "abort" not in events
+            assert server.global_steps == step - 1
+            for engine in engines:
+                ws = engine._trainer_tpu_sync_ws
+                assert (ws.d2h_calls, ws.bound, engine._bound_tensors) == (step, False, None)
+
+            # Training goes on and overwrites the trainer's tensors; the transfer reads the host copies.
+            for t in sent.values():
+                t.zero_()
+            fake_tpu_sync.transfer_gate.set()
+            background_metrics = asyncio.run(tpu_sync_engine.wait_for_tpu_sync_update(manager))
+            assert set(background_metrics) == TIMING_KEYS
+            assert background_metrics["timing_s/tpu-sync/rollout_paused"] > 0
+            assert fake_tpu_sync.transfers[-1]["skip_d2h"] is True
+            assert "release_sync_buffers" not in events  # the ranks unbound their weights already
+            assert events[-4:] == ["abort", "install_tpu_sync_weights", "set_global_steps", "resume"]
+            assert server.global_steps == step
+            for rank, model in enumerate(models):
+                _assert_state(model, _expected_vllm_state(expected, rank, tp))
+    finally:
+        if fake_tpu_sync.transfer_gate is not None:
+            fake_tpu_sync.transfer_gate.set()
+    fake_tpu_sync.transfer_gate = None
+
+    # Without an explicit wait, the next sync waits for the pending one and reports its background phases.
+    assert asyncio.run(tpu_sync_engine.wait_for_tpu_sync_update(manager)) == {}  # nothing pending
+    for step in (3, 4):
+        weights["current"] = _trainer_weights(seed=step)
+        metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=step))
+    assert metrics["timing_s/tpu-sync/total_sync"] > 0  # step 3's background part
+    assert metrics["timing_s/tpu-sync/wait_previous_sync"] >= 0
+    asyncio.run(tpu_sync_engine.wait_for_tpu_sync_update(manager))
+    assert server.global_steps == 4
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights["current"], rank, tp))
+
+
+def test_return_after_d2h_needs_a_d2h_that_returns_a_future(fake_tpu_sync, worker_ext):
+    weights, engines, models, events, manager, server, tp = _return_after_d2h_setup(worker_ext, return_after_d2h=True)
+    for step in (0, 1):
+        weights["current"] = _trainer_weights(seed=step)
+        metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=step))
+        # An older tpu-sync-torch: the ranks keep their weights bound and the sync runs to the end as before.
+        assert set(metrics) == TIMING_KEYS
+        assert server.global_steps == step
+        for rank, model in enumerate(models):
+            _assert_state(model, _expected_vllm_state(weights["current"], rank, tp))
+    assert "set_stage_d2h" in events
+    assert all(engine._trainer_tpu_sync_ws.d2h_calls == 0 for engine in engines)
+    assert all("skip_d2h" not in transfer for transfer in fake_tpu_sync.transfers)
+
+
+def test_return_after_d2h_raises_a_background_failure_on_the_next_sync(fake_tpu_sync, worker_ext, monkeypatch):
+    fake_tpu_sync.enable_d2h_future(monkeypatch)
+    weights, engines, models, events, manager, server, tp = _return_after_d2h_setup(worker_ext, return_after_d2h=True)
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+
+    def broken_install(**kwargs):
+        raise RuntimeError("install failed")
+
+    for sampler in server.workers:
+        monkeypatch.setattr(sampler, "install_tpu_sync_weights", broken_install)
+    weights["current"] = _trainer_weights(seed=1)
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))  # returns after the D2H
+    with pytest.raises(RuntimeError, match="install failed"):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=2))
+    assert server.global_steps == 0  # neither step 1 nor step 2 reached the rollout
+
+
+def test_wait_for_weight_update_hook_waits_for_the_background_sync(fake_tpu_sync, worker_ext, monkeypatch):
+    """verl's CheckpointEngineManager.wait_for_weight_update (called before validation and at the end of training)
+    waits for a tpu-sync update that finishes in the background."""
+    fake_tpu_sync.enable_d2h_future(monkeypatch)
+    weights, engines, models, events, manager, server, tp = _return_after_d2h_setup(worker_ext, return_after_d2h=True)
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    weights["current"] = _trainer_weights(seed=1)
+    fake_tpu_sync.transfer_gate = threading.Event()
+    try:
+        metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+        assert metrics["tpu-sync/returned_after_d2h"] == 1.0 and server.global_steps == 0
+        threading.Timer(0.05, fake_tpu_sync.transfer_gate.set).start()
+        # The patched method is synchronous for trainers (auto_await) and returns once the rollout holds step 1.
+        assert ckpt_base.CheckpointEngineManager.wait_for_weight_update(manager) is None
+        assert server.global_steps == 1
+    finally:
+        fake_tpu_sync.transfer_gate.set()
+        fake_tpu_sync.transfer_gate = None
 
 
 def _exact_parity_setup(worker_ext, weights, tp, verify_parity, flip_o_proj=False, loaded=True):

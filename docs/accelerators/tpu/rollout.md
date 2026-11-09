@@ -49,9 +49,10 @@ lines of the libtpu start-up dump that each TPU worker prints.
 TPU options of the TorchTitan engine go in its config, under `engine_kwargs.tpu`, like verl's other
 per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 `+actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.use_simple_fsdp=False`. Supported keys:
-`use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`,
-`optim_impl`, `seq_bucket_size` and `context_parallel_strategy` (see `TPUEngineOptions` in `options.py`); an unknown key is
-an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
+`use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`,
+`tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`,
+`mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `model_kernels`, `ep_capacity_factor` and
+`context_parallel_strategy` (see `TPUEngineOptions` in `options.py`); an unknown key is an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
 deprecated and log a warning.
 
 Qwen3 MoE models (HF `qwen3_moe`, e.g. Qwen3-30B-A3B) need no extra option. The engine turns off torchtitan's
@@ -60,6 +61,26 @@ TPU token dispatcher and Pallas grouped matmul (required: torchtitan's default `
 backward on TPU). This needs `expert_parallel_size=1` and a `seq_bucket_size` that times `num_experts_per_tok` is a
 multiple of 256 (the default 256 is); otherwise the engine raises. `use_dynamic_bsz=True` works on TPU: the plugin runs
 its int64 MAX / MIN all-reduces in int32, which `tpu_dist` supports.
+
+MoE models also require the fused LM-head log-prob (`use_fused_linear_cross_entropy`, on by default for them, with or
+without `use_torch_compile`): Tokamax's fused linear + softmax + cross-entropy Pallas kernel computes the per-token
+log-probs without writing the `[tokens, vocab]` logits (151,936 columns for Qwen3) to HBM, which is what lets a
+micro-batch of tens of thousands of tokens per chip fit. Its backward runs in PyTorch, in chunks of 2048 tokens (with
+tokamax 0.0.14, the Mosaic-TPU backward kernel returns a wrong LM-head weight gradient). Entropy, when a pass reports it without
+differentiating it (old log-probs), is computed one chunk of tokens at a time. If the kernel cannot be used
+(`tensor_parallel_size > 1`, tokamax missing) the engine raises instead of falling back to the logits; set
+`use_fused_linear_cross_entropy=False` to run without it. The engine logs the log-prob path it uses
+(`TPU log-prob path: ...`).
+
+Performance options for long packed micro-batches (the Qwen3-30B-A3B recipe sets them):
+
+| Option | Effect |
+|---|---|
+| `splash_max_block_size: 1024` | Largest Splash attention block (torchtitan's default 512). Splash's grid grows as `(tokens / block)^2`; 1024 cut `update_actor` by 17% at 24k tokens per chip on v5p |
+| `static_micro_batch_len: <tokens>` | Pads every packed micro-batch to at least this length (e.g. the `use_dynamic_bsz` token budget), so the trainer compiles one shape instead of recompiling when the packed length reaches a new bucket (`static_max_response_len` does the same for the response length) |
+| `moe_paired_grouped_mm: true` | Qwen3 MoE: torchtitan's paired W1/W3 Pallas grouped matmul (shares the routed-token loads) |
+| `moe_native_weight_layout: true` | Qwen3 MoE: kernel-native `(E, K, N)` expert weights; `state_dict()` / `load_state_dict()` keep the canonical layout and names, so the HF load and the tpu-sync expert export are unchanged |
+| `mixed_precision_reduce: bfloat16` | bf16 FSDP gradient reduce-scatter instead of fp32 (half the traffic; a performance A/B option) |
 
 The rollout settings that matter on TPU (the recipes already set them):
 
