@@ -36,6 +36,13 @@ try:
 except Exception as exc:
     logger.debug("ROCm ${primus:...} config resolver registration failed: %s", exc)
 
+try:
+    from verl_hardware_plugin.accelerators.rocm.hydra_searchpath import register_search_path
+
+    register_search_path()
+except Exception as exc:
+    logger.debug("ROCm Hydra config search path registration failed: %s", exc)
+
 if _is_rocm():
     try:
         from verl_hardware_plugin.accelerators.rocm.primus.megatron import engine  # noqa: F401

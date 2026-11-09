@@ -21,7 +21,8 @@ needed.
 verl_hardware_plugin/accelerators/rocm/
 ├── registration.py          # Registers the ${primus:...} resolver and, on ROCm torch, both engines
 ├── launch.py                # python -m ...rocm.launch <primus.yaml> [verl overrides]
-├── config/                  # Hydra groups appended to verl's search path (hydra_plugins/verl_hardware_plugin_rocm)
+├── hydra_searchpath.py      # Appends config/ to verl's Hydra search path (registered by registration.py)
+├── config/                  # Hydra groups: model_engine=primus / maxtext
 │   ├── model_engine/        # primus.yaml, maxtext.yaml
 │   ├── actor/ ref/ critic/  # primus_*.yaml extend verl's megatron_*; maxtext_*.yaml extend actor/ref/critic
 │   └── engine/maxtext.yaml  # MaxTextEngineConfig defaults

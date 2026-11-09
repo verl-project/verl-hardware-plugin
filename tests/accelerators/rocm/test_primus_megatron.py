@@ -170,6 +170,9 @@ def test_launcher_keeps_user_model_path(fake_primus, tmp_path):
 def test_hydra_groups_compose_with_verl(fake_primus):
     hydra = pytest.importorskip("hydra")
     import verl
+    from verl_hardware_plugin.accelerators.rocm.hydra_searchpath import register_search_path
+
+    register_search_path()
 
     config_dir = Path(verl.__file__).parent / "trainer" / "config"
     if not (config_dir / "actor" / "megatron_actor.yaml").exists():

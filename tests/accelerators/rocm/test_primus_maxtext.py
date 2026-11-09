@@ -166,7 +166,10 @@ def test_hydra_groups_compose_with_verl(fake_primus):
     hydra = pytest.importorskip("hydra")
     import verl
     from verl.utils.config import omega_conf_to_dataclass
+    from verl_hardware_plugin.accelerators.rocm.hydra_searchpath import register_search_path
     from verl_hardware_plugin.accelerators.rocm.primus.maxtext.config import MaxTextActorConfig, MaxTextEngineConfig
+
+    register_search_path()
 
     config_dir = Path(verl.__file__).parent / "trainer" / "config"
     with hydra.initialize_config_dir(config_dir=str(config_dir), version_base=None):
