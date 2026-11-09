@@ -273,6 +273,45 @@ def test_launch_tpu_vllm_servers_rejects_data_parallel(tpu_vllm):
         asyncio.run(tpu_vllm.launch_tpu_vllm_servers(_fake_replica(data_parallel_size=2)))
 
 
+@pytest.mark.parametrize(
+    "pod_type, chips, topology",
+    [
+        ("v7x-8", 8, "2,2,1,2"),
+        ("v6e-8", 8, "2,4,1"),
+        ("v5p-16", 4, "2,2,1"),
+        # TP=2 / TP=4 on TPU 7x: no known sub-host mesh, so the replica keeps the inherited value instead of failing.
+        ("v7x-8", 2, None),
+        ("v7x-8", 4, None),
+    ],
+)
+def test_launch_tpu_vllm_servers_single_host_topology_from_ray(tpu_vllm, monkeypatch, pod_type, chips, topology):
+    # The launcher may run on a CPU Ray head: no TPU_ACCELERATOR_TYPE, but the slice's TORCH_TPU_TOPOLOGY may leak.
+    monkeypatch.delenv("TPU_ACCELERATOR_TYPE", raising=False)
+    monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "2,2,4")
+    replica = _fake_replica()
+    replica.workers = [_FakeWorker(NODE_A) for _ in range(chips)]
+    replica.gpus_per_replica_node = chips
+    replica.nnodes = 1
+    nodes = [
+        {"Alive": True, "Resources": {"TPU": 4.0}, "NodeID": NODE_B, "Labels": {"ray.io/tpu-pod-type": "v6e-4"}},
+        {"Alive": True, "Resources": {"TPU": 4.0}, "NodeID": NODE_A, "Labels": {"ray.io/tpu-pod-type": pod_type}},
+    ]
+    platform = SimpleNamespace(ray_noset_envvars=lambda: [], rollout_env_vars=lambda: {})
+
+    async def run():
+        with (
+            mock.patch.object(tpu_vllm, "get_platform", return_value=platform),
+            mock.patch("ray.is_initialized", return_value=True),
+            mock.patch("ray.nodes", return_value=nodes),
+        ):
+            await tpu_vllm.launch_tpu_vllm_servers(replica)
+
+    asyncio.run(run())
+
+    [options] = replica.server_class.options_kwargs
+    assert options["runtime_env"]["env_vars"].get("TORCH_TPU_TOPOLOGY") == topology
+
+
 # ---------------------------------------------------------------------------
 # patch_vllm_for_tpu (without vllm-torchtpu installed)
 # ---------------------------------------------------------------------------

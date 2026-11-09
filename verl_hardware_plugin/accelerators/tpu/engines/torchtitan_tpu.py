@@ -70,18 +70,19 @@ from verl.workers.engine.utils import (
     prepare_micro_batches,
 )
 from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels, tpu_ragged_ep
+from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
     align_micro_batch_shapes_across_ranks,
     bucket_length,
+    chunked_entropy_from_hidden_tpu,
     compute_global_batch_num_tokens,
     compute_tpu_logprobs_chunked,
     configure_torch_compile_for_tpu,
     create_noop_dataloader_config,
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
-    fused_linear_logprobs_tpu,
     get_text_config,
     get_torchtitan_model_module_name,
     get_tpu_seq_bucket_size,
@@ -90,8 +91,11 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     install_tpu_attention,
     move_tpu_params_,
     pad_packed_inputs_for_tpu,
+    resolve_tpu_mixed_precision_reduce,
+    resolve_tpu_splash_max_block_size,
     resolve_tpu_torchtitan_options,
     resolve_tpu_use_fused_linear_cross_entropy,
+    set_splash_max_block_size,
     spmd_no_typecheck_context,
     torchtitan_model_attn_backend,
     tpu_eager_mode_context,
@@ -836,6 +840,51 @@ class TPUEngineTrainModeCtx(BaseEngineCtx):
         super().__exit__(exc_type, exc_value, traceback)
 
 
+_SPLASH_ROUTING_SELECTIVE_AC_CLS: Any = None
+_PALLAS_SPLASH_FWD_OP_MARKER = "splash_attn_fwd"
+
+
+def _op_qualified_name(op: Any) -> str:
+    name_fn = getattr(op, "name", None)
+    if callable(name_fn):
+        try:
+            return str(name_fn())
+        except Exception:
+            pass
+    return str(op)
+
+
+class _SplashAndRoutingSaveOps(set):
+    """Selective-AC save set keeping only Pallas ``SplashAttention`` forward outputs and MoE router ``aten.topk``."""
+
+    def __contains__(self, op: Any) -> bool:
+        try:
+            if super().__contains__(op):
+                return True
+        except TypeError:
+            pass
+        return _PALLAS_SPLASH_FWD_OP_MARKER in _op_qualified_name(op)
+
+
+def _splash_and_routing_selective_ac_config() -> Any:
+    """Builds a ``SelectiveAC.Config`` saving only ``SplashAttention`` forward ``(out, lse)`` and ``aten.topk``."""
+    global _SPLASH_ROUTING_SELECTIVE_AC_CLS
+    if _SPLASH_ROUTING_SELECTIVE_AC_CLS is None:
+        from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+        class _SplashAndRoutingSelectiveAC(SelectiveAC):
+            @dataclasses.dataclass(kw_only=True, slots=True)
+            class Config(SelectiveAC.Config):
+                preserve_rng_state: bool = False
+                force_recompute_mm_shapes_by_fqns: list[str] = dataclasses.field(default_factory=list)
+
+            def get_save_ops(self) -> set:
+                return _SplashAndRoutingSaveOps({torch.ops.aten.topk.default})
+
+        _SPLASH_ROUTING_SELECTIVE_AC_CLS = _SplashAndRoutingSelectiveAC
+    return _SPLASH_ROUTING_SELECTIVE_AC_CLS.Config()
+
+
 class TorchTitanTPUEngine(BaseEngine):
     """Standalone TorchTitan engine for Google TPU with ``tpu_dist`` / PJRT SPMD execution."""
 
@@ -881,10 +930,10 @@ class TorchTitanTPUEngine(BaseEngine):
             self._use_simple_fsdp,
             self._tpu_eager_mode,
         ) = resolve_tpu_torchtitan_options(engine_config)
-        self._use_fused_linear_cross_entropy = resolve_tpu_use_fused_linear_cross_entropy(engine_config)
 
         if engine_config.use_torch_compile:
             configure_torch_compile_for_tpu()
+            tpu_model_kernels.patch_torchtitan_tpu_dynamo_caches()
 
         # Derive torchtitan model name and flavor from HF config
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
@@ -913,6 +962,12 @@ class TorchTitanTPUEngine(BaseEngine):
         )
         # Mandatory per-model TPU setup (engines/tpu_model_kernels.py, _MODEL_SETUPS), e.g. Qwen3 MoE.
         setup = tpu_model_kernels.model_setup(torchtitan_name, self.model_config.hf_config)
+        # MoE models require the fused LM-head log-prob: their per-chip token budgets only fit without the
+        # [tokens, vocab] logits, so the engine raises rather than falling back to them.
+        self._fused_logprob_required = setup is not None and setup.requires_fused_logprob
+        self._use_fused_linear_cross_entropy = resolve_tpu_use_fused_linear_cross_entropy(
+            engine_config, required=self._fused_logprob_required
+        )
         model_spec = model_module.model_registry(
             torchtitan_flavor,
             attn_backend=torchtitan_model_attn_backend(torchtitan_name, self.engine_config.attn_type),
@@ -925,6 +980,8 @@ class TorchTitanTPUEngine(BaseEngine):
             model_spec,
             self._tpu_kernels,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
+            ep_token_chunks=tpu_options.ep_token_chunks,
+            ep_paired_grouped_mm=bool(tpu_options.ep_paired_grouped_mm),
         )
         if setup is not None and setup.configure is not None:
             setup.configure(
@@ -932,6 +989,8 @@ class TorchTitanTPUEngine(BaseEngine):
                 tpu_model_kernels.ModelSetupContext(
                     expert_parallel_size=self.engine_config.expert_parallel_size,
                     seq_bucket_size=get_tpu_seq_bucket_size(self.engine_config),
+                    moe_paired_grouped_mm=bool(tpu_options.moe_paired_grouped_mm),
+                    moe_native_weight_layout=bool(tpu_options.moe_native_weight_layout),
                 ),
             )
         if self._use_simple_fsdp:
@@ -1020,6 +1079,9 @@ class TorchTitanTPUEngine(BaseEngine):
             training_kwargs["mixed_precision_reduce"] = "bfloat16"
         if self.engine_config.max_seq_len is not None:
             training_kwargs["max_context_length"] = self.engine_config.max_seq_len
+        mixed_precision_reduce = resolve_tpu_mixed_precision_reduce(engine_config)
+        if mixed_precision_reduce is not None:
+            training_kwargs["mixed_precision_reduce"] = mixed_precision_reduce
         training = TrainingConfig(**training_kwargs)
 
         # Pad positions run 0..pad_size-1 (< bucket) and index the RoPE cache sized by max_context_length.
@@ -1042,6 +1104,8 @@ class TorchTitanTPUEngine(BaseEngine):
             ac_mode = "none"
         if self.engine_config.forward_only:
             activation_checkpoint = None
+        elif tpu_options.ac_save_splash_and_routing and ac_mode != "none":
+            activation_checkpoint = _splash_and_routing_selective_ac_config()
         else:
             activation_checkpoint = {
                 # torchtitan's TPUSelectiveAC drops collectives from the selective-AC save set so backward
@@ -1069,21 +1133,19 @@ class TorchTitanTPUEngine(BaseEngine):
             loss=CrossEntropyLoss.Config(),
         )
         if self._use_fused_linear_cross_entropy:
-            try:
-                from torchtitan.experiments.tpu.qwen3.config_registry import _FUSED_LOSS_OVERRIDE
-            except ImportError:
-                logger.warning(
-                    "Disabling use_fused_linear_cross_entropy: "
-                    "torchtitan.experiments.tpu.qwen3.config_registry not found"
-                )
-                self._use_fused_linear_cross_entropy = False
-            else:
-                if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
-                    self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+            self._enable_fused_logprob_head()
+        logger.warning(
+            "TPU log-prob path: %s",
+            "fused Tokamax linear + log-softmax (Pallas forward, chunked backward)"
+            if self._use_fused_linear_cross_entropy
+            else "LM-head logits + chunked log-softmax",
+        )
         for override_import in tpu_model_kernels.override_imports(self._tpu_kernels):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
         self.trainer = Trainer(self.config)
+        if engine_config.use_torch_compile:
+            tpu_model_kernels.patch_torchtitan_tpu_dynamo_caches()
         self.parallel_dims = self.trainer.parallel_dims
         self._dp_group = self._build_dp_gloo_group()
         # Like torchtitan's init_distributed (which verl bypasses): no autograd multithreading, so backward-thread
@@ -1099,6 +1161,8 @@ class TorchTitanTPUEngine(BaseEngine):
             for model_part in model_parts:
                 enable_fsdp_gradient_division(model_part, dp_size)
 
+        if self._use_splash_attention:
+            set_splash_max_block_size(resolve_tpu_splash_max_block_size(engine_config))
         install_tpu_attention(model_parts, use_splash=self._use_splash_attention)
         if self.parallel_dims.ep_enabled:
             ep_cap = (
@@ -1120,6 +1184,10 @@ class TorchTitanTPUEngine(BaseEngine):
                     ep_cap,
                     n_ep,
                 )
+            if engine_config.use_torch_compile and ep_mode == "static":
+                n_barriers = tpu_model_kernels.install_ep_chunk_barriers(model_parts)
+                if n_barriers:
+                    logger.info("Installed EP chunk window barriers on %d routed-experts modules", n_barriers)
 
         if engine_config.use_torch_compile:
             n_compiled = sum(
@@ -1406,15 +1474,22 @@ class TorchTitanTPUEngine(BaseEngine):
             dp_group=dp_group,
             same_micro_num_in_dp=True,
         )
-        if self._use_simple_fsdp or self.parallel_dims.cp_enabled:
+        tpu_options = get_tpu_engine_options(self.engine_config)
+        static_len = int(tpu_options.static_micro_batch_len or 0)
+        static_response_len = int(tpu_options.static_max_response_len or 0)
+        if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len:
             align_micro_batch_shapes_across_ranks(
-                micro_batches, bucket_size=get_tpu_seq_bucket_size(self.engine_config)
+                micro_batches,
+                bucket_size=get_tpu_seq_bucket_size(self.engine_config),
+                static_len=static_len,
+                static_response_len=static_response_len,
             )
 
         if "kda" in getattr(self, "_tpu_kernels", ()):
             # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
-            # micro-batch is one packed document, plus the bucket-padding tail.
-            budget = max(int(mb.batch_size[0]) for mb in micro_batches) + 1
+            # micro-batch is one packed document, plus the bucket-padding tail; bucketed so that use_dynamic_bsz's
+            # varying sequence counts do not recompile the kernels (see packed_document_budget).
+            budget = tpu_model_kernels.packed_document_budget(max(int(mb.batch_size[0]) for mb in micro_batches))
             updated = tpu_model_kernels.set_packed_document_budget(self.module, budget)
             if updated:
                 logger.info("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)
@@ -2175,6 +2250,31 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
         return input_ids, extra_inputs, extra_kwargs, output_args
 
+    def _enable_fused_logprob_head(self) -> None:
+        """Makes the LM head return ``(hidden_states, weight_t)`` (torchtitan's fused-loss override) for the fused
+        log-prob, and checks that the Tokamax kernel can be imported.
+
+        Without them the fused log-prob is turned off with a warning, or, if the model requires it, the engine
+        raises.
+        """
+        from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import require_tokamax
+
+        try:
+            from torchtitan.experiments.tpu.qwen3.config_registry import _FUSED_LOSS_OVERRIDE
+
+            require_tokamax()
+        except (ImportError, RuntimeError) as e:
+            if self._fused_logprob_required:
+                raise RuntimeError(
+                    "This model requires the fused LM-head log-prob (engine_kwargs.tpu.use_fused_linear_cross_entropy)"
+                    f", but it is unavailable: {e!r}. Set use_fused_linear_cross_entropy=False to run without it."
+                ) from e
+            logger.warning("Disabling use_fused_linear_cross_entropy: %r", e)
+            self._use_fused_linear_cross_entropy = False
+            return
+        if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
+            self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+
     def _maybe_gather_context_parallel(self, tensor: torch.Tensor, output_args: dict) -> torch.Tensor:
         """Under CP, gather this rank's token shard into the full bucket-padded sequence (original token order)."""
         if not self.parallel_dims.cp_enabled:
@@ -2219,12 +2319,21 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                         vocab_size=int(lm_head_weight_t.shape[1]),
                     ),
                 )
-                if not calculate_entropy:
+                if calculate_entropy and not torch.is_grad_enabled():
+                    # Entropy without gradient (old log-probs): one chunk of logits at a time, never all of them.
+                    entropy_rmpad = chunked_entropy_from_hidden_tpu(hidden_rmpad, lm_head_weight_t, temperature)
+                    model_output["entropy"] = _to_jagged(
+                        self._maybe_gather_context_parallel(entropy_rmpad, output_args),
+                        cu_seqlens,
+                        output_args.get("orig_seq_len"),
+                    )
+                if not calculate_entropy or not torch.is_grad_enabled():
                     fused_log_probs = self._maybe_gather_context_parallel(fused_log_probs, output_args)
                     model_output["log_probs"] = _to_jagged(fused_log_probs, cu_seqlens, output_args.get("orig_seq_len"))
                     return model_output
-            # Entropy needs the logits. The log-probs still come from the fused kernel, so the reference, old-log-prob
-            # and update passes all compute them the same way (an on-policy PPO ratio is exactly 1).
+            # A differentiated entropy (entropy loss) needs the logits. The log-probs still come from the fused kernel,
+            # so the reference, old-log-prob and update passes all compute them the same way (an on-policy PPO ratio
+            # is exactly 1).
             logits = hidden_states @ lm_head_weight_t
 
         if use_remove_padding:
