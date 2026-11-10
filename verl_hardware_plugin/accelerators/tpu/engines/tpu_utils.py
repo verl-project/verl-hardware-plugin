@@ -1176,6 +1176,27 @@ def set_splash_max_block_size(max_block_size: int) -> None:
     logger.info("Splash attention: largest block size %d", max_block_size)
 
 
+def row_slot_permutation(cu_seqlens: torch.Tensor, padded_len: int, slot_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(slot_src, contig_src)``: packed -> one-sequence-per-``slot_len``-row layout and back.
+
+    Sequence ``i`` moves to token ``i * slot_len``; the packed padding fills the rest. ``packed[slot_src]`` is the slot
+    layout and ``slot_layout[contig_src]`` the packed one.
+    """
+    offsets = cu_seqlens.tolist()
+    lengths = [b - a for a, b in zip(offsets[:-1], offsets[1:], strict=True)]
+    if padded_len % slot_len or len(lengths) > padded_len // slot_len or max(lengths, default=0) > slot_len:
+        raise ValueError(
+            f"gdn_row_slot_len={slot_len}: sequences {lengths} do not fit a {padded_len}-token micro-batch"
+        )
+    slot_src = torch.full((padded_len,), -1, dtype=torch.int64)
+    for i, (start, length) in enumerate(zip(offsets[:-1], lengths, strict=True)):
+        slot_src[i * slot_len : i * slot_len + length] = torch.arange(start, start + length)
+    slot_src[slot_src < 0] = torch.arange(offsets[-1] if offsets else 0, padded_len)
+    contig_src = torch.empty_like(slot_src)
+    contig_src[slot_src] = torch.arange(padded_len)
+    return slot_src, contig_src
+
+
 def install_tpu_attention(modules: Any, use_splash: bool) -> int:
     """Run TPU attention for every ``inner_attention``: torchtitan's ``SplashAttention`` or ``TPUVarlenAttention``.
 
