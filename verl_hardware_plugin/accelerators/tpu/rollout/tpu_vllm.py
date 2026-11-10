@@ -21,15 +21,19 @@ The same logic previously lived behind ``get_resource_name() == "TPU"`` branches
 """
 
 import asyncio
+import logging
 
 import ray
 
 from verl.plugin.platform import get_platform
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
+from verl_hardware_plugin.accelerators.tpu.platform_tpu import ray_tpu_accelerator_name, single_host_tpu_topology
 from verl_hardware_plugin.accelerators.tpu.profilers.tpu_vllm_timeline import vLLMServerTimelineMixin
 from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import patch_vllm_for_tpu
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import TPU_SYNC_BACKEND, canonical_backend
+
+logger = logging.getLogger(__name__)
 
 # vLLM imports the worker extension by name in its worker processes.
 TPU_SYNC_WORKER_EXTENSION_CLS = (
@@ -66,6 +70,23 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
         # vllm-torchtpu's default; set so that a job-level value cannot switch the replica to the Ray backend.
         "TPU_MULTIHOST_BACKEND": "mp",
     }
+    if replica.nnodes == 1:
+        # A replica on one host (e.g. one of several replicas on a multi-host rollout slice) is its own mesh; it
+        # must not inherit the slice's TORCH_TPU_TOPOLOGY. Multi-host replicas get theirs from vllm-torchtpu's
+        # rendezvous. The TPU type comes from the replica's host, not from this process's environment, which
+        # may be a CPU Ray head without TPU_ACCELERATOR_TYPE. Sizes without a known mesh (e.g. TP=2 / TP=4 on TPU
+        # 7x) keep the inherited environment, as before.
+        pod_type = ray_tpu_accelerator_name(node_ids=list(node_ids))
+        topology = single_host_tpu_topology(chips_per_host, pod_type=pod_type)
+        if topology:
+            env_vars["TORCH_TPU_TOPOLOGY"] = topology
+        else:
+            logger.warning(
+                "No single-host TPU mesh of %d chips (TPU type %r); the rollout replica keeps the inherited "
+                "TORCH_TPU_TOPOLOGY",
+                chips_per_host,
+                pod_type,
+            )
     prefix = replica._get_server_name_prefix()
     for node_rank, node_id in enumerate(node_ids):
         if replica.is_reward_model:

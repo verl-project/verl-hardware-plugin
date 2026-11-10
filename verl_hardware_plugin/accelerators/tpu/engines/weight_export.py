@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterable, Iterator, Optional
 
 import torch
 from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_name
@@ -38,6 +39,9 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
       activations, not parameters), so the parameters are again ``Shard(0)`` on a 1-D mesh: exported locally.
     * **EP** (``Shard(0)`` on the ``ep`` mesh dimension, with any size-1 dimensions such as ``efsdp=1`` ignored):
       whole-expert blocks sharded across ``ep``, exported locally.
+    * **SimpleFSDP + EP with efsdp > 1** (``(_StridedShard(0, split_factor=ep), Shard(0))`` on ``(efsdp, ep)``):
+      each rank still holds contiguous whole experts, block ``i_ep * efsdp + i_efsdp`` of ``efsdp * ep``, exported
+      locally (``_efsdp_ep_dim0_shard``).
     * **Replicated** (``Replicate()`` placements, or a plain tensor): ``None``. Every rank already holds the full
       tensor, so it is exported full without further communication here. It may have been gathered upstream,
       though: torchtitan's ``FusedQKVLinear`` (``fuse_qkv=True``) keeps ``wqkv`` FSDP sharded (``Shard(0)``) in
@@ -45,8 +49,9 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
       all-gather) before splitting it into q/k/v_proj. TODO: split ``wqkv`` locally so q/k/v export as local shards.
     * **Uneven dim-0 cuts**: ``None``, gathered. torch gives the remainder rows to the leading ranks, which is not
       the equal-block layout tpu-sync assumes.
-    * **FSDP x TP, HSDP** (2-D meshes) and ``_StridedShard``: ``None``, gathered. TODO: register these as n-D
-      blocks (``mesh_shape`` / ``global_shard_indices`` per dimension) once tpu-sync is confirmed to describe them.
+    * **FSDP x TP, HSDP** (2-D meshes) and other ``_StridedShard`` layouts: ``None``, gathered. TODO: register these
+      as n-D blocks (``mesh_shape`` / ``global_shard_indices`` per dimension) once tpu-sync is confirmed to describe
+      them.
     * **Expert stacks** (torchtitan's fused ``[E, ...]`` MoE weights): with an ``expert_stack_wire`` hook (Qwen3 MoE,
       ``rollout.qwen3_moe_layout``), ``local_shards()`` sends each stack as one 3-D tensor. An FSDP/EP ``Shard(0)``
       of whole experts, as this function recognizes it, is a dim-0 block of it and is exported locally. Any other
@@ -65,7 +70,11 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
     # Mesh dimensions of size 1 do not split anything (e.g. the ``efsdp`` dimension of routed experts when EP spans
     # every rank), so only the active dimensions have to form a 1-D layout.
     active = [d for d in range(mesh.ndim) if mesh.size(d) > 1]
-    if len(active) != 1 or len(param.placements) != mesh.ndim:
+    if len(param.placements) != mesh.ndim:
+        return None
+    if len(active) == 2:
+        return _efsdp_ep_dim0_shard(param, mesh, active)
+    if len(active) != 1:
         return None
     dim = active[0]
     placement = param.placements[dim]
@@ -84,6 +93,39 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
     if coordinate is None:
         return None
     return num_shards, int(coordinate[dim])
+
+
+def _efsdp_ep_dim0_shard(param: DTensor, mesh: Any, active: list[int]) -> Optional[tuple[int, int]]:
+    """``(efsdp * ep, i_ep * efsdp + i_efsdp)`` for torchtitan's SimpleFSDP + EP routed-expert layout.
+
+    With ``1 < EP < world`` (``efsdp > 1``), SimpleFSDP distributes the EP ``Shard(0)`` expert stack over
+    ``(efsdp, ep)`` as ``(_StridedShard(0, split_factor=ep), Shard(0))``: ``ep`` rank ``i_ep`` owns experts
+    ``[i_ep * E/ep, (i_ep + 1) * E/ep)``, and ``efsdp`` rank ``i_efsdp`` holds contiguous sub-block ``i_efsdp`` of
+    those. Each rank therefore holds whole contiguous experts at global dim-0 block ``i_ep * efsdp + i_efsdp`` of
+    ``efsdp * ep`` equal blocks, which tpu-sync places without any gather.
+    """
+    d_outer, d_inner = active
+    outer, inner = param.placements[d_outer], param.placements[d_inner]
+    inner_size = mesh.size(d_inner)
+    outer_size = mesh.size(d_outer)
+    if type(inner) is not Shard or inner.dim != 0:
+        return None
+    if not isinstance(outer, _StridedShard) or outer.dim != 0 or outer.split_factor != inner_size:
+        return None
+    # Any size-1 mesh dimension must not shard anything else.
+    for d, placement in enumerate(param.placements):
+        if d not in active and mesh.size(d) != 1:
+            return None
+    num_shards = outer_size * inner_size
+    full_rows = int(param.shape[0])
+    if full_rows % num_shards:
+        return None
+    if int(param.to_local().shape[0]) != full_rows // num_shards:
+        return None
+    coordinate = mesh.get_coordinate()
+    if coordinate is None:
+        return None
+    return num_shards, int(coordinate[d_inner]) * outer_size + int(coordinate[d_outer])
 
 
 def _is_replicated(param: Any) -> bool:

@@ -11,7 +11,9 @@ eager-mode contexts for ``torch_tpu`` training.
 
 from __future__ import annotations
 
+import functools
 import importlib
+import inspect
 import logging
 import math
 import os
@@ -31,6 +33,8 @@ from torch.distributed.tensor import DTensor
 
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import TorchtitanEngineConfig
+from verl_hardware_plugin.accelerators.tpu.device_api import tpu_synchronize
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_model_kernels import has_64mib_scoped_vmem
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 
 logger = logging.getLogger(__name__)
@@ -356,21 +360,71 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
     return use_splash_attention, use_simple_fsdp, tpu_eager_mode
 
 
-def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any) -> bool:
-    """Resolve whether to use the TPU Pallas fused linear + softmax cross-entropy kernel for logprobs.
+def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any, *, required: bool = False) -> bool:
+    """Whether to compute log-probs with the fused LM-head + cross-entropy kernel (``engines.fused_logprob``).
 
-    On by default with ``use_torch_compile`` when ``tensor_parallel_size == 1``. The kernel never writes the
-    ``[tokens, vocab]`` logits to HBM and keeps them in fp32, so its log-probs are more precise than verl's GPU
-    path, which rounds the logits to bf16 before the fp32 log-softmax. Disabled when ``tensor_parallel_size > 1``
-    because ``FusedLossLinearWrapper`` returns a ``(hidden_states, weight_t)`` tuple that is incompatible with
-    TorchTitan's ``ColwiseParallel`` output redistribution (TP uses :func:`compute_tpu_logprobs_chunked` instead).
+    The kernel never materializes the ``[tokens, vocab]`` logits, which saves memory and keeps them in fp32.
+    It only supports ``tensor_parallel_size == 1``.
+
+    Default: on with ``use_torch_compile``. With ``required`` (set by the engine for models that need it, e.g. MoE),
+    it is on by default and TP > 1 raises instead of falling back. ``use_fused_linear_cross_entropy=False`` always
+    turns it off.
     """
-    if getattr(engine_config, "tensor_parallel_size", 1) > 1:
+    user_choice = get_tpu_engine_options(engine_config).use_fused_linear_cross_entropy  # None (unset), True or False
+    tp_size = int(getattr(engine_config, "tensor_parallel_size", 1) or 1)
+
+    # 1. An explicit opt-out always wins.
+    if user_choice is False:
+        if required:
+            logger.warning(
+                "use_fused_linear_cross_entropy=False on a model that requires the fused log-prob: the "
+                "[tokens, vocab] logits are materialized and large token budgets may run out of memory"
+            )
         return False
-    return _or_default(
-        get_tpu_engine_options(engine_config).use_fused_linear_cross_entropy,
-        bool(getattr(engine_config, "use_torch_compile", False)),
-    )
+
+    # 2. The kernel does not support tensor parallelism.
+    if tp_size > 1:
+        if required:
+            raise ValueError(
+                f"tensor_parallel_size={tp_size}: this model requires the fused LM-head log-prob "
+                "(engine_kwargs.tpu.use_fused_linear_cross_entropy), which supports tensor_parallel_size=1 only. "
+                "Use FSDP (data_parallel_shard_size) instead, or set use_fused_linear_cross_entropy=False."
+            )
+        return False
+
+    # 3. On if the model requires it or the user asked for it; if unset, on with torch.compile.
+    if required or user_choice:
+        return True
+    return bool(getattr(engine_config, "use_torch_compile", False))
+
+
+_DEFAULT_SPLASH_MAX_BLOCK_SIZE = 512  # torchtitan's splash_block_size_for default
+_MIN_SPLASH_BLOCK_SIZE = 128
+
+
+def resolve_tpu_splash_max_block_size(engine_config: Any) -> int:
+    """``engine_kwargs.tpu.splash_max_block_size`` (default 512); a power of two >= 128."""
+    value = get_tpu_engine_options(engine_config).splash_max_block_size
+    block = _DEFAULT_SPLASH_MAX_BLOCK_SIZE if value is None else int(value)
+    if block < _MIN_SPLASH_BLOCK_SIZE or block & (block - 1):
+        raise ValueError(f"engine_kwargs.tpu.splash_max_block_size must be a power of two >= 128, got {value!r}")
+    return block
+
+
+_MIXED_PRECISION_REDUCE_DTYPES = ("float32", "bfloat16")
+
+
+def resolve_tpu_mixed_precision_reduce(engine_config: Any) -> Optional[str]:
+    """``engine_kwargs.tpu.mixed_precision_reduce`` (``float32`` / ``bfloat16``), or ``None`` for torchtitan's."""
+    value = get_tpu_engine_options(engine_config).mixed_precision_reduce
+    if value is None:
+        return None
+    dtype = value.strip().lower()
+    if dtype not in _MIXED_PRECISION_REDUCE_DTYPES:
+        raise ValueError(
+            f"engine_kwargs.tpu.mixed_precision_reduce must be one of {_MIXED_PRECISION_REDUCE_DTYPES}, got {value!r}"
+        )
+    return dtype
 
 
 _SYNC_DTENSOR_REDISTRIBUTE_PATCHED = False
@@ -641,35 +695,6 @@ def unwrap_metadata(val: Any) -> Any:
     return val
 
 
-def tpu_synchronize(
-    tensors: Optional[torch.Tensor] = None,
-    *,
-    wait: bool = True,
-    strict: bool = False,
-) -> None:
-    """Materialize and synchronize pending TPU operations (for ``tensors`` or the whole device).
-
-    Args:
-        tensors: Optional tensor (e.g. ``loss``) to materialize; ``None`` synchronizes the whole TPU device.
-        wait: Wait for device execution to complete when ``True``; dispatch asynchronously when ``False``.
-        strict: Raise ``RuntimeError`` if ``torch_tpu`` cannot synchronize instead of logging a warning.
-    """
-    if isinstance(tensors, torch.Tensor) and tensors.device.type != "tpu":
-        return
-    try:
-        from torch_tpu._internal import sync
-
-        if tensors is None:
-            sync.synchronize(wait=wait)
-        else:
-            sync.synchronize(tensors, wait=wait)
-    except Exception as e:  # ImportError on hosts without torch_tpu (CPU tests) included
-        if strict:
-            raise RuntimeError(f"TPU synchronization failed: {e}") from e
-        if not isinstance(e, ImportError):
-            logger.warning("Could not synchronize via torch_tpu: %s", e)
-
-
 def tpu_eager_mode_context(mode: Optional[str]):
     """Context manager running the enclosed ops under the ``torch_tpu`` eager ``mode`` (no-op for ``None``).
 
@@ -748,7 +773,12 @@ def compute_global_batch_num_tokens(data: TensorDict, dp_group: Any, tp_size: in
     return batch_num_tokens.item()
 
 
-def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], bucket_size: Optional[int] = None) -> None:
+def align_micro_batch_shapes_across_ranks(
+    micro_batches: list[TensorDict],
+    bucket_size: Optional[int] = None,
+    static_len: int = 0,
+    static_response_len: int = 0,
+) -> None:
     """Make every rank pad micro-batch ``i`` to the same packed length and response-length bucket.
 
     SimpleFSDP traces the all-gather/reduce-scatter into each compiled (``spmd_safe``) TransformerBlock, and
@@ -756,10 +786,21 @@ def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], bucke
     the TPU (``sync_flag_public_access_error``). One CPU all-reduce(MAX) over all micro-batches' buckets gives
     each micro-batch a common ``tpu_padded_seq_len`` / ``tpu_max_response_len`` that
     :func:`pad_packed_inputs_for_tpu` pads up to.
+
+    ``static_len`` / ``static_response_len`` (``engine_kwargs.tpu.static_micro_batch_len`` /
+    ``static_max_response_len``) raise every packed / response length to at least that many tokens (rounded up to
+    the bucket), so the trainer compiles one shape instead of one per bucket it meets.
     """
-    if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
-        return
     step = bucket_size if bucket_size is not None and bucket_size > 0 else get_tpu_seq_bucket_size()
+    static_padded = bucket_length(static_len, step) if static_len > 0 else 0
+    static_resp_padded = bucket_length(static_response_len, step) if static_response_len > 0 else 0
+    if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
+        for mb in micro_batches:
+            if static_padded:
+                tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", static_padded)
+            if static_resp_padded:
+                tu.assign_non_tensor_data(mb, "tpu_max_response_len", static_resp_padded)
+        return
     lens: list[int] = []
     for mb in micro_batches:
         ids = mb["input_ids"]
@@ -773,8 +814,9 @@ def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], bucke
     torch.distributed.all_reduce(lens_tensor, op=torch.distributed.ReduceOp.MAX)
     resolved_lens = lens_tensor.tolist()
     for i, mb in enumerate(micro_batches):
-        tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", int(resolved_lens[2 * i]))
-        tu.assign_non_tensor_data(mb, "tpu_max_response_len", int(resolved_lens[2 * i + 1]))
+        tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", max(int(resolved_lens[2 * i]), static_padded))
+        resp_len = int(resolved_lens[2 * i + 1])
+        tu.assign_non_tensor_data(mb, "tpu_max_response_len", max(resp_len, static_resp_padded) if resp_len else 0)
 
 
 def _wrap_routed_experts_on_edp_mesh(model: nn.Module, *, parallel_dims: Any, training: Any) -> None:
@@ -1018,6 +1060,67 @@ def _splash_attention_cls() -> type:
     return SplashAttention
 
 
+_SPLASH_64M_VMEM_BLOCK_KWARGS: dict[str, int] = {
+    "block_q": 1024,
+    "block_kv": 1024,
+    "block_dkv": 1024,
+    "block_kv_compute": 512,
+    "block_q_dkv": 1024,
+    "block_kv_dkv": 1024,
+    "block_kv_dkv_compute": 512,
+    "block_q_dq": 1024,
+    "block_kv_dq": 1024,
+}
+_SPLASH_1024_SUBCLASSES: dict[type, type] = {}
+
+
+def _splash_accepts_block_kwargs(splash_cls: type) -> bool:
+    try:
+        params = inspect.signature(splash_cls).parameters
+    except (TypeError, ValueError):
+        return False
+    return "block_q" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _get_splash_1024_auto_cls(splash_cls: type) -> type:
+    cached = _SPLASH_1024_SUBCLASSES.get(splash_cls)
+    if cached is not None:
+        return cached
+
+    class _Splash1024AutoAttention(splash_cls):  # type: ignore[valid-type,misc]
+        """Uses TorchTitan's 1024 Splash tiles on 1024-divisible TPU rows under >=60 MiB scoped VMEM, else auto-512."""
+
+        def __init__(
+            self,
+            *,
+            is_causal: bool = True,
+            local_window_size: Optional[int] = None,
+            original_module: Optional[nn.Module] = None,
+        ) -> None:
+            super().__init__(
+                is_causal=is_causal,
+                local_window_size=local_window_size,
+                original_module=original_module,
+                auto_block_size=True,
+            )
+            self._splash_1024 = splash_cls(
+                is_causal=is_causal,
+                local_window_size=local_window_size,
+                original_module=original_module,
+                auto_block_size=False,
+                **_SPLASH_64M_VMEM_BLOCK_KWARGS,
+            )
+
+        def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+            seq_len = q.shape[0] if q.dim() == 3 else q.shape[1]
+            if q.device.type != "cpu" and seq_len >= 1024 and seq_len % 1024 == 0:
+                return self._splash_1024(q, k, v, *args, **kwargs)
+            return super().forward(q, k, v, *args, **kwargs)
+
+    _SPLASH_1024_SUBCLASSES[splash_cls] = _Splash1024AutoAttention
+    return _Splash1024AutoAttention
+
+
 def _tpu_attention(inner: torch.nn.Module, use_splash: bool, local_window_size: Optional[int]) -> Any:
     """The TPU attention to run in place of ``inner`` (or as its CP local attention).
 
@@ -1025,17 +1128,73 @@ def _tpu_attention(inner: torch.nn.Module, use_splash: bool, local_window_size: 
     ``TPUVarlenAttention`` otherwise, since torchtitan's ``VarlenInnerAttention`` needs CUDA flash-attention and
     ``FlexInnerAttention`` a ``BlockMask``. With ``use_splash`` it becomes the fallback of torchtitan's
     ``SplashAttention`` (CPU, or lengths no splash block divides); ``auto_block_size`` picks block sizes per
-    call because verl's bucketed lengths (e.g. 768) do not always divide the default 512.
+    call because verl's bucketed lengths (e.g. 768) do not always divide the default 512. When >=60 MiB scoped
+    VMEM is configured, 1024-divisible TPU rows dispatch to TorchTitan's 1024 Splash tiles (``block_kv_compute=512``,
+    ``block_kv_dkv_compute=512``).
     """
     reference = inner.local_forward if _is_kv_all_gather_cp(inner) else TPUVarlenAttention(local_window_size)
     if not use_splash:
         return reference
-    return _splash_attention_cls()(
+    splash_cls = _splash_attention_cls()
+    if has_64mib_scoped_vmem() and _splash_accepts_block_kwargs(splash_cls):
+        return _get_splash_1024_auto_cls(splash_cls)(
+            is_causal=True,
+            local_window_size=local_window_size,
+            original_module=reference,
+        )
+    return splash_cls(
         is_causal=True,
         local_window_size=local_window_size,
         original_module=reference,
         auto_block_size=True,
     )
+
+
+def set_splash_max_block_size(max_block_size: int) -> None:
+    """Sets the largest block size torchtitan's ``SplashAttention`` (``auto_block_size=True``) picks per call.
+
+    ``SplashAttention`` takes its block size from the module-level ``splash_block_size_for(seq_len)``, whose cap is
+    512; long packed micro-batches (8-24k tokens) run faster with larger blocks, since Splash's grid grows as
+    ``(seq_len / block)^2``. Rebinds that function to one with ``max_block_size`` (the original for 512).
+    Process-wide, like the engine option it implements; a no-op without torchtitan's TPU kernels.
+
+    TODO(torchtitan): add a ``max_block_size`` parameter to ``SplashAttention`` upstream in torchtitan and pass it
+    when constructing the attention module instead of rebinding ``splash_block_size_for``.
+    """
+    try:
+        from torchtitan.experiments.tpu.kernels import splash_attention as splash_module
+    except ImportError:
+        return
+    original = getattr(splash_module, "_verl_original_splash_block_size_for", None)
+    if original is None:
+        original = splash_module.splash_block_size_for
+        splash_module._verl_original_splash_block_size_for = original
+    if max_block_size == _DEFAULT_SPLASH_MAX_BLOCK_SIZE:
+        splash_module.splash_block_size_for = original
+    else:
+        splash_module.splash_block_size_for = functools.partial(original, max_block_size=max_block_size)
+    logger.info("Splash attention: largest block size %d", max_block_size)
+
+
+def row_slot_permutation(cu_seqlens: torch.Tensor, padded_len: int, slot_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(slot_src, contig_src)``: packed -> one-sequence-per-``slot_len``-row layout and back.
+
+    Sequence ``i`` moves to token ``i * slot_len``; the packed padding fills the rest. ``packed[slot_src]`` is the slot
+    layout and ``slot_layout[contig_src]`` the packed one.
+    """
+    offsets = cu_seqlens.tolist()
+    lengths = [b - a for a, b in zip(offsets[:-1], offsets[1:], strict=True)]
+    if padded_len % slot_len or len(lengths) > padded_len // slot_len or max(lengths, default=0) > slot_len:
+        raise ValueError(
+            f"gdn_row_slot_len={slot_len}: sequences {lengths} do not fit a {padded_len}-token micro-batch"
+        )
+    slot_src = torch.full((padded_len,), -1, dtype=torch.int64)
+    for i, (start, length) in enumerate(zip(offsets[:-1], lengths, strict=True)):
+        slot_src[i * slot_len : i * slot_len + length] = torch.arange(start, start + length)
+    slot_src[slot_src < 0] = torch.arange(offsets[-1] if offsets else 0, padded_len)
+    contig_src = torch.empty_like(slot_src)
+    contig_src[slot_src] = torch.arange(padded_len)
+    return slot_src, contig_src
 
 
 def install_tpu_attention(modules: Any, use_splash: bool) -> int:
@@ -1081,103 +1240,44 @@ def install_tpu_attention(modules: Any, use_splash: bool) -> int:
     return replaced
 
 
-def _enable_reduction_none_in_torchtitan_linear_loss() -> Any:
-    """Import ``torchtitan.experiments.tpu.kernels.linear_softmax_cross_entropy_loss`` and allow ``reduction='none'``.
+FUSED_ENTROPY_MAX_CHUNK = 4096
 
-    Tokamax's ``pallas_mosaic_tpu_kernel`` and reference kernel natively support ``reduction='none'`` in both
-    forward (returning per-token NLL of shape ``(B,)``) and backward (accepting per-token cotangent ``dout``
-    of shape ``(B,)``). TorchTitan's ``_my_bwd`` unconditionally calls ``jax.numpy.reshape(dout, ())`` for
-    scalar reductions (``'sum'``/``'mean'``); rebinding ``jax.numpy.reshape`` in ``_my_bwd``'s globals to
-    preserve 1D ``dout`` when ``dout.size != 1`` lets us call TorchTitan's ``linear_softmax_cross_entropy_loss``
-    directly without duplicating any kernel or custom-op code.
+
+def fused_entropy_chunk_size(num_tokens: int, max_chunk: int = FUSED_ENTROPY_MAX_CHUNK, align: int = 256) -> int:
+    """Largest multiple of ``align`` that divides ``num_tokens`` and is <= ``max_chunk``; ``num_tokens`` otherwise.
+
+    One static chunk shape keeps the chunk loop to a single compiled program per micro-batch shape.
     """
-    from torchtitan.experiments.tpu.kernels import linear_softmax_cross_entropy_loss as lce_mod
-
-    if getattr(lce_mod, "_verl_reduction_none_patched", False):
-        return lce_mod
-
-    import types
-
-    orig_bwd = lce_mod._my_bwd
-    real_jax = lce_mod.jax
-
-    class _JaxNumpyProxy:
-        @staticmethod
-        def reshape(a: Any, shape: Any, *args: Any, **kwargs: Any) -> Any:
-            if shape == () and getattr(a, "size", 1) != 1:
-                return a
-            return real_jax.numpy.reshape(a, shape, *args, **kwargs)
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(real_jax.numpy, name)
-
-    class _JaxProxy:
-        numpy = _JaxNumpyProxy()
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(real_jax, name)
-
-    lce_mod._my_bwd = types.FunctionType(
-        orig_bwd.__code__,
-        {**orig_bwd.__globals__, "jax": _JaxProxy()},
-        orig_bwd.__name__,
-        orig_bwd.__defaults__,
-        orig_bwd.__closure__,
-    )
-    lce_mod._verl_reduction_none_patched = True
-    return lce_mod
+    if num_tokens <= max_chunk:
+        return num_tokens
+    chunk = (max_chunk // align) * align
+    while chunk >= align:
+        if num_tokens % chunk == 0:
+            return chunk
+        chunk -= align
+    return num_tokens
 
 
-def fused_linear_logprobs_tpu(
-    hidden_states: torch.Tensor,
-    labels: torch.Tensor,
-    weight_t: torch.Tensor,
-    *,
-    temperature: float = 1.0,
-    implementation: str = "mosaic_tpu",
-    b_block_size: int = 1024,
-    h_block_size: int = 512,
-    v_block_size: int = 2048,
+@torch.no_grad()
+def chunked_entropy_from_hidden_tpu(
+    hidden_states: torch.Tensor, weight_t: torch.Tensor, temperature: float, chunk_size: Optional[int] = None
 ) -> torch.Tensor:
-    """Compute per-token ``log_probs`` on TPU via the Pallas fused linear + softmax cross-entropy kernel.
+    """Per-token entropy of ``softmax(hidden_states @ weight_t / temperature)``, in token chunks, without gradient.
 
-    Avoids materializing the ``[T, V]`` logits and ``float32`` log-softmax tensors in HBM. Pads ``T`` up to
-    a multiple of ``b_block_size`` (1024) as required by Mosaic TPU tiles and slices back to ``[:T]``, so
-    padded rows receive zero upstream gradient in the backward pass.
+    For passes that report the entropy but do not differentiate it (old log-probs): the logits of one chunk of
+    tokens at a time are materialized (bf16 matmul as the unfused LM head, fp32 entropy as on GPU) instead of the
+    whole ``[T, V]`` logits.
     """
-    if hidden_states.dim() > 2:
-        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-    if labels.dim() > 1:
-        labels = labels.reshape(-1)
+    from verl.utils.torch_functional import entropy_from_logits
 
-    b_dim = int(hidden_states.shape[0])
-    x = hidden_states
-    temp = float(temperature)
-    if temp != 1.0:
-        x = (x * (1.0 / temp)).to(weight_t.dtype)
-    elif x.dtype != weight_t.dtype:
-        x = x.to(weight_t.dtype)
-
-    padded_b = max(b_block_size, ((b_dim + b_block_size - 1) // b_block_size) * b_block_size)
-    pad_b = padded_b - b_dim
-    if pad_b > 0:
-        x = F.pad(x, (0, 0, 0, pad_b))
-        labels = F.pad(labels, (0, pad_b), value=0)
-
-    lce_mod = _enable_reduction_none_in_torchtitan_linear_loss()
-    nll = lce_mod.linear_softmax_cross_entropy_loss(
-        x.contiguous(),
-        labels.contiguous(),
-        weight_t,
-        reduction="none",
-        implementation=implementation,
-        b_block_size=b_block_size,
-        h_block_size=h_block_size,
-        v_block_size=v_block_size,
-    )
-    if pad_b > 0:
-        nll = nll[:b_dim]
-    return -nll
+    hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+    num_tokens = int(hidden.shape[0])
+    chunk = chunk_size or fused_entropy_chunk_size(num_tokens)
+    out = []
+    for start in range(0, num_tokens, chunk):
+        logits = (hidden[start : start + chunk] @ weight_t) / temperature
+        out.append(entropy_from_logits(logits.float()))
+    return torch.cat(out)
 
 
 _PAD_VOCAB_STRIDE = 9973  # prime stride: spreads packed-padding token IDs across vocab instead of 1 or math experts

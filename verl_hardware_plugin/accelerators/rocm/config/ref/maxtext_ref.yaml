@@ -1,0 +1,17 @@
+# Primus MaxText reference model: same Primus experiment as the actor, forward only.
+defaults:
+  - ../engine@maxtext: maxtext
+  - ref
+  - _self_
+
+_target_: verl_hardware_plugin.accelerators.rocm.primus.maxtext.config.MaxTextActorConfig
+
+strategy: maxtext
+
+maxtext:
+  primus_config_path: ${oc.select:actor_rollout_ref.actor.maxtext.primus_config_path,""}
+  primus_module: ${oc.select:actor_rollout_ref.actor.maxtext.primus_module,pre_trainer}
+  primus_path: ${oc.select:actor_rollout_ref.actor.maxtext.primus_path,null}
+  maxtext_path: ${oc.select:actor_rollout_ref.actor.maxtext.maxtext_path,null}
+  primus_overrides: ${oc.select:actor_rollout_ref.actor.maxtext.primus_overrides,[]}
+  forward_only: true

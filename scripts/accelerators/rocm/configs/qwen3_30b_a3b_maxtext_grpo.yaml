@@ -1,0 +1,48 @@
+# Qwen3-30B-A3B GRPO with the Primus MaxText (JAX) trainer on one 8-GPU node.
+#   python -m verl_hardware_plugin.accelerators.rocm.launch qwen3_30b_a3b_maxtext_grpo.yaml ...
+# verl runs one JAX process per GPU (hardware: gpu_multiprocess is set by the engine).
+# A training mini-batch is num_devices * per_device_batch_size * gradient_accumulation_steps
+# sequences (8 * 1 * 8 = 64 = ppo_mini_batch_size * rollout.n), each padded to max_target_length.
+work_group: verl
+user_name: ${USER:verl}
+exp_name: qwen3_30b_a3b_maxtext_grpo
+workspace: ${PRIMUS_WORKSPACE:/tmp/verl-maxtext}
+
+modules:
+  pre_trainer:
+    framework: maxtext
+    config: pre_trainer.yaml
+    model: qwen3_30B_A3B.yaml
+    overrides:
+      run_name: qwen3_30b_a3b_grpo
+      base_output_directory: ${PRIMUS_WORKSPACE:/tmp/verl-maxtext}
+      steps: 100000
+      # Constant step size from the first update; MaxText's warmup starts from zero.
+      learning_rate: 1.0e-6
+      warmup_steps_fraction: 0.0
+      profiler: ""
+      shardy: true
+
+      # verl feeds the batches; MaxText's own pipeline stays synthetic and unused.
+      tokenizer_path: ${MODEL_PATH:Qwen/Qwen3-30B-A3B}
+      dataset_type: synthetic
+      enable_checkpointing: false
+      async_checkpointing: false
+
+      dcn_data_parallelism: -1
+      dcn_fsdp_parallelism: 1
+      ici_fsdp_parallelism: 1
+      ici_data_parallelism: 1
+      ici_expert_parallelism: -1
+
+      # Prompt plus response.
+      max_target_length: 5120
+      per_device_batch_size: 1
+      gradient_accumulation_steps: 8
+      remat_policy: full
+      # fp32 master weights: bf16 parameters round away updates of this size.
+      weight_dtype: float32
+      sparse_matmul: false
+      megablox: false
+      # No token dropping: dropped tokens corrupt RL log-probs.
+      capacity_factor: -1
