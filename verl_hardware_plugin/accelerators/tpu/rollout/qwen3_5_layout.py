@@ -50,9 +50,12 @@ import torch
 
 from verl_hardware_plugin.accelerators.tpu.rollout.direct_install import DirectInstallLayout
 from verl_hardware_plugin.accelerators.tpu.rollout.moe_weights import (
+    MOE_LAYOUT_TPU_EP,
     MOE_LAYOUTS,
     ParityCheckFn,
     expert_param,
+    moe_attr,
+    moe_parallel_mode,
     write_w2,
     write_w13,
 )
@@ -121,6 +124,28 @@ GDN_LAYER_SUFFIXES = (
     ".linear_attn.dt_bias",
 )
 EXPERT_BLOCK_SUFFIXES = (*SPLIT_TENSORS[2].pieces, ".mlp.experts.down_proj")
+
+
+# TODO(tpu): Remove ``rollout_expert_parallel`` / ``EP_EXPERT_TENSORS`` / ``zero_copy_targets`` once tpu-sync stages
+# received weights in host DRAM, linearizes/transposes on host, and H2Ds directly into vLLM weights. Standard
+# ``EXPERT_BLOCK_SUFFIXES`` already install directly under vLLM expert parallelism (``plan.expert_parallel`` shards them
+# on dim 0); this transposed wire layout exists only to avoid the HBM staging copy on large MoEs such as
+# Qwen3.5-397B-A17B where 42.2 GiB/rank of expert staging buffers would OOM 94.7 GiB HBM alongside weights + KV cache.
+class EPExpertTensor(NamedTuple):
+    """An HF expert stack sent in vLLM's expert-parallel layout (``engine_kwargs.tpu.rollout_expert_parallel``)."""
+
+    hf: str  # suffix of the HF tensor
+    ep: str  # suffix of the tpu-sync tensor: the HF tensor with its last two dimensions transposed
+    leaf: str  # vLLM's expert weight it is received into
+
+
+EP_EXPERT_TENSORS = (
+    EPExpertTensor(".mlp.experts.gate_up_proj", ".mlp.experts.w13_ep", "w13_weight"),
+    EPExpertTensor(".mlp.experts.down_proj", ".mlp.experts.w2_ep", "w2_weight"),
+)
+EP_EXPERT_BLOCK_SUFFIXES = tuple(t.ep for t in EP_EXPERT_TENSORS)
+for _t in EP_EXPERT_TENSORS:
+    SPLIT_TP_DIMS[_t.ep] = 0
 # vLLM fuses these into one parameter: (fused suffix, source suffixes in concat order).
 FUSED_TARGETS = (
     (
@@ -143,18 +168,21 @@ class Qwen3_5Dims(NamedTuple):
     num_k_heads: int
     num_v_heads: int
     moe_intermediate_size: Optional[int]  # None for the dense models
+    num_experts: Optional[int] = None  # None for the dense models (or inferred from wire shapes)
 
     @classmethod
     def from_config(cls, hf_text_config: Any) -> Qwen3_5Dims:
         num_k_heads = int(hf_text_config.linear_num_key_heads)
         num_v_heads = int(hf_text_config.linear_num_value_heads)
         moe_inter = getattr(hf_text_config, "moe_intermediate_size", None)
+        num_exp = getattr(hf_text_config, "num_experts", None)
         return cls(
             key_dim=num_k_heads * int(hf_text_config.linear_key_head_dim),
             value_dim=num_v_heads * int(hf_text_config.linear_value_head_dim),
             num_k_heads=num_k_heads,
             num_v_heads=num_v_heads,
             moe_intermediate_size=int(moe_inter) if moe_inter else None,
+            num_experts=int(num_exp) if num_exp else None,
         )
 
 
@@ -165,15 +193,24 @@ class DirectInstallPlan:
     dims: Qwen3_5Dims
     tp_rank: int
     tp_size: int
-    moe_layout: Optional[str]  # MOE_LAYOUT_TPU / MOE_LAYOUT_VLLM, None without experts
+    moe_layout: Optional[str]  # MOE_LAYOUT_TPU / MOE_LAYOUT_VLLM / MOE_LAYOUT_TPU_EP, None without experts
+    # True when vLLM runs expert parallelism over the whole TP group (whole experts per rank, dim-0 sharded); False
+    # when vLLM TP-slices every expert's intermediate dimension.
+    expert_parallel: bool = False
     # Updated by ``install``: whether vllm-torchtpu's zero MoE padding was verified (first sync only), and vLLM's
     # resolved expert parameter keys (``(prefix, leaf) -> key``), which do not change between syncs.
     padding_checked: bool = False
     expert_keys: dict[tuple[str, str], str] = field(default_factory=dict)
 
 
-def make_tpu_sync_local_layout(hf_text_config: Any) -> Callable[[dict[str, Any]], dict[str, Any]]:
+def make_tpu_sync_local_layout(
+    hf_text_config: Any, expert_parallel: bool = False
+) -> Callable[[dict[str, Any]], dict[str, Any]]:
     """Trainer side: the ``TrainerWeights.local_transform`` that exports the ``SPLIT_TENSORS`` as their pieces.
+
+    With ``expert_parallel`` (``engine_kwargs.tpu.rollout_expert_parallel``), the expert stacks are sent in vLLM's
+    expert-parallel layout instead (``EP_EXPERT_TENSORS``): a transposed copy of each, still sharded on the expert
+    dimension, so the rollout can bind its expert weights directly with no HBM staging copy.
 
     The pieces are views of the fused tensors along a dimension that FSDP does not shard for the experts (dim 0, the
     expert, stays sharded, so they are still exported as local shards). ``in_proj_qkv`` / ``conv1d`` come out of the
@@ -189,6 +226,13 @@ def make_tpu_sync_local_layout(hf_text_config: Any) -> Callable[[dict[str, Any]]
     qkv_rows = (dims.key_dim, dims.key_dim, dims.value_dim)
 
     def local_layout(chunk: dict[str, Any]) -> dict[str, Any]:
+        if expert_parallel:
+            for ep in EP_EXPERT_TENSORS:
+                for name in [n for n in chunk if n.endswith(ep.hf)]:
+                    ep_tensor = chunk.pop(name).transpose(-2, -1).contiguous()
+                    # A fresh copy, not the parameter: the export sends it without another copy.
+                    ep_tensor._tpu_sync_owned = True
+                    chunk[name[: -len(ep.hf)] + ep.ep] = ep_tensor
         for split in SPLIT_TENSORS:
             for name in [n for n in chunk if n.endswith(split.fused)]:
                 tensor = chunk.pop(name)
@@ -209,11 +253,16 @@ def refuse_split_tensors(weights: Iterator[tuple[str, torch.Tensor]]) -> Iterato
     """Undoes ``make_tpu_sync_local_layout`` for vLLM's checkpoint loaders: yields HF's fused tensors.
 
     Used when the rollout falls back to vLLM's loaders (``plan_direct_install`` returned no plan), which expect HF's
-    ``in_proj_qkv`` / ``conv1d`` / stacked ``mlp.experts.gate_up_proj``. A fused tensor is yielded once all of its
+    ``in_proj_qkv`` / ``conv1d`` / stacked ``mlp.experts.gate_up_proj`` / ``down_proj`` (also undoes the
+    expert-parallel layout). A fused tensor is yielded once all of its
     pieces arrived (sorted names keep a layer's pieces together); other tensors pass through.
     """
     pending: dict[str, dict[str, torch.Tensor]] = {}
     for name, tensor in weights:
+        ep = next((t for t in EP_EXPERT_TENSORS if name.endswith(t.ep)), None)
+        if ep is not None:
+            yield name[: -len(ep.ep)] + ep.hf, tensor.transpose(-2, -1)
+            continue
         for split in SPLIT_TENSORS:
             piece = next((p for p in split.pieces if name.endswith(p)), None)
             if piece is None:
@@ -254,8 +303,7 @@ def plan_direct_install(
         return None, f"incomplete Qwen3.5 config: {e}"
     if dims.num_k_heads % tp_size or dims.num_v_heads % tp_size:
         return None, f"GatedDeltaNet heads ({dims.num_k_heads} k, {dims.num_v_heads} v) do not split over TP={tp_size}"
-    if dims.moe_intermediate_size and dims.moe_intermediate_size % tp_size:
-        return None, f"moe_intermediate_size {dims.moe_intermediate_size} does not split over TP={tp_size}"
+    wire_ep = any(n.endswith(EP_EXPERT_BLOCK_SUFFIXES) for n in global_shapes)
 
     expected_rows = {
         ".in_proj_q.weight": dims.key_dim,
@@ -274,7 +322,8 @@ def plan_direct_install(
     if not gdn_layers:
         return None, "the trainer sent no GatedDeltaNet (linear_attn) tensors"
     expert_blocks = {n.split(".mlp.experts.", 1)[0] for n in global_shapes if ".mlp.experts." in n}
-    for layers, suffixes in ((gdn_layers, GDN_LAYER_SUFFIXES), (expert_blocks, EXPERT_BLOCK_SUFFIXES)):
+    expert_suffixes = EP_EXPERT_BLOCK_SUFFIXES if wire_ep else EXPERT_BLOCK_SUFFIXES
+    for layers, suffixes in ((gdn_layers, GDN_LAYER_SUFFIXES), (expert_blocks, expert_suffixes)):
         for layer in sorted(layers):
             missing = [s for s in suffixes if layer + s not in global_shapes]
             if missing:
@@ -300,24 +349,91 @@ def plan_direct_install(
         return None, f"worker rank {worker_rank} is not its TP rank {tp_rank}"
 
     moe_layout = None
+    expert_parallel = False
     if expert_blocks:
-        layouts = set()
-        for _, m in modules:
+        expert_counts = {
+            int(shape[0]) for name, shape in global_shapes.items() if name.endswith(expert_suffixes) and len(shape) == 3
+        }
+        if len(expert_counts) != 1:
+            return None, f"inconsistent expert counts in wire shapes: {sorted(expert_counts)}"
+        wire_experts = expert_counts.pop()
+        if dims.num_experts is not None and dims.num_experts != wire_experts:
+            return None, f"the trainer sent {wire_experts} experts, the config gives {dims.num_experts}"
+        num_experts = dims.num_experts or wire_experts
+        if not dims.moe_intermediate_size:
+            return None, "incomplete Qwen3.5 MoE config: missing moe_intermediate_size"
+
+        layouts: set[str] = set()
+        modes: set[bool] = set()
+        for mod_name, m in modules:
             if not (hasattr(m, "w13_weight") and hasattr(m, "quant_method")):
                 continue
-            if getattr(m, "use_ep", False):
-                return None, "vLLM uses expert parallelism"
+            use_ep = bool(moe_attr(m, "use_ep", False))
             method = type(m.quant_method).__name__
+            if wire_ep:
+                if not use_ep:
+                    return None, "the trainer sent the expert-parallel layout but vLLM does not use expert parallelism"
+                if method != "VllmUnquantizedFusedMoEMethod":
+                    return None, f"expert-parallel direct install needs vllm-torchtpu's unquantized MoE, not {method}"
+                ep_mode, why = moe_parallel_mode(m, num_experts, dims.moe_intermediate_size, tp_size, tp_rank)
+                if ep_mode is None:
+                    return None, f"vLLM's {mod_name}: {why}"
+                layouts.add(MOE_LAYOUT_TPU_EP)
+                modes.add(True)
+                continue
             if method not in MOE_LAYOUTS:
                 return None, f"unsupported vLLM MoE method {method} (quantized?)"
+            ep_mode, why = moe_parallel_mode(m, num_experts, dims.moe_intermediate_size, tp_size, tp_rank)
+            if ep_mode is None:
+                return None, f"vLLM's {mod_name}: {why}"
             layouts.add(MOE_LAYOUTS[method])
+            modes.add(use_ep if tp_size == 1 else ep_mode)
         if len(layouts) != 1:
             return None, f"vLLM MoE layouts {sorted(layouts) or 'not found'}"
+        if len(modes) != 1:
+            return None, "vLLM's MoE layers mix expert parallelism and TP-sliced experts"
         moe_layout = layouts.pop()
-    return DirectInstallPlan(dims, tp_rank, tp_size, moe_layout), ""
+        expert_parallel = modes.pop()
+    elif dims.moe_intermediate_size and dims.moe_intermediate_size % tp_size:
+        return None, f"moe_intermediate_size {dims.moe_intermediate_size} does not split over TP={tp_size}"
+    return DirectInstallPlan(dims, tp_rank, tp_size, moe_layout, expert_parallel=expert_parallel), ""
 
 
-def sampler_sharding_rule(name: str, global_shape: list[int], tp_size: int) -> Optional[tuple[list[str], list[int]]]:
+def zero_copy_targets(
+    plan: DirectInstallPlan,
+    model_sd: dict[str, torch.Tensor],
+    find_model_key: Callable[[str], Optional[str]],
+    global_shapes: dict[str, list[int]],
+) -> dict[str, torch.Tensor]:
+    """Rollout side: ``{tpu-sync tensor: vLLM weight}`` for the tensors received straight into vLLM's weights.
+
+    In the zero-copy expert-parallel layout (``EP_EXPERT_TENSORS``, ``rollout_expert_parallel=True``), rank r's slice
+    of each expert tensor is its vLLM ``w13_weight`` / ``w2_weight``, so those weights are bound to tpu-sync as the
+    receive buffers: no HBM staging copy of the experts, and nothing to install after the transfer.
+    """
+    if plan.moe_layout != MOE_LAYOUT_TPU_EP:
+        return {}
+    targets = {}
+    for name, shape in global_shapes.items():
+        ep = next((t for t in EP_EXPERT_TENSORS if name.endswith(t.ep)), None)
+        if ep is None:
+            continue
+        prefix = name[: -len(ep.ep)] + ".mlp.experts"
+        weight = _local(model_sd[expert_param(model_sd, find_model_key, prefix, ep.leaf, plan.expert_keys)])
+        expected = (shape[0] // plan.tp_size, *shape[1:])
+        if tuple(weight.shape) != expected or weight.dtype != torch.bfloat16 or not weight.is_contiguous():
+            raise RuntimeError(
+                f"{_ERROR_PREFIX}: vLLM's {prefix}.{ep.leaf} is {tuple(weight.shape)} {weight.dtype} "
+                f"(contiguous={weight.is_contiguous()}); the expert-parallel layout needs {expected}, bfloat16, "
+                "contiguous"
+            )
+        targets[name] = weight
+    return targets
+
+
+def sampler_sharding_rule(
+    name: str, global_shape: list[int], tp_size: int, plan: Optional[DirectInstallPlan] = None
+) -> Optional[tuple[list[str], list[int]]]:
     """``(sharding_spec, local_shape)`` of a Qwen3.5-specific tensor, or ``None`` to use the dense path's rules."""
     if any(name.endswith(s) for s in REPLICATED_SUFFIXES):
         return [""] * len(global_shape), list(global_shape)
@@ -326,7 +442,7 @@ def sampler_sharding_rule(name: str, global_shape: list[int], tp_size: int) -> O
         tp_dim = 1
     for suffix, dim in SPLIT_TP_DIMS.items():
         if name.endswith(suffix):
-            tp_dim = dim
+            tp_dim = 0 if (plan is not None and plan.expert_parallel and suffix in EXPERT_BLOCK_SUFFIXES) else dim
     if tp_dim is None:
         return None
     if global_shape[tp_dim] % tp_size:
@@ -391,6 +507,9 @@ def install(
             write(f"{prefix}.{vec}", rank_rows(f"{prefix}.{vec}", dims.num_v_heads))
         consumed.update(qkvz + conv + [f"{prefix}.A_log", f"{prefix}.dt_bias"])
 
+    if plan.moe_layout == MOE_LAYOUT_TPU_EP:
+        # Received straight into vLLM's expert weights (zero_copy_targets): nothing to copy.
+        consumed.update(n for n in staging if n.endswith(EP_EXPERT_BLOCK_SUFFIXES))
     for name in list(staging):
         m = _EXPERTS_RE.match(name)
         if m is None:
@@ -420,7 +539,7 @@ def _loader_weights(weights: Iterator[tuple[str, torch.Tensor]], hf_text_config:
 
 
 def _sharding_rule(name: str, global_shape: list[int], tp_size: int, plan: DirectInstallPlan) -> Optional[Any]:
-    return sampler_sharding_rule(name, global_shape, tp_size)  # the same for every plan
+    return sampler_sharding_rule(name, global_shape, tp_size, plan)
 
 
 LAYOUT = DirectInstallLayout(
@@ -429,5 +548,6 @@ LAYOUT = DirectInstallLayout(
     sharding_rule=_sharding_rule,
     install=install,
     fused_targets=FUSED_TARGETS,
+    zero_copy_targets=zero_copy_targets,
     loader_weights=_loader_weights,
 )

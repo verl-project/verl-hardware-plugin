@@ -53,6 +53,7 @@ from verl_hardware_plugin.accelerators.tpu.rollout.moe_weights import (
     MOE_LAYOUTS,
     ParityCheckFn,
     expert_param,
+    moe_parallel_mode,
     write_w2,
     write_w13,
 )
@@ -179,59 +180,8 @@ def split_expert_stacks(weights: Iterator[tuple[str, torch.Tensor]]) -> Iterator
             yield f"{prefix}.{e}.{proj}.weight", block
 
 
-def _moe_attr(module: Any, name: str, default: Any) -> Any:
-    """``module.<name>``, else ``module.moe_config.<name>`` (vLLM keeps the EP geometry on both, version-dependent)."""
-    value = getattr(module, name, None)
-    if value is None:
-        value = getattr(getattr(module, "moe_config", None), name, None)
-    return default if value is None else value
-
-
 def _moe_parallel_mode(module: Any, dims: Qwen3MoeDims, tp_size: int, tp_rank: int) -> tuple[Optional[bool], str]:
-    """``(expert_parallel, "")`` for a vLLM MoE layer this module can write on TP rank ``tp_rank``, else
-    ``(None, reason)``.
-
-    ``expert_parallel`` is True if the layer holds whole experts ``[r * E / tp, (r + 1) * E / tp)`` (EP over the whole
-    TP group, linear placement), False if it holds slice ``r`` of every expert's intermediate dimension (no EP).
-    """
-    num_experts = dims.num_experts
-    global_experts = int(_moe_attr(module, "global_num_experts", 0) or 0)
-    local_experts = int(_moe_attr(module, "local_num_experts", 0) or 0)
-    if global_experts and global_experts != num_experts:
-        return None, f"{global_experts} experts, the config gives {num_experts}"
-    activation = str(_moe_attr(module, "activation", "silu")).lower()
-    if "swigluoai" in activation or getattr(module, "w13_bias", None) is not None:
-        return None, f"activation {activation} / expert bias not supported"
-    if tp_size == 1:
-        return True, ""
-    if not bool(_moe_attr(module, "use_ep", False)):
-        # vLLM slices every expert's intermediate dimension over TP: one dim-1 (gate / up) or dim-2 (down) block of
-        # each stack per rank.
-        if dims.moe_intermediate_size % tp_size:
-            return None, f"moe_intermediate_size {dims.moe_intermediate_size} does not split over TP={tp_size}"
-        if local_experts and local_experts != num_experts:
-            return None, f"{local_experts} local experts without expert parallelism, the config gives {num_experts}"
-        moe_tp_size, moe_tp_rank = (
-            int(_moe_attr(module, "tp_size", tp_size)),
-            int(_moe_attr(module, "tp_rank", tp_rank)),
-        )
-        if (moe_tp_size, moe_tp_rank) != (tp_size, tp_rank):
-            return None, f"MoE TP size {moe_tp_size} / rank {moe_tp_rank}, needs the TP group ({tp_size} / {tp_rank})"
-        return False, ""
-    if num_experts % tp_size:
-        return None, f"{num_experts} experts do not split over TP={tp_size}"
-    ep_size, ep_rank = int(_moe_attr(module, "ep_size", 0) or 0), int(_moe_attr(module, "ep_rank", -1))
-    if ep_size != tp_size or ep_rank != tp_rank:
-        return None, f"EP size {ep_size} / rank {ep_rank}, needs EP over the whole TP group ({tp_size} / {tp_rank})"
-    placement = str(_moe_attr(module, "expert_placement_strategy", "linear"))
-    if placement != "linear":
-        return None, f"expert placement {placement!r}, needs 'linear'"
-    if local_experts and local_experts * tp_size != num_experts:
-        return (
-            None,
-            f"{local_experts} local experts on each of {tp_size} ranks, the config gives {num_experts} in total",
-        )
-    return True, ""
+    return moe_parallel_mode(module, dims.num_experts, dims.moe_intermediate_size, tp_size, tp_rank)
 
 
 def plan_direct_install(

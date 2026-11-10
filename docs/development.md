@@ -925,6 +925,7 @@ verl-hardware-plugin/
 │   │   ├── musa/                         # Moore Threads MUSA
 │   │   ├── supa/                         # Biren SUPA
 │   │   ├── tpu/                          # Google TPU
+│   │   ├── rocm/                         # AMD ROCm (no platform: built into verl; MoRI checkpoint engine)
 │   │   ├── trainium/                     # Reserved; no implementation or registration
 │   │   └── <backend>/                    # Each implemented backend owns these files
 │   │       ├── __init__.py               # Guarded platform registration only

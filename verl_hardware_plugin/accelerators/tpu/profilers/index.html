@@ -540,13 +540,18 @@ function buildTimelineModel(evs, metrics, sourceName) {
   // weight-sync phases: tpu-sync logs them as timing_s/tpu-sync/* step metrics; lay them out inside update_weights
   const loop0 = groups.has("trainer") ? groups.get("trainer").lanes.get("loop") : null;
   if (loop0 && !loop0.spans.some(s => s.name.startsWith("sync."))) {
-    // The quiesce runs concurrently with the trainer send; the other phases follow the longer of the two.
-    const concurrent = [["quiesce", "sync.quiesce"], ["trainer_init", "sync.trainer_send"]];
+    // Syncs that report rollout_paused pause the rollout after the transfer, right before the install. Older logs
+    // paused it concurrently with the trainer send, and their other phases follow the longer of the two.
+    const lateOrder = [["trainer_init", "sync.trainer_send"], ["sampler_init", "sync.sampler_init"], ["barrier", "sync.barrier"],
+                       ["p2p_transfer", "sync.p2p_transfer"], ["quiesce", "sync.quiesce"], ["sampler_h2d", "sync.sampler_install"],
+                       ["sampler_resume", "sync.resume"], ["trainer_release", "sync.trainer_release"]];
     const order = [["sampler_init", "sync.sampler_init"], ["barrier", "sync.barrier"], ["p2p_transfer", "sync.p2p_transfer"],
                    ["sampler_h2d", "sync.sampler_install"], ["sampler_resume", "sync.resume"],
                    ["trainer_release", "sync.trainer_release"]];
     for (const uw of loop0.spans.filter(s => s.name === "update_weights" && s.step != null)) {
       const m = metrics[uw.step] || {};
+      const late = m["timing_s/tpu-sync/rollout_paused"] !== undefined;
+      const concurrent = late ? [] : [["quiesce", "sync.quiesce"], ["trainer_init", "sync.trainer_send"]];
       let t = uw.t0;
       for (const [key, name] of concurrent) {
         const d = m["timing_s/tpu-sync/" + key];
@@ -555,7 +560,7 @@ function buildTimelineModel(evs, metrics, sourceName) {
                           args: {from: "timing_s/tpu-sync/" + key}, group: "trainer", lane: "loop"});
         t = Math.max(t, Math.min(uw.t1, uw.t0 + d));
       }
-      for (const [key, name] of order) {
+      for (const [key, name] of (late ? lateOrder : order)) {
         const d = m["timing_s/tpu-sync/" + key];
         if (!(d > 0)) continue;
         const t1 = Math.min(uw.t1, t + d);
