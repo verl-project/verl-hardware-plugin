@@ -1,3 +1,4 @@
+# Copyright 2024-2025 BAAI and Google LLC
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
@@ -17,9 +18,12 @@ import inspect
 import logging
 import math
 import os
+import sys
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
+from functools import cache
+from types import MethodType
 from typing import Any, Optional
 
 import torch
@@ -30,6 +34,7 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import TorchtitanEngineConfig
@@ -39,6 +44,159 @@ from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+class _TPURMSNormAffine(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, normalized: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(normalized, weight)
+        return normalized * weight.float()
+
+    @staticmethod
+    def backward(ctx, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        normalized, weight = ctx.saved_tensors
+        gradient = gradient.float()
+        grad_normalized = gradient * weight.float()
+        product = gradient * normalized
+        dimensions = tuple(range(product.ndim - weight.ndim))
+        grad_weight = product.sum(dim=dimensions, dtype=torch.float32) if dimensions else product
+        # Autograd casts at the parameter edge. Casting here permits XLA to push
+        # BF16 rounding inside the sum and defeats FP32 accumulation.
+        return grad_normalized, grad_weight
+
+
+def _tpu_fp32_rms_norm(self: nn.RMSNorm, x: torch.Tensor) -> torch.Tensor:
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        weight = self.weight
+        if weight is not None and weight.dtype == torch.bfloat16:
+            normalized = F.rms_norm(x.float(), self.normalized_shape, None, self.eps)
+            return _TPURMSNormAffine.apply(normalized, weight)
+        return F.rms_norm(x.float(), self.normalized_shape, None if weight is None else weight.float(), self.eps)
+
+
+def _tpu_fp32_feed_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    gate = self.w1(x)
+    activated = F.silu(gate.float()).to(gate.dtype)
+    return self.w2(activated * self.w3(x))
+
+
+def apply_tpu_precision_patches(model_parts: list[nn.Module]) -> None:
+    """Keep RMSNorm outputs FP32; round FP32 SiLU before gating, preserving specialized feed-forwards."""
+    torch.set_float32_matmul_precision("highest")
+    for model in model_parts:
+        for module in model.modules():
+            if isinstance(module, nn.RMSNorm):
+                module.forward = MethodType(_tpu_fp32_rms_norm, module)
+            module_type = type(module)
+            if (
+                module_type.__name__.startswith("SimpleFSDPFeedForward")
+                and hasattr(module, "_simple_fsdp_parametrization_list")
+                and len(module_type.__bases__) == 1
+            ):
+                module_type = module_type.__bases__[0]
+            if module_type.__module__ != "torchtitan.models.common.feed_forward":
+                continue
+            from torchtitan.models.common.feed_forward import FeedForward
+
+            if module_type is FeedForward:
+                module.forward = MethodType(_tpu_fp32_feed_forward, module)
+
+
+class _TPUFp32LogitsLinear(torch.autograd.Function):
+    """Retain FP32 accumulators of BF16 dot products, with BF16 backward dots."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        ctx.x_dtype, ctx.w_dtype = x.dtype, weight.dtype
+        x, weight = x.bfloat16(), weight.bfloat16()
+        ctx.save_for_backward(x, weight)
+        previous = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("medium")
+        try:
+            return x.float() @ weight.float().t()
+        finally:
+            torch.set_float32_matmul_precision(previous)
+
+    @staticmethod
+    def backward(ctx, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x, weight = ctx.saved_tensors
+        gradient = gradient.bfloat16()
+        grad_x = gradient @ weight
+        grad_weight = gradient.reshape(-1, gradient.shape[-1]).t() @ x.reshape(-1, x.shape[-1])
+        return grad_x.to(ctx.x_dtype), grad_weight.to(ctx.w_dtype)
+
+
+def _tpu_fp32_logits_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    if getattr(self, "bias", None) is not None:
+        raise ValueError("fp32_logits supports a bias-free LM head only")
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+        return _TPUFp32LogitsLinear.apply(x, weight)
+
+
+def apply_fp32_logits_tpu(modules: Any) -> int:
+    """Patch eager, bias-free LM heads while preserving parameter storage and tied weights."""
+    model_list = modules if isinstance(modules, list | tuple | nn.ModuleList) else [modules]
+    patched = 0
+    for model in model_list:
+        head = getattr(model, "lm_head", None)
+        if not isinstance(head, nn.Module) or getattr(head.forward, "__func__", None) is _tpu_fp32_logits_forward:
+            continue
+        if getattr(head, "bias", None) is not None:
+            raise ValueError("fp32_logits supports a bias-free LM head only")
+        head.forward = MethodType(_tpu_fp32_logits_forward, head)
+        patched += 1
+    if patched:
+        logger.warning("FP32 logits enabled on %d TPU LM heads", patched)
+    return patched
+
+
+_attention_dtype_fallback_logged = False
+
+
+def attention_compute_dtype(x: torch.Tensor) -> torch.dtype | None:
+    """Use the autocast dtype at the attention boundary, retaining FP32 otherwise."""
+    global _attention_dtype_fallback_logged
+    try:
+        return torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else None
+    except (RuntimeError, TypeError, ValueError) as error:
+        if not _attention_dtype_fallback_logged:
+            _attention_dtype_fallback_logged = True
+            logger.warning("Cannot query %s autocast (%s); TPU attention will use BF16", x.device.type, error)
+        return torch.bfloat16
+
+
+@cache
+def precision_splash_attention_cls(splash_cls: type[nn.Module]) -> type[nn.Module]:
+    """Adapt torchtitan's SplashAttention while retaining its CP/layout handling."""
+
+    class PrecisionSplashAttention(splash_cls):
+        def forward(self, q, k, v, **kwargs):
+            # Keep torchtitan's CPU fallback unrounded. TPU Splash always takes
+            # BF16 Q/K/V after the FP32 norms and RoPE, then restores Q's dtype.
+            if q.device.type == "cpu":
+                return super().forward(q, k, v, **kwargs)
+            input_dtype = q.dtype
+            result = super().forward(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16), **kwargs)
+            return result.to(input_dtype)
+
+    return PrecisionSplashAttention
+
+
+@contextmanager
+def tpu_precision_compiler_context():
+    """Keep TorchTPU from rounding RMSNorm affine products before their FP32 reduction."""
+    try:
+        from torch.tpu.compiler import custom_compiler_options
+    except ImportError as error:
+        # Hosts running CPU tests need neither TorchTPU nor its compiler options.
+        if not hasattr(torch, "tpu") or "torch_tpu" not in sys.modules:
+            yield
+            return
+        raise RuntimeError("TPU trainer precision requires TorchTPU's custom_compiler_options API") from error
+    with custom_compiler_options({"xla_disable_hlo_passes": "bfloat16-propagation"}):
+        yield
+
 
 # Attribute name used to attach the full bucket-padded device tensor to a CPU
 # nested tensor returned from ``prepare_model_outputs``, so loss functions can
@@ -289,6 +447,10 @@ def extend_torchtitan_engine_config() -> None:
     """
     extras: list[tuple[str, Any, Any]] = [
         ("engine_kwargs", dict[str, Any], field(default_factory=dict)),
+        ("mixed_precision_param", Optional[str], None),
+        # None preserves the existing automatic fused-loss default; an explicit
+        # False requests the BF16 head and disables that default.
+        ("fp32_logits", Optional[bool], None),
         # Deprecated: use engine_kwargs.tpu.<name>.
         ("use_splash_attention", Optional[bool], None),
         ("use_simple_fsdp", Optional[bool], None),
@@ -361,19 +523,31 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
 
 
 def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any, *, required: bool = False) -> bool:
-    """Whether to compute log-probs with the fused LM-head + cross-entropy kernel (``engines.fused_logprob``).
+    """Use fused FP32 log-probs with compile or models that require them, unless explicitly disabled.
 
-    The kernel never materializes the ``[tokens, vocab]`` logits, which saves memory and keeps them in fp32.
-    It only supports ``tensor_parallel_size == 1``.
-
-    Default: on with ``use_torch_compile``. With ``required`` (set by the engine for models that need it, e.g. MoE),
-    it is on by default and TP > 1 raises instead of falling back. ``use_fused_linear_cross_entropy=False`` always
-    turns it off.
+    An explicit ``fp32_logits`` choice selects the ordinary LM head and disables the automatic fused default.
+    Both fused log-probs and the FP32 LM head require ``tensor_parallel_size == 1``. Opting out on models that
+    require fused log-probs materializes ``[tokens, vocab]`` logits and may exhaust memory.
     """
-    user_choice = get_tpu_engine_options(engine_config).use_fused_linear_cross_entropy  # None (unset), True or False
+    options = get_tpu_engine_options(engine_config)
+    user_choice = options.use_fused_linear_cross_entropy
+    fp32_logits = options.fp32_logits
     tp_size = int(getattr(engine_config, "tensor_parallel_size", 1) or 1)
+    if fp32_logits is not None:
+        if user_choice is True:
+            raise ValueError(
+                f"torchtitan.fp32_logits={fp32_logits} explicitly selects the LM-head precision, but "
+                "engine_kwargs.tpu.use_fused_linear_cross_entropy=True bypasses that head. "
+                "Set use_fused_linear_cross_entropy=False, or unset fp32_logits to use the fused kernel's precision."
+            )
+        if fp32_logits and tp_size > 1:
+            raise ValueError(
+                "torchtitan.fp32_logits=True supports tensor_parallel_size=1 only; "
+                "its local FP32 LM-head projection cannot preserve tensor-parallel output sharding. "
+                "Set fp32_logits=False or tensor_parallel_size=1."
+            )
+        user_choice = False
 
-    # 1. An explicit opt-out always wins.
     if user_choice is False:
         if required:
             logger.warning(
@@ -382,7 +556,6 @@ def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any, *, required: 
             )
         return False
 
-    # 2. The kernel does not support tensor parallelism.
     if tp_size > 1:
         if required:
             raise ValueError(
@@ -392,10 +565,7 @@ def resolve_tpu_use_fused_linear_cross_entropy(engine_config: Any, *, required: 
             )
         return False
 
-    # 3. On if the model requires it or the user asked for it; if unset, on with torch.compile.
-    if required or user_choice:
-        return True
-    return bool(getattr(engine_config, "use_torch_compile", False))
+    return bool(required or user_choice or getattr(engine_config, "use_torch_compile", False))
 
 
 _DEFAULT_SPLASH_MAX_BLOCK_SIZE = 512  # torchtitan's splash_block_size_for default
@@ -696,7 +866,7 @@ def unwrap_metadata(val: Any) -> Any:
 
 
 def tpu_eager_mode_context(mode: Optional[str]):
-    """Context manager running the enclosed ops under the ``torch_tpu`` eager ``mode`` (no-op for ``None``).
+    """Run trainer operations with the eager ``mode`` and FP32 affine-gradient reductions.
 
     Mirrors torchtitan's ``tpu_config.eager_mode`` (``torchtitan/experiments/tpu/gmain.py``), which TPU
     recipes set to ``DEFER_AND_FUSE``: ops outside the compiled blocks are deferred and compiled into
@@ -706,14 +876,25 @@ def tpu_eager_mode_context(mode: Optional[str]):
     Uses torch_tpu's public ``torch.tpu.set_eager_mode`` / ``torch.tpu.EagerMode`` (torch_tpu >= 0.2.0), the same
     context manager as the private ``torch_tpu._internal.execution_mode.set_eager_mode``.
     """
-    if mode is None:
-        return nullcontext()
     tpu = getattr(torch, "tpu", None)
     set_eager_mode = getattr(tpu, "set_eager_mode", None)
     eager_mode = getattr(tpu, "EagerMode", None)
-    if set_eager_mode is None or eager_mode is None:  # no torch_tpu, e.g. the CPU tests
-        return nullcontext()
-    return set_eager_mode(getattr(eager_mode, mode))
+    eager_context = (
+        set_eager_mode(getattr(eager_mode, mode))
+        if mode is not None and set_eager_mode is not None and eager_mode is not None
+        else nullcontext()
+    )
+    if "torch_tpu" not in sys.modules:  # no torch_tpu, e.g. the CPU tests
+        return eager_context
+
+    @contextmanager
+    def trainer_context():
+        with ExitStack() as stack:
+            stack.enter_context(eager_context)
+            stack.enter_context(tpu_precision_compiler_context())
+            yield
+
+    return trainer_context()
 
 
 @torch.no_grad()
@@ -1016,6 +1197,14 @@ class TPUVarlenAttention(torch.nn.Module):
 
     def forward(self, q, k, v, *, scale=None, positions=None, segment_ids=None, out_transform=None, **kwargs):
         _reject_out_transform(out_transform)
+        input_dtype = q.dtype
+        compute_dtype = attention_compute_dtype(q)
+        if compute_dtype is not None:
+            q, k, v = (t.to(compute_dtype) for t in (q, k, v))
+        elif q.dtype != k.dtype or q.dtype != v.dtype:
+            # FP32 Q/K norms can coexist with a BF16 value projection without
+            # autocast; the math reference requires a common dtype.
+            q, k, v = (t.to(torch.float32) for t in (q, k, v))
         segment_ids = _document_ids(positions, segment_ids)
         was_3d = q.dim() == 3
         if was_3d:
@@ -1038,7 +1227,9 @@ class TPUVarlenAttention(torch.nn.Module):
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))
         if q.shape[1] != k.shape[1]:  # GQA
             k, v = (t.repeat_interleave(q.shape[1] // k.shape[1], dim=1) for t in (k, v))
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask.unsqueeze(1), scale=scale).transpose(1, 2)
+        with sdpa_kernel([SDPBackend.MATH]) if q.dtype == torch.float32 else nullcontext():
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask.unsqueeze(1), scale=scale).transpose(1, 2)
+        out = out.to(input_dtype)
         return out.squeeze(0) if was_3d else out
 
 
@@ -1135,7 +1326,7 @@ def _tpu_attention(inner: torch.nn.Module, use_splash: bool, local_window_size: 
     reference = inner.local_forward if _is_kv_all_gather_cp(inner) else TPUVarlenAttention(local_window_size)
     if not use_splash:
         return reference
-    splash_cls = _splash_attention_cls()
+    splash_cls = precision_splash_attention_cls(_splash_attention_cls())
     if has_64mib_scoped_vmem() and _splash_accepts_block_kwargs(splash_cls):
         return _get_splash_1024_auto_cls(splash_cls)(
             is_causal=True,

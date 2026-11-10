@@ -156,6 +156,10 @@ class TPUEngineOptions:
             skewed RL / math tokens across 32-64 EP ranks while vLLM rollout is dropless.
         qwen3_pallas_experts: Legacy Qwen3-30B-A3B flag; Pallas is required, so ``False`` is rejected.
         moe_paired_gemm: Legacy Qwen3-30B-A3B alias used only when ``moe_paired_grouped_mm`` is unset.
+        mixed_precision_param: TorchTitan mixed-precision parameter dtype, ``bfloat16`` or ``float32``;
+            unset preserves its default and FP32 master parameters.
+        fp32_logits: Preserve FP32 LM-head accumulators with BF16 operands; ``False`` requests BF16 logits.
+            Either explicit value disables the automatic fused-linear-loss default so this head is used.
         rollout_expert_parallel: Export Qwen3.5 MoE experts in vLLM's expert-parallel layout so the rollout
             receives them straight into its expert weights with no HBM staging copy (default: ``False``, see
             ``rollout/qwen3_5_layout.py``). Temporary for large MoEs whose expert shard cannot afford a second HBM
@@ -226,6 +230,8 @@ class TPUEngineOptions:
     ep_capacity_factor: Optional[float] = None
     qwen3_pallas_experts: Optional[bool] = None
     moe_paired_gemm: Optional[bool] = None
+    mixed_precision_param: Optional[str] = None
+    fp32_logits: Optional[bool] = None
     rollout_expert_parallel: Optional[bool] = None
     param_dtype: Optional[str] = None
     optimizer_host_offload: Optional[bool] = None
@@ -258,6 +264,8 @@ _ENGINE_KINDS: dict[str, type] = {
     "ep_capacity_factor": float,
     "qwen3_pallas_experts": bool,
     "moe_paired_gemm": bool,
+    "mixed_precision_param": str,
+    "fp32_logits": bool,
     "rollout_expert_parallel": bool,
     "param_dtype": str,
     "optimizer_host_offload": bool,
@@ -288,6 +296,7 @@ _ENGINE_LEGACY_ENV_VARS = {
     "seq_bucket_size": "VERL_TPU_SEQ_BUCKET_SIZE",
     "qwen3_pallas_experts": "VERL_TPU_QWEN3_PALLAS_EXPERTS",
     "moe_paired_gemm": "VERL_MOE_PAIRED_GEMM",
+    "fp32_logits": "VERL_TPU_FP32_LOGITS",
 }
 _ENGINE_LEGACY_CONFIG_FIELDS = (
     "use_splash_attention",
@@ -295,6 +304,8 @@ _ENGINE_LEGACY_CONFIG_FIELDS = (
     "use_fused_linear_cross_entropy",
     "fuse_qkv",
     "tpu_eager_mode",
+    "mixed_precision_param",
+    "fp32_logits",
 )
 
 
@@ -324,6 +335,9 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
     _apply_legacy_env(
         values, _ENGINE_KINDS, _ENGINE_LEGACY_ENV_VARS, f"torchtitan.engine_kwargs.{TPU_ENGINE_KWARGS_KEY}"
     )
+    mixed_precision_param = values.get("mixed_precision_param")
+    if mixed_precision_param not in (None, "bfloat16", "float32"):
+        raise ValueError("TPU engine mixed_precision_param must be bfloat16, float32, or null")
     if values.get("param_dtype") not in (None, "float32", "bfloat16"):
         raise ValueError(
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.param_dtype must be float32 or bfloat16, "
