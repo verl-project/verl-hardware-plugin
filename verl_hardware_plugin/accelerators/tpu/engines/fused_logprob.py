@@ -13,7 +13,18 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-BACKWARD_CHUNK = 2048  # rows per backward chunk: FP32 logits take rows x vocab x 4 B (1.2 GiB for Qwen3)
+BACKWARD_CHUNK_BYTES = 512 << 20  # FP32 logits bytes per backward chunk: rows x vocab-chunk x 4 B
+BACKWARD_MIN_VOCAB_CHUNK = 1024
+
+
+def backward_vocab_chunk(num_tokens: int, vocab: int, chunk_bytes: int = BACKWARD_CHUNK_BYTES) -> int:
+    """Vocab columns per backward chunk, so that the chunk's FP32 logits take about ``chunk_bytes``.
+
+    A multiple of 128 (TPU lane width) of at least ``BACKWARD_MIN_VOCAB_CHUNK``, or the whole vocab if it fits.
+    """
+    cols = chunk_bytes // (4 * max(num_tokens, 1))
+    cols = max(BACKWARD_MIN_VOCAB_CHUNK, (cols // 128) * 128)
+    return min(vocab, cols)
 
 
 def _loss_module() -> Any:
@@ -55,22 +66,32 @@ class _FusedLogprob(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad):  # type: ignore[override]
-        # d log p(label) / d logits = onehot(label) - softmax(logits); one chunk of FP32 logits at a time.
+        # d log p(label) / d logits = onehot(label) - softmax(logits), one vocab chunk of FP32 logits at a time.
+        # Chunking the vocab (not the tokens) keeps the peak at one [T, Vc] FP32 chunk plus the [H, Vc] FP32 weight
+        # slice: never an FP32 copy of the whole LM head or of its gradient (2 x 2.3 GiB for Qwen3-8B), and each
+        # grad_w column block is complete after one matmul, so it is written in the weight's dtype directly.
         # On torch_tpu, FP32 matmuls already default to single-pass BF16 MXU with FP32 accumulation; honor the
         # process-wide float32_matmul_precision rather than mutating it here.
         x, labels, weight_t, lse = ctx.saved_tensors
-        w32 = weight_t.float()
-        grad_x = torch.empty_like(x)
-        grad_w = torch.zeros_like(w32)
-        for start in range(0, x.shape[0], BACKWARD_CHUNK):
-            rows = slice(start, start + BACKWARD_CHUNK)
-            x32 = x[rows].float()
-            g = -torch.exp(x32 @ w32 - lse[rows].unsqueeze(-1))
-            g.scatter_add_(-1, labels[rows].long().unsqueeze(-1), torch.ones_like(g[:, :1]))
-            g *= grad[rows].float().unsqueeze(-1)
-            grad_x[rows] = (g @ w32.t()).to(x.dtype)
-            grad_w += x32.t() @ g
-        return grad_x, None, grad_w.to(weight_t.dtype), None
+        num_tokens, vocab = x.shape[0], weight_t.shape[1]
+        x32 = x.float()
+        scale = grad.float().unsqueeze(-1)
+        lse_col = lse.unsqueeze(-1)
+        labels = labels.long()
+        grad_x = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        grad_w = torch.empty_like(weight_t)
+        chunk = backward_vocab_chunk(num_tokens, vocab)
+        for start in range(0, vocab, chunk):
+            cols = slice(start, min(start + chunk, vocab))
+            w32 = weight_t[:, cols].float()
+            g = -torch.exp(x32 @ w32 - lse_col)  # -softmax over this chunk's columns
+            in_chunk = (labels >= cols.start) & (labels < cols.stop)
+            local = (labels - cols.start).clamp_(0, cols.stop - cols.start - 1).unsqueeze(-1)
+            g.scatter_add_(-1, local, in_chunk.to(g.dtype).unsqueeze(-1))
+            g *= scale
+            grad_x.addmm_(g, w32.t())
+            grad_w[:, cols] = (x32.t() @ g).to(weight_t.dtype)
+        return grad_x.to(x.dtype), None, grad_w, None
 
 
 def fused_linear_logprobs_tpu(

@@ -828,13 +828,52 @@ def test_fused_logprob_chunked_backward_matches_autograd():
         xk, wk = x.clone().requires_grad_(), weight_t.clone().requires_grad_()
         with (
             mock.patch.object(fused_logprob, "_forward_op", _forward_op),
-            mock.patch.object(fused_logprob, "BACKWARD_CHUNK", 4),  # several chunks, the last one ragged
+            # Several vocab chunks (30 columns in chunks of 8), the last one ragged; labels fall in every chunk.
+            mock.patch.object(fused_logprob, "backward_vocab_chunk", lambda num_tokens, vocab: 8),
         ):
             logp = fused_logprob.fused_linear_logprobs_tpu(xk, labels, wk, temperature=temperature, b_block_size=16)
         (logp * cotangent).sum().backward()
         torch.testing.assert_close(logp, expected.detach())
         torch.testing.assert_close(xk.grad, xr.grad, rtol=1e-4, atol=1e-5)
         torch.testing.assert_close(wk.grad, wr.grad, rtol=1e-4, atol=1e-5)
+
+
+def test_fused_logprob_backward_never_holds_the_whole_fp32_lm_head():
+    """The backward's largest temporaries are one [T, Vc] FP32 logits chunk and the [H, Vc] FP32 weight slice: it
+    must not make an FP32 copy of the whole (H, V) LM head or of its gradient (2 x 2.3 GiB for Qwen3-8B)."""
+    from verl_hardware_plugin.accelerators.tpu.engines import fused_logprob
+
+    # Qwen3-8B: 4096 x 151936 at 8192 tokens -> 512 MiB chunks of 16384 columns; a small vocab is one chunk.
+    assert fused_logprob.backward_vocab_chunk(8192, 151936) == 16384
+    assert fused_logprob.backward_vocab_chunk(65536, 151936) == 2048
+    assert fused_logprob.backward_vocab_chunk(1 << 20, 151936) == fused_logprob.BACKWARD_MIN_VOCAB_CHUNK
+    assert fused_logprob.backward_vocab_chunk(16, 30) == 30
+
+    torch.manual_seed(0)
+    tokens, hidden, vocab = 64, 16, 4096
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
+    weight_t = (torch.randn(hidden, vocab) * 0.3).to(torch.bfloat16)
+    labels = torch.randint(0, vocab, (tokens,))
+    lse = torch.logsumexp(x.float() @ weight_t.float(), -1)
+    sizes: list[int] = []
+
+    class _Ctx:
+        saved_tensors = (x, labels.to(torch.int32), weight_t, lse)
+
+    real_float = torch.Tensor.float
+
+    def counting_float(t):
+        sizes.append(t.numel())
+        return real_float(t)
+
+    with (
+        mock.patch.object(fused_logprob, "backward_vocab_chunk", lambda num_tokens, v: 512),
+        mock.patch.object(torch.Tensor, "float", counting_float),
+    ):
+        grad_x, _, grad_w, _ = fused_logprob._FusedLogprob.backward(_Ctx, torch.ones(tokens))
+    assert grad_x.shape == x.shape and grad_w.shape == weight_t.shape and grad_w.dtype == weight_t.dtype
+    # No FP32 conversion of a (H, V)-sized tensor; the weight is converted one 512-column slice at a time.
+    assert max(sizes) <= max(tokens * hidden, hidden * 512)
 
 
 def test_fused_log_prob_is_required_for_moe():
