@@ -9,15 +9,12 @@ patch to span several hosts. Each remaining patch fills a gap in vLLM (v0.29.0 -
 
 * ``TPUWorker.reset_encoder_cache``: no-op. verl resets vLLM's caches after every weight update,
   and vllm-torchtpu's worker does not implement this call. Upstream fix: implement it.
-* ``VLLM_DISABLE_COMPILE_CACHE=1``: a reloaded compile-cache artifact can make vLLM run the model
-  eagerly, which crashes libtpu (b/501165531). Upstream fix: that bug.
 * ``multiprocessing.process.BaseProcess.__init__``: install these patches in the EngineCore process and
   in vLLM's worker processes, which do not import the plugin.
 """
 
 import logging
 import multiprocessing.process
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +28,6 @@ def patch_vllm_for_tpu() -> None:
         return
 
     patch_multiprocessing_for_tpu()
-    # vLLM can reload a degenerate AOT compile artifact (num_artifacts=0) that silently runs the
-    # model eagerly; eager execution then hits the XLA:TPU unaligned-DUS CHECK (b/501165531).
-    os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
 
     # Imported here: CPU tests and processes outside the rollout may lack vLLM or vllm-torchtpu.
     try:

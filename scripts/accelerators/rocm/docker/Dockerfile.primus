@@ -1,0 +1,69 @@
+# verl + Primus Megatron trainer + vLLM rollout on AMD Instinct GPUs.
+#
+# Build:  docker build -f Dockerfile.primus -t verl-rocm-primus:v26.9 .
+#
+# The base image ships torch (ROCm), TransformerEngine, AITER and Primus-Turbo. Megatron-LM is not
+# installed: like Primus itself, put <Primus>/third_party/Megatron-LM on PYTHONPATH at run time.
+# verl and verl-hardware-plugin are installed editable from mounted checkouts at run time.
+ARG BASE_IMAGE=rocm/primus:v26.9
+FROM ${BASE_IMAGE}
+
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+WORKDIR /workspace
+# GPU targets for the vLLM build, e.g. --build-arg GPU_ARCHS=gfx942 for MI300X only.
+ARG GPU_ARCHS="gfx942;gfx950"
+ARG MAX_JOBS=64
+ENV PYTORCH_ROCM_ARCH="${GPU_ARCHS}"
+
+# Keep the base image's ROCm torch stack: every later pip call is constrained to it.
+RUN pip freeze | grep -iE '^(torch|torchvision|torchaudio|triton|amd-torch[a-z-]*|amd-aiter|transformer[-_]engine[a-z_-]*|primus[-_]turbo)==' \
+        > /workspace/base-constraints.txt \
+    && cat /workspace/base-constraints.txt
+ENV PIP_CONSTRAINT=/workspace/base-constraints.txt
+
+# vLLM from source with the ROCm fixes from verl's docker/rocm/Dockerfile.rocm.
+ARG VLLM_TAG=v0.32.0
+RUN pip install --no-cache-dir setuptools_scm \
+    && git clone https://github.com/vllm-project/vllm /workspace/vllm \
+    && cd /workspace/vllm \
+    && git checkout ${VLLM_TAG} \
+    && sed -i 's|\(  // std::cout << "create_and_map:\)|#ifdef USE_ROCM\n  // ROCm: zero freshly mapped VRAM to avoid stale data (PR #44972)\n  CUDA_CHECK((CUresult)hipMemset(reinterpret_cast<void*>(d_mem), 0, size));\n  if (error_code != 0) {\n    return;\n  }\n#endif\n\1|' csrc/cumem_allocator.cpp \
+    && sed -i 's/layer\.w13_weight\.data = self\._maybe_pad_weight(layer\.w13_weight\.data)/layer.w13_weight.data.copy_(self._maybe_pad_weight(layer.w13_weight.data))/' \
+        vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py \
+    && sed -i 's/layer\.w2_weight\.data = self\._maybe_pad_weight(layer\.w2_weight\.data)/layer.w2_weight.data.copy_(self._maybe_pad_weight(layer.w2_weight.data))/' \
+        vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py \
+    && (sed -i 's/return w13_weight\.contiguous(), w2_weight\.contiguous()/return w13_weight, w2_weight/' \
+        vllm/model_executor/layers/fused_moe/oracle/unquantized.py || true) \
+    && pip install --no-cache-dir -r requirements/rocm.txt \
+    && MAX_JOBS=${MAX_JOBS} python3 setup.py develop --no-deps \
+    && (pip uninstall -y tilelang || true) \
+    && rm -rf /workspace/vllm/.git
+
+# verl runtime dependencies (verl itself is mounted). Megatron-Bridge is the version verl pairs
+# with megatron-core 0.19.2; it is installed without its dependencies, as in verl's pyproject.
+RUN pip install --no-cache-dir \
+        'tensordict>=0.8.0,<=0.10.0,!=0.9.0' \
+        'ray[default]>=2.41.0' \
+        hydra-core omegaconf antlr4-python3-runtime \
+        codetiming dill 'pyarrow>=19.0.0' pandas peft pylatexenc \
+        accelerate datasets packaging wandb pybind11 math-verify mathruler \
+        'TransferQueue==0.1.11' pyzmq msgspec 'prometheus_client>=0.20.0' \
+        cachetools einops fastapi uvicorn torchdata tensorboard \
+        cupy-rocm-7-0==14.1.1 \
+    && pip install --no-cache-dir --no-deps "git+https://github.com/NVIDIA-NeMo/Megatron-Bridge.git@v0.6.2" \
+    && pip install --no-cache-dir 'megatron-energon==7.4.1'
+
+# vLLM finds ROCm through the amdsmi python module, which the image only
+# carries inside the rocm-sdk tree. Expose that package and its shared library.
+ENV ROCM_SDK=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel
+RUN mkdir -p /opt/amdsmi_lib && ln -sf ${ROCM_SDK}/lib/libamd_smi.so* /opt/amdsmi_lib/
+ENV PYTHONPATH=${ROCM_SDK}/share/amd_smi
+ENV LD_LIBRARY_PATH=/opt/amdsmi_lib:${LD_LIBRARY_PATH}
+
+ENV NVTE_USE_GROUPED_GEMM_TRITON=1
+ENV NCCL_DEBUG=ERROR
+ENV HSA_ENABLE_IPC_MODE_LEGACY=1
+ENV PIP_CONSTRAINT=
+RUN rm -rf /root/.cache
+CMD ["/usr/bin/bash"]

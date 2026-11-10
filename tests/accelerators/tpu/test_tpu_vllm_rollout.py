@@ -273,6 +273,45 @@ def test_launch_tpu_vllm_servers_rejects_data_parallel(tpu_vllm):
         asyncio.run(tpu_vllm.launch_tpu_vllm_servers(_fake_replica(data_parallel_size=2)))
 
 
+@pytest.mark.parametrize(
+    "pod_type, chips, topology",
+    [
+        ("v7x-8", 8, "2,2,1,2"),
+        ("v6e-8", 8, "2,4,1"),
+        ("v5p-16", 4, "2,2,1"),
+        # TP=2 / TP=4 on TPU 7x: no known sub-host mesh, so the replica keeps the inherited value instead of failing.
+        ("v7x-8", 2, None),
+        ("v7x-8", 4, None),
+    ],
+)
+def test_launch_tpu_vllm_servers_single_host_topology_from_ray(tpu_vllm, monkeypatch, pod_type, chips, topology):
+    # The launcher may run on a CPU Ray head: no TPU_ACCELERATOR_TYPE, but the slice's TORCH_TPU_TOPOLOGY may leak.
+    monkeypatch.delenv("TPU_ACCELERATOR_TYPE", raising=False)
+    monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "2,2,4")
+    replica = _fake_replica()
+    replica.workers = [_FakeWorker(NODE_A) for _ in range(chips)]
+    replica.gpus_per_replica_node = chips
+    replica.nnodes = 1
+    nodes = [
+        {"Alive": True, "Resources": {"TPU": 4.0}, "NodeID": NODE_B, "Labels": {"ray.io/tpu-pod-type": "v6e-4"}},
+        {"Alive": True, "Resources": {"TPU": 4.0}, "NodeID": NODE_A, "Labels": {"ray.io/tpu-pod-type": pod_type}},
+    ]
+    platform = SimpleNamespace(ray_noset_envvars=lambda: [], rollout_env_vars=lambda: {})
+
+    async def run():
+        with (
+            mock.patch.object(tpu_vllm, "get_platform", return_value=platform),
+            mock.patch("ray.is_initialized", return_value=True),
+            mock.patch("ray.nodes", return_value=nodes),
+        ):
+            await tpu_vllm.launch_tpu_vllm_servers(replica)
+
+    asyncio.run(run())
+
+    [options] = replica.server_class.options_kwargs
+    assert options["runtime_env"]["env_vars"].get("TORCH_TPU_TOPOLOGY") == topology
+
+
 # ---------------------------------------------------------------------------
 # patch_vllm_for_tpu (without vllm-torchtpu installed)
 # ---------------------------------------------------------------------------
@@ -285,21 +324,19 @@ def isolated_patches():
     base_process = multiprocessing.process.BaseProcess
     saved_init = base_process.__init__
     had_flag = "_tpu_patched" in base_process.__dict__
-    env = {k: v for k, v in os.environ.items() if k != "VLLM_DISABLE_COMPILE_CACHE"}
-    with (
-        mock.patch.dict(os.environ, env, clear=True),
-        mock.patch.object(tpu_vllm_patches, "_PATCHES_APPLIED", False),
-    ):
+    with mock.patch.object(tpu_vllm_patches, "_PATCHES_APPLIED", False):
         yield tpu_vllm_patches
     base_process.__init__ = saved_init
     if not had_flag and "_tpu_patched" in base_process.__dict__:
         del base_process._tpu_patched
 
 
-def test_patch_vllm_for_tpu_env_side_effects_without_torchtpu(isolated_patches):
-    isolated_patches.patch_vllm_for_tpu()
-
-    assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "1"
+def test_patch_vllm_for_tpu_side_effects_without_torchtpu(isolated_patches):
+    with mock.patch.dict(os.environ):
+        os.environ.pop("VLLM_DISABLE_COMPILE_CACHE", None)
+        isolated_patches.patch_vllm_for_tpu()
+        # vLLM's compile cache is left on (the plugin no longer sets VLLM_DISABLE_COMPILE_CACHE).
+        assert "VLLM_DISABLE_COMPILE_CACHE" not in os.environ
     assert multiprocessing.process.BaseProcess._tpu_patched is True
     # The executor patches need vllm-torchtpu, so the guard stays open for a later retry.
     assert isolated_patches._PATCHES_APPLIED is False
@@ -311,13 +348,6 @@ def test_patch_vllm_for_tpu_is_a_no_op_once_applied(isolated_patches):
     with mock.patch.dict(sys.modules, {"vllm": None}), mock.patch.object(isolated_patches.logger, "debug") as debug:
         isolated_patches.patch_vllm_for_tpu()
     debug.assert_not_called()
-    assert "VLLM_DISABLE_COMPILE_CACHE" not in os.environ
-
-
-def test_patch_vllm_for_tpu_keeps_explicit_compile_cache_setting(isolated_patches):
-    os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "0"
-    isolated_patches.patch_vllm_for_tpu()
-    assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "0"
 
 
 def test_pickleable_process_wrapper_applies_patches_before_target():

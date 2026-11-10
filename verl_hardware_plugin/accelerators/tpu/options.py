@@ -138,8 +138,9 @@ class TPUEngineOptions:
         use_splash_attention: Use the Pallas splash attention kernel (default: ``use_torch_compile`` or
             ``context_parallel_size > 1``).
         use_simple_fsdp: Shard with SimpleFSDP (default: ``use_torch_compile`` when PP is 1).
-        use_fused_linear_cross_entropy: Use the Pallas fused linear + cross-entropy kernel for log-probs
-            (default: ``use_torch_compile`` when TP is 1).
+        use_fused_linear_cross_entropy: Compute log-probs with Tokamax's fused linear + softmax + cross-entropy
+            Pallas kernel, without materializing the ``[tokens, vocab]`` logits (default: on for MoE models, where
+            it is required and the engine raises if it cannot be used; else ``use_torch_compile`` when TP is 1).
         fuse_qkv: Fuse attention Q/K/V projections in the model (default: ``True``; ``False`` avoids
             the FSDP all-gather inside ``FusedQKVLinear._split_qkv_on_save`` during ``state_dict()``).
         tpu_eager_mode: ``torch_tpu`` eager mode, ``DEFER_AND_FUSE`` or ``DEFER_NEVER``
@@ -178,6 +179,38 @@ class TPUEngineOptions:
         enable_tpu_topo_mesh: Preserve physical 3D ICI torus ``(x, y, z)`` rank order on ``ParallelismConfig``
             (``torch.tpu.topology_aware_mesh`` + ``DeviceMesh(preserve_rank_order=True)``). ``None`` (default) enables
             it automatically whenever supported by the installed ``torchtitan`` and ``torch`` (``torch >= 2.15``).
+        ep_token_chunks: With ``expert_parallel_size > 1`` and a torchtitan that has ``TpuQwen35RoutedExperts``
+            (Qwen3.5 fast dropless EP), pipeline each MoE layer's dispatch -> experts -> combine over this many token
+            chunks, overlapping one chunk's expert matmuls with the next chunk's EP collectives (default: unset, no
+            chunking). Needs ``ep_dispatcher=static`` so torchtitan's ``TpuQwen35TokenDispatcher`` runs.
+        ep_paired_grouped_mm: With ``expert_parallel_size > 1`` and a torchtitan whose ``TpuGroupedExperts`` has
+            ``allow_ep_paired_grouped_mm``, keep the paired (w1 + w3) Pallas grouped matmul under EP (default:
+            ``False``: unpaired under EP, as torchtitan builds without it require).
+        ac_save_splash_and_routing: When ``True`` and activation checkpointing is enabled, use a TPU ``SelectiveAC``
+            policy that saves only Pallas ``SplashAttention`` forward outputs (``(out, lse)``) and MoE router
+            ``aten.topk`` assignments while recomputing all projections, norms, GatedDeltaNet recurrences and MoE
+            collectives/matmuls (matching TorchTitan's ``tpu_selective`` ``("moe.routing",
+            "attention.inner_attention")`` benchmark memory policy).
+        static_micro_batch_len: Pad every packed micro-batch to at least this many tokens (rounded up to the
+            sequence bucket), e.g. the ``use_dynamic_bsz`` token budget, so the trainer compiles one sequence shape
+            instead of one per length bucket it meets (default: unset, off).
+        static_max_response_len: Pad every micro-batch's response-length bucket to at least this many tokens (e.g.
+            ``max_response_length``), so response-shaped tensors also keep one shape (default: unset, off).
+        splash_max_block_size: Largest Splash attention block size, a power of two >= 128 (default: ``512``,
+            torchtitan's). Long packed micro-batches run faster with ``1024``.
+        mixed_precision_reduce: dtype of the FSDP gradient reduce-scatter, ``float32`` (default, torchtitan's) or
+            ``bfloat16`` (half the traffic; a performance A/B option).
+        moe_paired_grouped_mm: Qwen3 MoE: run the W1/W3 expert projections with torchtitan's paired Pallas grouped
+            matmul, sharing the routed-token loads (default: ``False``).
+        moe_native_weight_layout: Qwen3 MoE: store the expert weights in the kernel-native ``(E, K, N)`` layout;
+            ``state_dict()`` / ``load_state_dict()`` still use the canonical layout and names (default: ``False``).
+        gdn_row_slot_len: Qwen3.5: start every sequence of a packed micro-batch at a multiple of this many tokens
+            and run the GatedDeltaNet over rows of this length (one sequence per row) instead of restarting it at
+            packed documents through Tokamax ``segment_ids`` (default: unset, off). Needs every sequence <= this
+            length and ``static_micro_batch_len`` = sequences per micro-batch x this.
+        frozen_param_regex: Parameters whose FQN matches this regex (``re.search``) are not trained: their
+            gradients are dropped before the gradient norm and the optimizer step, e.g. ``moe.router.gate`` freezes
+            the MoE router (default: unset, train every parameter).
         fixed_shape_rows: Packed-row lengths of fixed-shape micro-batches (``engines/tpu_fixed_shapes.py``), as
             colon-, comma- or space-separated integers or a list, e.g. ``8192:14336:16384``; each a multiple of the
             sequence bucket. Unset (default) keeps verl's dynamic micro-batching. When set (with
@@ -208,6 +241,17 @@ class TPUEngineOptions:
     fp32_master: Optional[bool] = None
     ep_dispatcher: Optional[str] = None
     enable_tpu_topo_mesh: Optional[bool] = None
+    ep_token_chunks: Optional[int] = None
+    ep_paired_grouped_mm: Optional[bool] = None
+    ac_save_splash_and_routing: Optional[bool] = None
+    static_micro_batch_len: Optional[int] = None
+    static_max_response_len: Optional[int] = None
+    splash_max_block_size: Optional[int] = None
+    mixed_precision_reduce: Optional[str] = None
+    moe_paired_grouped_mm: Optional[bool] = None
+    moe_native_weight_layout: Optional[bool] = None
+    gdn_row_slot_len: Optional[int] = None
+    frozen_param_regex: Optional[str] = None
     fixed_shape_rows: Optional[str] = None
     fixed_shape_max_seqs: Optional[int] = None
     fixed_shape_response_len: Optional[int] = None
@@ -231,6 +275,17 @@ _ENGINE_KINDS: dict[str, type] = {
     "fp32_master": bool,
     "ep_dispatcher": str,
     "enable_tpu_topo_mesh": bool,
+    "ep_token_chunks": int,
+    "ep_paired_grouped_mm": bool,
+    "ac_save_splash_and_routing": bool,
+    "static_micro_batch_len": int,
+    "static_max_response_len": int,
+    "splash_max_block_size": int,
+    "mixed_precision_reduce": str,
+    "moe_paired_grouped_mm": bool,
+    "moe_native_weight_layout": bool,
+    "gdn_row_slot_len": int,
+    "frozen_param_regex": str,
     "fixed_shape_rows": str,
     "fixed_shape_max_seqs": int,
     "fixed_shape_response_len": int,
@@ -299,6 +354,10 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
                 f"got {values['ep_dispatcher']!r}"
             )
         values["ep_dispatcher"] = ep_disp
+    if values.get("ep_token_chunks") is not None and values["ep_token_chunks"] < 1:
+        raise ValueError(
+            f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ep_token_chunks must be >= 1, got {values['ep_token_chunks']!r}"
+        )
     if values.get("fixed_shape_rows") is not None:
         rows = parse_fixed_shape_rows(values["fixed_shape_rows"])
         values["fixed_shape_rows"] = ":".join(str(row) for row in rows)
@@ -389,12 +448,18 @@ class TPUSyncOptions:
             transfer, so training gets that HBM back between syncs.
         tie_word_embeddings: Whether ``lm_head`` is tied to the input embedding, so it need not be sent.
             ``None`` sends ``lm_head``, which is correct for tied and untied models alike.
+        return_after_d2h: Return to the trainer as soon as its weights are copied to host memory, and finish the sync
+            (the transfer to the rollout hosts, the install and the resume) in the background while training goes on.
+            The next sync waits for it first. Applies from the second sync on and needs a ``tpu-sync-torch`` whose
+            ``WeightSynchronizer.d2h()`` returns a future. Off by default: it relies on verl waiting for a pending
+            update (``CheckpointEngineManager.wait_for_weight_update``) before validation and at the end of training.
     """
 
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM
     verify_parity: str = "off"
     release_buffers_after_sync: bool = True
     tie_word_embeddings: Optional[bool] = None
+    return_after_d2h: bool = False
 
     @property
     def verify_norms(self) -> bool:
@@ -412,6 +477,7 @@ _SYNC_KINDS: dict[str, type] = {
     "verify_parity": ParityMode,
     "release_buffers_after_sync": bool,
     "tie_word_embeddings": bool,
+    "return_after_d2h": bool,
 }
 assert set(_SYNC_KINDS) == {f.name for f in dataclasses.fields(TPUSyncOptions)}
 

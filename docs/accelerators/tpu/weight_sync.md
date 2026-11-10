@@ -21,14 +21,16 @@ The former name of the `ray-plasma-store` backend, `tpu`, is still accepted and 
 The driver runs each sync (`update_tpu_sync_weights`, which replaces `CheckpointEngineManager.update_weights`
 for this backend):
 
-1. It pauses generation. The initial sync at step 0 skips this.
-2. Every trainer rank binds its weights to its tpu-sync `WeightSynchronizer`
+1. Every trainer rank binds its weights to its tpu-sync `WeightSynchronizer`
    (`engines/weight_export.py` decides how each weight is exported):
    - an FSDP shard (`Shard(0)` on a 1-D mesh, dim 0 divisible by the mesh size) is registered as this rank's
      block of the full tensor; tpu-sync reshards the blocks of all ranks for the rollout, so no rank gathers it;
    - a replicated weight is already full on every rank and is registered full, without further communication.
      Note that q/k/v_proj are replicated only because torchtitan's `FusedQKVLinear` `state_dict()` hook already
      all-gathers the FSDP-sharded `wqkv` before splitting it (TODO: split it locally);
+   - routed experts with `1 < expert_parallel_size < world size` (so `efsdp > 1`) are
+     `(_StridedShard(0, split_factor=ep), Shard(0))` on the `(efsdp, ep)` mesh: every rank still holds contiguous
+     whole experts, block `i_ep * efsdp + i_efsdp` of `efsdp * ep`, and is registered locally like an FSDP shard;
    - Qwen3 MoE expert stacks (torchtitan's `[E, I, H]` / `[E, H, I]` per projection) are sent as is, one 3-D
      tensor per projection and layer (`model.layers.N.mlp.experts.gate_proj.weight` `[E, I, H]`, likewise
      `up_proj`, and `down_proj` `[E, H, I]`, as Qwen3.5's expert pieces). An FSDP shard of whole experts is a dim-0
@@ -44,15 +46,18 @@ for this backend):
    of every tensor in the job's `TpuSyncRendezvous` actor (`weight_sync/tpu_sync_rendezvous.py`). The driver
    creates that actor once per job, named after the Ray job and not detached, so jobs sharing a cluster never
    see each other's.
-3. On the first sync only, every rollout worker allocates tensor-parallel receive buffers of those shapes
+2. On the first sync only, every rollout worker allocates tensor-parallel receive buffers of those shapes
    and registers them.
-4. The controller moves the weights from the trainer chips, through the trainer hosts, to the rollout hosts.
+3. The controller moves the weights from the trainer chips, through the trainer hosts, to the rollout hosts.
    Its planner decides per tensor, from the source and destination slices together, whether the copy can
    skip the CPU (de)tiling pass.
+4. It pauses generation (the initial sync at step 0 skips this). Until then the rollout keeps generating: steps
+   1-3 do not write vLLM's parameters, as the transfer only writes the rollout hosts' memory.
 5. The trainer unbinds its send buffers, returning their HBM to training, and keeps the synchronizer (its
    pinned host buffers and controller registration) for the next sync. Meanwhile, each rollout worker copies
    the weights to HBM and fuses q/k/v and gate/up into vLLM's parameters (see [Rollout install](#rollout-install)).
-6. Generation resumes, tagged with the new weight version.
+6. Generation resumes, tagged with the new weight version. Generations that finished before the pause used the
+   previous weights and keep their tag.
 
 ## Requirements
 
@@ -85,6 +90,7 @@ actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 | `parallelism` | `8` | Parallel transfer streams per worker. |
 | `verify_parity` | `off` | Weight-sync check: `off`, `norm`, `exact` or `all` (`True` means `norm`). See [Parity checks](#parity-checks). A failed check stops the run. Meant for bring-up and after changing sharding or upgrading tpu-sync. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The deprecated environment variable `VERL_TPU_SYNC_RELEASE_BUFFERS` still overrides the option on the trainer workers and logs a deprecation warning. |
+| `return_after_d2h` | `False` | Return to the trainer as soon as its ranks have copied their weights to host memory and freed the device buffers, and finish the sync (transfer, pause, install, resume) in the background while training goes on. The next sync waits for it first and raises its error, if any. Applies from the second sync on (tpu-sync keeps the weights bound across the first transfer to a rollout topology) and needs a `tpu-sync-torch` whose `WeightSynchronizer.d2h()` returns a future; otherwise the sync runs to the end as before. See [Returning after the D2H](#returning-after-the-d2h). |
 
 ## Rollout install
 
@@ -153,7 +159,7 @@ trainer, log them with the step metrics:
 
 | Metric | Phase |
 |--------|-------|
-| `timing_s/tpu-sync/quiesce` | Pausing generation; runs concurrently with `trainer_init` |
+| `timing_s/tpu-sync/quiesce` | Pausing generation, right after the transfer |
 | `timing_s/tpu-sync/trainer_init` | Trainer ranks gathering their weights, and creating and registering a synchronizer (first sync) or rebinding the existing one |
 | `timing_s/tpu-sync/sampler_init` | Rollout workers allocating and registering their receive buffers |
 | `timing_s/tpu-sync/barrier` | Waiting until every worker has registered |
@@ -161,8 +167,12 @@ trainer, log them with the step metrics:
 | `timing_s/tpu-sync/sampler_h2d` | Rollout workers copying the weights to HBM and into vLLM's parameters |
 | `timing_s/tpu-sync/sampler_h2d_pure` | The host-to-device copy alone, on the slowest rollout worker |
 | `timing_s/tpu-sync/sampler_resume` | Resuming generation, after the parity checks (if enabled) |
+| `timing_s/tpu-sync/rollout_paused` | From the pause (abort) to the resume: the quiesce, the install, the parity checks and the resume |
 | `timing_s/tpu-sync/trainer_release` | Waiting for the trainer to free its send buffers; generation has already resumed |
-| `timing_s/tpu-sync/total_sync` | The whole sync, including the pause that overlaps `trainer_init` |
+| `timing_s/tpu-sync/total_sync` | The whole sync |
+| `timing_s/tpu-sync/trainer_d2h` | With `return_after_d2h`: the trainer ranks' own device-to-host copy, on the slowest rank |
+| `timing_s/tpu-sync/wait_previous_sync` | With `return_after_d2h`: waiting for the background part of the previous sync |
+| `tpu-sync/returned_after_d2h` | With `return_after_d2h`: 1 when the sync returned after the trainer's D2H |
 
 `sampler_h2d_pure` and the `verify_parity` checks read the rollout workers' return values, which verl's vLLM server
 passes back from `collective_rpc` (since verl-project/verl#8155). With an older verl, the sync still works, but
@@ -170,6 +180,25 @@ passes back from `collective_rpc` (since verl-project/verl#8155). With an older 
 
 Generation resumes as soon as the rollout holds the new weights and has passed the parity checks; it does not wait
 for the trainer to free its send buffers, which only gives trainer HBM back before the next training step.
+
+The rollout keeps generating until the transfer is done, so `rollout_paused` covers only the quiesce, the install, the
+parity checks and the resume. The trainer waits longer instead: the quiesce no longer overlaps `trainer_init`, and the
+transfer shares the rollout hosts with generation, which makes its time vary more. On 2 × v6e-8 (Qwen3-8B, trainer
+FSDP8, rollout TP8, `verify_parity=norm`, steps 2–10), the rollout was paused for 0.73 s per sync instead of the whole
+sync (2.1 s), and `update_weights` took 2.71 s instead of 2.11 s. The transfer took 0.94–1.01 s with the rollout
+paused and 0.89–1.83 s with it generating; the receiving hosts show TCP receive-queue pruning and drops in both cases.
+
+## Returning after the D2H
+
+With `return_after_d2h`, a sync returns to the trainer after `trainer_init` (which then includes the ranks' own D2H,
+reported as `trainer_d2h`), and the transfer reads the trainer's host staging buffers (`skip_d2h`). The other phases run
+in the background and are reported by the next sync, together with `wait_previous_sync`: the step metrics of a sync
+show the background phases of the sync before it.
+
+The plugin routes verl's `CheckpointEngineManager.wait_for_weight_update` to the pending background sync, so a trainer
+that calls it before validation and before its training loop exits sees the new weights installed. With a verl whose
+trainer does not call it yet, a validation right after a sync can run on the previous weights, and the background part
+of the last sync may not finish before the process exits; keep `return_after_d2h` off there.
 
 ## Verify
 
@@ -181,20 +210,21 @@ pytest tests/accelerators/tpu/test_tpu_sync_checkpoint_engine.py -v
 
 On TPU, set `VERL_LOGGING_LEVEL=INFO` and `SAGEMAKER_CONTAINER_LOG_LEVEL=INFO` in the job's `env_vars` (see
 [vLLM Rollout](./rollout.md#run)). Every sync then logs its phase times. For example, from a
-Qwen3-0.6B run with one v6e-8 slice for training and one for rollout (two TP=4 replicas, `verify_parity=all`):
+Qwen3-8B run with one v6e-8 slice for training (FSDP8) and one for rollout (one TP=8 replica, `verify_parity=norm`):
 
 ```text
-[TPU-SYNC TELEMETRY | Orchestrator] Step 2 Completed in 0.9981s:
-  * Sampler Quiesce/Pause  : 0.0338s (overlaps Trainer Init)
-  * Trainer Init           : 0.3757s
-  * Sampler Init           : 0.0053s
+[TPU-SYNC TELEMETRY | Orchestrator] Step 4 Completed in 2.6860s:
+  * Trainer Init           : 0.5383s
+  * Sampler Init           : 0.0529s
   * Barrier Check          : 0.0002s
-  * Controller P2P         : 0.2022s
-  * Sampler H2D DMA        : 0.0325s
-  * Parity Check           : 0.3745s
-  * Sampler Resume         : 0.0046s
-  * Trainer Buffer Release : 0.0003s (rollout already generating)
-  * Total End-to-End Sync  : 0.9981s
+  * Controller P2P         : 1.3000s
+  * Sampler Quiesce/Pause  : 0.1809s (after the transfer)
+  * Sampler H2D DMA        : 0.0935s
+  * Parity Check           : 0.5100s
+  * Sampler Resume         : 0.0068s
+  * Rollout Paused         : 0.7929s
+  * Trainer Buffer Release : 0.0004s (rollout already generating)
+  * Total End-to-End Sync  : 2.6860s
 ```
 
 The first sync (step 0) is slower, because the rollout workers allocate and register their receive
