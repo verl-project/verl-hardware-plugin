@@ -58,9 +58,10 @@ _ensure_torch_tpu()  # Attempt at module load time so availability checks are fa
 # runtime_env for them to reach the trainer workers, the rollout servers and vLLM's engine workers.
 TPU_FORWARDED_ENV_VARS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS")
 TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_",)
-# Extra ``LIBTPU_INIT_ARGS`` / ``XLA_FLAGS`` appended only on ``RayWorkerGroup`` trainer/reference workers (never on
-# vLLM rollout servers), e.g. ``--xla_tpu_scoped_vmem_limit_kib=65472``, TorchTitan's MoE SparseCore collective-offload
-# flags, and ``--xla_enable_hlo_sharding_v3=false``.
+# Extra ``LIBTPU_INIT_ARGS`` / ``XLA_FLAGS`` only on ``RayWorkerGroup`` trainer/reference workers (never on vLLM
+# rollout servers), e.g. ``--xla_tpu_scoped_vmem_limit_kib=65472``, TorchTitan's MoE SparseCore collective-offload
+# flags, and ``--xla_enable_hlo_sharding_v3=false``. The XLA flags are appended to the job's ``XLA_FLAGS``; the libtpu
+# flags are merged into its ``LIBTPU_INIT_ARGS`` by ``trainer_libtpu_init_args``.
 TRAINER_EXTRA_LIBTPU_INIT_ARGS_ENV = "VERL_TPU_TRAINER_LIBTPU_INIT_ARGS"
 TRAINER_EXTRA_XLA_FLAGS_ENV = "VERL_TPU_TRAINER_XLA_FLAGS"
 
@@ -469,20 +470,24 @@ class TPUDeviceModuleProxy:
 
 
 # libtpu flags for the trainer's processes only (the rollout's vLLM processes keep the job's LIBTPU_INIT_ARGS).
-TRAINER_LIBTPU_ENV = "VERL_TPU_TRAINER_LIBTPU_INIT_ARGS"
 _trainer_libtpu_logged: set[str] = set()
 
 
 def trainer_libtpu_init_args(name_prefix: str) -> Optional[str]:
     """This process's ``LIBTPU_INIT_ARGS`` with the ``--flag=value`` entries of ``VERL_TPU_TRAINER_LIBTPU_INIT_ARGS``
-    merged in, for the workers of every group but verl's rollout groups; None keeps the job's value."""
-    extra = os.environ.get(TRAINER_LIBTPU_ENV, "").replace(",", " ").split()
+    merged in, for the workers of every group but verl's rollout groups; None keeps the job's value.
+
+    The entries may be comma- or space-separated. A flag that the job's ``LIBTPU_INIT_ARGS`` also names takes the
+    trainer value in its place, the job's other flags are kept in order, and an entry that is not ``--flag=value``
+    raises.
+    """
+    extra = os.environ.get(TRAINER_EXTRA_LIBTPU_INIT_ARGS_ENV, "").replace(",", " ").split()
     if not extra or name_prefix.startswith("rollout"):
         return None
     ok = set("abcdefghijklmnopqrstuvwxyz0123456789_")
     bad = [f for f in extra if not (f[:2] == "--" and "=" in f and set(f[2:].split("=", 1)[0]) <= ok)]
     if bad:
-        raise ValueError(f"{TRAINER_LIBTPU_ENV}: entries must be --flag=value, got {bad}")
+        raise ValueError(f"{TRAINER_EXTRA_LIBTPU_INIT_ARGS_ENV}: entries must be --flag=value, got {bad}")
     names = {f.split("=", 1)[0] for f in extra}
     base = [f for f in os.environ.get("LIBTPU_INIT_ARGS", "").split() if f.split("=", 1)[0] not in names]
     args = " ".join(base + extra)
@@ -846,10 +851,9 @@ class PlatformTPU(PlatformBase):
         env_vars = {}
         if "VERL_PLATFORM" in os.environ:
             env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
-        trainer_libtpu = os.environ.get(TRAINER_EXTRA_LIBTPU_INIT_ARGS_ENV, "").strip()
-        if trainer_libtpu:
-            base_libtpu = os.environ.get("LIBTPU_INIT_ARGS", "").strip()
-            env_vars["LIBTPU_INIT_ARGS"] = f"{base_libtpu} {trainer_libtpu}".strip()
+        trainer_libtpu = trainer_libtpu_init_args(name_prefix)
+        if trainer_libtpu is not None:
+            env_vars["LIBTPU_INIT_ARGS"] = trainer_libtpu
         trainer_xla = os.environ.get(TRAINER_EXTRA_XLA_FLAGS_ENV, "").strip()
         if trainer_xla:
             base_xla = os.environ.get("XLA_FLAGS", "").strip()
@@ -866,8 +870,4 @@ class PlatformTPU(PlatformBase):
             pgs=pgs,
         )
         env_vars.update(tpu_env)
-        # The trainer workers' own LIBTPU_INIT_ARGS wins over the job's.
-        trainer_args = trainer_libtpu_init_args(name_prefix)
-        if trainer_args is not None:
-            env_vars["LIBTPU_INIT_ARGS"] = trainer_args
         return env_vars

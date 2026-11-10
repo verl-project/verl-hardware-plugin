@@ -13,7 +13,9 @@ import pytest
 import torch
 
 from verl_hardware_plugin.accelerators.tpu import platform_tpu
-from verl_hardware_plugin.accelerators.tpu.platform_tpu import TRAINER_LIBTPU_ENV, PlatformTPU, trainer_libtpu_init_args
+from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU, trainer_libtpu_init_args
+
+TRAINER_LIBTPU_ENV = platform_tpu.TRAINER_EXTRA_LIBTPU_INIT_ARGS_ENV
 
 JOB = "--xla_a=1 --xla_tpu_dvfs_p_state=0 --xla_b=true"
 TRAINER = "--xla_tpu_dvfs_p_state=7,--xla_enable_async_all_gather=true"
