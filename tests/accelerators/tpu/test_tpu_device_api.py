@@ -1,14 +1,19 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""TPU device queries go through torch.accelerator (torch_tpu >= 0.2.0) or the legacy torch.tpu API."""
+"""TPU device queries go through torch.accelerator (torch_tpu >= 0.2.0)."""
 
+import ast
+import logging
+import os
 import types
+from pathlib import Path
 from unittest import mock
 
 import pytest
 import torch
 
+import verl_hardware_plugin.accelerators.tpu as tpu_pkg
 from verl_hardware_plugin.accelerators.tpu import device_api
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import TPUDeviceModuleProxy
 
@@ -16,8 +21,10 @@ from verl_hardware_plugin.accelerators.tpu.platform_tpu import TPUDeviceModulePr
 @pytest.fixture(autouse=True)
 def _reset_cache():
     device_api._accelerator_is_tpu_cache = None
+    device_api._tpu_runtime_up_pid = None
     yield
     device_api._accelerator_is_tpu_cache = None
+    device_api._tpu_runtime_up_pid = None
 
 
 def _internal(name):
@@ -54,6 +61,7 @@ def test_uses_torch_accelerator_when_tpu_device_apis_are_internal():
             n: _internal(n)
             for n in ("is_available", "device_count", "current_device", "synchronize", "get_rng_state", "initial_seed")
         },
+        is_initialized=lambda: True,
         default_generators=[generator],
     )
     acc = _fake_accelerator()
@@ -72,35 +80,23 @@ def test_uses_torch_accelerator_when_tpu_device_apis_are_internal():
         assert proxy.initial_seed() == 123
 
 
-def test_falls_back_to_legacy_torch_tpu_api():
-    """Older torch_tpu: torch.accelerator is not TPU-backed, torch.tpu functions are public."""
+def test_cpu_only_process_without_tpu_devices_never_calls_internal_torch_tpu_apis():
+    """torch_tpu >= 0.2.0 on a CPU-only process: current_accelerator() is None and torch.tpu device APIs raise."""
     legacy_tpu = types.SimpleNamespace(
-        is_available=lambda: True,
-        device_count=lambda: 4,
-        current_device=lambda: 2,
-        synchronize=mock.MagicMock(),
-        get_rng_state=mock.MagicMock(return_value=torch.tensor([1])),
-        initial_seed=lambda: 5,
+        **{n: _internal(n) for n in ("is_available", "device_count", "current_device", "synchronize")}
     )
     acc = _fake_accelerator(current_accelerator=lambda: None)
     with mock.patch.object(torch, "accelerator", acc), mock.patch.object(torch, "tpu", legacy_tpu, create=True):
         proxy = TPUDeviceModuleProxy(legacy_tpu)
-        assert proxy.is_available() is True
-        assert proxy.device_count() == 4
-        assert proxy.current_device() == 2
-        proxy.synchronize()
-        legacy_tpu.synchronize.assert_called_once_with()
-        acc.synchronize.assert_not_called()
-        assert torch.equal(proxy.get_rng_state(), torch.tensor([1]))
-        assert proxy.initial_seed() == 5
-
-
-def test_is_available_is_false_without_tpu_devices():
-    """torch_tpu >= 0.2.0 on a CPU-only process: no TPU accelerator and torch.tpu.is_available raises."""
-    legacy_tpu = types.SimpleNamespace(is_available=_internal("is_available"))
-    acc = _fake_accelerator(current_accelerator=lambda: None)
-    with mock.patch.object(torch, "accelerator", acc), mock.patch.object(torch, "tpu", legacy_tpu, create=True):
         assert device_api.is_available() is False
+        assert proxy.is_available() is False
+        assert device_api.device_count() == 0
+        assert proxy.device_count() == 0
+        assert device_api.current_device() == 0
+        assert proxy.current_device() == 0
+        assert device_api.synchronize() is None
+        assert proxy.synchronize() is None
+        acc.synchronize.assert_not_called()
 
 
 def _memory_accelerator():
@@ -153,7 +149,8 @@ def test_memory_statistics_are_zero_until_the_tpu_runtime_is_up(current_accelera
         assert proxy.memory_stats() == {}
         assert proxy.mem_get_info() == (0, 0)
         proxy.reset_peak_memory_stats()
-    for name in ("memory_allocated", "memory_stats", "get_memory_info", "reset_peak_memory_stats"):
+        proxy.synchronize()
+    for name in ("memory_allocated", "memory_stats", "get_memory_info", "reset_peak_memory_stats", "synchronize"):
         getattr(acc, name).assert_not_called()
 
 
@@ -197,6 +194,71 @@ def test_platform_leaves_torch_tpu_untouched():
         assert not hasattr(tpu, name)
 
 
+def test_synchronize_and_tpu_synchronize_contracts_and_no_internal_imports(caplog, monkeypatch):
+    """synchronize() preserves PyTorch error semantics while tpu_synchronize() handles tensors and wait=False."""
+    pkg_dir = Path(tpu_pkg.__file__).resolve().parent
+    for py_file in sorted(pkg_dir.rglob("*.py")):
+        for node in ast.walk(ast.parse(py_file.read_text(encoding="utf-8"))):
+            mods = [a.name for a in node.names] if isinstance(node, ast.Import) else []
+            if isinstance(node, ast.ImportFrom) and node.module:
+                mods.append(node.module)
+            assert not any(m == "torch_tpu._internal" or m.startswith("torch_tpu._internal.") for m in mods), py_file
+
+    acc = _fake_accelerator()
+    tpu_mod = types.SimpleNamespace(is_initialized=lambda: True)
+    fake_event = mock.MagicMock()
+    fake_event_cls = mock.MagicMock(return_value=fake_event)
+    fake_tpu_tensor = mock.MagicMock(spec=torch.Tensor)
+    fake_tpu_tensor.device = types.SimpleNamespace(type="tpu", index=1)
+
+    with (
+        mock.patch.object(torch, "accelerator", acc),
+        mock.patch.object(torch, "tpu", tpu_mod, create=True),
+        mock.patch.object(torch, "Event", fake_event_cls),
+    ):
+        # 1. Standard device_api.synchronize(device) delegates to torch.accelerator.synchronize and propagates errors.
+        device_api.synchronize("tpu:0")
+        assert device_api._tpu_runtime_up_pid == os.getpid()
+        acc.synchronize.assert_called_once_with("tpu:0")
+        acc.synchronize.side_effect = RuntimeError("XLA sticky error")
+        with pytest.raises(RuntimeError, match="XLA sticky error"):
+            device_api.synchronize()
+        acc.synchronize.side_effect = None
+        acc.synchronize.reset_mock()
+
+        # 2. tpu_synchronize: CPU tensor & CPU tensor sequence fast-exit without touching accelerator.
+        device_api.tpu_synchronize(torch.ones(4), wait=True, strict=True)
+        device_api.tpu_synchronize([torch.ones(2), torch.zeros(2)], wait=False, strict=True)
+        acc.synchronize.assert_not_called()
+
+        # 3. tpu_synchronize(wait=False): None records on current stream; explicit TPU tensor passes current_stream(dev)
+        #    because c10::Event discards device.index when record() is called with no stream argument.
+        device_api.tpu_synchronize(wait=False)
+        fake_event_cls.assert_called_once_with()
+        fake_event.record.assert_called_once_with()
+        fake_event_cls.reset_mock()
+        fake_event.reset_mock()
+
+        device_api.tpu_synchronize([torch.ones(2), fake_tpu_tensor], wait=False)
+        acc.current_stream.assert_called_once_with(fake_tpu_tensor.device)
+        fake_event.record.assert_called_once_with("stream0")
+
+        # 4. Fork invalidation: a child PID does not inherit the parent's cached PJRT-initialized state.
+        tpu_mod.is_initialized = lambda: False
+        monkeypatch.setattr(os, "getpid", lambda: -99999)
+        device_api.tpu_synchronize(wait=True, strict=True)
+        acc.synchronize.assert_not_called()
+
+        # 5. strict vs lenient error handling on tpu_synchronize.
+        tpu_mod.is_initialized = lambda: True
+        fake_event.record.side_effect = RuntimeError("stream dispatch failed")
+        with pytest.raises(RuntimeError, match="TPU synchronization failed: stream dispatch failed"):
+            device_api.tpu_synchronize(wait=False, strict=True)
+        with caplog.at_level(logging.WARNING, logger=device_api.__name__):
+            device_api.tpu_synchronize(wait=False, strict=False)
+        assert "Could not synchronize TPU device" in caplog.text
+
+
 def test_placement_group_claims_tpu_slices_in_numeric_order():
     """Clusters with >=10 TPU slices claim tpu-group-0, tpu-group-1, ..., tpu-group-10 in numeric order."""
     import ray
@@ -215,3 +277,28 @@ def test_placement_group_claims_tpu_slices_in_numeric_order():
         claimed = [platform.auto_assign_accelerator_type(f"pool_{k}", None) for k in range(6)]
     assert claimed == ["tpu-group-0", "tpu-group-1", "tpu-group-2", "tpu-group-9", "tpu-group-10", "tpu-group-10"]
     assert platform_tpu_mod is not None
+
+
+def test_get_worker_env_vars_merges_trainer_extra_libtpu_init_args(monkeypatch):
+    """Trainer-only libtpu flags append onto LIBTPU_INIT_ARGS for RayWorkerGroup actors without touching rollout."""
+    from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
+
+    pool = mock.MagicMock()
+    pool.get_placement_groups.return_value = []
+    platform = PlatformTPU()
+    monkeypatch.setattr(platform, "get_tpu_env_vars", lambda **kwargs: {"TORCH_TPU_TOPOLOGY": "2,2,1,2"})
+
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_tpu_use_enhanced_launch_barrier=false")
+    monkeypatch.delenv("VERL_TPU_TRAINER_LIBTPU_INIT_ARGS", raising=False)
+    env_plain = platform.get_worker_env_vars(pool, 0, 8, 0, 8, "actor", "TPU")
+    assert "LIBTPU_INIT_ARGS" not in env_plain
+
+    monkeypatch.setenv(
+        "VERL_TPU_TRAINER_LIBTPU_INIT_ARGS",
+        "--xla_tpu_scoped_vmem_limit_kib=65472 --xla_tpu_enable_sparse_core_collective_aggregator=true",
+    )
+    env_trainer = platform.get_worker_env_vars(pool, 0, 8, 0, 8, "actor", "TPU")
+    assert env_trainer["LIBTPU_INIT_ARGS"] == (
+        "--xla_tpu_use_enhanced_launch_barrier=false "
+        "--xla_tpu_scoped_vmem_limit_kib=65472 --xla_tpu_enable_sparse_core_collective_aggregator=true"
+    )

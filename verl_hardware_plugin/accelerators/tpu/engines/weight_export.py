@@ -19,6 +19,10 @@ from typing import Any, Callable, Iterable, Iterator, Optional
 
 import torch
 from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor.placement_types import _StridedShard
+
+from verl.utils.debug import log_gpu_memory_usage
+from verl.utils.device import get_device_name
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -33,6 +37,11 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
     * **FSDP** (``Shard(0)`` on a 1-D mesh) with dim 0 divisible by the mesh size: a block, exported locally.
     * **FSDP + CP**: torchtitan shards parameters over the flattened ``dp_shard`` x ``cp`` mesh dimension (CP splits
       activations, not parameters), so the parameters are again ``Shard(0)`` on a 1-D mesh: exported locally.
+    * **EP** (``Shard(0)`` on the ``ep`` mesh dimension, with any size-1 dimensions such as ``efsdp=1`` ignored):
+      whole-expert blocks sharded across ``ep``, exported locally.
+    * **SimpleFSDP + EP with efsdp > 1** (``(_StridedShard(0, split_factor=ep), Shard(0))`` on ``(efsdp, ep)``):
+      each rank still holds contiguous whole experts, block ``i_ep * efsdp + i_efsdp`` of ``efsdp * ep``, exported
+      locally (``_efsdp_ep_dim0_shard``).
     * **Replicated** (``Replicate()`` placements, or a plain tensor): ``None``. Every rank already holds the full
       tensor, so it is exported full without further communication here. It may have been gathered upstream,
       though: torchtitan's ``FusedQKVLinear`` (``fuse_qkv=True``) keeps ``wqkv`` FSDP sharded (``Shard(0)``) in
@@ -40,11 +49,12 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
       all-gather) before splitting it into q/k/v_proj. TODO: split ``wqkv`` locally so q/k/v export as local shards.
     * **Uneven dim-0 cuts**: ``None``, gathered. torch gives the remainder rows to the leading ranks, which is not
       the equal-block layout tpu-sync assumes.
-    * **FSDP x TP, HSDP** (2-D meshes) and ``_StridedShard``: ``None``, gathered. TODO: register these as n-D
-      blocks (``mesh_shape`` / ``global_shard_indices`` per dimension) once tpu-sync is confirmed to describe them.
+    * **FSDP x TP, HSDP** (2-D meshes) and other ``_StridedShard`` layouts: ``None``, gathered. TODO: register these
+      as n-D blocks (``mesh_shape`` / ``global_shard_indices`` per dimension) once tpu-sync is confirmed to describe
+      them.
     * **Expert stacks** (torchtitan's fused ``[E, ...]`` MoE weights): with an ``expert_stack_wire`` hook (Qwen3 MoE,
-      ``rollout.qwen3_moe_layout``), ``local_shards()`` sends each stack as one 3-D tensor. An FSDP ``Shard(0)`` of
-      whole experts, as this function recognizes it, is a dim-0 block of it and is exported locally. Any other
+      ``rollout.qwen3_moe_layout``), ``local_shards()`` sends each stack as one 3-D tensor. An FSDP/EP ``Shard(0)``
+      of whole experts, as this function recognizes it, is a dim-0 block of it and is exported locally. Any other
       layout of the stack (e.g. torchtitan's dim-1 expert sharding when the FSDP degree exceeds the expert count, or
       an uneven expert split) is gathered first. Without the hook, stacks are gathered and split into one HF tensor
       per expert.
@@ -57,22 +67,65 @@ def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
     if not isinstance(param, DTensor) or param.ndim < 2:
         return None
     mesh = param.device_mesh
-    if mesh.ndim != 1 or len(param.placements) != 1:
+    # Mesh dimensions of size 1 do not split anything (e.g. the ``efsdp`` dimension of routed experts when EP spans
+    # every rank), so only the active dimensions have to form a 1-D layout.
+    active = [d for d in range(mesh.ndim) if mesh.size(d) > 1]
+    if len(param.placements) != mesh.ndim:
         return None
-    placement = param.placements[0]
+    if len(active) == 2:
+        return _efsdp_ep_dim0_shard(param, mesh, active)
+    if len(active) != 1:
+        return None
+    dim = active[0]
+    placement = param.placements[dim]
     # type() rather than isinstance(): _StridedShard subclasses Shard but permutes which block a rank holds.
     if type(placement) is not Shard or placement.dim != 0:
         return None
-    num_shards = mesh.size(0)
+    # Size-1 mesh dimensions leave the local block unchanged regardless of placement (torchtitan puts _StridedShard
+    # on the routed experts' size-1 ``efsdp`` dimension under EP).
+    num_shards = mesh.size(dim)
     full_rows = int(param.shape[0])
-    if num_shards <= 1 or full_rows % num_shards:
+    if full_rows % num_shards:
         return None
     if int(param.to_local().shape[0]) != full_rows // num_shards:
         return None
     coordinate = mesh.get_coordinate()
     if coordinate is None:
         return None
-    return num_shards, int(coordinate[0])
+    return num_shards, int(coordinate[dim])
+
+
+def _efsdp_ep_dim0_shard(param: DTensor, mesh: Any, active: list[int]) -> Optional[tuple[int, int]]:
+    """``(efsdp * ep, i_ep * efsdp + i_efsdp)`` for torchtitan's SimpleFSDP + EP routed-expert layout.
+
+    With ``1 < EP < world`` (``efsdp > 1``), SimpleFSDP distributes the EP ``Shard(0)`` expert stack over
+    ``(efsdp, ep)`` as ``(_StridedShard(0, split_factor=ep), Shard(0))``: ``ep`` rank ``i_ep`` owns experts
+    ``[i_ep * E/ep, (i_ep + 1) * E/ep)``, and ``efsdp`` rank ``i_efsdp`` holds contiguous sub-block ``i_efsdp`` of
+    those. Each rank therefore holds whole contiguous experts at global dim-0 block ``i_ep * efsdp + i_efsdp`` of
+    ``efsdp * ep`` equal blocks, which tpu-sync places without any gather.
+    """
+    d_outer, d_inner = active
+    outer, inner = param.placements[d_outer], param.placements[d_inner]
+    inner_size = mesh.size(d_inner)
+    outer_size = mesh.size(d_outer)
+    if type(inner) is not Shard or inner.dim != 0:
+        return None
+    if not isinstance(outer, _StridedShard) or outer.dim != 0 or outer.split_factor != inner_size:
+        return None
+    # Any size-1 mesh dimension must not shard anything else.
+    for d, placement in enumerate(param.placements):
+        if d not in active and mesh.size(d) != 1:
+            return None
+    num_shards = outer_size * inner_size
+    full_rows = int(param.shape[0])
+    if full_rows % num_shards:
+        return None
+    if int(param.to_local().shape[0]) != full_rows // num_shards:
+        return None
+    coordinate = mesh.get_coordinate()
+    if coordinate is None:
+        return None
+    return num_shards, int(coordinate[d_inner]) * outer_size + int(coordinate[d_outer])
 
 
 def _is_replicated(param: Any) -> bool:
@@ -83,11 +136,23 @@ def _is_replicated(param: Any) -> bool:
 def _bf16_on(tensor: torch.Tensor, device: Any) -> torch.Tensor:
     """A bf16 copy of ``tensor`` on ``device`` that never aliases the trainer's parameter storage."""
     out = tensor.to(device, dtype=torch.bfloat16, non_blocking=True)
-    if out is tensor:
-        # Already bf16 on the device: .to() returned the parameter itself. The receiver reads the exported tensor
-        # after the export returns, so it must not change under a later optimizer step.
+    if out is tensor or out._base is not None:
+        # Already bf16 on the device (or a view): .to() returned the parameter/view itself. The receiver reads the
+        # exported tensor as a standalone buffer after the export returns, so it must own its storage and not change
+        # under a later optimizer step.
         out = out.clone()
     return out
+
+
+def _owned(tensor: torch.Tensor, aliases_param: bool) -> torch.Tensor:
+    """``tensor``, or a copy of it if it may alias the parameter or is a view into a larger buffer.
+
+    The exported tensors are bound to tpu-sync as whole buffers, read after the export returns. With bf16 parameters
+    (``engine_kwargs.tpu.param_dtype``), the bf16 cast is a no-op: a replicated parameter's ``full_tensor()`` is then
+    the parameter itself, or a view of it (e.g. Qwen3.5's q / k / v rows of the fused ``in_proj_qkv``), which
+    tpu-sync rejects and a later optimizer step would mutate.
+    """
+    return tensor.clone() if aliases_param or tensor._base is not None else tensor
 
 
 class TrainerWeights:
@@ -204,6 +269,8 @@ class TrainerWeights:
                 yield hf_name, full[e].clone(), None
             del full
         if local:
+            if get_device_name() == "tpu":
+                log_gpu_memory_usage("After the tpu-sync weight export", logger=logger)
             logger.info(
                 f"Weight export: {counts['local']} local shards, {counts['replicated']} replicated tensors (fused "
                 f"q/k/v are all-gathered inside torchtitan's state_dict()), {counts['gathered']} all-gathered here"
@@ -212,19 +279,24 @@ class TrainerWeights:
     def _export_tensor(self, name: str, param: Any, local: bool) -> tuple[torch.Tensor, Optional[tuple[int, int]], str]:
         """``(tensor, shard, kind)`` of one dense weight (or whole expert stack) exported as ``name``.
 
-        With ``local``, an FSDP ``Shard(0)`` block (``fsdp_dim0_shard``) is exported as is (``kind`` ``"local"``,
+        With ``local``, an FSDP/EP ``Shard(0)`` block (``fsdp_dim0_shard``) is exported as is (``kind`` ``"local"``,
         ``shard`` its ``(num_shards, shard_index)``); every other sharded layout is gathered (``"gathered"``, logged);
         a replicated or plain tensor is sent full (``"replicated"``). Without ``local``, everything is gathered.
         """
         if not isinstance(param, DTensor):
-            return param.to(torch.bfloat16, non_blocking=True), None, "replicated"
+            converted = param.to(torch.bfloat16, non_blocking=True)
+            return _owned(converted, aliases_param=converted is param), None, "replicated"
         shard = fsdp_dim0_shard(param) if local else None
         if shard is not None:
-            return _bf16_on(param.to_local(), self._device), shard, "local"
+            local_block = param.to_local()
+            if getattr(param, "_tpu_sync_owned", False) and local_block.dtype == torch.bfloat16:
+                return local_block.to(self._device, non_blocking=True), shard, "local"
+            return _bf16_on(local_block, self._device), shard, "local"
         kind = "replicated" if _is_replicated(param) else "gathered"
         if local and kind == "gathered":
             logger.info(
                 f"{name}: all-gathered for the weight sync (mesh ndim={param.device_mesh.ndim}, "
                 f"placements={param.placements}, shape={tuple(param.shape)}, local={tuple(param.to_local().shape)})"
             )
-        return param.to(self._device, dtype=torch.bfloat16, non_blocking=True).full_tensor(), None, kind
+        converted = param.to(self._device, dtype=torch.bfloat16, non_blocking=True)
+        return _owned(converted.full_tensor(), aliases_param=converted is param), None, kind

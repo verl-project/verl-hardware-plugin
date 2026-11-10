@@ -25,21 +25,28 @@ decoupled from core verl's GPU TorchTitan engine:
 from __future__ import annotations
 
 import dataclasses
+import functools
 import gc
 import importlib
 import inspect
+import io
+import json
 import logging
 import math
 import os
 import re
+import shutil
+from collections.abc import Collection, Iterable, Mapping
 from contextlib import nullcontext
 from typing import Any, Callable, Iterator, Optional
 
 import torch
 import torch.distributed
+from safetensors.torch import save_file
 from tensordict import TensorDict
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor.experimental._context_parallel._load_balancer import _HeadTailLoadBalancer
 
 from verl.trainer.config import CheckpointConfig
@@ -62,30 +69,34 @@ from verl.workers.engine.utils import (
     postprocess_batch_func,
     prepare_micro_batches,
 )
-from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels
+from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels, tpu_ragged_ep
+from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
     align_micro_batch_shapes_across_ranks,
     bucket_length,
+    chunked_entropy_from_hidden_tpu,
     compute_global_batch_num_tokens,
     compute_tpu_logprobs_chunked,
     configure_torch_compile_for_tpu,
     create_noop_dataloader_config,
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
-    fused_linear_logprobs_tpu,
     get_text_config,
     get_torchtitan_model_module_name,
     get_tpu_seq_bucket_size,
     get_tpu_simple_fsdp_parallelize_fn,
-    install_parallel_dims_cache_for_tpu,
     install_sync_dtensor_redistribute_for_tpu,
     install_tpu_attention,
     move_tpu_params_,
     pad_packed_inputs_for_tpu,
+    resolve_tpu_mixed_precision_reduce,
+    resolve_tpu_splash_max_block_size,
     resolve_tpu_torchtitan_options,
     resolve_tpu_use_fused_linear_cross_entropy,
+    row_slot_permutation,
+    set_splash_max_block_size,
     spmd_no_typecheck_context,
     torchtitan_model_attn_backend,
     tpu_eager_mode_context,
@@ -118,6 +129,63 @@ _LAYER_FQN_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 _LAYER_PREFIX_RE = re.compile(r"^(.*?(?:^|\.)layers\.\d+)\.")
 _OPTIMIZER_STEP_LAYERS_PER_CHUNK = 4
 _OPTIMIZER_STEP_MAX_PARAMS_PER_CHUNK = 64
+
+# ``checkpoint.save_contents`` entries stored in the TorchTitan DCP checkpoint (TorchTitan writes them together).
+_DCP_CHECKPOINT_CONTENTS = frozenset({"model", "optimizer", "extra"})
+
+# Size cap of one safetensors shard in the ``hf_model`` export, as in verl's FSDP ``hf_model`` export.
+_HF_MAX_SHARD_BYTES = 5 * 1024**3
+
+
+def write_hf_safetensors(
+    named_tensors: Iterable[tuple[str, torch.Tensor]],
+    out_dir: str,
+    is_writer: bool,
+    skip_names: Collection[str] = (),
+    max_shard_bytes: int = _HF_MAX_SHARD_BYTES,
+) -> Optional[dict[str, str]]:
+    """Stream ``(hf_name, tensor)`` pairs into safetensors shards plus ``model.safetensors.index.json``.
+
+    Every rank must drain ``named_tensors``: producing a tensor may run collectives (``TrainerWeights`` all-gathers
+    each FSDP shard). Only ``is_writer`` copies the tensors to host memory and writes files, so host memory peaks at
+    about one shard. ``skip_names`` drops tensors that HF re-creates on load, such as a tied ``lm_head.weight``.
+    """
+    shard: dict[str, torch.Tensor] = {}
+    shard_bytes = total_bytes = 0
+    tmp_shards: list[tuple[str, list[str]]] = []
+
+    def flush_shard() -> None:
+        nonlocal shard, shard_bytes
+        tmp_path = os.path.join(out_dir, f"model-{len(tmp_shards) + 1:05d}.safetensors.tmp")
+        save_file(shard, tmp_path, metadata={"format": "pt"})
+        tmp_shards.append((tmp_path, list(shard)))
+        shard, shard_bytes = {}, 0
+
+    if is_writer:
+        os.makedirs(out_dir, exist_ok=True)
+    for name, tensor in named_tensors:
+        if not is_writer or name in skip_names:
+            tpu_synchronize(tensor, wait=True)
+            continue
+        nbytes = tensor.numel() * tensor.element_size()
+        if shard and shard_bytes + nbytes > max_shard_bytes:
+            flush_shard()
+        shard[name] = tensor.detach().contiguous().to("cpu", copy=True)
+        shard_bytes += nbytes
+        total_bytes += nbytes
+    if not is_writer:
+        return None
+    if shard:
+        flush_shard()
+
+    weight_map: dict[str, str] = {}
+    for i, (tmp_path, names) in enumerate(tmp_shards, start=1):
+        file_name = f"model-{i:05d}-of-{len(tmp_shards):05d}.safetensors"
+        os.replace(tmp_path, os.path.join(out_dir, file_name))
+        weight_map.update(dict.fromkeys(names, file_name))
+    with open(os.path.join(out_dir, "model.safetensors.index.json"), "w", encoding="utf-8") as f:
+        json.dump({"metadata": {"total_size": total_bytes}, "weight_map": weight_map}, f, indent=2)
+    return weight_map
 
 
 # TODO: Upstream ``hf_range_reader`` into ``torchtitan`` (``StateDictAdapter.get_hf_storage_reader``) and remove
@@ -153,6 +221,527 @@ def _param_mesh_key(param: torch.Tensor) -> int | None:
     spec = getattr(param, "_spec", None)
     mesh = getattr(spec, "mesh", None) if spec is not None else None
     return None if mesh is None else id(mesh)
+
+
+def _can_pin_memory() -> bool:
+    """Whether ``torch.empty(..., pin_memory=True)`` has an active accelerator host allocator."""
+    accel = getattr(torch, "accelerator", None)
+    if accel is not None and callable(getattr(accel, "is_available", None)):
+        try:
+            return bool(accel.is_available())
+        except Exception:
+            return False
+    return False
+
+
+def _alloc_cpu_staging(shape: torch.Size | tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """Allocate a contiguous host staging buffer (pinned when an accelerator runtime is active)."""
+    if _can_pin_memory():
+        try:
+            return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+        except RuntimeError:
+            pass
+    return torch.empty(shape, dtype=dtype, device="cpu")
+
+
+def _record_tpu_event(is_tpu: bool) -> Any:
+    """Record and return a ``torch.tpu.Event`` on the active TPU stream, or ``None`` off-TPU."""
+    if not is_tpu:
+        return None
+    tpu_mod = getattr(torch, "tpu", None)
+    event_cls = getattr(tpu_mod, "Event", None)
+    if event_cls is None:
+        return None
+    ev = event_cls()
+    ev.record()
+    return ev
+
+
+def _wrap_local_like_param(local: torch.Tensor, like_param: torch.Tensor) -> torch.Tensor:
+    """Wrap ``local`` in a ``DTensor`` view sharing ``local``'s storage when ``like_param`` is a ``DTensor``."""
+    if isinstance(like_param, DTensor) and local.ndim > 0:
+        spec = DTensorSpec(
+            like_param._spec.mesh,
+            like_param._spec.placements,
+            tensor_meta=TensorMeta(like_param.shape, like_param.stride(), local.dtype),
+        )
+        return DTensor(local.view_as(local), spec, requires_grad=False)
+    return local
+
+
+def _direct_d2h_source(tensor: torch.Tensor) -> torch.Tensor:
+    """Ensure ``tensor`` satisfies ``torch_tpu`` ``CanCopyStorageDirect`` (zero offset, contiguous, tight storage)."""
+    if not tensor.is_contiguous() or tensor.storage_offset() != 0 or tensor.untyped_storage().nbytes() != tensor.nbytes:
+        return tensor.contiguous()
+    return tensor
+
+
+@functools.lru_cache(maxsize=1)
+def _cpu_fused_adamw_supported() -> bool:
+    """Whether ``torch.optim.AdamW(..., fused=True)`` runs on CPU ``float32`` tensors."""
+    try:
+        probe = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32, device="cpu"))
+        probe.grad = torch.zeros(1, dtype=torch.float32, device="cpu")
+        torch.optim.AdamW([probe], lr=1e-3, fused=True).step()
+        return True
+    except Exception:
+        return False
+
+
+@torch.no_grad()
+def _move_optimizer_state(optimizer: Any, params: list[torch.nn.Parameter], device: Any) -> None:
+    """Moves the optimizer states of ``params`` to ``device``, reusing pinned host staging buffers on CPU."""
+    target_device = torch.device(device)
+    to_cpu = target_device.type == "cpu"
+    host_cache: dict[tuple[int, str], torch.Tensor] = getattr(optimizer, "_tpu_pinned_host_state", None)  # type: ignore[assignment]
+    if host_cache is None:
+        host_cache = {}
+        optimizer._tpu_pinned_host_state = host_cache
+
+    any_tpu_d2h = False
+    for p in params:
+        state = optimizer.state.get(p)
+        if not state:
+            continue
+        for key, value in list(state.items()):
+            if not isinstance(value, torch.Tensor) or value.device == target_device:
+                continue
+            local_val = value._local_tensor if isinstance(value, DTensor) else value
+            if local_val.ndim == 0:
+                state[key] = value.to(target_device)
+                continue
+            cache_key = (id(p), str(key))
+            if to_cpu:
+                buf = host_cache.get(cache_key)
+                if buf is None or buf.shape != local_val.shape or buf.dtype != local_val.dtype:
+                    buf = _alloc_cpu_staging(local_val.shape, local_val.dtype)
+                    host_cache[cache_key] = buf
+                src = _direct_d2h_source(local_val)
+                is_tpu_src = src.device.type == "tpu"
+                buf.copy_(src, non_blocking=is_tpu_src)
+                any_tpu_d2h = any_tpu_d2h or is_tpu_src
+                state[key] = _wrap_local_like_param(buf, value)
+            else:
+                dev_local = torch.empty(local_val.shape, dtype=local_val.dtype, device=target_device)
+                dev_local.copy_(local_val, non_blocking=target_device.type == "tpu")
+                state[key] = _wrap_local_like_param(dev_local, value)
+    if any_tpu_d2h:
+        tpu_synchronize(wait=True)
+
+
+def _state_to(state: dict, device: Any) -> dict:
+    """``state`` (one parameter's optimizer state) with its tensors moved to ``device``."""
+    return {
+        k: v.to(device) if isinstance(v, torch.Tensor) and v.device != torch.device(device) else v
+        for k, v in state.items()
+    }
+
+
+def _scalar_float(val: Any) -> float:
+    return float(val.item()) if isinstance(val, torch.Tensor) else float(val)
+
+
+class _Fp32Masters:
+    """FP32 master weights of bf16 parameters and their optimizer states (``engine_kwargs.tpu.fp32_master``).
+
+    The model keeps bf16 parameters for forward, backward and the weight sync. The optimizer steps an FP32 master
+    copy of each parameter instead (FP32 AdamW moments too) and the result is cast back into the bf16 parameter, so
+    small updates (lr 1e-6 is ~3-4 orders of magnitude below a bf16 ulp of a weight) accumulate instead of rounding
+    to zero.
+
+    * ``host=False``: masters and states stay on the TPU and step through the inner optimizer one chunk at a time.
+    * ``host=True`` (``optimizer_host_offload``): for ``AdamW``, masters and FP32 moments stay permanently resident on
+      CPU and step via CPU ``fused=True`` ``AdamW``, while double-buffered pinned ``bfloat16`` staging buffers pipeline
+      async gradient D2H (``2 B/param``) and stepped-weight H2D (``2 B/param``), cutting PCIe traffic ``6x`` vs moving
+      ``(master, exp_avg, exp_avg_sq)`` (``24 B/param``) across PCIe every step. Non-``AdamW`` optimizers fall back to
+      per-chunk device stepping.
+    """
+
+    def __init__(self, host: bool):
+        self.home: Any = "cpu" if host else None
+        self._entries: dict[int, tuple[torch.Tensor, dict]] = {}
+        self._cpu_params: dict[int, torch.nn.Parameter] = {}
+        self._cpu_opt: Optional[torch.optim.AdamW] = None
+        self._staging_slots: tuple[
+            dict[tuple[int, tuple[int, ...], torch.dtype], torch.Tensor],
+            dict[tuple[int, tuple[int, ...], torch.dtype], torch.Tensor],
+        ] = ({}, {})
+
+    def clear(self) -> None:
+        """Drop all master weights and cached CPU optimizer state."""
+        self._entries.clear()
+        self._cpu_params.clear()
+        self._staging_slots[0].clear()
+        self._staging_slots[1].clear()
+        if self._cpu_opt is not None:
+            self._cpu_opt.state.clear()
+
+    def can_step_on_cpu(self, opt: Any, group: Optional[Mapping[str, Any]] = None) -> bool:
+        if self.home != "cpu" or type(opt) is not torch.optim.AdamW:
+            return False
+        if group is not None and bool(group.get("differentiable", False)):
+            return False
+        return True
+
+    def _ensure_cpu_adamw(self, group: Mapping[str, Any]) -> torch.optim.AdamW:
+        betas = group.get("betas", (0.9, 0.999))
+        lr = _scalar_float(group.get("lr", 1e-3))
+        eps = _scalar_float(group.get("eps", 1e-8))
+        weight_decay = _scalar_float(group.get("weight_decay", 0.0))
+        amsgrad = bool(group.get("amsgrad", False))
+        maximize = bool(group.get("maximize", False))
+        b0, b1 = _scalar_float(betas[0]), _scalar_float(betas[1])
+        if self._cpu_opt is None:
+            dummy = torch.nn.Parameter(torch.empty(0, dtype=torch.float32, device="cpu"))
+            use_fused = _cpu_fused_adamw_supported()
+            self._cpu_opt = torch.optim.AdamW(
+                [dummy],
+                lr=lr,
+                betas=(b0, b1),
+                eps=eps,
+                weight_decay=weight_decay,
+                amsgrad=amsgrad,
+                maximize=maximize,
+                fused=use_fused,
+                foreach=False if use_fused else True,
+            )
+            self._cpu_opt.param_groups[0]["params"] = []
+        else:
+            cg = self._cpu_opt.param_groups[0]
+            cg["lr"] = lr
+            cg["betas"] = (b0, b1)
+            cg["eps"] = eps
+            cg["weight_decay"] = weight_decay
+            cg["amsgrad"] = amsgrad
+            cg["maximize"] = maximize
+        return self._cpu_opt
+
+    def _get_slot_buffer(self, slot: int, idx: int, shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
+        pool = self._staging_slots[slot]
+        key = (idx, tuple(shape), dtype)
+        buf = pool.get(key)
+        if buf is None:
+            buf = _alloc_cpu_staging(shape, dtype)
+            pool[key] = buf
+        return buf
+
+    @torch.no_grad()
+    def _get_or_bind_cpu_master(self, p: torch.nn.Parameter, cpu_opt: torch.optim.AdamW) -> torch.nn.Parameter:
+        pid = id(p)
+        entry = self._entries.get(pid)
+        if entry is None:
+            old_mp = self._cpu_params.pop(pid, None)
+            if old_mp is not None:
+                cpu_opt.state.pop(old_mp, None)
+            local_p = p._local_tensor if isinstance(p, DTensor) else p.data
+            local_master = local_p.detach().to(device="cpu", dtype=torch.float32).contiguous()
+            mp = torch.nn.Parameter(local_master, requires_grad=True)
+            self._cpu_params[pid] = mp
+            self._entries[pid] = (_wrap_local_like_param(local_master, p), {})
+            return mp
+
+        master_view, state_view = entry
+        local_master = master_view._local_tensor if isinstance(master_view, DTensor) else master_view
+        if local_master.device.type != "cpu" or local_master.dtype != torch.float32 or not local_master.is_contiguous():
+            local_master = local_master.detach().to(device="cpu", dtype=torch.float32).contiguous()
+            master_view = _wrap_local_like_param(local_master, p)
+
+        mp = self._cpu_params.get(pid)
+        if (
+            mp is None
+            or mp.data.data_ptr() != local_master.data_ptr()
+            or (mp not in cpu_opt.state and bool(state_view))
+        ):
+            if mp is not None:
+                cpu_opt.state.pop(mp, None)
+            mp = torch.nn.Parameter(local_master, requires_grad=True)
+            self._cpu_params[pid] = mp
+            if state_view:
+                cpu_state: dict[str, Any] = {}
+                bound_state_view: dict[str, Any] = {}
+                for k, v in state_view.items():
+                    if isinstance(v, torch.Tensor):
+                        lv = v._local_tensor if isinstance(v, DTensor) else v
+                        if lv.device.type != "cpu" or lv.dtype != torch.float32 or not lv.is_contiguous():
+                            lv = lv.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                        cpu_state[k] = lv
+                        bound_state_view[k] = _wrap_local_like_param(lv, p)
+                    else:
+                        cpu_state[k] = v
+                        bound_state_view[k] = v
+                cpu_opt.state[mp] = cpu_state
+                self._entries[pid] = (master_view, bound_state_view)
+            else:
+                self._entries[pid] = (master_view, {})
+        return mp
+
+    @torch.no_grad()
+    def step_group_chunks_on_cpu(
+        self,
+        group: Mapping[str, Any],
+        chunks: list[list[torch.nn.Parameter]],
+        *,
+        max_norm: float,
+        grad_norm: torch.Tensor,
+    ) -> None:
+        """Pipeline TPU gradient clip + pinned bf16 D2H with CPU fused FP32 AdamW + pinned bf16 H2D."""
+        active_chunks = [[p for p in chunk if p.grad is not None] for chunk in chunks]
+        active_chunks = [c for c in active_chunks if c]
+        if not active_chunks:
+            return
+
+        is_tpu = grad_norm.device.type == "tpu"
+        cpu_opt = self._ensure_cpu_adamw(group)
+        d2h_events: list[Any] = [None, None]
+        h2d_events: list[Any] = [None, None]
+        slot_bufs: list[list[torch.Tensor]] = [[], []]
+
+        def _enqueue_d2h(chunk_params: list[torch.nn.Parameter], slot: int) -> None:
+            if h2d_events[slot] is not None:
+                h2d_events[slot].synchronize()
+                h2d_events[slot] = None
+            for p in chunk_params:
+                if isinstance(p.grad, DTensor) and any(pl.is_partial() for pl in p.grad.placements):
+                    p.grad = p.grad.redistribute(placements=p.placements)
+            torch.nn.utils.clip_grads_with_norm_(chunk_params, max_norm, grad_norm, foreach=False)
+            if is_tpu:
+                # Fuse all gradient clip scalings of this chunk into one async XLA program before D2H DMAs.
+                tpu_synchronize(wait=False)
+            cur_bufs: list[torch.Tensor] = []
+            for idx, p in enumerate(chunk_params):
+                assert p.grad is not None
+                local_g = p.grad._local_tensor if isinstance(p.grad, DTensor) else p.grad
+                src_g = _direct_d2h_source(local_g)
+                buf = self._get_slot_buffer(slot, idx, src_g.shape, src_g.dtype)
+                buf.copy_(src_g, non_blocking=is_tpu)
+                cur_bufs.append(buf)
+                p.grad = None
+            slot_bufs[slot] = cur_bufs
+            d2h_events[slot] = _record_tpu_event(is_tpu)
+
+        def _step_cpu_and_enqueue_h2d(chunk_params: list[torch.nn.Parameter], slot: int) -> None:
+            if d2h_events[slot] is not None:
+                d2h_events[slot].synchronize()
+                d2h_events[slot] = None
+            elif is_tpu:
+                tpu_synchronize(wait=True)
+
+            mps: list[torch.nn.Parameter] = []
+            bufs = slot_bufs[slot]
+            for p, buf in zip(chunk_params, bufs, strict=True):
+                mp = self._get_or_bind_cpu_master(p, cpu_opt)
+                mp.grad = buf.to(dtype=torch.float32)
+                mps.append(mp)
+
+            cpu_opt.param_groups[0]["params"] = mps
+            try:
+                cpu_opt.step()
+            finally:
+                cpu_opt.param_groups[0]["params"] = []
+
+            for p, mp, buf in zip(chunk_params, mps, bufs, strict=True):
+                pid = id(p)
+                master_view, state_view = self._entries[pid]
+                if not state_view:
+                    cpu_state = cpu_opt.state.get(mp, {})
+                    bound_state = {
+                        k: _wrap_local_like_param(v, p) if isinstance(v, torch.Tensor) else v
+                        for k, v in cpu_state.items()
+                    }
+                    self._entries[pid] = (master_view, bound_state)
+                mp.grad = None
+                buf.copy_(mp.detach())
+                local_p = p._local_tensor if isinstance(p, DTensor) else p.data
+                local_p.copy_(buf, non_blocking=is_tpu)
+            h2d_events[slot] = _record_tpu_event(is_tpu)
+
+        _enqueue_d2h(active_chunks[0], 0)
+        for i, chunk_params in enumerate(active_chunks):
+            if i + 1 < len(active_chunks):
+                _enqueue_d2h(active_chunks[i + 1], (i + 1) % 2)
+            _step_cpu_and_enqueue_h2d(chunk_params, i % 2)
+
+        for slot in (0, 1):
+            if h2d_events[slot] is not None:
+                h2d_events[slot].synchronize()
+                h2d_events[slot] = None
+        if is_tpu:
+            tpu_synchronize(wait=True)
+
+    @torch.no_grad()
+    def begin(self, opt: Any, chunk: list[torch.nn.Parameter]) -> list[tuple[torch.nn.Parameter, torch.nn.Parameter]]:
+        """FP32 parameters (with FP32 gradients and their saved optimizer states) for ``chunk``'s stepped params."""
+        pairs = []
+        for p in chunk:
+            if p.grad is None:
+                continue
+            entry = self._entries.get(id(p))
+            if entry is None:
+                master, state = p.detach().float(), {}
+            else:
+                master, state = entry[0].to(p.device), _state_to(entry[1], p.device)
+            master_param = torch.nn.Parameter(master, requires_grad=True)
+            master_param.grad = p.grad.float()
+            if state:
+                opt.state[master_param] = state
+            pairs.append((p, master_param))
+        return pairs
+
+    @torch.no_grad()
+    def write_back(self, pairs: list[tuple[torch.nn.Parameter, torch.nn.Parameter]]) -> None:
+        """Casts the stepped FP32 masters into their bf16 parameters (on the device, before the chunk's sync)."""
+        for p, master_param in pairs:
+            p.copy_(master_param.detach())
+            p.grad = None
+            master_param.grad = None
+
+    def end(self, opt: Any, pairs: list[tuple[torch.nn.Parameter, torch.nn.Parameter]]) -> None:
+        """Saves the masters and their optimizer states (to host memory with ``host``) after the chunk's sync."""
+        for p, master_param in pairs:
+            state = opt.state.pop(master_param, {})
+            master = master_param.detach()
+            if self.home is not None:
+                master, state = master.to(self.home), _state_to(state, self.home)
+            self._entries[id(p)] = (master, state)
+
+
+def _fp32_masters_of(engine: Any) -> Optional[_Fp32Masters]:
+    """``engine``'s FP32 master weights of ``engine_kwargs.tpu.fp32_master`` (None when it is off), created lazily."""
+    tpu_options = getattr(engine, "_tpu_options", None)
+    if not (tpu_options and tpu_options.fp32_master):
+        return None
+    masters = getattr(engine, "_fp32_master_store", None)
+    if masters is None:
+        masters = _Fp32Masters(host=bool(tpu_options.optimizer_host_offload))
+        engine._fp32_master_store = masters
+    return masters
+
+
+class _NonSeekableWriter(io.RawIOBase):
+    """Append-only binary stream wrapper so ``torch.save`` never seeks backwards on GCSFuse streaming mounts."""
+
+    def __init__(self, raw: Any):
+        self._raw = raw
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def write(self, b: Any) -> int:
+        return self._raw.write(b)
+
+    def flush(self) -> None:
+        self._raw.flush()
+
+
+def _fp32_master_ckpt_filename(rank: int, world_size: int) -> str:
+    return f"fp32_master_rank_{rank:05d}_of_{world_size:05d}.pt"
+
+
+def _pack_ckpt_tensor(value: Any) -> Any:
+    if isinstance(value, DTensor):
+        return {"__dtensor_local__": value._local_tensor.detach().cpu()}
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    return value
+
+
+def _unpack_ckpt_tensor_like(saved: Any, like_param: torch.Tensor, target_device: torch.device) -> Any:
+    if isinstance(saved, dict) and "__dtensor_local__" in saved:
+        local = saved["__dtensor_local__"].to(device=target_device)
+        return _wrap_local_like_param(local, like_param)
+    if isinstance(saved, torch.Tensor):
+        return saved.to(device=target_device)
+    return saved
+
+
+@torch.no_grad()
+def _copy_local_into_(dst: torch.Tensor, saved: Any) -> None:
+    src = saved["__dtensor_local__"] if isinstance(saved, dict) and "__dtensor_local__" in saved else saved
+    target = dst._local_tensor if isinstance(dst, DTensor) else dst.data
+    target.copy_(src.to(device=target.device, dtype=target.dtype))
+
+
+def _gcs_ckpt_blob_target(path: str) -> Optional[tuple[str, str]]:
+    """Resolve a direct ``gs://`` URI or a ``VERL_GCS_CKPT_BUCKET``-backed mount path to ``(bucket, blob)``.
+
+    Streaming multi-terabyte checkpoints directly via ``google.cloud.storage`` avoids staging 35-70 GiB/rank shards
+    onto node-local root disks through GCSFuse's ``/gcsfuse-tmp`` cache.
+    """
+    if path.startswith("gs://"):
+        without_scheme = path[len("gs://") :].strip("/")
+        bucket_name, _, blob_name = without_scheme.partition("/")
+        if bucket_name:
+            return bucket_name, blob_name
+        return None
+    bucket_name = os.environ.get("VERL_GCS_CKPT_BUCKET", "").strip()
+    if not bucket_name:
+        return None
+    mount_root = os.path.normpath(os.environ.get("VERL_GCS_CKPT_MOUNT", "/gcs_ckpt"))
+    norm = os.path.normpath(path)
+    mount_prefix = f"{mount_root.rstrip('/')}/"
+    if norm == mount_root or norm.startswith(mount_prefix):
+        rel = norm[len(mount_prefix) :].lstrip("/") if norm != mount_root else ""
+        prefix = os.environ.get("VERL_GCS_CKPT_PREFIX", "").strip("/")
+        blob_name = f"{prefix}/{rel}".strip("/") if prefix and rel else (prefix or rel)
+        return bucket_name, blob_name
+    return None
+
+
+def _prune_old_fp32_master_checkpoints(local_path: str, max_ckpt_to_keep: Optional[int]) -> None:
+    if max_ckpt_to_keep is None or max_ckpt_to_keep <= 0:
+        return
+    norm_path = os.path.normpath(local_path)
+    step_dir = os.path.dirname(norm_path)
+    if os.path.basename(norm_path) != "actor" or not os.path.basename(step_dir).startswith("global_step_"):
+        return
+    ckpt_root = os.path.dirname(step_dir)
+    gcs_root = _gcs_ckpt_blob_target(ckpt_root)
+    if gcs_root is not None:
+        from google.cloud import storage
+
+        bucket_name, root_prefix = gcs_root
+        prefix_with_slash = f"{root_prefix.rstrip('/')}/"
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        it = bucket.list_blobs(prefix=prefix_with_slash, delimiter="/")
+        list(it)  # populate it.prefixes
+        found_gcs: list[tuple[int, str]] = []
+        for sub_prefix in it.prefixes:
+            rel_name = sub_prefix[len(prefix_with_slash) :].rstrip("/")
+            m = re.fullmatch(r"global_step_(\d+)", rel_name)
+            if m:
+                found_gcs.append((int(m.group(1)), sub_prefix))
+        found_gcs.sort(key=lambda item: item[0])
+        if len(found_gcs) > max_ckpt_to_keep:
+            for _, old_prefix in found_gcs[:-max_ckpt_to_keep]:
+                logger.info(
+                    "Removing old GCS checkpoint prefix gs://%s/%s (max_ckpt_to_keep=%d)",
+                    bucket_name,
+                    old_prefix,
+                    max_ckpt_to_keep,
+                )
+                blobs = list(bucket.list_blobs(prefix=old_prefix))
+                for i in range(0, len(blobs), 100):
+                    bucket.delete_blobs(blobs[i : i + 100])
+        return
+
+    if not os.path.isdir(ckpt_root):
+        return
+    found: list[tuple[int, str]] = []
+    for entry in os.listdir(ckpt_root):
+        m = re.fullmatch(r"global_step_(\d+)", entry)
+        if m:
+            full = os.path.join(ckpt_root, entry)
+            if os.path.isdir(full):
+                found.append((int(m.group(1)), full))
+    found.sort(key=lambda item: item[0])
+    if len(found) > max_ckpt_to_keep:
+        for _, old_dir in found[:-max_ckpt_to_keep]:
+            logger.info("Removing old checkpoint directory %s (max_ckpt_to_keep=%d)", old_dir, max_ckpt_to_keep)
+            shutil.rmtree(old_dir, ignore_errors=True)
 
 
 def _partition_params_into_chunks(
@@ -252,6 +841,51 @@ class TPUEngineTrainModeCtx(BaseEngineCtx):
         super().__exit__(exc_type, exc_value, traceback)
 
 
+_SPLASH_ROUTING_SELECTIVE_AC_CLS: Any = None
+_PALLAS_SPLASH_FWD_OP_MARKER = "splash_attn_fwd"
+
+
+def _op_qualified_name(op: Any) -> str:
+    name_fn = getattr(op, "name", None)
+    if callable(name_fn):
+        try:
+            return str(name_fn())
+        except Exception:
+            pass
+    return str(op)
+
+
+class _SplashAndRoutingSaveOps(set):
+    """Selective-AC save set keeping only Pallas ``SplashAttention`` forward outputs and MoE router ``aten.topk``."""
+
+    def __contains__(self, op: Any) -> bool:
+        try:
+            if super().__contains__(op):
+                return True
+        except TypeError:
+            pass
+        return _PALLAS_SPLASH_FWD_OP_MARKER in _op_qualified_name(op)
+
+
+def _splash_and_routing_selective_ac_config() -> Any:
+    """Builds a ``SelectiveAC.Config`` saving only ``SplashAttention`` forward ``(out, lse)`` and ``aten.topk``."""
+    global _SPLASH_ROUTING_SELECTIVE_AC_CLS
+    if _SPLASH_ROUTING_SELECTIVE_AC_CLS is None:
+        from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+        class _SplashAndRoutingSelectiveAC(SelectiveAC):
+            @dataclasses.dataclass(kw_only=True, slots=True)
+            class Config(SelectiveAC.Config):
+                preserve_rng_state: bool = False
+                force_recompute_mm_shapes_by_fqns: list[str] = dataclasses.field(default_factory=list)
+
+            def get_save_ops(self) -> set:
+                return _SplashAndRoutingSaveOps({torch.ops.aten.topk.default})
+
+        _SPLASH_ROUTING_SELECTIVE_AC_CLS = _SplashAndRoutingSelectiveAC
+    return _SPLASH_ROUTING_SELECTIVE_AC_CLS.Config()
+
+
 class TorchTitanTPUEngine(BaseEngine):
     """Standalone TorchTitan engine for Google TPU with ``tpu_dist`` / PJRT SPMD execution."""
 
@@ -297,16 +931,17 @@ class TorchTitanTPUEngine(BaseEngine):
             self._use_simple_fsdp,
             self._tpu_eager_mode,
         ) = resolve_tpu_torchtitan_options(engine_config)
-        self._use_fused_linear_cross_entropy = resolve_tpu_use_fused_linear_cross_entropy(engine_config)
 
         if engine_config.use_torch_compile:
             configure_torch_compile_for_tpu()
+            tpu_model_kernels.patch_torchtitan_tpu_dynamo_caches()
 
         # Derive torchtitan model name and flavor from HF config
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
         self._torchtitan_name = torchtitan_name
 
         tpu_options = get_tpu_engine_options(self.engine_config)
+        self._tpu_options = tpu_options
 
         # Get ModelSpec from model registry
         model_module = importlib.import_module(get_torchtitan_model_module_name(torchtitan_name))
@@ -326,12 +961,21 @@ class TorchTitanTPUEngine(BaseEngine):
             )
             else {}
         )
+        # Mandatory per-model TPU setup (engines/tpu_model_kernels.py, _MODEL_SETUPS), e.g. Qwen3 MoE.
+        setup = tpu_model_kernels.model_setup(torchtitan_name, self.model_config.hf_config)
+        # MoE models require the fused LM-head log-prob: their per-chip token budgets only fit without the
+        # [tokens, vocab] logits, so the engine raises rather than falling back to them.
+        self._fused_logprob_required = setup is not None and setup.requires_fused_logprob
+        self._use_fused_linear_cross_entropy = resolve_tpu_use_fused_linear_cross_entropy(
+            engine_config, required=self._fused_logprob_required
+        )
         model_spec = model_module.model_registry(
             torchtitan_flavor,
             attn_backend=torchtitan_model_attn_backend(torchtitan_name, self.engine_config.attn_type),
             seq_len=self.engine_config.max_seq_len,
             **fuse_qkv_kwargs,
             **tpu_model_kernels.model_registry_kwargs(self._tpu_kernels),
+            **(setup.registry_kwargs() if setup else {}),
         )
         if self.model_config.hf_config.model_type == "qwen3_moe" and torchtitan_flavor in (
             "30B-A3B",
@@ -339,39 +983,38 @@ class TorchTitanTPUEngine(BaseEngine):
         ):
             from torchtitan.models.common.moe import MoE
 
-            # Match HF routing: no training-only expert bias or auxiliary router loss.
+            if tpu_options.qwen3_pallas_experts is False:
+                raise ValueError("qwen3_pallas_experts=False is unsupported: Qwen3 MoE requires Pallas on TPU")
+            if tpu_options.moe_paired_grouped_mm is None and tpu_options.moe_paired_gemm is not None:
+                tpu_options = self._tpu_options = dataclasses.replace(
+                    tpu_options, moe_paired_grouped_mm=tpu_options.moe_paired_gemm
+                )
+            # Upstream configures the experts and balancing; only disable training-only auxiliary losses here.
             moe_configs = list(model_spec.model.traverse(MoE.Config))
             if not moe_configs:
                 raise ValueError("Qwen3-30B config has no MoE layers")
             for _, moe, _, _ in moe_configs:
-                moe.load_balance_coeff = None
                 if hasattr(moe, "aux_loss"):
                     moe.aux_loss = None
                 if hasattr(moe.router, "aux_loss"):
                     moe.router.aux_loss = None
-            if tpu_options.qwen3_pallas_experts is not False:
-                from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts, TpuGroupedExpertsConverter
-                from torchtitan.experiments.tpu.token_dispatcher import TpuTokenDispatcherConverter
-
-                model = TpuTokenDispatcherConverter.Config().build().convert(model_spec.model)
-                model = TpuGroupedExpertsConverter.Config().build().convert(model)
-                experts_configs = list(model.traverse(TpuGroupedExperts.Config))
-                if len(experts_configs) != len(moe_configs):
-                    raise ValueError("Qwen3-30B Pallas conversion must provide one expert config per MoE layer")
-                for _, experts, _, _ in experts_configs:
-                    experts.use_pallas_grouped_mm = True
-                    experts.use_pallas_paired_grouped_mm = (
-                        tpu_options.moe_paired_gemm is not False and self.engine_config.expert_parallel_size == 1
-                    )
-                    experts.use_kernel_native_weight_layout = False  # Preserve HF weight export and FSDP layout.
-                    experts.pallas_grouped_mm_tile_m = 256
-                    experts.pallas_grouped_mm_tgmm_tiling = (256, 0, 0)
-                model_spec = dataclasses.replace(model_spec, model=model)
         tpu_model_kernels.configure_model_spec(
             model_spec,
             self._tpu_kernels,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
+            ep_token_chunks=tpu_options.ep_token_chunks,
+            ep_paired_grouped_mm=bool(tpu_options.ep_paired_grouped_mm),
         )
+        if setup is not None and setup.configure is not None:
+            setup.configure(
+                model_spec,
+                tpu_model_kernels.ModelSetupContext(
+                    expert_parallel_size=self.engine_config.expert_parallel_size,
+                    seq_bucket_size=get_tpu_seq_bucket_size(self.engine_config),
+                    moe_paired_grouped_mm=bool(tpu_options.moe_paired_grouped_mm),
+                    moe_native_weight_layout=bool(tpu_options.moe_native_weight_layout),
+                ),
+            )
         if self._use_simple_fsdp:
             model_spec = dataclasses.replace(
                 model_spec,
@@ -410,22 +1053,34 @@ class TorchTitanTPUEngine(BaseEngine):
             decay_type=self.optimizer_config.decay_type,
             min_lr_factor=self.optimizer_config.min_lr_factor,
         )
-        parallelism = ParallelismConfig(
-            data_parallel_replicate_degree=self.engine_config.data_parallel_replicate_size,
-            data_parallel_shard_degree=self.engine_config.data_parallel_shard_size,
-            fsdp_reshard_after_forward=self.engine_config.reshard_after_forward,
-            tensor_parallel_degree=self.engine_config.tensor_parallel_size,
-            pipeline_parallel_degree=self.engine_config.pipeline_parallel_size,
-            context_parallel_degree=self.engine_config.context_parallel_size,
-            expert_parallel_degree=self.engine_config.expert_parallel_size,
-            spmd_backend=self.engine_config.spmd_backend,
-            use_simple_fsdp=self._use_simple_fsdp,
-        )
+        parallelism_kwargs: dict[str, Any] = {
+            "data_parallel_replicate_degree": self.engine_config.data_parallel_replicate_size,
+            "data_parallel_shard_degree": self.engine_config.data_parallel_shard_size,
+            "fsdp_reshard_after_forward": self.engine_config.reshard_after_forward,
+            "tensor_parallel_degree": self.engine_config.tensor_parallel_size,
+            "pipeline_parallel_degree": self.engine_config.pipeline_parallel_size,
+            "context_parallel_degree": self.engine_config.context_parallel_size,
+            "expert_parallel_degree": self.engine_config.expert_parallel_size,
+            "spmd_backend": self.engine_config.spmd_backend,
+            "use_simple_fsdp": self._use_simple_fsdp,
+        }
+        topo_mesh = tpu_ragged_ep.should_enable_tpu_topo_mesh(tpu_options.enable_tpu_topo_mesh, ParallelismConfig)
+        if topo_mesh is not None:
+            parallelism_kwargs["enable_tpu_topo_mesh"] = topo_mesh
+        parallelism = ParallelismConfig(**parallelism_kwargs)
         if parallelism.context_parallel_degree > 1:
             self._enable_context_parallel(parallelism, model_spec.model)
+        async_save = not self.engine_config.forward_only and (
+            bool(getattr(self.checkpoint_config, "async_save", False))
+            or os.environ.get("VERL_TORCHTITAN_ASYNC_CHECKPOINT", "0") == "1"
+        )
         # interval=1: save whenever verl calls save_checkpoint (TorchTitan's default 500 skips the other steps).
         checkpoint = CheckpointManager.Config(
-            enable=True, interval=1, initial_load_in_hf=True, initial_load_path=model_config.path
+            enable=True,
+            interval=1,
+            initial_load_in_hf=True,
+            initial_load_path=model_config.path,
+            async_mode="async" if async_save else "disabled",
         )
         compile_config = CompileConfig(enable=self.engine_config.use_torch_compile, backend="tpu")
 
@@ -440,8 +1095,15 @@ class TorchTitanTPUEngine(BaseEngine):
             engine_dtype = getattr(self.engine_config, "dtype", "bfloat16")
             if engine_dtype in ("bfloat16", "float32"):
                 training_kwargs["dtype"] = engine_dtype
+        elif tpu_options.param_dtype == "bfloat16":
+            # Pure bf16 training (engine_kwargs.tpu.param_dtype): bf16 parameters, gradients and optimizer states.
+            training_kwargs["dtype"] = "bfloat16"
+            training_kwargs["mixed_precision_reduce"] = "bfloat16"
         if self.engine_config.max_seq_len is not None:
             training_kwargs["max_context_length"] = self.engine_config.max_seq_len
+        mixed_precision_reduce = resolve_tpu_mixed_precision_reduce(engine_config)
+        if mixed_precision_reduce is not None:
+            training_kwargs["mixed_precision_reduce"] = mixed_precision_reduce
         training = TrainingConfig(**training_kwargs)
 
         # Pad positions run 0..pad_size-1 (< bucket) and index the RoPE cache sized by max_context_length.
@@ -464,6 +1126,8 @@ class TorchTitanTPUEngine(BaseEngine):
             ac_mode = "none"
         if self.engine_config.forward_only:
             activation_checkpoint = None
+        elif tpu_options.ac_save_splash_and_routing and ac_mode != "none":
+            activation_checkpoint = _splash_and_routing_selective_ac_config()
         else:
             activation_checkpoint = {
                 # torchtitan's TPUSelectiveAC drops collectives from the selective-AC save set so backward
@@ -491,22 +1155,27 @@ class TorchTitanTPUEngine(BaseEngine):
             loss=CrossEntropyLoss.Config(),
         )
         if self._use_fused_linear_cross_entropy:
-            try:
-                from torchtitan.experiments.tpu.qwen3.config_registry import _FUSED_LOSS_OVERRIDE
-            except ImportError:
-                logger.warning(
-                    "Disabling use_fused_linear_cross_entropy: "
-                    "torchtitan.experiments.tpu.qwen3.config_registry not found"
-                )
-                self._use_fused_linear_cross_entropy = False
-            else:
-                if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
-                    self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+            self._enable_fused_logprob_head()
+        logger.warning(
+            "TPU log-prob path: %s",
+            "fused Tokamax linear + log-softmax (Pallas forward, chunked backward)"
+            if self._use_fused_linear_cross_entropy
+            else "LM-head logits + chunked log-softmax",
+        )
+        self._gdn_row_slot_len = int(tpu_options.gdn_row_slot_len or 0)
+        if self._gdn_row_slot_len:
+            if not self._use_fused_linear_cross_entropy:
+                raise ValueError("gdn_row_slot_len needs the fused log-prob path (use_fused_linear_cross_entropy)")
+            # Each gdn_row_slot_len-token row holds one sequence, so the GatedDeltaNet needs no document resets.
+            self.config.override.imports.append(
+                ("torchtitan.experiments.tpu.qwen3_5.gated_delta.gated_delta_document_resets", {"enabled": False})
+            )
         for override_import in tpu_model_kernels.override_imports(self._tpu_kernels):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
-        install_parallel_dims_cache_for_tpu()
         self.trainer = Trainer(self.config)
+        if engine_config.use_torch_compile:
+            tpu_model_kernels.patch_torchtitan_tpu_dynamo_caches()
         self.parallel_dims = self.trainer.parallel_dims
         self._dp_group = self._build_dp_gloo_group()
         # Like torchtitan's init_distributed (which verl bypasses): no autograd multithreading, so backward-thread
@@ -522,6 +1191,8 @@ class TorchTitanTPUEngine(BaseEngine):
             for model_part in model_parts:
                 enable_fsdp_gradient_division(model_part, dp_size)
 
+        if self._use_splash_attention:
+            set_splash_max_block_size(resolve_tpu_splash_max_block_size(engine_config))
         install_tpu_attention(model_parts, use_splash=self._use_splash_attention)
         if self.parallel_dims.ep_enabled:
             ep_cap = (
@@ -529,9 +1200,24 @@ class TorchTitanTPUEngine(BaseEngine):
                 if tpu_options.ep_capacity_factor is not None
                 else tpu_model_kernels.DEFAULT_EP_CAPACITY_FACTOR
             )
-            n_ep = tpu_model_kernels.set_ep_capacity_factor(model_parts, ep_cap)
+            ep_mode, n_ep = tpu_ragged_ep.install_tpu_ep_token_dispatcher(
+                model_parts,
+                ep_dispatcher=tpu_options.ep_dispatcher,
+                capacity_factor=ep_cap,
+                spmd_backend=parallelism.spmd_backend,
+                compile_config=compile_config,
+            )
             if n_ep:
-                logger.warning("Set TpuQwen35TokenDispatcher.capacity_factor=%.2f on %d dispatchers", ep_cap, n_ep)
+                logger.warning(
+                    "Configured %s TPU EP token dispatcher (capacity_factor=%.2f) on %d modules",
+                    ep_mode,
+                    ep_cap,
+                    n_ep,
+                )
+            if engine_config.use_torch_compile and ep_mode == "static":
+                n_barriers = tpu_model_kernels.install_ep_chunk_barriers(model_parts)
+                if n_barriers:
+                    logger.info("Installed EP chunk window barriers on %d routed-experts modules", n_barriers)
 
         if engine_config.use_torch_compile:
             n_compiled = sum(
@@ -715,10 +1401,9 @@ class TorchTitanTPUEngine(BaseEngine):
         return my_group
 
     def _drop_checkpoint_state_dict_cache(self) -> None:
-        """Free torchtitan ``ModelWrapper.cached_state_dict`` after the initial HF load."""
-        from torchtitan.components.checkpointer import MODEL
-
-        self.checkpointer.states[MODEL].cached_state_dict = {}
+        """Free torchtitan ``ModelWrapper.cached_state_dict`` after checkpoint load or save."""
+        for wrapper in self.checkpointer.states.values():
+            wrapper.cached_state_dict = {}
 
     def initialize(self):
         """Initialize model/checkpointer and release unused optimizer state on forward-only reference workers."""
@@ -732,6 +1417,14 @@ class TorchTitanTPUEngine(BaseEngine):
         if not self.engine_config.forward_only:
             self.optimizer = self.trainer.optimizers
             self.lr_scheduler = self.trainer.lr_schedulers
+            if self._tpu_options.frozen_param_regex:
+                pattern = re.compile(self._tpu_options.frozen_param_regex)
+                self._frozen_params = [p for m in self.module for n, p in m.named_parameters() if pattern.search(n)]
+                logger.info(
+                    "frozen_param_regex=%r freezes %d parameters",
+                    self._tpu_options.frozen_param_regex,
+                    len(self._frozen_params),
+                )
         else:
             self.optimizer = None
             self.lr_scheduler = None
@@ -819,15 +1512,22 @@ class TorchTitanTPUEngine(BaseEngine):
             dp_group=dp_group,
             same_micro_num_in_dp=True,
         )
-        if self._use_simple_fsdp or self.parallel_dims.cp_enabled:
+        tpu_options = get_tpu_engine_options(self.engine_config)
+        static_len = int(tpu_options.static_micro_batch_len or 0)
+        static_response_len = int(tpu_options.static_max_response_len or 0)
+        if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len:
             align_micro_batch_shapes_across_ranks(
-                micro_batches, bucket_size=get_tpu_seq_bucket_size(self.engine_config)
+                micro_batches,
+                bucket_size=get_tpu_seq_bucket_size(self.engine_config),
+                static_len=static_len,
+                static_response_len=static_response_len,
             )
 
-        if "kda" in getattr(self, "_tpu_kernels", ()):
+        if "kda" in getattr(self, "_tpu_kernels", ()) and not getattr(self, "_gdn_row_slot_len", 0):
             # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
-            # micro-batch is one packed document, plus the bucket-padding tail.
-            budget = max(int(mb.batch_size[0]) for mb in micro_batches) + 1
+            # micro-batch is one packed document, plus the bucket-padding tail; bucketed so that use_dynamic_bsz's
+            # varying sequence counts do not recompile the kernels (see packed_document_budget).
+            budget = tpu_model_kernels.packed_document_budget(max(int(mb.batch_size[0]) for mb in micro_batches))
             updated = tpu_model_kernels.set_packed_document_budget(self.module, budget)
             if updated:
                 logger.info("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)
@@ -846,7 +1546,13 @@ class TorchTitanTPUEngine(BaseEngine):
             else nullcontext()
         )
 
-        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode):
+        if getattr(self, "_gdn_row_slot_len", 0):
+            from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+
+            row_ctx = set_unflatten_seq_len(self._gdn_row_slot_len)
+        else:
+            row_ctx = nullcontext()
+        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), row_ctx:
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                     loss, output = self.forward_step(
@@ -925,6 +1631,8 @@ class TorchTitanTPUEngine(BaseEngine):
             timeline.span("optimizer_step", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()),
             tpu_eager_mode_context(self._tpu_eager_mode),
         ):
+            for p in getattr(self, "_frozen_params", ()):
+                p.grad = None  # frozen: out of the gradient norm, and AdamW skips parameters without a gradient
             param_chunks = self._optimizer_param_chunks()
             grad_norm = self._chunked_grad_norm(param_chunks)
             tpu_synchronize(grad_norm, wait=True)
@@ -999,24 +1707,47 @@ class TorchTitanTPUEngine(BaseEngine):
         Each inner optimizer steps only the current chunk: its param groups are narrowed to the chunk's parameters
         for the call (and restored afterwards), so the optimizer state and hyperparameters are untouched. Stepping
         the inner optimizers bypasses ``OptimizersContainer.step()``, so its pre/post step hooks run here, e.g. the
-        MoE load-balancing expert-bias update that torchtitan registers as a pre-step hook.
+        MoE load-balancing expert-bias update that torchtitan registers as a pre-step hook. It is registered only for
+        MoE models that keep load balancing on; a ``ModelSetup`` may turn it off (e.g. Qwen3 MoE).
         """
         for hook in getattr(self.optimizer, "_optimizer_step_pre_hooks", {}).values():
             hook(self.optimizer, (), {})
         max_norm = self.config.training.max_norm
+        tpu_options = getattr(self, "_tpu_options", None)
+        host_offload = bool(tpu_options and tpu_options.optimizer_host_offload)
+        masters = _fp32_masters_of(self)
         for opt, group_entries in param_chunks:
             for group, _, _ in group_entries:
                 group["params"] = []
             try:
                 for group, _, chunks in group_entries:
+                    if masters is not None and masters.can_step_on_cpu(opt, group):
+                        masters.step_group_chunks_on_cpu(group, chunks, max_norm=max_norm, grad_norm=grad_norm)
+                        continue
                     for chunk in chunks:
                         if not any(p.grad is not None for p in chunk):
                             continue
                         torch.nn.utils.clip_grads_with_norm_(chunk, max_norm, grad_norm, foreach=False)
+                        if masters is not None:
+                            pairs = masters.begin(opt, chunk)
+                            group["params"] = [master_param for _, master_param in pairs]
+                            opt.step()
+                            masters.write_back(pairs)
+                            if grad_norm.device.type == "tpu":
+                                tpu_synchronize(wait=True)
+                            masters.end(opt, pairs)
+                            group["params"] = []
+                            continue
                         group["params"] = chunk
+                        if host_offload:
+                            _move_optimizer_state(opt, chunk, chunk[0].device)
                         opt.step()
                         if grad_norm.device.type == "tpu":
                             tpu_synchronize(wait=True)  # end this chunk's program before tracing the next one
+                        if host_offload:
+                            # The chunk's optimizer states live in host memory between steps (engine_kwargs.tpu.
+                            # optimizer_host_offload), so only one chunk's states are ever on the device.
+                            _move_optimizer_state(opt, chunk, "cpu")
                         for p in chunk:
                             p.grad = None
                         group["params"] = []
@@ -1060,6 +1791,165 @@ class TorchTitanTPUEngine(BaseEngine):
             else:
                 raise ValueError(f"Invalid device type: {device}")
 
+    def _save_fp32_master_checkpoint(
+        self,
+        masters: _Fp32Masters,
+        local_path: str,
+        global_step: int,
+        max_ckpt_to_keep: Optional[int],
+    ) -> None:
+        is_dist = torch.distributed.is_initialized()
+        rank = torch.distributed.get_rank() if is_dist else 0
+        world_size = torch.distributed.get_world_size() if is_dist else 1
+        if rank == 0 and _gcs_ckpt_blob_target(local_path) is None:
+            os.makedirs(local_path, exist_ok=True)
+        if is_dist:
+            torch.distributed.barrier()
+
+        saved_masters: dict[str, dict[str, Any]] = {}
+        saved_params: dict[str, Any] = {}
+        for idx, module in enumerate(self.module):
+            for name, p in module.named_parameters():
+                fqn = f"{idx}.{name}"
+                entry = masters._entries.get(id(p))
+                if entry is not None:
+                    master, state = entry
+                    saved_masters[fqn] = {
+                        "master": _pack_ckpt_tensor(master),
+                        "state": {k: _pack_ckpt_tensor(v) for k, v in state.items()},
+                    }
+                else:
+                    saved_params[fqn] = _pack_ckpt_tensor(p)
+
+        saved_buffers = {
+            f"{idx}.{bname}": _pack_ckpt_tensor(b)
+            for idx, module in enumerate(self.module)
+            for bname, b in module.named_buffers()
+        }
+        optimizer_param_groups = (
+            [
+                [{k: v for k, v in g.items() if k not in ("params", "param_names")} for g in opt.param_groups]
+                for opt in getattr(self.optimizer, "optimizers", ())
+            ]
+            if getattr(self, "optimizer", None) is not None
+            else None
+        )
+        payload = {
+            "format_version": 1,
+            "global_step": int(global_step),
+            "rank": rank,
+            "world_size": world_size,
+            "masters": saved_masters,
+            "params": saved_params,
+            "buffers": saved_buffers,
+            "optimizer_param_groups": optimizer_param_groups,
+            "lr_scheduler": self.lr_scheduler.state_dict() if getattr(self, "lr_scheduler", None) is not None else None,
+        }
+        final_file = os.path.join(local_path, _fp32_master_ckpt_filename(rank, world_size))
+        gcs_target = _gcs_ckpt_blob_target(final_file)
+        if gcs_target is not None:
+            import time as _time
+
+            from google.cloud import storage
+
+            bucket_name, blob_name = gcs_target
+            for attempt_idx in range(3):
+                try:
+                    client = storage.Client()
+                    blob = client.bucket(bucket_name).blob(blob_name)
+                    with blob.open("wb", chunk_size=64 * 1024 * 1024, ignore_flush=True) as raw_f:
+                        with io.BufferedWriter(_NonSeekableWriter(raw_f), buffer_size=16 * 1024 * 1024) as stream:
+                            torch.save(payload, stream)
+                    break
+                except Exception as exc:
+                    if attempt_idx == 2:
+                        raise
+                    logger.warning(
+                        "Rank %d/%d retrying direct GCS checkpoint upload to gs://%s/%s after error: %s",
+                        rank,
+                        world_size,
+                        bucket_name,
+                        blob_name,
+                        exc,
+                    )
+                    _time.sleep(2.0 * (attempt_idx + 1))
+        else:
+            tmp_file = f"{final_file}.tmp"
+            with open(tmp_file, "wb") as raw_f:
+                with io.BufferedWriter(_NonSeekableWriter(raw_f), buffer_size=16 * 1024 * 1024) as stream:
+                    torch.save(payload, stream)
+            os.replace(tmp_file, final_file)
+        if is_dist:
+            torch.distributed.barrier()
+
+        if rank == 0:
+            _prune_old_fp32_master_checkpoints(local_path, max_ckpt_to_keep)
+        if is_dist:
+            torch.distributed.barrier()
+
+    def _load_fp32_master_checkpoint(self, masters: _Fp32Masters, local_path: str) -> None:
+        is_dist = torch.distributed.is_initialized()
+        rank = torch.distributed.get_rank() if is_dist else 0
+        world_size = torch.distributed.get_world_size() if is_dist else 1
+        ckpt_file = os.path.join(local_path, _fp32_master_ckpt_filename(rank, world_size))
+        if not os.path.exists(ckpt_file):
+            raise FileNotFoundError(f"FP32 master checkpoint shard not found for rank {rank}/{world_size}: {ckpt_file}")
+
+        masters.clear()
+        if getattr(self, "optimizer", None) is not None:
+            for opt in getattr(self.optimizer, "optimizers", ()):
+                opt.state.clear()
+        gc.collect()
+
+        payload: dict[str, Any] = {}
+        num_slots = min(2, max(1, (world_size + 3) // 4)) if is_dist else 1
+        for slot in range(num_slots):
+            if not is_dist or ((rank % 8) // 4) % num_slots == slot:
+                payload = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+            if is_dist:
+                torch.distributed.barrier()
+
+        if payload.get("world_size") != world_size:
+            raise ValueError(
+                f"Checkpoint world_size={payload.get('world_size')} does not match current world_size={world_size}"
+            )
+
+        saved_masters: dict[str, dict[str, Any]] = payload.get("masters", {})
+        saved_params: dict[str, Any] = payload.get("params", {})
+        saved_buffers: dict[str, Any] = payload.get("buffers", {})
+
+        for idx, module in enumerate(self.module):
+            for name, p in module.named_parameters():
+                fqn = f"{idx}.{name}"
+                if fqn in saved_masters:
+                    entry_data = saved_masters.pop(fqn)
+                    master_saved = entry_data["master"]
+                    _copy_local_into_(p, master_saved)
+                    param_dev = p._local_tensor.device if isinstance(p, DTensor) else p.device
+                    home_dev = torch.device(masters.home) if masters.home is not None else param_dev
+                    master = _unpack_ckpt_tensor_like(master_saved, p, home_dev)
+                    state = {k: _unpack_ckpt_tensor_like(v, p, home_dev) for k, v in entry_data["state"].items()}
+                    masters._entries[id(p)] = (master, state)
+                elif fqn in saved_params:
+                    _copy_local_into_(p, saved_params.pop(fqn))
+                else:
+                    raise KeyError(f"Parameter {fqn!r} missing from FP32 master checkpoint {ckpt_file}")
+
+            for bname, b in module.named_buffers():
+                bfqn = f"{idx}.{bname}"
+                if bfqn in saved_buffers:
+                    _copy_local_into_(b, saved_buffers.pop(bfqn))
+
+        saved_opt_groups = payload.get("optimizer_param_groups")
+        if saved_opt_groups is not None and getattr(self, "optimizer", None) is not None:
+            for opt, groups in zip(self.optimizer.optimizers, saved_opt_groups, strict=True):
+                for g, sg in zip(opt.param_groups, groups, strict=True):
+                    g.update(sg)
+
+        lr_sched_state = payload.get("lr_scheduler")
+        if lr_sched_state is not None and getattr(self, "lr_scheduler", None) is not None:
+            self.lr_scheduler.load_state_dict(lr_sched_state)
+
     def save_checkpoint(
         self,
         local_path: str,
@@ -1068,54 +1958,129 @@ class TorchTitanTPUEngine(BaseEngine):
         max_ckpt_to_keep: Optional[int] = None,
         **kwargs,
     ) -> None:
-        """Save checkpoint."""
-        if self._is_offload_param:
-            self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
+        """Save checkpoint according to ``checkpoint.save_contents``."""
+        with timeline.span(
+            "save_checkpoint", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane(), step=global_step
+        ):
+            save_contents = self._checkpoint_save_contents()
+            if self._is_offload_param:
+                self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
 
-        # Override TorchTitan's folder to use verl's path
+            if "hf_model" in save_contents:
+                self._save_hf_model(os.path.join(local_path, "huggingface"))
+
+            if save_contents & _DCP_CHECKPOINT_CONTENTS:
+                self._save_dcp_checkpoint(local_path, global_step, max_ckpt_to_keep)
+
+            torch.distributed.barrier()
+            if self._is_offload_param:
+                self.to(device="cpu", model=True, optimizer=False, grad=False)
+
+    def _checkpoint_save_contents(self) -> set[str]:
+        """``checkpoint.save_contents`` as a set; defaults to the DCP contents when unset."""
+        checkpoint_config = getattr(self, "checkpoint_config", None)
+        contents = getattr(checkpoint_config, "save_contents", None)
+        return set(contents) if contents is not None else set(_DCP_CHECKPOINT_CONTENTS)
+
+    def _save_dcp_checkpoint(self, local_path: str, global_step: int, max_ckpt_to_keep: Optional[int]) -> None:
+        """Save the TorchTitan DCP checkpoint (or FP32 master shards when ``fp32_master=True``)."""
+        masters = _fp32_masters_of(self)
+        if masters is not None:
+            self._save_fp32_master_checkpoint(masters, local_path, global_step, max_ckpt_to_keep)
+            return
+
         parent_dir = os.path.dirname(local_path)
         self.checkpointer.folder = parent_dir
-
         if max_ckpt_to_keep is not None:
             self.checkpointer.keep_latest_k = max_ckpt_to_keep
 
         self.checkpointer.save(curr_step=global_step)
+        self._drop_checkpoint_state_dict_cache()
 
-        torch.distributed.barrier()
-        if self._is_offload_param:
-            self.to(device="cpu", model=True, optimizer=False, grad=False)
+        save_future = getattr(self.checkpointer, "save_future", None)
+        if save_future is not None and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+            tracker_file = os.path.join(os.path.dirname(parent_dir), "latest_checkpointed_iteration.txt")
+
+            def _write_latest_tracker(fut, path=tracker_file, step=global_step):
+                if fut.exception() is None:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(str(step))
+
+            save_future.add_done_callback(_write_latest_tracker)
+
+    def _save_hf_model(self, hf_dir: str) -> None:
+        """Write the full model in HF format (bf16 safetensors shards, config, tokenizer) to ``hf_dir``."""
+        is_writer = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        hf_config = self.model_config.hf_config
+        skip_names = {"lm_head.weight"} if getattr(hf_config, "tie_word_embeddings", False) else set()
+        if is_writer:
+            os.makedirs(hf_dir, exist_ok=True)
+            hf_config.save_pretrained(hf_dir)
+            if self.model_config.generation_config is not None:
+                self.model_config.generation_config.save_pretrained(hf_dir)
+            processing_class = self.model_config.processor or self.model_config.tokenizer
+            if processing_class is not None:
+                processing_class.save_pretrained(hf_dir)
+
+        weights, _ = self.get_per_tensor_param()
+        weight_map = write_hf_safetensors(weights, hf_dir, is_writer=is_writer, skip_names=skip_names)
+        if weight_map is not None:
+            logger.warning(
+                "Saved hf_model (%d tensors in %d shards) to %s",
+                len(weight_map),
+                len(set(weight_map.values())),
+                hf_dir,
+            )
 
     def load_checkpoint(
         self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
     ) -> None:
         """Load checkpoint."""
-        if self._is_offload_param:
-            self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
+        with timeline.span("load_checkpoint", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()):
+            masters = _fp32_masters_of(self)
+            if masters is not None:
+                if self._is_offload_param:
+                    self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
+                self._load_fp32_master_checkpoint(masters, local_path)
+                for module in self.module:
+                    for p in module.parameters():
+                        if hasattr(p, "_tpu_cpu_offload_tensor"):
+                            delattr(p, "_tpu_cpu_offload_tensor")
+                tpu_synchronize(wait=True)
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                if self._is_offload_param:
+                    self.to(device="cpu", model=True, optimizer=False, grad=False)
+                return
 
-        # Override TorchTitan's folder to use verl's path
-        parent_dir = os.path.dirname(local_path)
-        self.checkpointer.folder = parent_dir
+            if self._is_offload_param:
+                self.to(device=get_device_name(), model=True, optimizer=False, grad=False)
 
-        # Extract step number from path (verl uses global_step_N format)
-        match = re.search(r"global_step_(\d+)", local_path)
-        if match:
-            step = int(match.group(1))
-            self.checkpointer.load(step=step)
-        else:
-            # Fallback to latest
-            self.checkpointer.load(step=-1)
-        for module in self.module:
-            for p in module.parameters():
-                if hasattr(p, "_tpu_cpu_offload_tensor"):
-                    delattr(p, "_tpu_cpu_offload_tensor")
-        tpu_synchronize(wait=True)
+            # Override TorchTitan's folder to use verl's path
+            parent_dir = os.path.dirname(local_path)
+            self.checkpointer.folder = parent_dir
 
-        torch.distributed.barrier()
-        if self._is_offload_param:
-            self.to(device="cpu", model=True, optimizer=False, grad=False)
+            # Extract step number from path (verl uses global_step_N format)
+            match = re.search(r"global_step_(\d+)", local_path)
+            if match:
+                step = int(match.group(1))
+                self.checkpointer.load(step=step)
+            else:
+                # Fallback to latest
+                self.checkpointer.load(step=-1)
+            for module in self.module:
+                for p in module.parameters():
+                    if hasattr(p, "_tpu_cpu_offload_tensor"):
+                        delattr(p, "_tpu_cpu_offload_tensor")
+            tpu_synchronize(wait=True)
 
-        if self._is_offload_optimizer and self.optimizer is not None:
-            offload_fsdp_optimizer(self.optimizer)
+            torch.distributed.barrier()
+            if self._is_offload_param:
+                self.to(device="cpu", model=True, optimizer=False, grad=False)
+
+            if self._is_offload_optimizer and self.optimizer is not None:
+                offload_fsdp_optimizer(self.optimizer)
 
     def _to_hf_named_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Re-key a torchtitan state dict to HuggingFace names, values untouched."""
@@ -1201,7 +2166,10 @@ class TorchTitanTPUEngine(BaseEngine):
             from verl_hardware_plugin.accelerators.tpu.rollout.qwen3_5_layout import make_tpu_sync_local_layout
 
             hf_config = self.model_config.hf_config
-            local_transform = make_tpu_sync_local_layout(getattr(hf_config, "text_config", None) or hf_config)
+            local_transform = make_tpu_sync_local_layout(
+                getattr(hf_config, "text_config", None) or hf_config,
+                expert_parallel=bool(self._tpu_options.rollout_expert_parallel),
+            )
         elif getattr(self, "_torchtitan_name", None) == "qwen3":
             # Qwen3 MoE: tpu-sync sends each expert stack as one 3-D tensor, so that FSDP shards of whole experts are
             # sent without a gather and the rollout installs its slices straight into vLLM's w13 / w2
@@ -1250,6 +2218,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         bucket_size = get_tpu_seq_bucket_size(self.engine_config)
         if use_remove_padding:
             vocab_size = getattr(get_text_config(self.model_config.hf_config), "vocab_size", None)
+            cu_seqlens = input_ids.offsets()
             input_ids, position_ids, labels, orig_seq_len = pad_packed_inputs_for_tpu(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -1259,6 +2228,12 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                 vocab_size=vocab_size,
             )
             output_args["orig_seq_len"] = orig_seq_len
+            if getattr(self, "_gdn_row_slot_len", 0):
+                # One sequence per GatedDeltaNet row; prepare_model_outputs restores the packed order.
+                slot_src, contig_src = row_slot_permutation(cu_seqlens, input_ids.shape[-1], self._gdn_row_slot_len)
+                slot_src = slot_src.to(input_ids.device)
+                input_ids, position_ids = input_ids[..., slot_src], position_ids[..., slot_src]
+                output_args["gdn_contig_src"] = contig_src.to(input_ids.device)
         else:
             pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
             batch_size = micro_batch.batch_size[0]
@@ -1328,6 +2303,31 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
         return input_ids, extra_inputs, extra_kwargs, output_args
 
+    def _enable_fused_logprob_head(self) -> None:
+        """Makes the LM head return ``(hidden_states, weight_t)`` (torchtitan's fused-loss override) for the fused
+        log-prob, and checks that the Tokamax kernel can be imported.
+
+        Without them the fused log-prob is turned off with a warning, or, if the model requires it, the engine
+        raises.
+        """
+        from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import require_tokamax
+
+        try:
+            from torchtitan.experiments.tpu.qwen3.config_registry import _FUSED_LOSS_OVERRIDE
+
+            require_tokamax()
+        except (ImportError, RuntimeError) as e:
+            if self._fused_logprob_required:
+                raise RuntimeError(
+                    "This model requires the fused LM-head log-prob (engine_kwargs.tpu.use_fused_linear_cross_entropy)"
+                    f", but it is unavailable: {e!r}. Set use_fused_linear_cross_entropy=False to run without it."
+                ) from e
+            logger.warning("Disabling use_fused_linear_cross_entropy: %r", e)
+            self._use_fused_linear_cross_entropy = False
+            return
+        if _FUSED_LOSS_OVERRIDE not in self.config.override.imports:
+            self.config.override.imports.append(_FUSED_LOSS_OVERRIDE)
+
     def _maybe_gather_context_parallel(self, tensor: torch.Tensor, output_args: dict) -> torch.Tensor:
         """Under CP, gather this rank's token shard into the full bucket-padded sequence (original token order)."""
         if not self.parallel_dims.cp_enabled:
@@ -1356,6 +2356,9 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         fused_log_probs = None
         if isinstance(logits, tuple):
             hidden_states, lm_head_weight_t = logits
+            if "gdn_contig_src" in output_args:
+                # gdn_row_slot_len: back from one sequence per row to the packed token order.
+                hidden_states = hidden_states.index_select(-2, output_args["gdn_contig_src"])
             if use_remove_padding and not self.parallel_dims.tp_enabled:
                 if labels.dim() > 1:
                     labels = labels.squeeze(0)
@@ -1372,12 +2375,21 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                         vocab_size=int(lm_head_weight_t.shape[1]),
                     ),
                 )
-                if not calculate_entropy:
+                if calculate_entropy and not torch.is_grad_enabled():
+                    # Entropy without gradient (old log-probs): one chunk of logits at a time, never all of them.
+                    entropy_rmpad = chunked_entropy_from_hidden_tpu(hidden_rmpad, lm_head_weight_t, temperature)
+                    model_output["entropy"] = _to_jagged(
+                        self._maybe_gather_context_parallel(entropy_rmpad, output_args),
+                        cu_seqlens,
+                        output_args.get("orig_seq_len"),
+                    )
+                if not calculate_entropy or not torch.is_grad_enabled():
                     fused_log_probs = self._maybe_gather_context_parallel(fused_log_probs, output_args)
                     model_output["log_probs"] = _to_jagged(fused_log_probs, cu_seqlens, output_args.get("orig_seq_len"))
                     return model_output
-            # Entropy needs the logits. The log-probs still come from the fused kernel, so the reference, old-log-prob
-            # and update passes all compute them the same way (an on-policy PPO ratio is exactly 1).
+            # A differentiated entropy (entropy loss) needs the logits. The log-probs still come from the fused kernel,
+            # so the reference, old-log-prob and update passes all compute them the same way (an on-policy PPO ratio
+            # is exactly 1).
             logits = hidden_states @ lm_head_weight_t
 
         if use_remove_padding:

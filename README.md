@@ -24,7 +24,7 @@ The platforms and engines in this repository are **reference implementations** �
 | Platform | Device | Communication | Status | Doc |
 |----------|--------|---------------|--------|-----|
 | FlagOS | NVIDIA GPU (verified) | FlagCX / NCCL | ✅ Supported | [User Guide](docs/integrations/flagos/nvidia/README.md) |
-| Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Example (requires vendor support) | [User Guide](docs/accelerators/xpu/README.md) |
+| Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Supported | [User Guide](docs/accelerators/xpu/README.md) |
 | Cambricon MLU | MLU | CNCL | ✅ Supported | [User Guide](docs/accelerators/mlu/README.md) |
 | MetaX | MetaX GPUs (CUDA-compatible) | NCCL API / MCCL | ✅ Supported | [User Guide](docs/accelerators/metax/README.md) |
 | Enflame GCU | GCU | ECCL / FlagCX | ✅ Example (requires vendor support) | [User Guide](docs/accelerators/enflame/README.md) |
@@ -33,6 +33,7 @@ The platforms and engines in this repository are **reference implementations** �
 | Moore Threads | MUSA | MCCL | ✅ Supported | [User Guide](docs/accelerators/musa/README.md) |
 | Google TPU | v6e | tpu_dist | ✅ Supported | [User Guide](docs/accelerators/tpu/README.md), [GRPO example](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) |
 | Biren | SUPA (CUDA-compatible) | BCCL | ✅ Example (requires vendor support) | [User Guide](docs/accelerators/supa/README.md) |
+| AMD ROCm | MI300X / MI355X | RCCL; MoRI-IO weight sync | Platform built-in (verl core); Primus Megatron / MaxText engines and `mori` checkpoint engine here | [User Guide](docs/accelerators/rocm/README.md) |
 
 
 ## Installation
@@ -70,6 +71,7 @@ verl_hardware_plugin/
 │   ├── metax/
 │   ├── mlu/
 │   ├── musa/
+│   ├── rocm/       # AMD ROCm (platform built into verl; Primus engines, checkpoint engine)
 │   ├── supa/       # Biren SUPA
 │   ├── tpu/        # Google TPU
 │   ├── trainium/   # Reserved for a future AWS Trainium integration
@@ -161,6 +163,7 @@ Each hardware platform provides a standalone user guide (following the structure
 - **[Moore Threads GPU](docs/accelerators/musa/README.md)** — Moore Threads GPU user guide
 - **[Google TPU](docs/accelerators/tpu/README.md)** — Google TPU platform guide
 - **[Biren SUPA](docs/accelerators/supa/README.md)** — Biren SUPA accelerator user guide
+- **[AMD ROCm](docs/accelerators/rocm/README.md)** — Primus Megatron / MaxText (JAX) trainers and MoRI-IO weight sync on AMD GPUs
 
 Future integration location: [AWS Trainium](docs/accelerators/trainium/README.md)
 (placeholder only; no implementation).

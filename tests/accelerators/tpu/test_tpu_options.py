@@ -51,6 +51,12 @@ def test_engine_kwargs_are_parsed_and_typed():
                 "seq_bucket_size": "512",
                 "context_parallel_strategy": "ulysses",
                 "ep_capacity_factor": "4.0",
+                "rollout_expert_parallel": "true",
+                "param_dtype": "bfloat16",
+                "optimizer_host_offload": "true",
+                "fp32_master": "true",
+                "ep_token_chunks": "2",
+                "ep_paired_grouped_mm": "true",
             }
         )
     )
@@ -63,6 +69,12 @@ def test_engine_kwargs_are_parsed_and_typed():
         seq_bucket_size=512,
         context_parallel_strategy="ulysses",
         ep_capacity_factor=4.0,
+        rollout_expert_parallel=True,
+        param_dtype="bfloat16",
+        optimizer_host_offload=True,
+        fp32_master=True,
+        ep_token_chunks=2,
+        ep_paired_grouped_mm=True,
     )
     assert get_tpu_engine_options(_cfg()) == TPUEngineOptions()
     assert get_tpu_engine_options(None) == TPUEngineOptions()
@@ -78,6 +90,9 @@ def test_engine_kwargs_are_parsed_and_typed():
         ({"ep_capacity_factor": 0}, "Invalid TPU engine option ep_capacity_factor"),
         ({"ep_capacity_factor": "nan"}, "Invalid TPU engine option ep_capacity_factor"),
         ({"ep_capacity_factor": True}, "Invalid TPU engine option ep_capacity_factor"),
+        ({"param_dtype": "float16"}, "param_dtype must be float32 or bfloat16"),
+        ({"fp32_master": True}, "fp32_master needs param_dtype=bfloat16"),
+        ({"param_dtype": "float32", "fp32_master": True}, "fp32_master needs param_dtype=bfloat16"),
     ],
 )
 def test_bad_engine_kwargs_raise(tpu, match):
@@ -134,6 +149,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
         verify_parity="off",
         release_buffers_after_sync=True,
         tie_word_embeddings=None,
+        return_after_d2h=False,
     )
     # Command-line overrides may arrive as strings.
     options = get_tpu_sync_options(
@@ -142,6 +158,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
             "verify_parity": "true",
             "release_buffers_after_sync": "0",
             "tie_word_embeddings": 1,
+            "return_after_d2h": "true",
         }
     )
     assert options == TPUSyncOptions(
@@ -149,6 +166,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
         verify_parity="norm",
         release_buffers_after_sync=False,
         tie_word_embeddings=True,
+        return_after_d2h=True,
     )
 
 
@@ -211,3 +229,35 @@ def test_tpu_chips_per_host_override(monkeypatch):
     monkeypatch.setenv("VERL_TPU_CHIPS_PER_HOST", "four")
     with pytest.raises(ValueError, match="VERL_TPU_CHIPS_PER_HOST"):
         tpu_chips_per_host_override()
+
+
+def test_ep_dispatcher_and_topo_mesh_options():
+    from types import SimpleNamespace
+
+    opts = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": " RAGGED ", "enable_tpu_topo_mesh": True}})
+    )
+    assert opts.ep_dispatcher == "ragged"
+    assert opts.enable_tpu_topo_mesh is True
+
+    opts_static = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": "static", "enable_tpu_topo_mesh": False}})
+    )
+    assert opts_static.ep_dispatcher == "static"
+    assert opts_static.enable_tpu_topo_mesh is False
+
+    with pytest.raises(ValueError, match="engine_kwargs.tpu.ep_dispatcher"):
+        tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": "deepep"}}))
+
+
+def test_ac_save_splash_and_routing_option():
+    from types import SimpleNamespace
+
+    opts = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(engine_kwargs={"tpu": {"ac_save_splash_and_routing": "true"}})
+    )
+    assert opts.ac_save_splash_and_routing is True
+    opts_off = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(engine_kwargs={"tpu": {"ac_save_splash_and_routing": False}})
+    )
+    assert opts_off.ac_save_splash_and_routing is False
