@@ -463,6 +463,7 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
                 )
             self._vllm_tp_size = int(published["tp_size"])
             self._vllm_params = {name: VllmParam.from_dict(d) for name, d in published["params"].items()}
+        assert self._vllm_tp_size is not None
         export = build_vllm_layout_export(valid_weights, self._shard_info, self._vllm_params, self._vllm_tp_size)
         self._shard_info = {name: (n, i) for name, (n, i, _) in export.shards.items()}
         self._shard_dims = {name: dim for name, (_, _, dim) in export.shards.items()}

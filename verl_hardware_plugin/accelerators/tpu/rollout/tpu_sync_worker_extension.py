@@ -582,7 +582,7 @@ class TPUSyncWorkerMixin:
                 f"(receive_into_vllm, nothing to install) completed in {t_total:.4f}s "
                 f"(H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
             )
-            result = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+            result: dict[str, Any] = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
             if parity is not None:
                 result["exact_parity"] = parity.result(rank, [])
             return result
@@ -598,7 +598,7 @@ class TPUSyncWorkerMixin:
                 f"install_tpu_sync_weights (load_weights) completed in {t_total:.4f}s "
                 f"(H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
             )
-            result: dict[str, Any] = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+            result = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
             if exact_parity:
                 # Checkpoint loaders re-shard and re-layout the tensors themselves; there is no 1:1 target to compare.
                 result["exact_parity"] = {"rank": rank, "skipped": "not supported with the vLLM-loader install"}
