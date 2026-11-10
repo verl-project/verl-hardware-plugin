@@ -482,19 +482,30 @@ class _LocalShardWeights(TrainerWeights):
 
 
 class _Linear(nn.Module):
-    """Holds one bf16 ``weight``; ``flipped`` marks vllm-torchtpu's transposed ``(in, out)`` layout."""
+    """Holds one bf16 ``weight``; ``flipped`` marks vllm-torchtpu's transposed ``(in, out)`` layout.
 
-    def __init__(self, *shape, flipped=False):
+    ``output_sizes`` / ``kv_replicas`` mimic vLLM's fused linears (``MergedColumnParallelLinear.output_sizes``,
+    ``QKVParallelLinear.num_kv_head_replicas``): the sources' global output sizes and the KV-head replication.
+    """
+
+    def __init__(self, *shape, flipped=False, output_sizes=None, kv_replicas=None):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(shape, dtype=torch.bfloat16), requires_grad=False)
         self._tpu_weight_flipped = flipped
+        if output_sizes is not None:
+            self.output_sizes = list(output_sizes)
+        if kv_replicas is not None:
+            self.num_kv_head_replicas = kv_replicas
 
 
 class _FakeVllmModel(nn.Module):
     """One TP rank of the vLLM model: fused qkv/gate_up, column and vocab parallel on dim 0, row parallel on dim 1.
 
-    With ``tp > KV_HEADS`` every rank holds one whole KV head (replicated on ``tp // KV_HEADS`` ranks).
+    With ``tp > KV_HEADS`` every rank holds one whole KV head (replicated on ``tp // KV_HEADS`` ranks). Like every
+    vLLM model class, it declares ``packed_modules_mapping``: which HF modules each fused module concatenates.
     """
+
+    packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"], "gate_up_proj": ["gate_proj", "up_proj"]}
 
     def __init__(self, tp, flip_o_proj=False, flip_linears=False):
         super().__init__()
@@ -502,11 +513,19 @@ class _FakeVllmModel(nn.Module):
         flip_o_proj = flip_o_proj or flip_linears
         attn = nn.Module()
         qkv_out = Q_ROWS // tp + 2 * KV_ROWS // min(tp, KV_HEADS)
-        attn.qkv_proj = _Linear(HIDDEN, qkv_out, flipped=True) if flip_linears else _Linear(qkv_out, HIDDEN)
+        qkv_meta = dict(output_sizes=(Q_ROWS, KV_ROWS, KV_ROWS), kv_replicas=max(1, tp // KV_HEADS))
+        attn.qkv_proj = (
+            _Linear(HIDDEN, qkv_out, flipped=True, **qkv_meta) if flip_linears else _Linear(qkv_out, HIDDEN, **qkv_meta)
+        )
         attn.o_proj = _Linear(Q_ROWS // tp, HIDDEN, flipped=True) if flip_o_proj else _Linear(HIDDEN, Q_ROWS // tp)
         mlp = nn.Module()
         gate_up_out = 2 * INTERMEDIATE // tp
-        mlp.gate_up_proj = _Linear(HIDDEN, gate_up_out, flipped=True) if flip_linears else _Linear(gate_up_out, HIDDEN)
+        gu_meta = dict(output_sizes=(INTERMEDIATE, INTERMEDIATE))
+        mlp.gate_up_proj = (
+            _Linear(HIDDEN, gate_up_out, flipped=True, **gu_meta)
+            if flip_linears
+            else _Linear(gate_up_out, HIDDEN, **gu_meta)
+        )
         mlp.down_proj = (
             _Linear(INTERMEDIATE // tp, HIDDEN, flipped=True) if flip_linears else _Linear(HIDDEN, INTERMEDIATE // tp)
         )
@@ -1277,7 +1296,7 @@ def test_build_vllm_layout_export_full_fused_orders_rank_slices():
     tp = 2
     params = {
         LAYER + "self_attn.qkv_proj.weight": vllm_layout.VllmParam(
-            (HIDDEN, (Q_ROWS + 2 * KV_ROWS) // tp), "torch.bfloat16", True
+            (HIDDEN, (Q_ROWS + 2 * KV_ROWS) // tp), "torch.bfloat16", True, tuple(QKV), (Q_ROWS, KV_ROWS, KV_ROWS)
         ),
         LAYER + "self_attn.o_proj.weight": vllm_layout.VllmParam((Q_ROWS // tp, HIDDEN), "torch.bfloat16", True),
         "model.norm.weight": vllm_layout.VllmParam((HIDDEN,), "torch.bfloat16", False),
@@ -1291,6 +1310,89 @@ def test_build_vllm_layout_export_full_fused_orders_rank_slices():
     assert torch.equal(out[LAYER + "self_attn.o_proj.weight"], weights[LAYER + "self_attn.o_proj.weight"].T)
     assert torch.equal(out["model.norm.weight"], weights["model.norm.weight"])
     assert export.sources[LAYER + "self_attn.qkv_proj.weight"] == tuple(QKV)
+
+
+def test_build_vllm_layout_export_follows_vllm_fusion_not_a_table():
+    """The fusion comes from vLLM's description, not from a built-in name table: a fused module under any name
+    (``mlp.w13`` <- gate, up) is exported as vLLM holds it, and ``qkv_proj`` with replicated KV heads (TP > KV
+    heads) follows the reported ``kv_replicas``."""
+    weights = _trainer_weights()
+    gate, up = weights[LAYER + "mlp.gate_proj.weight"], weights[LAYER + "mlp.up_proj.weight"]
+    tp = 2
+    params = {
+        LAYER + "mlp.w13.weight": vllm_layout.VllmParam(
+            (2 * INTERMEDIATE // tp, HIDDEN),
+            "torch.bfloat16",
+            False,
+            (LAYER + "mlp.gate_proj.weight", LAYER + "mlp.up_proj.weight"),
+            (INTERMEDIATE, INTERMEDIATE),
+        ),
+    }
+    out = dict(vllm_layout.build_vllm_layout_export(list(weights.items()), {}, params, tp).weights)
+    expected = torch.cat([torch.cat([gate.chunk(tp)[r], up.chunk(tp)[r]]) for r in range(tp)])
+    assert torch.equal(out[LAYER + "mlp.w13.weight"], expected)
+
+    tp = 4  # > KV_HEADS: each KV head is replicated on 2 ranks
+    q, k, v = (weights[n] for n in QKV)
+    local_rows = Q_ROWS // tp + 2 * KV_ROWS // KV_HEADS
+    params = {
+        LAYER + "self_attn.qkv_proj.weight": vllm_layout.VllmParam(
+            (local_rows, HIDDEN), "torch.bfloat16", False, tuple(QKV), (Q_ROWS, KV_ROWS, KV_ROWS), kv_replicas=2
+        ),
+    }
+    out = dict(vllm_layout.build_vllm_layout_export(list(weights.items()), {}, params, tp).weights)
+    expected = torch.cat(
+        [torch.cat([q.chunk(tp)[r], k.chunk(KV_HEADS)[r // 2], v.chunk(KV_HEADS)[r // 2]]) for r in range(tp)]
+    )
+    assert torch.equal(out[LAYER + "self_attn.qkv_proj.weight"], expected)
+    # A wrong replication factor does not add up to vLLM's rows.
+    params[LAYER + "self_attn.qkv_proj.weight"] = vllm_layout.VllmParam(
+        (local_rows, HIDDEN), "torch.bfloat16", False, tuple(QKV), (Q_ROWS, KV_ROWS, KV_ROWS), kv_replicas=1
+    )
+    with pytest.raises(vllm_layout.VllmLayoutError, match="rows per rank"):
+        vllm_layout.build_vllm_layout_export(list(weights.items()), {}, params, tp)
+
+    # A source the trainer does not have is an error, not a silent drop.
+    bad = {
+        LAYER + "mlp.gate_up_proj.weight": vllm_layout.VllmParam(
+            (2 * INTERMEDIATE // 2, HIDDEN),
+            "torch.bfloat16",
+            False,
+            (LAYER + "mlp.gate_proj.weight", LAYER + "mlp.nope.weight"),
+        )
+    }
+    with pytest.raises(vllm_layout.VllmLayoutError, match="no tensor for its vLLM sources"):
+        vllm_layout.build_vllm_layout_export(list(weights.items()), {}, bad, 2)
+    # Source rows that do not add up to vLLM's output sizes are an error too.
+    bad = {
+        LAYER + "mlp.gate_up_proj.weight": vllm_layout.VllmParam(
+            (2 * INTERMEDIATE // 2, HIDDEN),
+            "torch.bfloat16",
+            False,
+            (LAYER + "mlp.gate_proj.weight", LAYER + "mlp.up_proj.weight"),
+            (INTERMEDIATE, INTERMEDIATE + 1),
+        )
+    }
+    with pytest.raises(vllm_layout.VllmLayoutError, match="output sizes"):
+        vllm_layout.build_vllm_layout_export(list(weights.items()), {}, bad, 2)
+
+
+def test_describe_vllm_params_reports_vllm_fusion_sources(fake_tpu_sync, worker_ext):
+    """The rollout reports each fused parameter's HF sources, output sizes and KV replication from the vLLM model
+    (``packed_modules_mapping`` + the fused module), so the trainer needs no model knowledge."""
+    tp = 4
+    sampler = _make_sampler(worker_ext, 0, tp, _FakeVllmModel(tp, flip_linears=True))
+    desc = sampler.describe_vllm_params()
+    assert desc["tp_size"] == tp
+    qkv = vllm_layout.VllmParam.from_dict(desc["params"][LAYER + "self_attn.qkv_proj.weight"])
+    assert qkv.sources == tuple(QKV)
+    assert qkv.output_sizes == (Q_ROWS, KV_ROWS, KV_ROWS)
+    assert qkv.kv_replicas == tp // KV_HEADS and qkv.flipped
+    gate_up = vllm_layout.VllmParam.from_dict(desc["params"][LAYER + "mlp.gate_up_proj.weight"])
+    assert gate_up.sources == (LAYER + "mlp.gate_proj.weight", LAYER + "mlp.up_proj.weight")
+    assert gate_up.output_sizes == (INTERMEDIATE, INTERMEDIATE) and gate_up.kv_replicas == 1
+    o_proj = vllm_layout.VllmParam.from_dict(desc["params"][LAYER + "self_attn.o_proj.weight"])
+    assert o_proj.sources == () and o_proj.output_sizes == ()
 
 
 def test_parity_check_with_local_shards_waits_for_every_rank_and_reports_mismatch(

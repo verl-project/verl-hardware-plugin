@@ -414,15 +414,19 @@ class TPUSyncWorkerMixin:
     def describe_vllm_params(self) -> dict:
         """vLLM's parameters as this rank holds them, for the trainer's export in vLLM's layout (``receive_into_vllm``).
 
-        Returns ``{"tp_size": TP, "params": {name: {"local_shape", "dtype", "flipped"}}}`` over
-        ``vllm_model.state_dict()``; ``flipped`` is vllm-torchtpu's ``_tpu_weight_flipped`` on the owning module (the
-        weight is stored transposed, ``(in, out)``). Parameters that share storage (a tied ``lm_head``) are listed once.
+        Returns ``{"tp_size": TP, "params": {name: VllmParam.to_dict()}}`` over ``vllm_model.state_dict()``;
+        ``flipped`` is vllm-torchtpu's ``_tpu_weight_flipped`` on the owning module (the weight is stored transposed,
+        ``(in, out)``). A parameter of a fused module (one the model class's ``packed_modules_mapping`` lists, e.g.
+        ``qkv_proj`` <- ``q_proj, k_proj, v_proj``) carries its HF source names in order, the module's global
+        ``output_sizes`` and its ``num_kv_head_replicas``, so the trainer needs no model knowledge. Parameters that
+        share storage (a tied ``lm_head``) are listed once.
         """
         vllm_model = self._get_vllm_model()
         worker: Any = getattr(self, "worker", self)
         tp_size = int(worker.vllm_config.parallel_config.tensor_parallel_size)
         model_sd = vllm_model.state_dict()
         modules = dict(vllm_model.named_modules())
+        packed = dict(getattr(vllm_model, "packed_modules_mapping", None) or {})
         params: dict[str, dict] = {}
         seen_storage: set[int] = set()
         for key in sorted(model_sd):
@@ -431,8 +435,19 @@ class TPUSyncWorkerMixin:
             if t.data_ptr() in seen_storage:
                 continue
             seen_storage.add(t.data_ptr())
-            flipped = bool(getattr(get_parent_module(key, modules), "_tpu_weight_flipped", False))
-            params[key] = VllmParam(tuple(t.shape), str(t.dtype), flipped).to_dict()
+            module = get_parent_module(key, modules)
+            flipped = bool(getattr(module, "_tpu_weight_flipped", False))
+            module_name, _, leaf = key.rpartition(".")
+            owner, _, module_leaf = module_name.rpartition(".")
+            sources: tuple[str, ...] = ()
+            output_sizes: tuple[int, ...] = ()
+            kv_replicas = 1
+            if module_leaf in packed:
+                prefix = f"{owner}." if owner else ""
+                sources = tuple(f"{prefix}{src}.{leaf}" for src in packed[module_leaf])
+                output_sizes = tuple(int(s) for s in getattr(module, "output_sizes", ()) or ())
+                kv_replicas = int(getattr(module, "num_kv_head_replicas", 1) or 1)
+            params[key] = VllmParam(tuple(t.shape), str(t.dtype), flipped, sources, output_sizes, kv_replicas).to_dict()
         return {"tp_size": tp_size, "params": params}
 
     def _init_receive_into_vllm(

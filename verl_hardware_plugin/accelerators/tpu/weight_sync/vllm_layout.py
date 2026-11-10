@@ -10,14 +10,15 @@ rollout to bind its vLLM parameters as the receive buffers, the trainer must sen
 it: one virtual global tensor per vLLM parameter whose TP slices are the rollout ranks' local weights.
 
 ``build_vllm_layout_export`` turns the trainer's HF-named tensors (full, or this rank's FSDP shards) into that form,
-given the rollout's parameter description (``describe_vllm_params`` on the rollout worker). Unfused tensors keep their
-FSDP blocks (transposed when vLLM flipped them) and tpu-sync reshards them for the rollout's TP split as usual. A
-fused parameter's rollout-rank slice is the concatenation of the sources' slices, so with FSDP degree F equal to the
+given the rollout's parameter description (``describe_vllm_params`` on the rollout worker). The description carries
+vLLM's own fusion table: each fused parameter lists its HF sources (from the model class's ``packed_modules_mapping``,
+which every vLLM model declares and its weight loader follows), the per-source output sizes and, for ``qkv_proj``,
+how many ranks replicate each KV head. Nothing here is specific to a model family. Unfused tensors keep their FSDP
+blocks (transposed when vLLM flipped them) and tpu-sync reshards them for the rollout's TP split as usual. A fused
+parameter's rollout-rank slice is the concatenation of the sources' slices, so with FSDP degree F equal to the
 rollout TP degree, trainer rank t's shards of q/k/v are exactly rollout rank t's slices and the fused block is a local
 concatenation; no communication is needed.
 
-TODO(tpu): the fusion table (``FUSED_SOURCES``) is the dense Qwen3 / Llama layout, copied from vLLM. Derive the
-mapping from vLLM itself instead (trace its weight loaders once at init), so any model vLLM loads is covered.
 TODO(tpu): F != TP, interleaved placements (MoE round-robin experts, Qwen3.5 head interleaving) and replicated GQA KV
 heads need an exchange among trainer ranks before the export; they raise ``VllmLayoutError`` for now.
 """
@@ -32,32 +33,44 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# vLLM parameter suffix -> the HF tensors it concatenates along the HF output dim (dim 0), in order.
-FUSED_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (
-        ".self_attn.qkv_proj.weight",
-        (".self_attn.q_proj.weight", ".self_attn.k_proj.weight", ".self_attn.v_proj.weight"),
-    ),
-    (".self_attn.qkv_proj.bias", (".self_attn.q_proj.bias", ".self_attn.k_proj.bias", ".self_attn.v_proj.bias")),
-    (".mlp.gate_up_proj.weight", (".mlp.gate_proj.weight", ".mlp.up_proj.weight")),
-    (".mlp.gate_up_proj.bias", (".mlp.gate_proj.bias", ".mlp.up_proj.bias")),
-)
-
 
 @dataclass(frozen=True)
 class VllmParam:
-    """One vLLM parameter as one rollout rank holds it (the same shape on every rank)."""
+    """One vLLM parameter as one rollout rank holds it (the same shape on every rank).
+
+    ``sources`` names the HF tensors a fused parameter concatenates along its output dim, in order (from the vLLM
+    model's ``packed_modules_mapping``); empty for an unfused parameter. ``output_sizes`` are the sources' global
+    output sizes (the fused module's ``output_sizes``) and ``kv_replicas`` how many TP ranks share each KV head
+    (``QKVParallelLinear.num_kv_head_replicas``; 1 when every rank has its own KV rows).
+    """
 
     local_shape: tuple[int, ...]
     dtype: str  # e.g. "torch.bfloat16"
     flipped: bool  # vllm-torchtpu transposed it to (in, out)
+    sources: tuple[str, ...] = ()
+    output_sizes: tuple[int, ...] = ()
+    kv_replicas: int = 1
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> VllmParam:
-        return cls(tuple(d["local_shape"]), str(d["dtype"]), bool(d["flipped"]))
+        return cls(
+            tuple(d["local_shape"]),
+            str(d["dtype"]),
+            bool(d["flipped"]),
+            tuple(d.get("sources") or ()),
+            tuple(int(s) for s in d.get("output_sizes") or ()),
+            int(d.get("kv_replicas") or 1),
+        )
 
     def to_dict(self) -> dict[str, Any]:
-        return {"local_shape": list(self.local_shape), "dtype": self.dtype, "flipped": self.flipped}
+        return {
+            "local_shape": list(self.local_shape),
+            "dtype": self.dtype,
+            "flipped": self.flipped,
+            "sources": list(self.sources),
+            "output_sizes": list(self.output_sizes),
+            "kv_replicas": self.kv_replicas,
+        }
 
 
 @dataclass
@@ -75,33 +88,48 @@ class VllmLayoutError(RuntimeError):
     """The trainer's tensors cannot be exported in vLLM's layout without communication (see the module TODOs)."""
 
 
+def _candidates(name: str) -> tuple[str, str]:
+    """``name`` and its twin with the ``model.`` prefix toggled (vLLM and HF names differ only there)."""
+    return name, (name[6:] if name.startswith("model.") else f"model.{name}")
+
+
 def _lookup(params: dict[str, VllmParam], name: str) -> Optional[tuple[str, VllmParam]]:
     """Finds ``name`` in vLLM's parameters, tolerating a ``model.`` prefix difference."""
-    for candidate in (name, name[6:] if name.startswith("model.") else f"model.{name}"):
+    for candidate in _candidates(name):
         if candidate in params:
             return candidate, params[candidate]
     return None
 
 
-def _rank_slices(sources: list[torch.Tensor], tp_size: int, local_out: int) -> list[list[torch.Tensor]]:
+def _find_weight(weights: dict[str, torch.Tensor], name: str) -> Optional[str]:
+    """Finds the trainer tensor for a vLLM-side source name, tolerating a ``model.`` prefix difference."""
+    for candidate in _candidates(name):
+        if candidate in weights:
+            return candidate
+    return None
+
+
+def _rank_slices(
+    sources: list[torch.Tensor], tp_size: int, local_out: int, kv_replicas: int
+) -> list[list[torch.Tensor]]:
     """Per rollout rank, each full source's slice (HF dim 0), for a fused parameter with ``local_out`` rows per rank.
 
     The first source (q) is split ``tp_size`` ways. With GQA (``tp_size`` > KV heads) vLLM replicates each KV head on
-    ``m = tp_size // num_kv_heads`` ranks, so the other sources (k, v) are split ``tp_size // m`` ways and rank r
-    takes block ``r // m``. ``m`` follows from the row budget: ``local_out = q/tp + m * sum(kv)/tp``.
+    ``kv_replicas`` ranks, so the other sources (k, v) are split ``tp_size // kv_replicas`` ways and rank r takes
+    block ``r // kv_replicas``. The per-rank row count is checked against ``local_out``.
     """
     q_rows = sources[0].shape[0]
+    m = kv_replicas
     if q_rows % tp_size:
         raise VllmLayoutError(f"first source has {q_rows} rows, not a multiple of TP={tp_size}")
-    rest = sum(s.shape[0] for s in sources[1:])
-    m = 1
-    if rest:
-        budget = local_out - q_rows // tp_size
-        if budget <= 0 or (budget * tp_size) % rest:
-            raise VllmLayoutError(f"cannot split {[s.shape[0] for s in sources]} rows into {local_out} per rank")
-        m = budget * tp_size // rest
-        if tp_size % m or any(s.shape[0] % (tp_size // m) for s in sources[1:]):
-            raise VllmLayoutError(f"KV replication factor {m} does not divide TP={tp_size} or the KV rows")
+    if m < 1 or tp_size % m or any(s.shape[0] % (tp_size // m) for s in sources[1:]):
+        raise VllmLayoutError(f"KV replication factor {m} does not divide TP={tp_size} or the KV rows")
+    rows = q_rows // tp_size + sum(s.shape[0] // (tp_size // m) for s in sources[1:])
+    if rows != local_out:
+        raise VllmLayoutError(
+            f"sources {[s.shape[0] for s in sources]} give {rows} rows per rank at TP={tp_size}, "
+            f"kv_replicas={m}; vLLM holds {local_out}"
+        )
     out = []
     for r in range(tp_size):
         slices = [sources[0].chunk(tp_size, dim=0)[r]]
@@ -178,7 +206,7 @@ def build_vllm_layout_export(
                 )
         elif fused:
             # Full sources: rank r's slice is the r-th slice of each source, in source order.
-            per_rank = _rank_slices([weights[n] for n in hf_names], tp_size, local_out)
+            per_rank = _rank_slices([weights[n] for n in hf_names], tp_size, local_out, param.kv_replicas)
             tensor = torch.cat([s for slices in per_rank for s in slices], dim=0)
         else:
             # A single source: the same tensor (tpu-sync reshards the FSDP blocks for the rollout's TP split).
@@ -208,18 +236,28 @@ def build_vllm_layout_export(
         export.sources[vllm_name] = hf_names
         consumed.update(hf_names)
 
-    # 1. Fused parameters.
-    for target_suffix, src_suffixes in FUSED_SOURCES:
-        for hf_name in list(weights):
-            if not hf_name.endswith(src_suffixes[0]):
-                continue
-            prefix = hf_name[: -len(src_suffixes[0])]
-            hf_names = tuple(prefix + s for s in src_suffixes)
-            if not all(n in weights for n in hf_names):
-                continue
-            found = _lookup(vllm_params, prefix + target_suffix)
-            if found is not None:
-                emit(found[0], found[1], hf_names)
+    # 1. Fused parameters: vLLM told us their sources (its packed_modules_mapping).
+    for vllm_name in sorted(vllm_params):
+        param = vllm_params[vllm_name]
+        if not param.sources:
+            continue
+        resolved = [_find_weight(weights, s) for s in param.sources]
+        if any(r is None for r in resolved):
+            missing = [s for s, r in zip(param.sources, resolved, strict=True) if r is None]
+            raise VllmLayoutError(f"{vllm_name}: the trainer has no tensor for its vLLM sources {missing}")
+        hf_names = tuple(r for r in resolved if r is not None)
+        if param.output_sizes and len(param.output_sizes) != len(hf_names):
+            raise VllmLayoutError(
+                f"{vllm_name}: vLLM lists {len(param.output_sizes)} output sizes for {len(hf_names)} sources"
+            )
+        if param.output_sizes:
+            # Global rows per source: a dim-0 FSDP block holds 1/F of them.
+            rows = [weights[n].shape[0] * (shard_info[n][0] if n in shard_info else 1) for n in hf_names]
+            if rows != list(param.output_sizes):
+                raise VllmLayoutError(
+                    f"{vllm_name}: trainer source rows {rows} != vLLM's output sizes {list(param.output_sizes)}"
+                )
+        emit(vllm_name, param, hf_names)
 
     # 2. Everything else: the same tensor, transposed when vLLM flipped it.
     for hf_name in weights:
