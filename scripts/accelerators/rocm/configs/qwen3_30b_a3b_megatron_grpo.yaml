@@ -1,0 +1,65 @@
+# Primus experiment for GRPO on Qwen3-30B-A3B with verl (Primus Megatron trainer).
+# One MI300X node (8 GPUs): TP1 PP1 CP2 EP4, packed THD sequences, BF16.
+#
+#   python -m verl_hardware_plugin.accelerators.rocm.launch qwen3_30b_a3b_megatron_grpo.yaml <verl overrides>
+work_group: verl
+user_name: ${USER:verl}
+exp_name: qwen3_30b_a3b_grpo
+workspace: ${PRIMUS_WORKSPACE:/tmp/verl-primus}
+
+modules:
+  pre_trainer:
+    framework: megatron
+    config: pre_trainer.yaml
+    model: qwen3_30B_A3B.yaml
+    overrides:
+      stage: post_training
+      hf_path: ${MODEL_PATH:Qwen/Qwen3-30B-A3B}
+      tokenizer_model: ${MODEL_PATH:Qwen/Qwen3-30B-A3B}
+
+      bf16: true
+      fp16: false
+      untie_embeddings_and_output_weights: true
+
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 2
+      expert_model_parallel_size: 4
+      expert_tensor_parallel_size: 1
+      sequence_parallel: false
+      use_distributed_optimizer: true
+
+      recompute_granularity: full
+      recompute_method: uniform
+      recompute_num_layers: 1
+
+      # verl feeds packed THD batches (actor_rollout_ref.model.use_remove_padding=True).
+      use_packed_attention: true
+      # TransformerEngine CK fused attention (the image sets NVTE_FLASH_ATTN=0, NVTE_FUSED_ATTN=1).
+      attention_backend: fused
+      apply_rope_fusion: true
+      masked_softmax_fusion: true
+      bias_activation_fusion: true
+      bias_dropout_fusion: true
+      gradient_accumulation_fusion: false
+      moe_grouped_gemm: true
+      moe_permute_fusion: true
+      moe_router_dtype: fp32
+
+      # TransformerEngine/Megatron kernels; Primus-Turbo kernels can be enabled one at a time.
+      enable_primus_turbo: false
+      use_turbo_attention: false
+      use_turbo_rms_norm: false
+      use_turbo_gemm: false
+      use_turbo_parallel_linear: false
+      use_turbo_grouped_gemm: false
+      use_turbo_grouped_mlp: false
+
+      lr: 1.0e-6
+      min_lr: 0.0
+      lr_decay_style: constant
+      lr_warmup_iters: 0
+      weight_decay: 0.1
+      adam_beta1: 0.9
+      adam_beta2: 0.98
+      clip_grad: 1.0

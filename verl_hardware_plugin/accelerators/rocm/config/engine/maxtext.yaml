@@ -1,0 +1,37 @@
+# MaxText engine: one JAX process per GPU over a MaxText mesh from a Primus YAML (framework: maxtext).
+_target_: verl_hardware_plugin.accelerators.rocm.primus.maxtext.config.MaxTextEngineConfig
+
+strategy: maxtext
+
+# Primus experiment YAML with a framework=maxtext module.
+primus_config_path: ???
+
+primus_module: pre_trainer
+
+primus_path: ${oc.env:PRIMUS_PATH,null}
+
+# MaxText checkout; null means $MAXTEXT_PATH, then <primus_path>/third_party/maxtext.
+maxtext_path: ${oc.env:MAXTEXT_PATH,null}
+
+# Primus-style key=value overrides applied on top of the module, e.g. ["learning_rate=2e-6"].
+primus_overrides: []
+
+# Hugging Face checkpoint to start from; null means the actor model path.
+hf_weights_path: null
+
+load_hf_weights: true
+
+# Fraction of each GPU JAX preallocates; the rest holds the torch buffers of the weight sync.
+mem_fraction: 0.85
+
+param_offload: false
+
+optimizer_offload: false
+
+seed: 42
+
+full_determinism: false
+
+forward_only: false
+
+dtype: bfloat16

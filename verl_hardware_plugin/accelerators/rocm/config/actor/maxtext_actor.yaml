@@ -1,0 +1,16 @@
+# Primus MaxText actor. The optimizer and its schedule are MaxText's, read from the Primus YAML;
+# actor.optim only mirrors the learning rate for logging.
+defaults:
+  - ../optim@optim: fsdp
+  - ../engine@maxtext: maxtext
+  - actor
+  - _self_
+
+_target_: verl_hardware_plugin.accelerators.rocm.primus.maxtext.config.MaxTextActorConfig
+
+strategy: maxtext
+
+optim:
+  lr: ${primus:learning_rate,1e-6,actor_rollout_ref.actor.maxtext}
+  weight_decay: ${primus:adam_weight_decay,0.0,actor_rollout_ref.actor.maxtext}
+  clip_grad: ${primus:gradient_clipping_threshold,1.0,actor_rollout_ref.actor.maxtext}

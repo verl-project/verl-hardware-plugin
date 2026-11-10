@@ -1,0 +1,4 @@
+# @package _global_
+# Primus MaxText (JAX): the maxtext strategy configured by a Primus experiment YAML.
+#   model_engine=maxtext actor_rollout_ref.actor.maxtext.primus_config_path=<exp.yaml>
+model_engine: maxtext

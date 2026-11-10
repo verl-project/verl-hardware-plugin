@@ -27,7 +27,7 @@ hardware = "verl_hardware_plugin"
 include = ["verl_hardware_plugin*"]
 
 [tool.setuptools.package-data]
-verl_hardware_plugin = ["**/*.html"]
+verl_hardware_plugin = ["**/*.html", "**/*.yaml"]
 
 [tool.ruff]
 line-length = 120

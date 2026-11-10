@@ -1,0 +1,31 @@
+# Primus Megatron critic. Uses its own Primus experiment (critic.megatron.primus_config_path),
+# defaulting to the actor's.
+defaults:
+  - megatron_critic
+  - _self_
+
+megatron:
+  _target_: verl_hardware_plugin.accelerators.rocm.primus.megatron.config.PrimusMcoreEngineConfig
+  primus_config_path: ${oc.select:actor_rollout_ref.actor.megatron.primus_config_path,""}
+  primus_module: ${oc.select:actor_rollout_ref.actor.megatron.primus_module,pre_trainer}
+  primus_path: ${oc.env:PRIMUS_PATH,null}
+  primus_turbo_path: ${oc.env:PRIMUS_TURBO_PATH,null}
+  primus_overrides: []
+  primus_patches: kernels
+  primus_strict_config: true
+
+  tensor_model_parallel_size: ${primus:tensor_model_parallel_size,1,critic.megatron}
+  pipeline_model_parallel_size: ${primus:pipeline_model_parallel_size,1,critic.megatron}
+  virtual_pipeline_model_parallel_size: ${primus:virtual_pipeline_model_parallel_size,null,critic.megatron}
+  context_parallel_size: ${primus:context_parallel_size,1,critic.megatron}
+  expert_model_parallel_size: ${primus:expert_model_parallel_size,1,critic.megatron}
+  expert_tensor_parallel_size: ${primus:expert_tensor_parallel_size,null,critic.megatron}
+  sequence_parallel: ${primus:sequence_parallel,true,critic.megatron}
+  use_distributed_optimizer: ${primus:use_distributed_optimizer,true,critic.megatron}
+  dtype: ${primus:dtype,bfloat16,critic.megatron}
+
+  override_transformer_config:
+    recompute_granularity: ${primus:recompute_granularity,null,critic.megatron}
+    recompute_method: ${primus:recompute_method,null,critic.megatron}
+    recompute_num_layers: ${primus:recompute_num_layers,null,critic.megatron}
+    attention_backend: ${primus:attention_backend,fused,critic.megatron}
