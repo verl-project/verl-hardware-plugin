@@ -1,0 +1,4 @@
+# @package _global_
+# Primus Megatron: verl's megatron strategy configured by a Primus experiment YAML.
+#   model_engine=primus actor_rollout_ref.actor.megatron.primus_config_path=<exp.yaml>
+model_engine: primus

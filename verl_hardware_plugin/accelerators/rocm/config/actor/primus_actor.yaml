@@ -1,0 +1,51 @@
+# Primus Megatron actor: verl's megatron actor whose parallelism and optimizer come from a Primus YAML.
+# Change those values in the Primus YAML (or megatron.primus_overrides), not here: the engine rejects
+# a mismatch between this config and the YAML.
+defaults:
+  - megatron_actor
+  - _self_
+
+megatron:
+  _target_: verl_hardware_plugin.accelerators.rocm.primus.megatron.config.PrimusMcoreEngineConfig
+
+  # Primus experiment YAML with a framework=megatron module.
+  primus_config_path: ???
+  primus_module: pre_trainer
+  primus_path: ${oc.env:PRIMUS_PATH,null}
+  primus_turbo_path: ${oc.env:PRIMUS_TURBO_PATH,null}
+
+  # Primus-style key=value overrides applied on top of the module, e.g. ["context_parallel_size=4"].
+  primus_overrides: []
+
+  # Primus patch selection: kernels | none | all | comma-separated patch ids.
+  primus_patches: kernels
+  primus_strict_config: true
+
+  tensor_model_parallel_size: ${primus:tensor_model_parallel_size,1}
+  pipeline_model_parallel_size: ${primus:pipeline_model_parallel_size,1}
+  virtual_pipeline_model_parallel_size: ${primus:virtual_pipeline_model_parallel_size,null}
+  context_parallel_size: ${primus:context_parallel_size,1}
+  expert_model_parallel_size: ${primus:expert_model_parallel_size,1}
+  expert_tensor_parallel_size: ${primus:expert_tensor_parallel_size,null}
+  sequence_parallel: ${primus:sequence_parallel,true}
+  use_distributed_optimizer: ${primus:use_distributed_optimizer,true}
+  dtype: ${primus:dtype,bfloat16}
+
+  # Keys verl's megatron engine config sets by default; the rest of the YAML transformer settings
+  # are folded in by the engine.
+  override_transformer_config:
+    recompute_granularity: ${primus:recompute_granularity,null}
+    recompute_method: ${primus:recompute_method,null}
+    recompute_num_layers: ${primus:recompute_num_layers,null}
+    attention_backend: ${primus:attention_backend,fused}
+
+optim:
+  lr: ${primus:lr,1e-6}
+  min_lr: ${primus:min_lr,0.0}
+  weight_decay: ${primus:weight_decay,0.01}
+  lr_decay_style: ${primus:lr_decay_style,constant}
+  lr_warmup_steps: ${primus:lr_warmup_steps,-1}
+  clip_grad: ${primus:clip_grad,1.0}
+  betas:
+    - ${primus:adam_beta1,0.9}
+    - ${primus:adam_beta2,0.999}

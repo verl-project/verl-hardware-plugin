@@ -734,9 +734,11 @@ def test_engine_forward_backward_batch_fixed_shapes_vs_verls_partition(torchtita
     assert len(calls_f) > prewarm_calls
     assert {call[0] for call in calls_f} <= {96, 160, 256}
     assert {call[1] for call in calls_f} == {(8, 64)}
-    # Tokamax document budget: constant max_seqs + 1 from the pre-warm on; verl's partition: largest micro-batch + 1.
+    # Tokamax document budget: constant max_seqs + 1 from the pre-warm on; verl's partition: the bucketed budget of its
+    # largest micro-batch (packed_document_budget).
     assert {call[3] for call in calls_f} == {8 + 1}
-    assert {call[3] for call in calls_v} == {max(call[2] for call in calls_v) + 1}
+    budget_v = torchtitan_tpu.tpu_model_kernels.packed_document_budget(max(call[2] for call in calls_v))
+    assert {call[3] for call in calls_v} == {budget_v}
 
 
 def test_engine_forward_only_uses_fixed_shapes_without_prewarm(torchtitan_tpu):

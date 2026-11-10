@@ -58,6 +58,11 @@ _ensure_torch_tpu()  # Attempt at module load time so availability checks are fa
 # runtime_env for them to reach the trainer workers, the rollout servers and vLLM's engine workers.
 TPU_FORWARDED_ENV_VARS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS")
 TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_",)
+# Extra ``LIBTPU_INIT_ARGS`` / ``XLA_FLAGS`` appended only on ``RayWorkerGroup`` trainer/reference workers (never on
+# vLLM rollout servers), e.g. ``--xla_tpu_scoped_vmem_limit_kib=65472``, TorchTitan's MoE SparseCore collective-offload
+# flags, and ``--xla_enable_hlo_sharding_v3=false``.
+TRAINER_EXTRA_LIBTPU_INIT_ARGS_ENV = "VERL_TPU_TRAINER_LIBTPU_INIT_ARGS"
+TRAINER_EXTRA_XLA_FLAGS_ENV = "VERL_TPU_TRAINER_XLA_FLAGS"
 
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471
@@ -211,13 +216,14 @@ def tpu_v7x_process_env(topology: str, rank: int, local_rank: int) -> dict[str, 
     }
 
 
-def ray_tpu_accelerator_name(node_ips: Optional[list[str]] = None) -> str:
+def ray_tpu_accelerator_name(node_ips: Optional[list[str]] = None, node_ids: Optional[list[str]] = None) -> str:
     """The pod type or accelerator type Ray reports for a TPU node (``""`` without Ray or TPU nodes).
 
     Reads ``ray.io/tpu-pod-type``, else ``ray.io/accelerator-type``, of the alive TPU nodes. With
-    ``node_ips`` (the hosts of the pool being configured) only those nodes count, so a cluster that mixes
-    generations is read per pool; when none of them is a TPU node Ray knows, this warns and returns ``""``
-    rather than describing some other node, and the caller falls back to the environment.
+    ``node_ips`` or ``node_ids`` (the hosts of the pool being configured, by IP or Ray node id) only those
+    nodes count, so a cluster that mixes generations is read per pool; when none of them is a TPU node Ray
+    knows, this warns and returns ``""`` rather than describing some other node, and the caller falls back
+    to the environment.
     """
     try:
         if not ray.is_initialized():
@@ -226,12 +232,13 @@ def ray_tpu_accelerator_name(node_ips: Optional[list[str]] = None) -> str:
     except Exception as e:
         logger.debug("Could not read the TPU node labels from Ray: %s", e)
         return ""
-    if node_ips:
-        tpu_nodes = [node for node in tpu_nodes if node.get("NodeManagerAddress") in node_ips]
+    if node_ips or node_ids:
+        ips, ids = set(node_ips or ()), set(node_ids or ())
+        tpu_nodes = [node for node in tpu_nodes if node.get("NodeManagerAddress") in ips or node.get("NodeID") in ids]
         if not tpu_nodes:
             logger.warning(
                 "None of the pool's hosts %s is a TPU node Ray knows; the TPU type comes from the environment",
-                sorted(node_ips),
+                sorted(ips | ids),
             )
             return ""
     names = []
@@ -266,6 +273,20 @@ def tpu_mesh_env(total_chips: int, num_nodes: int, rank: int, local_rank: int, p
     if is_tpu_v7x(pod_type):
         env.update(tpu_v7x_process_env(topology, rank=rank, local_rank=local_rank))
     return env
+
+
+def single_host_tpu_topology(num_chips: int, pod_type: str = "") -> str:
+    """The mesh of ``num_chips`` chips (TensorCore devices on TPU 7x) of one host, e.g. a rollout replica that uses
+    one host of a multi-host slice, or ``""`` when no mesh of that size is known.
+
+    Such a replica must not inherit the slice's ``TORCH_TPU_TOPOLOGY`` (set by the GKE TPU webhook or the job):
+    vllm-torchtpu builds the slice-builder addresses of its local workers only, and libtpu then fails with
+    "Expected <slice chips> worker addresses, got <host chips>". Sizes without a known mesh (e.g. 2 or 4 TPU 7x
+    devices, a TP=2 / TP=4 replica: ``TPU_V7X_TOPOLOGY_MAP`` lists whole hosts only) return ``""`` so that the
+    caller keeps the inherited environment rather than failing.
+    """
+    topology_map = TPU_V7X_TOPOLOGY_MAP if is_tpu_v7x(pod_type) else DEFAULT_TPU_TOPOLOGY_MAP
+    return topology_map.get(num_chips, "")
 
 
 def resolve_tpu_topology_bounds(
@@ -401,10 +422,7 @@ class TPUDeviceModuleProxy:
             return 0
 
     def synchronize(self, device_index: Optional[int] = None) -> None:
-        try:
-            tpu_device_api.synchronize()
-        except Exception as e:
-            logger.warning(f"TPU synchronize() failed: {e}")
+        tpu_device_api.synchronize(device_index)
 
     # torch_tpu >= 0.2.0 makes these torch.tpu functions internal (they raise when called from
     # outside torch / torch_tpu), so they are served through torch.accelerator instead of being
@@ -592,7 +610,7 @@ class PlatformTPU(PlatformBase):
         self.device_module.set_device(device_index)
 
     def synchronize(self, device_index: Optional[int] = None) -> None:
-        self.device_module.synchronize()
+        self.device_module.synchronize(device_index)
 
     def manual_seed(self, seed: int) -> None:
         torch.manual_seed(seed)
@@ -828,6 +846,14 @@ class PlatformTPU(PlatformBase):
         env_vars = {}
         if "VERL_PLATFORM" in os.environ:
             env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
+        trainer_libtpu = os.environ.get(TRAINER_EXTRA_LIBTPU_INIT_ARGS_ENV, "").strip()
+        if trainer_libtpu:
+            base_libtpu = os.environ.get("LIBTPU_INIT_ARGS", "").strip()
+            env_vars["LIBTPU_INIT_ARGS"] = f"{base_libtpu} {trainer_libtpu}".strip()
+        trainer_xla = os.environ.get(TRAINER_EXTRA_XLA_FLAGS_ENV, "").strip()
+        if trainer_xla:
+            base_xla = os.environ.get("XLA_FLAGS", "").strip()
+            env_vars["XLA_FLAGS"] = f"{base_xla} {trainer_xla}".strip()
         for var in self.ray_noset_envvars():
             env_vars[var] = "1"
         pgs = resource_pool.get_placement_groups(device_name=device_name)

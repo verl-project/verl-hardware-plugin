@@ -1,0 +1,17 @@
+# Primus Megatron reference model: same Primus experiment and parallelism as the actor.
+defaults:
+  - megatron_ref
+  - _self_
+
+megatron:
+  _target_: verl_hardware_plugin.accelerators.rocm.primus.megatron.config.PrimusMcoreEngineConfig
+  primus_config_path: ${oc.select:actor_rollout_ref.actor.megatron.primus_config_path,""}
+  primus_module: ${oc.select:actor_rollout_ref.actor.megatron.primus_module,pre_trainer}
+  primus_path: ${oc.select:actor_rollout_ref.actor.megatron.primus_path,null}
+  primus_turbo_path: ${oc.select:actor_rollout_ref.actor.megatron.primus_turbo_path,null}
+  primus_overrides: ${oc.select:actor_rollout_ref.actor.megatron.primus_overrides,[]}
+  primus_patches: ${oc.select:actor_rollout_ref.actor.megatron.primus_patches,kernels}
+  primus_strict_config: ${oc.select:actor_rollout_ref.actor.megatron.primus_strict_config,true}
+  sequence_parallel: ${oc.select:actor_rollout_ref.actor.megatron.sequence_parallel,true}
+  use_distributed_optimizer: ${oc.select:actor_rollout_ref.actor.megatron.use_distributed_optimizer,true}
+  dtype: ${oc.select:actor_rollout_ref.actor.megatron.dtype,bfloat16}

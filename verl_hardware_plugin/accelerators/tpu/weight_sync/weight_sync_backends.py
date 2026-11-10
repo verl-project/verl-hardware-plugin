@@ -133,6 +133,28 @@ def apply_checkpoint_engine_manager_hooks() -> None:
 
             ckpt_base.CheckpointEngineWorker.__init__ = _patched_worker_init
             ckpt_base.CheckpointEngineManager.update_weights = _patched_mgr_update
+
+            # tpu-sync with return_after_d2h finishes an update in the background; trainers that wait for it
+            # (verl's CheckpointEngineManager.wait_for_weight_update, called before validation and before the
+            # training loop exits) must wait for that background part. Added even where verl has no such method
+            # yet, so it is there for the trainers that call it.
+            _orig_mgr_wait = getattr(ckpt_base.CheckpointEngineManager, "wait_for_weight_update", None)
+
+            @ckpt_base.auto_await
+            async def _patched_mgr_wait(self):
+                if canonical_backend(self.backend) == TPU_SYNC_BACKEND:
+                    from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_checkpoint_engine
+
+                    await tpu_sync_checkpoint_engine.wait_for_tpu_sync_update(self)
+                    return None
+                if _orig_mgr_wait is None:
+                    return None
+                res = _orig_mgr_wait(self)
+                if inspect.isawaitable(res):
+                    return await res
+                return res
+
+            ckpt_base.CheckpointEngineManager.wait_for_weight_update = _patched_mgr_wait
             ckpt_base._verl_tpu_ckpt_patched = True
     except Exception as e:
         logger.debug("Failed to patch CheckpointEngineWorker/Manager for TPU: %s", e)
