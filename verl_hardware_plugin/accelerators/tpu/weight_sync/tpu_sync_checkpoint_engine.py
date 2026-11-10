@@ -50,6 +50,7 @@ from verl_hardware_plugin.accelerators.tpu.options import TPU_SYNC_DEFAULT_PARAL
 from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_api
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import (
+    TPUSyncParityError,
     post_trainer_stats,
     report_exact_parity,
     verify_rollout_parity,
@@ -723,8 +724,9 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
         this one waited for.
 
     Raises:
-        TPUSyncParityError: An enabled parity check (``verify_parity``) failed; generation is not resumed. With
-            ``return_after_d2h`` the next sync (or ``wait_for_tpu_sync_update``) raises it.
+        TPUSyncParityError: An enabled parity check (``verify_parity``) failed, or, with ``tie_word_embeddings``, the
+            tied LM head check (``_tied_lm_head_report``); generation is not resumed. With ``return_after_d2h`` the
+            next sync (or ``wait_for_tpu_sync_update``) raises it.
     """
     backend = manager.backend or TPU_SYNC_BACKEND
     options = get_tpu_sync_options(_tpu_sync_engine_kwargs(manager.config, backend), backend)
@@ -949,6 +951,9 @@ async def _finish_tpu_sync(
     #    missing stats/results; it runs before resume_generation_replicas, so a failed sync stops the run instead
     #    of resuming generation on wrong weights.
     t_parity_start = time.perf_counter()
+    # The tied LM head check of every rollout worker: one line each; with tie_word_embeddings set, a missing, not
+    # copied or not bitwise equal lm_head raises TPUSyncParityError here, before generation resumes.
+    _tied_lm_head_report(global_steps, install_results, _replica_labels(manager), bool(options.tie_word_embeddings))
     if exact_install_kwargs:
         report_exact_parity(global_steps, install_results, _replica_labels(manager))
     if verify_parity:
@@ -1041,6 +1046,55 @@ async def _finish_tpu_sync(
         # fuse/transpose into vLLM params, the TPU sync barrier and the RPC round trip).
         metrics["timing_s/tpu-sync/sampler_h2d_pure"] = t_h2d_pure
     return metrics
+
+
+def _tied_lm_head_report(
+    global_steps: Optional[int], install_results: list, replica_labels: list[str], tied: bool
+) -> None:
+    """Logs the tied LM head check of every rollout worker, and fails the sync on a failed check when ``tied``.
+
+    Logs ``install_tpu_sync_weights(...)["tied_lm_head"]`` of every rollout worker as one
+    ``[TPU-SYNC TIED LM_HEAD | Step <s> | replica <r>] rank <k>: ...`` line, at WARNING so that the lines reach the
+    job log at any ``VERL_LOGGING_LEVEL``. With ``tied`` (``engine_kwargs.tpu-sync.tie_word_embeddings``) it raises
+    ``TPUSyncParityError`` (the caller has not resumed generation) when a worker returned no result, did not copy
+    ``lm_head`` from the embedding or share it with the embedding (any other mode), or is not bitwise equal to it.
+    With ``tied`` unset it only logs what it got and never raises.
+    """
+    step = global_steps or 0
+    failures: list[str] = []
+    for label, per_replica in zip(replica_labels, install_results, strict=True):
+        workers = per_replica if isinstance(per_replica, list | tuple) else [per_replica]
+        stats = [w for w in workers if isinstance(w, dict) and "h2d" in w]
+        prefix = f"[TPU-SYNC TIED LM_HEAD | Step {step}{label or ' | replica 0'}]"
+        if not stats:
+            if tied:  # Option unset: report only, never raise (the checks below behave exactly as before).
+                failures.append(f"{prefix} no rollout worker returned install results")
+            continue
+        for w in stats:
+            r = w.get("tied_lm_head")
+            if not isinstance(r, dict):
+                if tied:
+                    failures.append(f"{prefix} a worker returned no tied LM head check result")
+                continue
+            if r.get("max_abs_diff") is None:
+                line = f"{prefix} rank {r.get('rank')}: lm_head {r.get('mode')}; not paired with an embedding"
+            else:
+                line = (
+                    f"{prefix} rank {r.get('rank')}: lm_head {r.get('mode')}; "
+                    f"max|lm_head - embed|={r['max_abs_diff']:.6g} "
+                    f"({'bitwise equal' if r.get('equal') else 'DIFFERENT'}); "
+                    f"checksum lm_head l1={r.get('lm_head_l1', float('nan')):.9g} "
+                    f"l2sq={r.get('lm_head_l2sq', float('nan')):.9g} | embed l1={r.get('embed_l1', float('nan')):.9g} "
+                    f"l2sq={r.get('embed_l2sq', float('nan')):.9g}; numel {r.get('numel')}"
+                )
+            if tied and (r.get("mode") not in ("copied", "shared") or r.get("equal") is not True):
+                failures.append(line)
+            else:
+                logger.warning(line)
+    if failures:
+        raise TPUSyncParityError(
+            "TIED LM_HEAD CHECK FAILED (fail-closed, generation not resumed):\n" + "\n".join(failures)
+        )
 
 
 def _replica_labels(manager: Any) -> list[str]:

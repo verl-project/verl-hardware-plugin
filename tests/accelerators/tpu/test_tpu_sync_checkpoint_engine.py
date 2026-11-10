@@ -1666,6 +1666,242 @@ def test_manager_hook_routes_tpu_sync_backend(monkeypatch, backend):
 
 
 # ---------------------------------------------------------------------------
+# Tied LM head check (tie_word_embeddings: the rollout fills lm_head from the embedding)
+# ---------------------------------------------------------------------------
+
+
+def _tied_trainer_weights(seed: int = 0) -> dict[str, torch.Tensor]:
+    """``_trainer_weights`` of a model whose LM head is tied to its input embedding (one weight, sent once)."""
+    weights = _trainer_weights(seed)
+    weights["lm_head.weight"] = weights["model.embed_tokens.weight"].clone()
+    return weights
+
+
+class _NoCopyParameter(nn.Parameter):
+    """An LM head whose ``copy_`` does nothing: a copy into it that silently does not land."""
+
+    def copy_(self, src, non_blocking=False):
+        return self
+
+
+class _OneLevelDown(nn.Module):
+    """A model whose LM head and embedding sit one module level below where the tied-embedding copy looks.
+
+    The direct install still resolves every received tensor (``resolve_model_key`` adds the ``model.`` prefix).
+    """
+
+    def __init__(self, inner):
+        super().__init__()
+        self.model = inner
+
+
+def _share_lm_head(model):
+    """The rollout model of a tied checkpoint, as vLLM builds it: ``lm_head`` shares the embedding's tensor."""
+    model.lm_head.weight = model.model.embed_tokens.weight
+    return model
+
+
+def _tied_setup(worker_ext, checkpoint, tie_word_embeddings, verify_parity="off", tp=2, wrap=None):
+    """TP=``tp`` rollout models holding ``checkpoint`` (what vLLM loaded), and 2 trainer ranks sending local shards
+    of ``current["weights"]`` (``checkpoint`` until a test changes it). ``tie_word_embeddings=None`` leaves the option
+    unset; ``wrap`` transforms each rollout model before the sampler gets it.
+    """
+    models = [_FakeVllmModel(tp) for _ in range(tp)]
+    for rank, model in enumerate(models):
+        model.load_state_dict(_expected_vllm_state(checkpoint, rank, tp))
+    served = [wrap(model) for model in models] if wrap is not None else models
+    samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(served)]
+    current = {"weights": checkpoint}
+    events: list = []
+    kwargs = {} if tie_word_embeddings is None else {"tie_word_embeddings": tie_word_embeddings}
+    manager, _ = _make_manager(
+        [_trainer_engine(rank, verify_parity=verify_parity, **kwargs) for rank in range(2)],
+        lambda rank: _LocalShardWeights(current["weights"], rank, 2),
+        samplers,
+        events,
+        verify_parity=verify_parity,
+        **kwargs,
+    )
+    return manager, models, samplers, events, current
+
+
+def _tied_lines(text: str, step: int) -> list[str]:
+    return [line for line in text.splitlines() if f"[TPU-SYNC TIED LM_HEAD | Step {step} " in line]
+
+
+@pytest.mark.parametrize(
+    ("tie_word_embeddings", "mode"),
+    [(True, "copied"), (True, "shared"), (None, "received")],
+    ids=["tie_on", "tie_on_shared", "tie_unset"],
+)
+def test_tied_lm_head_check_reports_every_sync(fake_tpu_sync, worker_ext, caplog, tie_word_embeddings, mode):
+    """Copied or shared (option set) or received (unset): the same lm_head bits, checked and logged every sync."""
+    tp = 2
+    weights = _tied_trainer_weights(seed=0)
+    wrap = _share_lm_head if mode == "shared" else None
+    manager, models, _, events, current = _tied_setup(
+        worker_ext, weights, tie_word_embeddings, verify_parity="exact", wrap=wrap
+    )
+    for step in (0, 1):
+        current["weights"] = weights = _tied_trainer_weights(seed=step)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+            asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=step))
+        assert events[-1] == "resume"
+        if step == 0:
+            # Copied: 8 received tensors and the checkpoint's lm_head vs the embedding. Shared: nothing to copy, so
+            # only the 8 received tensors. Received (option unset): 9 received tensors.
+            checked = 8 if mode == "shared" else 9
+            exact = f"PARITY EXACT | Step 0] 2 rollout ranks, [{checked}] tensors checked per rank, 0 mismatched"
+            assert exact in caplog.text
+        lines = _tied_lines(caplog.text, step)
+        assert len(lines) == tp
+        for rank, model in enumerate(models):
+            # The trainer's tied weight, with or without the option: the same bits.
+            expected = weights["model.embed_tokens.weight"].chunk(tp, dim=0)[rank]
+            assert torch.equal(model.lm_head.weight, expected)
+            assert torch.equal(model.model.embed_tokens.weight, expected)
+            l1, l2sq = float(expected.float().abs().sum().item()), float(expected.float().pow(2).sum().item())
+            (line,) = [line for line in lines if f"] rank {rank}: " in line]
+            assert f"lm_head {mode}; max|lm_head - embed|=0 (bitwise equal)" in line
+            assert f"lm_head l1={l1:.9g} l2sq={l2sq:.9g} | embed l1={l1:.9g} l2sq={l2sq:.9g}" in line
+            assert f"numel {expected.numel()}" in line
+    assert "TIED LM_HEAD CHECK FAILED" not in caplog.text
+
+
+def test_tied_lm_head_check_fails_on_a_checkpoint_lm_head_that_is_not_the_embedding(fake_tpu_sync, worker_ext):
+    """A rollout checkpoint whose lm_head is not its embedding cannot be tied: the step-0 exact check fails."""
+    checkpoint = _trainer_weights(seed=0)  # untied: lm_head != embed_tokens
+    manager, _, _, events, current = _tied_setup(worker_ext, checkpoint, True, verify_parity="exact")
+    current["weights"] = dict(checkpoint, **{"lm_head.weight": checkpoint["model.embed_tokens.weight"].clone()})
+    with pytest.raises(parity.TPUSyncParityError) as excinfo:
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    message = str(excinfo.value)
+    assert "2 rollout ranks, [9] tensors checked per rank, 2 mismatched" in message
+    assert "rank 0: lm_head.weight <- model.embed_tokens.weight (tied copy): max|diff|=" in message
+    assert "install_tpu_sync_weights" in events and "resume" not in events
+
+
+def test_tied_lm_head_check_fails_when_lm_head_is_out_of_the_copys_reach(fake_tpu_sync, worker_ext):
+    """Without the check, this rollout would keep the checkpoint's lm_head for the whole run."""
+    weights = _tied_trainer_weights(seed=0)
+    manager, _, _, events, _ = _tied_setup(worker_ext, weights, True, wrap=_OneLevelDown)
+    with pytest.raises(RuntimeError, match=r"TIED LM_HEAD CHECK FAILED \(fail-closed\).*neither received"):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    assert "install_tpu_sync_weights" in events and "resume" not in events
+
+
+def test_tied_lm_head_check_fails_when_the_copy_does_not_land(fake_tpu_sync, worker_ext):
+    weights = _tied_trainer_weights(seed=0)
+
+    def no_copy(model):
+        model.lm_head.weight = _NoCopyParameter(model.lm_head.weight.data, requires_grad=False)
+        return model
+
+    manager, models, _, events, current = _tied_setup(worker_ext, weights, True, wrap=no_copy)
+    # Step 0: the checkpoint's lm_head already equals the embedding, so the values are right and the check passes.
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    current["weights"] = _tied_trainer_weights(seed=1)
+    events.clear()
+    with pytest.raises(RuntimeError, match=r"lm_head copied from embed_tokens but not bitwise equal to it"):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert "install_tpu_sync_weights" in events and "resume" not in events
+    assert not torch.equal(models[0].lm_head.weight, models[0].model.embed_tokens.weight)
+
+
+@pytest.mark.parametrize("tie_word_embeddings", [True, None], ids=["tie_on", "tie_unset"])
+def test_tied_lm_head_check_without_worker_results(fake_tpu_sync, worker_ext, caplog, tie_word_embeddings):
+    """A rollout worker that returns no check result fails the sync with the option set; unset, the sync goes on."""
+    weights = _tied_trainer_weights()
+    manager, _, samplers, events, _ = _tied_setup(worker_ext, weights, tie_word_embeddings)
+    for sampler in samplers:
+        real_install = sampler.install_tpu_sync_weights
+
+        def install(real_install=real_install, **kwargs):
+            result = real_install(**kwargs)
+            result.pop("tied_lm_head")
+            return result
+
+        sampler.install_tpu_sync_weights = install
+    if tie_word_embeddings:
+        with pytest.raises(parity.TPUSyncParityError, match=r"Step 0 \| replica 0\] a worker returned no tied LM head"):
+            asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+        assert "resume" not in events
+    else:
+        with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+            asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+        assert events[-1] == "resume" and not _tied_lines(caplog.text, 0)
+
+
+def test_tied_lm_head_report_names_replicas_and_fails_only_with_the_option(caplog):
+    def check(rank, mode, equal=True):
+        return {"rank": rank, "mode": mode, "numel": 4, "equal": equal, "max_abs_diff": 0.0 if equal else 0.5}
+
+    install_results = [
+        [{"h2d": 0.1, "tied_lm_head": check(0, "copied")}, {"h2d": 0.1, "tied_lm_head": check(1, "shared")}],
+        [{"h2d": 0.1, "tied_lm_head": check(0, "received")}],
+        [{"h2d": 0.1, "tied_lm_head": check(0, "copied", equal=False)}],
+        [{"h2d": 0.1}],
+        None,  # A rollout server that does not pass the worker results back.
+        [{"h2d": 0.1, "tied_lm_head": {"rank": 0, "mode": "received-unpaired", "equal": None}}],
+    ]
+    labels = [f" | replica {i}" for i in range(len(install_results))]
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        # Unset option: every result is logged, nothing fails.
+        tpu_sync_engine._tied_lm_head_report(3, install_results, labels, tied=False)
+    assert "[TPU-SYNC TIED LM_HEAD | Step 3 | replica 0] rank 1: lm_head shared; max|lm_head - embed|=0" in caplog.text
+    different = "rank 0: lm_head copied; max|lm_head - embed|=0.5 (DIFFERENT)"
+    assert f"[TPU-SYNC TIED LM_HEAD | Step 3 | replica 2] {different}" in caplog.text
+    assert "[TPU-SYNC TIED LM_HEAD | Step 3 | replica 5] rank 0: lm_head received-unpaired; not paired" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        with pytest.raises(parity.TPUSyncParityError) as excinfo:
+            tpu_sync_engine._tied_lm_head_report(3, install_results, labels, tied=True)
+    message = str(excinfo.value)
+    assert message.startswith("TIED LM_HEAD CHECK FAILED (fail-closed, generation not resumed):")
+    assert "replica 0" not in message
+    assert "[TPU-SYNC TIED LM_HEAD | Step 3 | replica 0] rank 1: lm_head shared" in caplog.text
+    assert "| replica 1] rank 0: lm_head received;" in message  # option set: the trainer must not send lm_head
+    assert f"| replica 2] {different}" in message
+    assert "| replica 3] a worker returned no tied LM head check result" in message
+    assert "| replica 4] no rollout worker returned install results" in message
+    assert "| replica 5] rank 0: lm_head received-unpaired; not paired with an embedding" in message
+    # One replica (no label): named replica 0 in the lines.
+    with pytest.raises(parity.TPUSyncParityError, match=r"\[TPU-SYNC TIED LM_HEAD \| Step 0 \| replica 0\] rank 0"):
+        tpu_sync_engine._tied_lm_head_report(None, install_results[2:3], [""], tied=True)
+
+
+def test_tied_lm_head_pair_looks_where_the_copy_looks(worker_ext):
+    # A separate LM head next to model.embed_tokens (e.g. vLLM's Qwen3_5ForCausalLM for an untied checkpoint): the
+    # copy path.
+    separate = _FakeVllmModel(1)
+    head, emb = worker_ext._tied_lm_head_pair(separate)
+    assert head is separate.lm_head.weight and emb is separate.model.embed_tokens.weight
+    with torch.no_grad():
+        separate.model.embed_tokens.weight.normal_()
+        separate.lm_head.weight.copy_(separate.model.embed_tokens.weight)
+    result = worker_ext._tied_lm_head_guard((head, emb), received_lm_head=False, rank=0)
+    assert (result["mode"], result["equal"], result["lm_head_l1"]) == ("copied", True, result["embed_l1"])
+
+    # An LM head sharing the embedding's tensor (as vLLM builds a tied checkpoint): the shared path.
+    shared = _share_lm_head(_FakeVllmModel(1))
+    head, emb = worker_ext._tied_lm_head_pair(shared)
+    assert head is shared.lm_head.weight and emb is shared.model.embed_tokens.weight and head is emb
+    result = worker_ext._tied_lm_head_guard((head, emb), received_lm_head=False, rank=3)
+    assert (result["rank"], result["mode"], result["equal"]) == (3, "shared", True)
+
+    # An LM head next to embed_tokens, and no pair where the copy looks.
+    flat = nn.Module()
+    flat.lm_head, flat.embed_tokens = _Linear(4, 2), _Linear(4, 2)
+    head, emb = worker_ext._tied_lm_head_pair(flat)
+    assert head is flat.lm_head.weight and emb is flat.embed_tokens.weight
+    assert worker_ext._tied_lm_head_pair(_OneLevelDown(_FakeVllmModel(1))) is None
+    assert worker_ext._tied_lm_head_guard(None, received_lm_head=True, rank=0)["mode"] == "received-unpaired"
+    with pytest.raises(RuntimeError, match="neither received"):
+        worker_ext._tied_lm_head_guard(None, received_lm_head=False, rank=0)
+
+
+# ---------------------------------------------------------------------------
 # Rollout side: vLLMTPUSyncWorkerExtension
 # ---------------------------------------------------------------------------
 

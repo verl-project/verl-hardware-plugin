@@ -180,6 +180,77 @@ def _uses_vllm_weight_loader(vllm_model: Any, global_shapes: dict[str, list[int]
     )
 
 
+# The extra entry of the step-0 exact parity check for a tied LM head: the checkpoint's lm_head, compared with the
+# installed embedding before the tied-embedding copy overwrites it.
+TIED_LM_HEAD_PARITY_NAME = "lm_head.weight <- model.embed_tokens.weight (tied copy)"
+
+
+def _tied_lm_head_pair(vllm_model: Any) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """``(lm_head weight, embedding weight)`` of the rollout model, or None if it has no such pair.
+
+    Looks exactly where the tied-embedding copy of ``install_tpu_sync_weights`` looks: ``lm_head`` next to
+    ``model.embed_tokens``, or next to ``embed_tokens``.
+    """
+    if hasattr(vllm_model, "lm_head") and hasattr(vllm_model, "model") and hasattr(vllm_model.model, "embed_tokens"):
+        return vllm_model.lm_head.weight, vllm_model.model.embed_tokens.weight
+    if hasattr(vllm_model, "lm_head") and hasattr(vllm_model, "embed_tokens"):
+        return vllm_model.lm_head.weight, vllm_model.embed_tokens.weight
+    return None
+
+
+@torch.no_grad()
+def _tied_lm_head_guard(pair: Optional[tuple[torch.Tensor, torch.Tensor]], received_lm_head: bool, rank: int) -> dict:
+    """Fail-closed check and per-sync checksums of the LM head, after the tied-embedding copy.
+
+    Returned under ``install_tpu_sync_weights(...)["tied_lm_head"]``. Raises ``RuntimeError`` when ``lm_head`` was
+    neither received nor reachable by the tied-embedding copy (it would keep the checkpoint's values for the whole
+    run), or when it was copied from the embedding and is not bitwise equal to it. The comparison uses the operations
+    of ``ExactParityCheck.check`` (float, sub, abs, max, item) and the checksums those of ``compute_tensor_stats``
+    (float, abs / pow, sum, item).
+    """
+    if pair is None:
+        if received_lm_head:
+            return {"rank": rank, "mode": "received-unpaired", "equal": None}
+        raise RuntimeError(
+            f"TIED LM_HEAD CHECK FAILED (fail-closed): tpu-sync Sampler Rank {rank}: lm_head was neither received (the "
+            "trainer does not send it with engine_kwargs.tpu-sync.tie_word_embeddings) nor copied (no lm_head / "
+            "embed_tokens where the tied-embedding copy looks): it would keep its checkpoint values"
+        )
+    head, emb = pair
+    if received_lm_head:
+        mode = "received"
+    else:
+        mode = "shared" if head.data_ptr() == emb.data_ptr() else "copied"
+    out = {
+        "rank": rank,
+        "mode": mode,
+        "numel": int(head.numel()),
+        "shape": list(head.shape),
+        "embed_shape": list(emb.shape),
+    }
+    if tuple(head.shape) != tuple(emb.shape):
+        out.update(equal=False, max_abs_diff=float("inf"))
+    else:
+        h, e = head.detach().float(), emb.detach().float()
+        diff = (h - e).abs().max().item() if h.numel() else 0.0
+        out.update(
+            equal=diff == 0.0,
+            max_abs_diff=float(diff),
+            lm_head_l1=float(h.abs().sum().item()),
+            lm_head_l2sq=float(h.pow(2).sum().item()),
+            embed_l1=float(e.abs().sum().item()),
+            embed_l2sq=float(e.pow(2).sum().item()),
+        )
+        del h, e
+    if mode == "copied" and not out["equal"]:
+        raise RuntimeError(
+            f"TIED LM_HEAD CHECK FAILED (fail-closed): tpu-sync Sampler Rank {rank}: lm_head copied from embed_tokens "
+            f"but not bitwise equal to it (max|diff|={out['max_abs_diff']:.4g}, shapes {out['shape']} / "
+            f"{out['embed_shape']})"
+        )
+    return out
+
+
 class TPUSyncWorkerMixin:
     """Shared tpu-sync P2P weight receiver and parameter installer for TPU rollout workers (vLLM and SGLang)."""
 
@@ -415,6 +486,8 @@ class TPUSyncWorkerMixin:
         Returns:
             Per-worker timings in seconds: ``total`` (whole install), ``h2d`` (pure ``_tpu_sync_ws.h2d()``)
             and ``sync`` (final TPU sync barrier), plus ``exact_parity`` (this rank's result) when requested.
+            The direct install also returns ``tied_lm_head``: how ``lm_head`` got its values (received, copied
+            from the embedding or shared with it) and the checksums of both (``_tied_lm_head_guard``).
             Empty if the synchronizer is not initialized.
         """
         if getattr(self, "_tpu_sync_ws", None) is None:
@@ -510,6 +583,12 @@ class TPUSyncWorkerMixin:
         # 3. Handle tied word embeddings. Only when the trainer did not send lm_head itself: for untied
         #    models (e.g. Qwen3-8B / 32B) the received lm_head must not be overwritten by embed_tokens.
         received_lm_head = any(k == "lm_head.weight" or k.endswith(".lm_head.weight") for k in self._tpu_sync_staging)
+        # The step-0 exact check extends to the tied copy: the checkpoint's lm_head (not yet overwritten) must equal the
+        # installed embedding bit for bit (the trainer ties one weight to both); the branches below then copy it.
+        tied_pair = _tied_lm_head_pair(vllm_model)
+        if parity is not None and not received_lm_head and tied_pair is not None:
+            if tied_pair[0].data_ptr() != tied_pair[1].data_ptr():
+                parity.check(TIED_LM_HEAD_PARITY_NAME, tied_pair[0], tied_pair[1])
         if received_lm_head:
             pass
         elif (
@@ -522,6 +601,10 @@ class TPUSyncWorkerMixin:
         elif hasattr(vllm_model, "lm_head") and hasattr(vllm_model, "embed_tokens"):
             if vllm_model.lm_head.weight.data_ptr() != vllm_model.embed_tokens.weight.data_ptr():
                 vllm_model.lm_head.weight.copy_(vllm_model.embed_tokens.weight)
+
+        # Fail closed on a tied lm_head that was neither received nor copied, or that differs from the embedding; the
+        # result carries the checksums of both, every sync.
+        tied_lm_head = _tied_lm_head_guard(tied_pair, received_lm_head, rank)
 
         # TODO(tpu): fail the first sync if some rollout parameter received no weights (it would keep the checkpoint's
         #   value for the whole run), for every direct install; Qwen3.5 first needs to confirm which parameters
@@ -537,7 +620,7 @@ class TPUSyncWorkerMixin:
             f"completed in {t_total:.4f}s (H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
         )
         # Returned through collective_rpc so the orchestrator can log them as step metrics.
-        result = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+        result = {"total": t_total, "h2d": t_h2d, "sync": t_sync, "tied_lm_head": tied_lm_head}
         if parity is not None:
             # Covers every tensor written through copy_into, and the regions that a direct-install layout writes
             # itself (e.g. the experts' w13 / w2), through the ``check`` passed to its install.
