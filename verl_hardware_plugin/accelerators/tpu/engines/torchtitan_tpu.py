@@ -985,6 +985,27 @@ class TorchTitanTPUEngine(BaseEngine):
             **tpu_model_kernels.model_registry_kwargs(self._tpu_kernels),
             **(setup.registry_kwargs() if setup else {}),
         )
+        if self.model_config.hf_config.model_type == "qwen3_moe" and torchtitan_flavor in (
+            "30B-A3B",
+            "30B-A3B-global-aux",
+        ):
+            from torchtitan.models.common.moe import MoE
+
+            if tpu_options.qwen3_pallas_experts is False:
+                raise ValueError("qwen3_pallas_experts=False is unsupported: Qwen3 MoE requires Pallas on TPU")
+            if tpu_options.moe_paired_grouped_mm is None and tpu_options.moe_paired_gemm is not None:
+                tpu_options = self._tpu_options = dataclasses.replace(
+                    tpu_options, moe_paired_grouped_mm=tpu_options.moe_paired_gemm
+                )
+            # Upstream configures the experts and balancing; only disable training-only auxiliary losses here.
+            moe_configs = list(model_spec.model.traverse(MoE.Config))
+            if not moe_configs:
+                raise ValueError("Qwen3-30B config has no MoE layers")
+            for _, moe, _, _ in moe_configs:
+                if hasattr(moe, "aux_loss"):
+                    moe.aux_loss = None
+                if hasattr(moe.router, "aux_loss"):
+                    moe.router.aux_loss = None
         tpu_model_kernels.configure_model_spec(
             model_spec,
             self._tpu_kernels,

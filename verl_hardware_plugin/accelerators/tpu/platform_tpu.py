@@ -56,7 +56,7 @@ _ensure_torch_tpu()  # Attempt at module load time so availability checks are fa
 # read: the libtpu / XLA compiler flags, and the plugin's own knobs (``VERL_TPU_*``, including ``VERL_TPU_SYNC_*``). Ray
 # workers start from the raylet's environment, not the driver's, so the platform names them in the job's
 # runtime_env for them to reach the trainer workers, the rollout servers and vLLM's engine workers.
-TPU_FORWARDED_ENV_VARS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS")
+TPU_FORWARDED_ENV_VARS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS", "VERL_MOE_PAIRED_GEMM")
 TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_",)
 # Extra ``LIBTPU_INIT_ARGS`` / ``XLA_FLAGS`` appended only on ``RayWorkerGroup`` trainer/reference workers (never on
 # vLLM rollout servers), e.g. ``--xla_tpu_scoped_vmem_limit_kib=65472``, TorchTitan's MoE SparseCore collective-offload

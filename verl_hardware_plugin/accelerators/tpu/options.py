@@ -154,6 +154,8 @@ class TPUEngineOptions:
         ep_capacity_factor: Per-destination-rank token capacity multiplier of the TPU EP token dispatcher when
             ``expert_parallel_size > 1`` (default: ``4.0``). torchtitan's pretraining default (``1.25``) drops
             skewed RL / math tokens across 32-64 EP ranks while vLLM rollout is dropless.
+        qwen3_pallas_experts: Legacy Qwen3-30B-A3B flag; Pallas is required, so ``False`` is rejected.
+        moe_paired_gemm: Legacy Qwen3-30B-A3B alias used only when ``moe_paired_grouped_mm`` is unset.
         mixed_precision_param: TorchTitan mixed-precision parameter dtype, ``bfloat16`` or ``float32``;
             unset preserves its default and FP32 master parameters.
         fp32_logits: Preserve FP32 LM-head accumulators with BF16 operands; ``False`` requests BF16 logits.
@@ -226,6 +228,8 @@ class TPUEngineOptions:
     seq_bucket_size: Optional[int] = None
     model_kernels: Optional[str] = None
     ep_capacity_factor: Optional[float] = None
+    qwen3_pallas_experts: Optional[bool] = None
+    moe_paired_gemm: Optional[bool] = None
     mixed_precision_param: Optional[str] = None
     fp32_logits: Optional[bool] = None
     rollout_expert_parallel: Optional[bool] = None
@@ -258,6 +262,8 @@ _ENGINE_KINDS: dict[str, type] = {
     "seq_bucket_size": int,
     "model_kernels": str,
     "ep_capacity_factor": float,
+    "qwen3_pallas_experts": bool,
+    "moe_paired_gemm": bool,
     "mixed_precision_param": str,
     "fp32_logits": bool,
     "rollout_expert_parallel": bool,
@@ -288,6 +294,8 @@ _ENGINE_LEGACY_ENV_VARS = {
     "tpu_eager_mode": "VERL_TPU_EAGER_MODE",
     "optim_impl": "VERL_TPU_OPTIM_IMPL",
     "seq_bucket_size": "VERL_TPU_SEQ_BUCKET_SIZE",
+    "qwen3_pallas_experts": "VERL_TPU_QWEN3_PALLAS_EXPERTS",
+    "moe_paired_gemm": "VERL_MOE_PAIRED_GEMM",
     "fp32_logits": "VERL_TPU_FP32_LOGITS",
 }
 _ENGINE_LEGACY_CONFIG_FIELDS = (
