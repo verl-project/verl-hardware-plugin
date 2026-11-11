@@ -10,7 +10,9 @@
   variable the package does not read is named in one warning; TP / DP / PP above 1 and a missing KV budget refuse.
 """
 
+import ast
 import importlib
+import importlib.util
 import logging
 import subprocess
 import sys
@@ -18,20 +20,47 @@ from types import SimpleNamespace
 
 import pytest
 
+from verl_hardware_plugin.accelerators.tpu import options
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc import common
 
 PLATFORM = "verl_hardware_plugin.accelerators.tpu.platform_tpu"
+REGISTRATION = "verl_hardware_plugin.accelerators.tpu.registration"
 
 
 @pytest.mark.parametrize(
-    "value, on", [(None, False), ("", False), ("0", False), ("true", False), ("1", True), (" 1 ", True)]
+    "value, on",
+    [
+        (None, False),
+        ("", False),
+        ("0", False),
+        ("true", False),
+        (" 1 ", False),
+        (" 1", False),
+        ("1 ", False),
+        ("1", True),
+    ],
 )
-def test_feature_switch(value, on):
+def test_feature_switch(monkeypatch, value, on):
+    """Exactly "1" is on, and a value means the same at every gate: the package and the platform's worker environment
+    read the switch with the one parser, options.inproc_rollout_enabled (the registration too: see below)."""
     env = {} if value is None else {common.INPROC_ENV: value}
-    assert common.inproc_enabled(env) is on
+    assert options.inproc_rollout_enabled(env) is on and common.inproc_enabled(env) is on
+    assert _platform(monkeypatch, env).inproc_on() is on
     if not on:
         with pytest.raises(RuntimeError, match="not switched on"):
             common.check_switches(env)
+
+
+@pytest.mark.parametrize("module", [REGISTRATION, PLATFORM, common.__name__])
+def test_every_gate_reads_the_switch_with_the_one_parser(module):
+    """No gate parses VERL_TPU_ROLLOUT_INPROC itself: each calls options.inproc_rollout_enabled, the one module that
+    spells the variable."""
+    tree = ast.parse(open(importlib.util.find_spec(module).origin, encoding="utf-8").read())
+    spelled = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Constant) and n.value == common.INPROC_ENV]
+    assert spelled == [], f"{module} spells the switch itself (lines {spelled}) instead of calling its parser"
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    assert "inproc_rollout_enabled" in names, f"{module} does not read the switch with its parser"
+    assert options.INPROC_ROLLOUT_ENV == common.INPROC_ENV == "VERL_TPU_ROLLOUT_INPROC"
 
 
 @pytest.mark.parametrize(

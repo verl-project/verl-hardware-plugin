@@ -110,8 +110,8 @@ COORDINATOR_METHODS = (
     "broadcast_tensor_dict",
 )
 
-# Switch values that must leave the feature off. The plugin's registration and platform hooks enable it on the exact
-# string "1" only.
+# Switch values that must leave the feature off. Every gate (the registration, the platform hooks, the package) reads
+# the switch with the plugin's one parser of it, which is on for the exact string "1" only.
 OFF_ARMS = {
     "unset": {},
     "inproc_0": {INPROC_ENV: "0"},
@@ -120,6 +120,7 @@ OFF_ARMS = {
     "inproc_yes": {INPROC_ENV: "yes"},
     "inproc_space_1": {INPROC_ENV: " 1"},
     "inproc_1_space": {INPROC_ENV: "1 "},
+    "inproc_space_1_space": {INPROC_ENV: " 1 "},
     "role_trainer_only": {ROLE_ENV: "trainer"},
     "run_switch_only": {PARITY_EVERY_ENV: "1", ROLE_ENV: "trainer"},
 }

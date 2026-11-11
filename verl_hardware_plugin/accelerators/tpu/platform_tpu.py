@@ -26,7 +26,7 @@ from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
 from verl_hardware_plugin.accelerators.tpu import device_api as tpu_device_api
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import extend_torchtitan_engine_config
-from verl_hardware_plugin.accelerators.tpu.options import tpu_chips_per_host_override
+from verl_hardware_plugin.accelerators.tpu.options import inproc_rollout_enabled, tpu_chips_per_host_override
 from verl_hardware_plugin.accelerators.tpu.patches import reduce_avg_allreduce_patch
 
 extend_torchtitan_engine_config()
@@ -469,13 +469,13 @@ class TPUDeviceModuleProxy:
 
 
 # In-process colocation (rollout/inproc): the trainer ranks also host the vLLM engine.
-INPROC_ENV = "VERL_TPU_ROLLOUT_INPROC"
 INPROC_ROLE_ENV = "VERL_TPU_INPROC_ROLE"
 
 
 def inproc_on() -> bool:
-    """The trainer ranks host an in-process vLLM engine (``VERL_TPU_ROLLOUT_INPROC=1``)."""
-    return os.environ.get(INPROC_ENV, "") == "1"
+    """The trainer ranks host an in-process vLLM engine (``VERL_TPU_ROLLOUT_INPROC=1``, read by the switch's one
+    parser, :func:`~verl_hardware_plugin.accelerators.tpu.options.inproc_rollout_enabled`)."""
+    return inproc_rollout_enabled()
 
 
 def inproc_trainer_env() -> dict[str, str]:

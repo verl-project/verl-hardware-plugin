@@ -12,6 +12,8 @@ import traceback
 from collections.abc import Mapping
 from typing import Any, Optional
 
+from verl_hardware_plugin.accelerators.tpu.options import INPROC_ROLLOUT_ENV, inproc_rollout_enabled
+
 # One logger for the whole package; every line starts with ``inproc``. Quiet by default (the plugin's convention).
 logger = logging.getLogger("verl_hardware_plugin.accelerators.tpu.rollout.inproc")
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -19,8 +21,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 PREFIX = "inproc"
 INTEGRITY_TAG = "INTEGRITY FAILED"
 
-# The feature switch (opt-in, default off) and the variable the platform sets on the trainer worker groups.
-INPROC_ENV = "VERL_TPU_ROLLOUT_INPROC"
+# The feature switch (opt-in, default off; parsed by options.inproc_rollout_enabled only) and the variable the
+# platform sets on the trainer worker groups.
+INPROC_ENV = INPROC_ROLLOUT_ENV
 ROLE_ENV = "VERL_TPU_INPROC_ROLE"
 # The run-level switches. Every other safety decision is fixed in code.
 PARITY_EVERY_ENV = (
@@ -47,8 +50,9 @@ def warn(msg: str) -> None:
 
 
 def inproc_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
-    env = os.environ if environ is None else environ
-    return env.get(INPROC_ENV, "").strip() == "1"
+    """The feature switch, read with its one parser (exactly ``"1"`` is on), as the registration and platform gates
+    read it."""
+    return inproc_rollout_enabled(environ)
 
 
 def _choice(env: Mapping[str, str], name: str, allowed: tuple[str, ...]) -> str:

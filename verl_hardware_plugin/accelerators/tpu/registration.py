@@ -6,6 +6,8 @@
 import logging
 import os
 
+from verl_hardware_plugin.accelerators.tpu.options import inproc_rollout_enabled
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -35,7 +37,7 @@ def register_rollout() -> None:
         def _load_vllm() -> type:
             from verl.utils.device import get_resource_name
 
-            if os.environ.get("VERL_TPU_ROLLOUT_INPROC", "") == "1":
+            if inproc_rollout_enabled():
                 # in-process colocation: the replica's server is the trainer worker itself (rollout/inproc)
                 from verl_hardware_plugin.accelerators.tpu.rollout import inproc
                 from verl_hardware_plugin.accelerators.tpu.rollout.inproc import engine as inproc_engine
@@ -82,7 +84,7 @@ except Exception as exc:
 # the trainer worker's direct rollout methods. The plugin's backend loader swallows a raise here, so the failure is
 # logged as a warning and the later fail-closed points refuse instead: the replica loader above re-checks the switches
 # when verl creates the replicas, and the rollout re-checks them in init_model.
-if os.environ.get("VERL_TPU_ROLLOUT_INPROC", "") == "1":
+if inproc_rollout_enabled():
     try:
         from verl_hardware_plugin.accelerators.tpu.rollout import inproc
 
