@@ -651,6 +651,22 @@ def test_auto_assign_accelerator_type_shares_slices_only_within_a_replica_kind()
         assert platform.auto_assign_accelerator_type("rollout_pool_reward_1", None) == "tpu-group-1"
 
 
+@pytest.mark.parametrize(
+    "trainer, slice_a, slice_b",
+    [("tpu-group-0", "tpu-group-1", "tpu-group-2"), ("tpu-group-0", "tpu-group-a-0", "tpu-group-b-0")],
+)
+def test_auto_assign_accelerator_type_fills_unequal_rollout_slices_by_capacity(trainer, slice_a, slice_b):
+    # Rollout slice A is 1 host (8 devices), B is 2 hosts (16): three TP=8 policy replicas fit as A, B, B. Going
+    # round-robin would put the third on the full A, whose placement group would never be scheduled.
+    platform = PlatformTPU()
+    hosts = [trainer] * 4 + [slice_a] + [slice_b] * 2
+    nodes = [{"Alive": True, "Resources": {"TPU": 8.0, group: 1.0}} for group in hosts]
+    with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
+        assert platform.auto_assign_accelerator_type("global_pool", None) == trainer
+        claimed = [platform.auto_assign_accelerator_type(f"rollout_pool_{r}", None) for r in range(3)]
+    assert claimed == [slice_a, slice_b, slice_b]
+
+
 def test_rollout_replica_kind_is_the_pool_name_without_the_rank():
     from verl_hardware_plugin.accelerators.tpu.platform_tpu import rollout_replica_kind
 
