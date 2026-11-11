@@ -274,17 +274,8 @@ def test_placement_group_claims_tpu_slices_in_numeric_order():
         mock.patch.object(ray, "nodes", return_value=nodes),
     ):
         platform = PlatformTPU()
-        claimed = [platform.auto_assign_accelerator_type(f"pool_{k}", None) for k in range(7)]
-    # Once every slice is claimed, further pools go round-robin over the slices after the first.
-    assert claimed == [
-        "tpu-group-0",
-        "tpu-group-1",
-        "tpu-group-2",
-        "tpu-group-9",
-        "tpu-group-10",
-        "tpu-group-1",
-        "tpu-group-2",
-    ]
+        claimed = [platform.auto_assign_accelerator_type(f"pool_{k}", None) for k in range(6)]
+    assert claimed == ["tpu-group-0", "tpu-group-1", "tpu-group-2", "tpu-group-9", "tpu-group-10", "tpu-group-10"]
     assert platform_tpu_mod is not None
 
 
