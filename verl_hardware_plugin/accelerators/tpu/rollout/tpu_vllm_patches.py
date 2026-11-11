@@ -6,10 +6,8 @@
 
 The rollout runs on vLLM's ``mp`` executor and vllm-torchtpu's ``mp`` multi-host backend, which need no
 patch to span several hosts. Each remaining patch fills a gap in vLLM (v0.29.0 - v0.32.0) and vllm-torchtpu
-(ff860050 - 732c4346) and can be dropped once upstream closes it:
+(281b5266+) and can be dropped once upstream closes it:
 
-* ``TPUWorker.reset_encoder_cache``: no-op. verl resets vLLM's caches after every weight update,
-  and vllm-torchtpu's worker does not implement this call. Upstream fix: implement it.
 * ``ApplyRotaryEmb`` and ``SiluAndMul``: compute TPU rotations and SiLU in FP32, retaining
   CUDA activation rounding. RoPE also avoids a concat that can crash TPU fusion (b/501165531).
 * ``VERL_TPU_VLLM_ATTN_FP32_STATS=1`` and ``VERL_TPU_VLLM_RMSNORM_CUDA_ORDER=1``: opt in
@@ -244,22 +242,14 @@ def patch_vllm_for_tpu() -> None:
 
     # Imported here: CPU tests and processes outside the rollout may lack vLLM or vllm-torchtpu.
     try:
-        from vllm_torchtpu.worker.tpu_worker import TPUWorker
+        import vllm_torchtpu  # noqa: F401
     except ImportError as exc:
         logger.debug("Skipping vLLM TPU patches (vllm / vllm_torchtpu not installed): %s", exc)
         return
 
     _apply_tpu_precision_patches()
-    TPUWorker.reset_encoder_cache = _reset_encoder_cache
     _PATCHES_APPLIED = True
     logger.info("Successfully applied all TPU patches to vLLM and vllm-torchtpu.")
-
-
-def _reset_encoder_cache(self) -> None:
-    """``TPUWorker.reset_encoder_cache``, which verl calls after every weight update: a no-op.
-
-    The encoder cache holds multimodal encoder outputs; text models have none to reset.
-    """
 
 
 class PickleableProcessWrapper:
