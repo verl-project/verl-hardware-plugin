@@ -58,6 +58,7 @@ from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous impor
     create_tpu_sync_rendezvous,
     get_tpu_sync_rendezvous,
 )
+from verl_hardware_plugin.accelerators.tpu.weight_sync.vllm_layout import VllmParam, build_vllm_layout_export
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import (
     TPU_SYNC_BACKEND,
     apply_checkpoint_engine_manager_hooks,
@@ -254,6 +255,10 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         # dropping the Python references alone frees nothing. On by default so the trainer keeps that HBM headroom
         # between syncs; opt out with engine_kwargs.tpu-sync.release_buffers_after_sync=False.
         self.release_buffers_after_sync = options.release_buffers_after_sync
+        # Export in vLLM's layout so the rollout receives straight into its parameters (weight_sync/vllm_layout.py).
+        self.receive_into_vllm = options.receive_into_vllm
+        self._vllm_params: Optional[dict[str, VllmParam]] = None
+        self._vllm_tp_size: Optional[int] = None
         if torch.distributed.is_initialized():
             self.rank = torch.distributed.get_rank()
         else:
@@ -265,8 +270,10 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         # (name, shape, dtype, shard) of the tensors the live synchronizer was created and registered with; a later
         # send_weights with the same signature rebinds instead of re-creating it.
         self._registered_signature: Optional[list[tuple]] = None
-        # name -> (num_shards, shard_index) for the tensors of the last send_weights sent as a local dim-0 shard.
+        # name -> (num_shards, shard_index) for the tensors of the last send_weights sent as a local shard, and the
+        # dim they are sharded on (0, or 1 for a tensor exported transposed in vLLM's layout).
         self._shard_info: dict[str, tuple[int, int]] = {}
+        self._shard_dims: dict[str, int] = {}
         # Keeps the bound device buffers alive until release_sync_buffers (the controller-driven push reads
         # them after send_weights returns).
         self._bound_tensors: Optional[list[torch.Tensor]] = None
@@ -358,6 +365,9 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         sorted_weights = sorted(unfused_weights.items(), key=lambda x: x[0])
         valid_weights = validate_and_sanitize_tensors(sorted_weights, device=torch.device(TPU_SYNC_DEVICE))
         self._shard_info = {name: shard_info[name] for name, _ in valid_weights if name in shard_info}
+        self._shard_dims = {}
+        if self.receive_into_vllm:
+            valid_weights = await self._export_in_vllm_layout(valid_weights)
 
         tpu_synchronize(strict=True)
         t_gathered = time.time()
@@ -366,7 +376,10 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         # buffers, listener threads and controller registration, and only swaps the device buffers the D2H reads
         # from (release_sync_buffers unbinds them between syncs). Re-creating it every sync re-allocates, pins
         # and first-touches a model-sized host buffer per rank and re-registers with the controller.
-        signature = [(name, tuple(t.shape), t.dtype, self._shard_info.get(name)) for name, t in valid_weights]
+        signature = [
+            (name, tuple(t.shape), t.dtype, self._shard_info.get(name), self._shard_dims.get(name, 0))
+            for name, t in valid_weights
+        ]
         rebound = self._trainer_tpu_sync_ws is not None and signature == self._registered_signature
         if rebound:
             logger.info(f"Trainer Rank {self.rank}: rebinding {len(valid_weights)} tensors to the WeightSynchronizer")
@@ -433,6 +446,33 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
             self._bound_tensors = None
         return metrics
 
+    async def _export_in_vllm_layout(
+        self, valid_weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Re-packs ``valid_weights`` (HF names) into vLLM's parameter layout (``receive_into_vllm``).
+
+        The rollout's parameter description is read from the rendezvous once (the driver publishes it before the
+        first sync). Updates ``_shard_info`` / ``_shard_dims`` to the exported tensors.
+        """
+        if self._vllm_params is None:
+            published = await self.registry.get_vllm_params.remote()
+            if not published:
+                raise RuntimeError(
+                    f"Trainer Rank {self.rank}: receive_into_vllm is on but the rollout's vLLM parameter description "
+                    "is not in the rendezvous (the driver publishes it with describe_vllm_params before the first sync)"
+                )
+            self._vllm_tp_size = int(published["tp_size"])
+            self._vllm_params = {name: VllmParam.from_dict(d) for name, d in published["params"].items()}
+        assert self._vllm_tp_size is not None
+        export = build_vllm_layout_export(valid_weights, self._shard_info, self._vllm_params, self._vllm_tp_size)
+        self._shard_info = {name: (n, i) for name, (n, i, _) in export.shards.items()}
+        self._shard_dims = {name: dim for name, (_, _, dim) in export.shards.items()}
+        logger.info(
+            f"Trainer Rank {self.rank}: exported {len(export.weights)} tensors in vLLM's layout "
+            f"({len(export.shards)} sharded, TP={self._vllm_tp_size})"
+        )
+        return export.weights
+
     async def _create_and_register(self, valid_weights: list[tuple[str, torch.Tensor]]) -> None:
         """(Re)creates the WeightSynchronizer over ``valid_weights`` and registers it with the controller."""
         self._close_synchronizer()
@@ -450,7 +490,7 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         def full_shape(name: str, p: torch.Tensor) -> list[int]:
             shape = list(p.shape)
             if name in self._shard_info:
-                shape[0] *= self._shard_info[name][0]
+                shape[self._shard_dims.get(name, 0)] *= self._shard_info[name][0]
             return shape
 
         # Record global shapes in the rendezvous so the sampler can size its receive buffers.
@@ -464,8 +504,9 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
             logger.warning(f"Could not record global shapes in the tpu-sync rendezvous: {e}")
 
         # Build variable metadata protos for each dynamic tensor. Every variable carries its full shape:
-        # - a local FSDP shard is block `shard_index` of `num_shards` dim-0 blocks: mesh_shape=[num_shards, 1, ...]
-        #   and global_shard_indices=[shard_index], and tpu-sync reshards the blocks of all ranks for the rollout;
+        # - a local FSDP shard is block `shard_index` of `num_shards` blocks along its shard dim (dim 0; dim 1 for
+        #   a tensor exported transposed in vLLM's layout): mesh_shape has num_shards on that dim and
+        #   global_shard_indices=[shard_index], and tpu-sync reshards the blocks of all ranks for the rollout;
         # - a full tensor (the same on every rank) is unsharded: mesh_shape=[1] * rank.
         variable_protos = []
         max_shards = 1
@@ -474,9 +515,12 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
             if name in self._shard_info:
                 num_shards, shard_index = self._shard_info[name]
                 max_shards = max(max_shards, num_shards)
+                dim = self._shard_dims.get(name, 0)
+                mesh_shape, spec = [1] * len(shape), [""] * len(shape)
+                mesh_shape[dim], spec[dim] = num_shards, "fsdp"
                 sharding: dict[str, Any] = {
-                    "mesh_shape": [num_shards] + [1] * (len(shape) - 1),
-                    "sharding_spec": ["fsdp"] + [""] * (len(shape) - 1),
+                    "mesh_shape": mesh_shape,
+                    "sharding_spec": spec,
                     "global_shard_indices": [shard_index],
                 }
             else:
@@ -764,6 +808,21 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
             await asyncio.to_thread(ray.get, refs)
         manager._tpu_sync_stage_d2h = stage_d2h
 
+    # 0. With receive_into_vllm, the trainer exports in vLLM's layout, so it needs the rollout's parameter
+    #    description (shapes, dtypes, which weights vllm-torchtpu transposed) before its first export. Every rank
+    #    of every replica holds the same shapes, so one worker's description serves all.
+    if options.receive_into_vllm and not getattr(manager, "_tpu_sync_vllm_params_published", False):
+        described = await manager.replicas[0].server_handle.collective_rpc.remote(method="describe_vllm_params")
+        description = next((d for d in (described or []) if isinstance(d, dict) and "params" in d), None)
+        if description is None:
+            raise RuntimeError("receive_into_vllm: the rollout workers returned no vLLM parameter description")
+        await manager._tpu_sync_rendezvous.set_vllm_params.remote(description)
+        manager._tpu_sync_vllm_params_published = True
+        logger.info(
+            f"tpu-sync: published {len(description['params'])} vLLM parameters (TP={description['tp_size']}) for "
+            "the trainer's export in vLLM's layout"
+        )
+
     # 1. Every trainer rank binds its tensors to its synchronizer, registers them with the controller and records
     #    the global shapes (and, with stage_d2h, copies them to host memory and unbinds them). ray.get blocks until
     #    all ranks finish, so run it in a thread to keep the event loop free.
@@ -870,6 +929,7 @@ async def _finish_tpu_sync(
                     "global_shapes": global_shapes,
                     "parallelism": parallelism,
                     "job_name": _sampler_job_name(replica, replica_idx),
+                    "receive_into_vllm": options.receive_into_vllm,
                 },
             )
             for replica_idx, replica in enumerate(manager.replicas)
