@@ -518,6 +518,7 @@ LOGITS_AT_LOAD = LogitsAtLoad()
 
 RECOMPILE_GUARD_ENV = register_switch("VERL_TPU_INPROC_RECOMPILE_GUARD")  # "fatal" (default) | "report"
 RECOMPILE_GUARD_N = 8  # an engine function recompiling more than 8 times after warm-up (non-shape classes) trips
+REVIEWED_TORCH = "2.13"  # the torch release whose private dynamo hooks the ledger was reviewed on
 SHAPE_CLASSES = ("size",)  # the reason class of a new input shape
 
 

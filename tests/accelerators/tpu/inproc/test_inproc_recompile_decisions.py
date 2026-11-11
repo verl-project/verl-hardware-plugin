@@ -321,6 +321,7 @@ def test_the_build_refuses_an_armed_guard_without_its_hook(monkeypatch, mode, re
         r._prepare()
     if refused:
         assert "the recompile guard cannot be installed" in str(err.value), err.value
+        assert f"reviewed on torch {cg.REVIEWED_TORCH}" in str(err.value), err.value  # names the reviewed torch
     else:  # past the guard's check: the next refusal is the runtime check's (no trainer runtime here)
         assert "the recompile guard" not in str(err.value) and "torch.distributed is not initialized" in str(err.value)
 

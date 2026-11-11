@@ -45,6 +45,7 @@ from verl_hardware_plugin.accelerators.tpu.rollout.inproc.compile_guard import (
     CALL_PINS,
     LOGITS_AT_LOAD,
     RECOMPILES,
+    REVIEWED_TORCH,
     install_call_pins_and_watch,
 )
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.engine import (
@@ -150,7 +151,8 @@ class TPUInProcRollout(BaseRollout):
         # the recompile accounting before anything of the engine compiles; an armed guard without its hook refuses
         if not RECOMPILES.install() and RECOMPILES.armed:
             raise RuntimeError(
-                f"the recompile guard cannot be installed ({RECOMPILES.unavailable}): refusing to build without it"
+                f"the recompile guard cannot be installed on torch {torch.__version__} ({RECOMPILES.unavailable}; its "
+                f"dynamo hooks were reviewed on torch {REVIEWED_TORCH}): refusing to build without it"
             )
         self._check_runtime_up()
         self._patch_vllm_in_process()
