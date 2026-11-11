@@ -10,7 +10,10 @@ tiny dense checkpoint, mocked device side). Requests go through the trainer work
 plugin's registration adds to verl's ``ActorRolloutRefWorker`` (``generate`` / ``abort_all_requests`` /
 ``resume_generation`` / ``inproc_server_info``), into verl's own server code on the in-process adapter and its pump.
 
-Case (env ``INPROC_TEST_CASE``, JSON): ``{"model_dir", "mode": "serve"}``. Prints one line ``RESULT <json>``.
+Case (env ``INPROC_TEST_CASE``, JSON): ``{"model_dir", "mode": "serve" | "lazy"}``. ``lazy``: three waves of
+concurrent requests, the self-check re-armed after each as every weight sync does; every final ``RequestOutput`` the
+pump hands to a request and every ``TokenOutput`` verl returns, recorded canonically (each float as its 8 bytes), and
+the lazy output path's window counts per wave. Prints one line ``RESULT <json>``.
 """
 
 from __future__ import annotations
@@ -180,7 +183,72 @@ def main_serve(case: dict) -> dict:
     return out
 
 
-MODES = {"serve": main_serve}
+def _canon(x):
+    """a value with every float as its 8 bytes (hex), recursively; tensors and arrays as lists"""
+    import struct
+
+    if hasattr(x, "tolist"):
+        x = x.tolist()
+    if isinstance(x, float):
+        return struct.pack("<d", x).hex()
+    if isinstance(x, dict):
+        return {str(k): _canon(v) for k, v in sorted(x.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(x, list | tuple):
+        return [_canon(v) for v in x]
+    return x
+
+
+def main_lazy(case: dict) -> dict:
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc import engine as eng_mod
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc.lazy_output import lp_canon
+
+    finals: dict = {}
+    orig_put = eng_mod._Collector.put
+
+    def put(self, output):  # every final RequestOutput the pump hands to a request
+        if not self._fut.done():
+            c = output.outputs[0] if output.outputs else None
+            finals[self.external_id] = {
+                "finished": output.finished,
+                "num_cached_tokens": output.num_cached_tokens,
+                "token_ids": None if c is None else list(c.token_ids),
+                "cumulative_logprob": None if c is None else _canon(c.cumulative_logprob),
+                "logprobs": None if c is None else repr(lp_canon(c.logprobs)),
+                "finish_reason": None if c is None else str(c.finish_reason),
+            }
+        return orig_put(self, output)
+
+    eng_mod._Collector.put = put
+    r, wk, W, cap = build(case)
+    lazy = r.server._inproc_lazy
+    out: dict = {"lazy_state": {"installed": lazy.installed, "why_not": lazy.why_not}, "waves": []}
+
+    async def wave(w: int):
+        n = 12
+        lengths = [20 + 10 * i + 7 * w for i in range(n)]
+        outs = await asyncio.gather(
+            *[W.generate(wk, prompt_of(i + 100 * w), params(i, lengths[i]), f"w{w}-{i}") for i in range(n)]
+        )
+        return [
+            {
+                "token_ids": list(o.token_ids),
+                "log_probs": _canon(o.log_probs),
+                "stop": o.stop_reason,
+                "extra": _canon(o.extra_fields),
+            }
+            for o in outs
+        ]
+
+    for w in range(3):
+        token_outputs = asyncio.run(wave(w))
+        out["waves"].append({"token_outputs": token_outputs, "window": r._lazy_window()})
+        lazy.arm_verify()  # as every weight sync does
+    out["finals"] = finals
+    out["failed_lines"] = [x for x in cap.lines if "FAILED" in x or "MISMATCH" in x][:5]
+    return out
+
+
+MODES = {"serve": main_serve, "lazy": main_lazy}
 
 
 if __name__ == "__main__":
