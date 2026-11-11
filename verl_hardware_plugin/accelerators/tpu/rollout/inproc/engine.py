@@ -33,6 +33,7 @@ from verl_hardware_plugin.accelerators.tpu.rollout.inproc.boundary import (
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.common import integrity_mode, log, warn
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.compile_guard import LOGITS_AT_LOAD, RECOMPILES
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.gc_policy import GC_DEFER
+from verl_hardware_plugin.accelerators.tpu.rollout.inproc.lazy_output import LazyFinalOutputs
 
 AUDIT_EVERY = 64  # after warm-up the device-thread record and the collective counter run on every 64th pump step
 
@@ -92,6 +93,7 @@ class InProcAsyncEngine:
         self.window_aborted = 0
         self.window_failed = 0
         self.warm = False  # set at the end of the build: the pump then samples its audit-only checks
+        self.lazy: Optional[LazyFinalOutputs] = None  # the lazy final-only output path (set by the build)
 
     async def add_request(
         self, request_id, prompt, sampling_params, lora_request=None, priority=0, data_parallel_rank=None, **_
@@ -356,7 +358,12 @@ def _build_engine_into(srv: Any, args: Any) -> None:
     srv._inproc_worker = worker
     srv._inproc_vllm_config = vllm_config
     srv._inproc_engine_args = engine_args
+    # the lazy final-only output path on vLLM's OutputProcessor (when its guard passes), its self-check armed for the
+    # first requests (and re-armed at every sync)
+    srv._inproc_lazy = LazyFinalOutputs(eng)
+    srv._inproc_lazy.arm_verify()
     srv.engine = InProcAsyncEngine(eng, srv._inproc_rank)
+    srv.engine.lazy = srv._inproc_lazy
 
 
 def preinit_vllm_parallel_state(local_rank: int = 0) -> dict:

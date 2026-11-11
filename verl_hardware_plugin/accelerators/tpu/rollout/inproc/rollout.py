@@ -71,6 +71,16 @@ from verl_hardware_plugin.accelerators.tpu.rollout.inproc.weight_sync import (
     verify_reason,
 )
 
+LAZY_WINDOW_COUNTS = (
+    "deferred_outputs",
+    "vllm_outputs",
+    "verified_requests",
+    "verified_equal",
+    "flushes",
+    "rows_one_pass",
+    "lists_vllm",
+)
+
 
 class TPUInProcRollout(BaseRollout):
     """verl's ``("vllm", "async")`` rollout with ``VERL_TPU_ROLLOUT_INPROC=1``: one in-process TP=1 engine per trainer
@@ -309,6 +319,7 @@ class TPUInProcRollout(BaseRollout):
                 "reviewed": (boundary.ENV_OVERRIDE_PROBE or {}).get("reviewed"),
                 "after_build": env_problems or "unchanged within the reviewed effects",
             },
+            "lazy_output": self._lazy_state(),
             "tpu_sync_contract": "ok",
             "layout": {
                 "model_type": getattr(self.hf_text_config, "model_type", None),
@@ -473,11 +484,29 @@ class TPUInProcRollout(BaseRollout):
             return st.fatal_pending
         return None
 
+    def _lazy_state(self) -> dict:
+        lazy = getattr(getattr(self, "server", None), "_inproc_lazy", None)
+        if lazy is None:
+            return {"installed": False, "why_not": "not built"}
+        return {"installed": lazy.installed, "why_not": lazy.why_not}
+
+    def _lazy_window(self) -> dict:
+        """The lazy output path's counts in the window since the previous sync (taken at every sync, sync 0 included),
+        every count present."""
+        lazy = getattr(self.engine, "lazy", None)
+        if lazy is None:
+            return {"installed": False}
+        win = lazy.take()
+        for k in LAZY_WINDOW_COUNTS:
+            win.setdefault(k, 0)
+        return win
+
     def _health_record(self, step: int, window: dict) -> dict:
-        """The per-sync health line: the recompile record, the device-thread and collective invariants and the rollout
-        window."""
+        """The per-sync health line: the recompile record, the lazy output path's window, the device-thread and
+        collective invariants and the rollout window."""
         return {
             "compile": RECOMPILES.compile_record(),
+            "lazy": self._lazy_window(),
             "threads": {
                 "device_threads": len(DEVICE_THREADS.counts),
                 "collectives_world_gt1": sum(COLLECTIVES.big.values()),
@@ -582,6 +611,9 @@ class TPUInProcRollout(BaseRollout):
                     )
             self._last_wsum = (step, wsum, opt_mark)
         window = self.engine.window_take()
+        lazy = getattr(self.server, "_inproc_lazy", None)
+        if lazy is not None:  # the lazy output path's self-check on the next rollout's first request
+            lazy.arm_verify()
         rec = {
             "step": step,
             "export_s": round(t1 - t0, 4),
