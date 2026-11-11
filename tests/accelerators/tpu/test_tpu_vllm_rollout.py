@@ -10,6 +10,7 @@ upstream verl (which hooks are overridden and what they return) and the launch a
 
 import asyncio
 import importlib
+import importlib.util
 import multiprocessing.process
 import os
 import pickle
@@ -390,7 +391,7 @@ def test_launch_tpu_vllm_servers_gives_engines_on_one_host_disjoint_devices_and_
         ):
             assert env[name] == f"{prefix}_tp{chips}_r{replica.replica_rank}"
         ports = _engine_ports(env, chips)
-        assert all(1024 <= port < 32768 for port in ports)  # below Linux's ephemeral range, which portpicker uses
+        assert all(21000 <= port < 22000 for port in ports)  # clear of Ray's worker ports and the ephemeral range
         assert seen_ports.isdisjoint(ports)
         seen_ports |= ports
 
@@ -456,11 +457,92 @@ def test_host_slots_never_move_and_survive_restarts(tpu_vllm):
 
 
 def test_subhost_port_base_is_configurable(tpu_vllm, monkeypatch):
-    monkeypatch.setenv(tpu_vllm.SUBHOST_PORT_BASE_ENV, "21000")
+    monkeypatch.setenv(tpu_vllm.SUBHOST_PORT_BASE_ENV, "23000")
     env = tpu_vllm.subhost_engine_env(slot=1, devices_per_engine=4, replica_rank=5)
-    assert env["MEGASCALE_COORDINATOR_ADDRESS"] == "127.0.0.1:21080"
-    assert env["MASTER_PORT"] == "21280"
-    assert env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == "localhost:21380,localhost:21381,localhost:21382,localhost:21383"
+    assert env["MEGASCALE_COORDINATOR_ADDRESS"] == "127.0.0.1:23080"
+    assert env["MASTER_PORT"] == "23280"
+    assert env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == "localhost:23380,localhost:23381,localhost:23382,localhost:23383"
+    assert tpu_vllm.subhost_port_block() == range(23000, 23460)
+    tpu_vllm.check_subhost_port_block(tpu_vllm.subhost_port_block())
+
+
+def test_default_subhost_ports_are_clear_of_ray_workers_and_ephemeral_ports(tpu_vllm, monkeypatch):
+    monkeypatch.delenv(tpu_vllm.SUBHOST_PORT_BASE_ENV, raising=False)
+    block = tpu_vllm.subhost_port_block()
+    assert block == range(21000, 21460)
+    ray_low, ray_high = tpu_vllm.RAY_DEFAULT_WORKER_PORTS
+    assert (ray_low, ray_high) == (10002, 19999)  # ray start's --min-worker-port / --max-worker-port defaults
+    assert block.start > ray_high and block.stop - 1 < tpu_vllm.EPHEMERAL_PORTS[0]
+    tpu_vllm.check_subhost_port_block(block)
+    # Every port of 4 x TP=2 or 2 x TP=4 engines, and of their workers, is inside the block.
+    for chips in (2, 4):
+        for slot in range(8 // chips):
+            assert _engine_ports(tpu_vllm.subhost_engine_env(slot, chips, replica_rank=slot), chips) <= set(block)
+
+
+@pytest.mark.parametrize(
+    "base, ray_ports, match",
+    [
+        ("19000", None, "Ray's worker ports 10002-19999"),  # the base of the c56 TPU runs
+        ("32700", None, "ephemeral ports 32768-60999"),
+        ("21000", (21400, 22000), "Ray's worker ports 21400-22000"),  # a custom Ray range this process knows
+        ("800", None, "outside 1024-65535"),
+    ],
+)
+def test_subhost_port_block_must_clear_ray_worker_and_ephemeral_ports(tpu_vllm, monkeypatch, base, ray_ports, match):
+    monkeypatch.setenv(tpu_vllm.SUBHOST_PORT_BASE_ENV, base)
+    if ray_ports:
+        monkeypatch.setattr(tpu_vllm, "ray_worker_port_range", lambda: ray_ports)
+    with pytest.raises(ValueError, match=match):
+        tpu_vllm.check_subhost_port_block(tpu_vllm.subhost_port_block())
+    # The launcher checks the block before it starts any engine.
+    with pytest.raises(ValueError, match=match):
+        _launch_on_v7x_hosts(tpu_vllm, [_single_host_replica(0, 4)])
+
+
+def test_ray_worker_port_range_reads_the_local_node_else_the_default(tpu_vllm):
+    params = SimpleNamespace(min_worker_port=30000, max_worker_port=30999)
+    with mock.patch.object(ray._private.worker, "_global_node", SimpleNamespace(_ray_params=params)):
+        assert tpu_vllm.ray_worker_port_range() == (30000, 30999)
+    params = SimpleNamespace(min_worker_port=0, max_worker_port=0)  # unknown: a driver that joined a cluster
+    with mock.patch.object(ray._private.worker, "_global_node", SimpleNamespace(_ray_params=params)):
+        assert tpu_vllm.ray_worker_port_range() == (10002, 19999)
+    with mock.patch.object(ray._private.worker, "_global_node", None):
+        assert tpu_vllm.ray_worker_port_range() == (10002, 19999)
+
+
+def test_host_claim_is_shared_by_one_controller_and_refused_to_another(tpu_vllm, tmp_path):
+    path = str(tmp_path / "claim.lock")
+    claim = tpu_vllm.claim_host_for_subhost_engines
+    fds = [claim("controller-a", path), claim("controller-a", path)]  # two engines of one controller
+    with pytest.raises(RuntimeError, match="another controller \\(controller-a\\)"):
+        claim("controller-b", path)
+    for fd in fds:  # controller a's engines exit: the kernel drops their locks
+        os.close(fd)
+    os.close(claim("controller-b", path))  # a stale claim is taken over
+
+
+def test_two_controllers_on_one_host_fail_fast_instead_of_sharing_a_slot(tpu_vllm, tmp_path, monkeypatch):
+    # Two independent controllers (each its own copy of the module: its own slot table and id) put a TP=4 replica on
+    # the same host. Each allocator alone picks slot 0, i.e. the same devices and ports.
+    spec = importlib.util.find_spec("verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm")
+    other = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(other)
+    envs = [_launch_on_v7x_hosts(module, [_single_host_replica(0, 4)])[0] for module in (tpu_vllm, other)]
+    assert envs[0]["TPU_LOCAL_RANK_OFFSET"] == envs[1]["TPU_LOCAL_RANK_OFFSET"] == "0"
+    assert envs[0][tpu_vllm.SUBHOST_OWNER_ENV] != envs[1][tpu_vllm.SUBHOST_OWNER_ENV]
+
+    # Their server actors start on the host: the first claims it, the second fails before it builds an engine.
+    monkeypatch.setattr(tpu_vllm, "SUBHOST_CLAIM_FILE", str(tmp_path / "claim.lock"))
+    servers = []
+    for env in envs:
+        with mock.patch.dict(os.environ, {tpu_vllm.SUBHOST_OWNER_ENV: env[tpu_vllm.SUBHOST_OWNER_ENV]}):
+            if servers:
+                with pytest.raises(RuntimeError, match="another controller"):
+                    tpu_vllm.TPUvLLMHttpServer()
+            else:
+                servers.append(tpu_vllm.TPUvLLMHttpServer())
+    os.close(servers[0]._subhost_host_claim)
 
 
 # ---------------------------------------------------------------------------

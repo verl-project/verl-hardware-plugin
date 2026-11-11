@@ -16,15 +16,19 @@ and its multi-node layout, and changes only what TPU needs:
 * With ``checkpoint_engine.backend=tpu-sync``, vLLM's workers load the tpu-sync worker extension
   (``tpu_sync_worker_extension.py``), which receives the trainer's weights over the network.
 * On TPU 7x, TP=2 and TP=4 replicas share their host with other replicas (e.g. 16 x TP=2 on four hosts):
-  each engine takes a slot of the host's devices and its own fixed ports (see ``subhost_engine_env``).
+  each engine takes a slot of the host's devices and its own fixed ports (see ``subhost_engine_env``), and all
+  the engines of a host must come from one controller (``claim_host_for_subhost_engines``).
 
 The same logic previously lived behind ``get_resource_name() == "TPU"`` branches in verl's
 ``vllm_async_server.py`` and ``replica.py``.
 """
 
 import asyncio
+import fcntl
 import logging
 import os
+import socket
+import uuid
 
 import ray
 
@@ -52,13 +56,24 @@ TPU_SYNC_WORKER_EXTENSION_CLS = (
     "verl_hardware_plugin.accelerators.tpu.rollout.tpu_sync_worker_extension.vLLMTPUSyncWorkerExtension"
 )
 
-# Engines that share a host listen on fixed ports below Linux's ephemeral range (32768-60999). Otherwise
-# vllm-torchtpu draws MASTER_PORT and the slice-builder ports from that range with portpicker, which several engines
-# and Ray workers starting at once on one host can race for ("bind ... Address already in use"). The engine at
-# device offset ``o`` takes the block that starts at ``base + 20 * o``.
+# Engines that share a host listen on fixed ports. Otherwise vllm-torchtpu draws MASTER_PORT and the slice-builder
+# ports from Linux's ephemeral range with portpicker, which several engines and Ray workers starting at once on one
+# host can race for ("bind ... Address already in use"). The engine at device offset ``o`` takes the ports from
+# ``base + 20 * o``, so a host's engines use ``[base, base + 20 * devices + 300)``: 21000-21459 by default, clear of
+# Ray's default worker ports (``ray start --min-worker-port 10002 --max-worker-port 19999``) and of Linux's ephemeral
+# ports (32768-60999). ``check_subhost_port_block`` enforces that.
 SUBHOST_PORT_BASE_ENV = "VERL_TPU_ROLLOUT_SUBHOST_PORT_BASE"
-DEFAULT_SUBHOST_PORT_BASE = 19000
+DEFAULT_SUBHOST_PORT_BASE = 21000
 _PORTS_PER_DEVICE = 20
+RAY_DEFAULT_WORKER_PORTS = (10002, 19999)
+EPHEMERAL_PORTS = (32768, 60999)
+
+# A host's sub-host engines must all belong to one controller: each controller assigns slots on its own, so engines
+# of two controllers would take the same devices and ports. The first engine of a host claims it for its controller
+# (``claim_host_for_subhost_engines``), and engines of any other controller fail at startup.
+SUBHOST_OWNER_ENV = "VERL_TPU_SUBHOST_OWNER"
+SUBHOST_CLAIM_FILE = "/tmp/verl_tpu_subhost_rollout.lock"
+_CONTROLLER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 # {node id: {engine: slot}} and {node id: devices per engine} of the engines that share a host. Every replica of a
 # job is launched from this process (asyncio.gather), so the table sees all the engines of a host. A slot, once
@@ -114,6 +129,78 @@ def reset_host_slots(node_id: str | None = None) -> None:
         _HOST_ENGINE_DEVICES.pop(node_id, None)
 
 
+def _subhost_port_base() -> int:
+    return int(os.environ.get(SUBHOST_PORT_BASE_ENV, DEFAULT_SUBHOST_PORT_BASE))
+
+
+def subhost_port_block(devices_per_host: int = TPU_V7X_DEVICES_PER_HOST) -> range:
+    """Every port the engines that share one host may listen on (see ``subhost_engine_env``)."""
+    base = _subhost_port_base()
+    return range(base, base + _PORTS_PER_DEVICE * devices_per_host + 300)
+
+
+def ray_worker_port_range() -> tuple[int, int]:
+    """The ports Ray workers bind, when this process started the Ray node and knows them; else ``ray start``'s default.
+
+    A process that connected to a running cluster cannot read the raylet's ``--min-worker-port`` /
+    ``--max-worker-port``: with a custom range, keep ``VERL_TPU_ROLLOUT_SUBHOST_PORT_BASE`` clear of it by hand.
+    """
+    try:
+        params = ray._private.worker._global_node._ray_params
+        low, high = int(params.min_worker_port or 0), int(params.max_worker_port or 0)
+        if 0 < low <= high:
+            return low, high
+    except Exception:
+        pass
+    return RAY_DEFAULT_WORKER_PORTS
+
+
+def check_subhost_port_block(block: range) -> None:
+    """Raise if ``block`` reaches into Ray's worker ports or Linux's ephemeral ports, or is not a valid port range."""
+    if block.start < 1024 or block.stop > 65536:
+        raise ValueError(f"Rollout engine ports {block.start}-{block.stop - 1} are outside 1024-65535")
+    for name, (low, high) in (
+        ("Ray's worker ports", ray_worker_port_range()),
+        ("Linux's ephemeral ports", EPHEMERAL_PORTS),
+    ):
+        if block.start <= high and low < block.stop:
+            raise ValueError(
+                f"The ports of the rollout engines that share a host, {block.start}-{block.stop - 1}, overlap {name} "
+                f"{low}-{high}. Set {SUBHOST_PORT_BASE_ENV} to a base that keeps them clear of both Ray's worker "
+                f"ports and {EPHEMERAL_PORTS[0]}-{EPHEMERAL_PORTS[1]} (default {DEFAULT_SUBHOST_PORT_BASE})."
+            )
+
+
+def claim_host_for_subhost_engines(owner: str, path: str = SUBHOST_CLAIM_FILE) -> int:
+    """Claim this host for the sub-host engines of controller ``owner``; return the descriptor that holds the claim.
+
+    Engines of one controller share the claim: each holds a shared ``flock`` on ``path`` for the life of its process,
+    and the file names the owner. An engine of another controller fails here rather than open the same devices and
+    ports. A claim whose engines are all gone (the kernel drops their locks) is taken over.
+    """
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fcntl.flock(fd, fcntl.LOCK_SH)  # live engines hold the claim (this also waits out a takeover)
+        else:
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, owner.encode(), 0)
+            fcntl.flock(fd, fcntl.LOCK_SH)
+        holder = os.pread(fd, 4096, 0).decode()
+        if holder != owner:
+            raise RuntimeError(
+                f"This host already runs TP=2 / TP=4 rollout engines of another controller ({holder}); this engine "
+                f"belongs to {owner}. Engines that share a host must all come from one verl job's rollout, which "
+                "assigns their devices and ports: give each job its own rollout hosts."
+            )
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def subhost_engine_env(slot: int, devices_per_engine: int, replica_rank: int) -> dict[str, str]:
     """The environment of a vLLM engine in slot ``slot`` of a host it shares with other engines.
 
@@ -121,7 +208,7 @@ def subhost_engine_env(slot: int, devices_per_engine: int, replica_rank: int) ->
     ``tpu_vllm_patches.patch_tpu_worker_subhost_env``, which ``SUBHOST_MEGASCALE_PORT_ENV`` switches on.
     """
     offset = slot * devices_per_engine
-    block = int(os.environ.get(SUBHOST_PORT_BASE_ENV, DEFAULT_SUBHOST_PORT_BASE)) + _PORTS_PER_DEVICE * offset
+    block = _subhost_port_base() + _PORTS_PER_DEVICE * offset
     return {
         # vllm-torchtpu binds worker r to device offset + r: TPU_LOCAL_RANK_OFFSET in its spawn-time worker binding,
         # DEBUG_TPU_LOCAL_RANK_OFFSET where TPUWorker.init_device sets LOCAL_RANK. Neither is part of its compile
@@ -137,6 +224,8 @@ def subhost_engine_env(slot: int, devices_per_engine: int, replica_rank: int) ->
         # pod, so every engine in the container would share it.
         "MEGASCALE_COORDINATOR_ADDRESS": f"127.0.0.1:{block}",
         SUBHOST_MEGASCALE_PORT_ENV: str(block),
+        # The server actor claims the host for this controller (see claim_host_for_subhost_engines).
+        SUBHOST_OWNER_ENV: _CONTROLLER_ID,
         # Compile caches of their own: a cache keyed by the replica alone hands one TP size's executables to another
         # ("local device count is 0" when a TP=8 engine loaded TP=4 executables).
         "VLLM_CACHE_ROOT": f"/tmp/vllm_cache_tp{devices_per_engine}_r{replica_rank}",
@@ -195,6 +284,8 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
         # Such a replica uses part of its host and shares it with other replicas (auto_assign_accelerator_type
         # spreads them over the rollout slices), so it takes a slot of the host's devices and ports of its own.
         shares_host = is_tpu_v7x(pod_type) and chips_per_host in TPU_V7X_SUBHOST_TOPOLOGY_MAP
+        if shares_host:
+            check_subhost_port_block(subhost_port_block())
     prefix = replica._get_server_name_prefix()
     for node_rank, node_id in enumerate(node_ids):
         if replica.is_reward_model:
@@ -260,6 +351,10 @@ class TPUvLLMHttpServer(vLLMServerTimelineMixin, vLLMHttpServer):
         # This actor builds the vLLM engine and starts its EngineCore process, so patch vLLM before
         # anything else. The patches carry themselves into the EngineCore and vLLM's workers.
         patch_vllm_for_tpu()
+        owner = os.environ.get(SUBHOST_OWNER_ENV)
+        if owner:
+            # Held until this actor exits; the engine's processes are its children.
+            self._subhost_host_claim = claim_host_for_subhost_engines(owner, SUBHOST_CLAIM_FILE)
         super().__init__(*args, **kwargs)
 
     def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:

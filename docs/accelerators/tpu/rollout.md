@@ -111,11 +111,20 @@ The rollout settings that matter on TPU (the recipes already set them):
 
 With `tensor_model_parallel_size` 2 or 4 on TPU 7x (one or two chips), several replicas share a host, e.g.
 16 x TP=2 or 8 x TP=4 on four `2x2x1` rollout hosts. `auto_assign_accelerator_type` spreads the replicas evenly
-over the rollout slices, and each engine on a host gets its own slot of the host's devices
-(`TPU_LOCAL_RANK_OFFSET`), fixed ports below the ephemeral range (from `VERL_TPU_ROLLOUT_SUBHOST_PORT_BASE`,
-default `19000`, 20 ports per device), its own libtpu MegaScale coordinator, and compile caches under
+over the slices the rollout replicas hold, and each engine on a host gets its own slot of the host's devices
+(`TPU_LOCAL_RANK_OFFSET`), fixed ports, its own libtpu MegaScale coordinator, and compile caches under
 `/tmp/*_tp<N>_r<replica>`. The replicas on a host must all use the same TP size. TP=8 (a whole host) and
 multi-host replicas launch as before.
+
+- **Ports:** the engines of a host use `[base, base + 460)`, with base `VERL_TPU_ROLLOUT_SUBHOST_PORT_BASE`
+  (default `21000`, i.e. 21000-21459). The block must stay clear of Ray's worker ports (`ray start
+  --min-worker-port/--max-worker-port`, 10002-19999 by default) and of Linux's ephemeral ports (32768-60999); the
+  launcher raises if it is not. It can read a custom Ray worker range only in the process that started Ray, so if
+  your cluster sets one, choose the base yourself.
+- **One controller per host:** all the engines of a host must come from one verl job, which assigns their slots
+  and ports. The first engine of a host claims it for its job (a shared `flock` on
+  `/tmp/verl_tpu_subhost_rollout.lock`, held while the engine runs), and an engine of another job fails at startup.
+  Give each job its own rollout hosts.
 
 ## Verify
 
