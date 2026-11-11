@@ -677,6 +677,48 @@ def test_rollout_replica_kind_is_the_pool_name_without_the_rank():
     assert rollout_replica_kind("global_pool") is None and rollout_replica_kind("reward_pool") is None
 
 
+@pytest.mark.parametrize("tp, expected_topology", [(2, "1,1,1,2"), (4, "1,2,1,2"), (8, "2,2,1,2")])
+def test_get_tpu_env_vars_resolves_single_host_subhost_rollout_worker_group(tp, expected_topology):
+    platform = PlatformTPU()
+    pg = SimpleNamespace(id="pg-0")
+    nodes = [
+        {
+            "NodeID": "node-ro-0",
+            "NodeManagerAddress": "10.0.0.10",
+            "Alive": True,
+            "Resources": {"TPU": 8.0},
+            "Labels": {"ray.io/tpu-pod-type": "v7x-8"},
+        }
+    ]
+    pg_table = {"state": "CREATED", "bundles_to_node_id": {i: "node-ro-0" for i in range(tp)}}
+    with (
+        mock.patch("ray.is_initialized", return_value=True),
+        mock.patch("ray.nodes", return_value=nodes),
+        mock.patch("ray._private.state.state.placement_group_table", return_value=pg_table),
+        mock.patch.dict(os.environ, {"TPU_HOST_BOUNDS": "1,1,4", "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1"}, clear=False),
+    ):
+        env = platform.get_tpu_env_vars(
+            rank=0,
+            world_size=tp,
+            local_rank=0,
+            local_world_size=tp,
+            name_prefix="rollout_standalone_0",
+            pgs=[pg],
+        )
+        assert env["TORCH_TPU_TOPOLOGY"] == expected_topology
+        assert env["CHIPS_PER_HOST"] == str(tp)
+        if tp in (2, 4):
+            with pytest.raises(ValueError, match="TPU 7x mesh"):
+                platform.get_tpu_env_vars(
+                    rank=0,
+                    world_size=tp,
+                    local_rank=0,
+                    local_world_size=tp,
+                    name_prefix="ActorRolloutRefWorker",
+                    pgs=[pg],
+                )
+
+
 def _clear_forwarded_tpu_env(monkeypatch):
     """Unset the variables the platform forwards, so the test shell's own exports do not leak in."""
     for name in list(os.environ):
