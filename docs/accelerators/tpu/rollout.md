@@ -107,6 +107,16 @@ The rollout settings that matter on TPU (the recipes already set them):
 | `actor_rollout_ref.rollout.checkpoint_engine.backend` | `ray-plasma-store`, or `tpu-sync` (see [Weight Sync](./weight_sync.md)) |
 | `actor_rollout_ref.hybrid_engine` | `False` |
 
+### Several engines per host (TPU 7x)
+
+With `tensor_model_parallel_size` 2 or 4 on TPU 7x (one or two chips), several replicas share a host, e.g.
+16 x TP=2 or 8 x TP=4 on four `2x2x1` rollout hosts. `auto_assign_accelerator_type` spreads the replicas evenly
+over the rollout slices, and each engine on a host gets its own slot of the host's devices
+(`TPU_LOCAL_RANK_OFFSET`), fixed ports below the ephemeral range (from `VERL_TPU_ROLLOUT_SUBHOST_PORT_BASE`,
+default `19000`, 20 ports per device), its own libtpu MegaScale coordinator, and compile caches under
+`/tmp/*_tp<N>_r<replica>`. The replicas on a host must all use the same TP size. TP=8 (a whole host) and
+multi-host replicas launch as before.
+
 ## Verify
 
 On any host, without vLLM, SGLang, or a TPU:

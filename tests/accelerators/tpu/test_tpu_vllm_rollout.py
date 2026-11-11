@@ -315,6 +315,155 @@ def test_launch_tpu_vllm_servers_single_host_topology_from_ray(tpu_vllm, monkeyp
 
 
 # ---------------------------------------------------------------------------
+# Several engines on one TPU 7x host (8 x TP=4, 16 x TP=2)
+# ---------------------------------------------------------------------------
+
+
+def _single_host_replica(replica_rank, chips, node=NODE_A):
+    replica = _fake_replica()
+    replica.workers = [_FakeWorker(node) for _ in range(chips)]
+    replica.gpus_per_replica_node = chips
+    replica.nnodes = 1
+    replica.replica_rank = replica_rank
+    return replica
+
+
+def _launch_on_v7x_hosts(tpu_vllm, replicas):
+    """Launch the replicas concurrently, as verl does, on single-host TPU 7x nodes; return their server env."""
+    nodes = [
+        {"Alive": True, "Resources": {"TPU": 8.0}, "NodeID": node, "Labels": {"ray.io/tpu-pod-type": "v7x-8"}}
+        for node in (NODE_A, NODE_B)
+    ]
+    platform = SimpleNamespace(ray_noset_envvars=lambda: [], rollout_env_vars=lambda: {})
+
+    async def run():
+        with (
+            mock.patch.object(tpu_vllm, "get_platform", return_value=platform),
+            mock.patch("ray.is_initialized", return_value=True),
+            mock.patch("ray.nodes", return_value=nodes),
+        ):
+            await asyncio.gather(*[tpu_vllm.launch_tpu_vllm_servers(replica) for replica in replicas])
+
+    asyncio.run(run())
+    envs = []
+    for replica in replicas:
+        [options] = replica.server_class.options_kwargs
+        envs.append(options["runtime_env"]["env_vars"])
+    return envs
+
+
+def _engine_ports(env, chips):
+    """Every port an engine and its workers listen on."""
+    from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import (
+        SUBHOST_MEGASCALE_PORT_ENV,
+        subhost_worker_env,
+    )
+
+    megascale = int(env[SUBHOST_MEGASCALE_PORT_ENV])
+    ports = {int(env["MASTER_PORT"]), int(env["MEGASCALE_COORDINATOR_ADDRESS"].rsplit(":", 1)[1])}
+    ports |= {int(address.rsplit(":", 1)[1]) for address in env["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")}
+    for rank in range(chips):
+        worker = subhost_worker_env(rank, int(env["TPU_LOCAL_RANK_OFFSET"]) + rank, megascale)
+        ports |= {int(worker["MEGASCALE_PORT"]), int(worker["MEGASCALE_DEBUG_PORT"])}
+    return ports
+
+
+@pytest.mark.parametrize("chips, topology", [(4, "1,2,1,2"), (2, "1,1,1,2")])
+def test_launch_tpu_vllm_servers_gives_engines_on_one_host_disjoint_devices_and_ports(tpu_vllm, chips, topology):
+    # Replicas arrive in any order (asyncio.gather): here the highest rank first.
+    per_host = 8 // chips
+    replicas = [_single_host_replica(rank, chips) for rank in reversed(range(per_host))]
+    envs = _launch_on_v7x_hosts(tpu_vllm, replicas)
+
+    assert [int(env["TPU_LOCAL_RANK_OFFSET"]) for env in envs] == [slot * chips for slot in range(per_host)]
+    seen_ports = set()
+    for replica, env in zip(replicas, envs, strict=True):
+        assert env["TORCH_TPU_TOPOLOGY"] == topology
+        assert env["DEBUG_TPU_LOCAL_RANK_OFFSET"] == env["TPU_LOCAL_RANK_OFFSET"]
+        assert env["TPU_MULTIHOST_BACKEND"] == "mp"
+        assert env["MASTER_ADDR"] == "127.0.0.1"
+        assert len(env["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == chips
+        for name, prefix in (
+            ("VLLM_CACHE_ROOT", "/tmp/vllm_cache"),
+            ("TORCHINDUCTOR_CACHE_DIR", "/tmp/inductor_cache"),
+            ("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", "/tmp/tpu_tier3"),
+        ):
+            assert env[name] == f"{prefix}_tp{chips}_r{replica.replica_rank}"
+        ports = _engine_ports(env, chips)
+        assert all(1024 <= port < 32768 for port in ports)  # below Linux's ephemeral range, which portpicker uses
+        assert seen_ports.isdisjoint(ports)
+        seen_ports |= ports
+
+
+def test_launch_tpu_vllm_servers_rejects_more_engines_than_a_host_holds(tpu_vllm):
+    with pytest.raises(ValueError, match="no free slot"):
+        _launch_on_v7x_hosts(tpu_vllm, [_single_host_replica(rank, 4) for rank in range(3)])
+
+
+def test_launch_tpu_vllm_servers_slots_are_per_host(tpu_vllm):
+    replicas = [_single_host_replica(rank, 4, node) for rank, node in enumerate((NODE_A, NODE_B, NODE_A, NODE_B))]
+    envs = _launch_on_v7x_hosts(tpu_vllm, replicas)
+    assert [env["TPU_LOCAL_RANK_OFFSET"] for env in envs] == ["0", "0", "4", "4"]
+
+
+@pytest.mark.parametrize("pod_type, chips", [("v7x-8", 8), ("v7x-8", 1), ("v6e-8", 4)])
+def test_launch_tpu_vllm_servers_whole_host_and_other_replicas_are_unchanged(tpu_vllm, monkeypatch, pod_type, chips):
+    # A TP=8 replica owns its TPU 7x host; TP=1 (a standalone process opens only a chip's first core) and other
+    # generations are not sub-host engines either. Their server env is what it was before.
+    monkeypatch.delenv("TPU_ACCELERATOR_TYPE", raising=False)
+    replica = _single_host_replica(0, chips)
+    nodes = [{"Alive": True, "Resources": {"TPU": 8.0}, "NodeID": NODE_A, "Labels": {"ray.io/tpu-pod-type": pod_type}}]
+    platform = SimpleNamespace(ray_noset_envvars=lambda: [], rollout_env_vars=lambda: {})
+
+    async def run():
+        with (
+            mock.patch.object(tpu_vllm, "get_platform", return_value=platform),
+            mock.patch("ray.is_initialized", return_value=True),
+            mock.patch("ray.nodes", return_value=nodes),
+        ):
+            await tpu_vllm.launch_tpu_vllm_servers(replica)
+
+    asyncio.run(run())
+    [options] = replica.server_class.options_kwargs
+    topology = tpu_vllm.single_host_tpu_topology(chips, pod_type=pod_type)
+    assert options["runtime_env"] == {"env_vars": {"TPU_MULTIHOST_BACKEND": "mp", "TORCH_TPU_TOPOLOGY": topology}}
+    assert tpu_vllm._HOST_SLOTS == {}
+
+
+def test_host_slots_never_move_and_survive_restarts(tpu_vllm):
+    alloc = tpu_vllm.allocate_host_slot
+    # Forward and reverse arrival of two TP=4 engines: neither ever shares a slot.
+    assert [alloc("a", engine, 4, 8) for engine in ("r0", "r4")] == [0, 1]
+    assert [alloc("b", engine, 4, 8) for engine in ("r4", "r0")] == [0, 1]
+    # Out-of-order arrival of four TP=2 engines.
+    assert [alloc("c", engine, 2, 8) for engine in ("r12", "r4", "r8", "r0")] == [0, 1, 2, 3]
+    # A restarted engine (same name) gets its slot back without disturbing the others.
+    assert alloc("b", "r4", 4, 8) == 0 and alloc("b", "r0", 4, 8) == 1
+    # A full host rejects a third TP=4 engine; releasing one frees its slot for a replacement.
+    with pytest.raises(ValueError, match="no free slot"):
+        alloc("b", "r8", 4, 8)
+    tpu_vllm.release_host_slot("b", "r4")
+    assert alloc("b", "r8", 4, 8) == 0 and alloc("b", "r0", 4, 8) == 1
+    # Engines of different sizes cannot share a host, and a size must tile the host.
+    with pytest.raises(ValueError, match="already runs engines of 4 devices"):
+        alloc("b", "r9", 2, 8)
+    with pytest.raises(ValueError, match="do not tile"):
+        alloc("d", "r0", 3, 8)
+    tpu_vllm.reset_host_slots("b")
+    assert alloc("b", "r9", 2, 8) == 0
+    tpu_vllm.reset_host_slots()
+    assert tpu_vllm._HOST_SLOTS == {} and tpu_vllm._HOST_ENGINE_DEVICES == {}
+
+
+def test_subhost_port_base_is_configurable(tpu_vllm, monkeypatch):
+    monkeypatch.setenv(tpu_vllm.SUBHOST_PORT_BASE_ENV, "21000")
+    env = tpu_vllm.subhost_engine_env(slot=1, devices_per_engine=4, replica_rank=5)
+    assert env["MEGASCALE_COORDINATOR_ADDRESS"] == "127.0.0.1:21080"
+    assert env["MASTER_PORT"] == "21280"
+    assert env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == "localhost:21380,localhost:21381,localhost:21382,localhost:21383"
+
+
+# ---------------------------------------------------------------------------
 # patch_vllm_for_tpu (without vllm-torchtpu installed)
 # ---------------------------------------------------------------------------
 

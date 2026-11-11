@@ -15,6 +15,8 @@ and its multi-node layout, and changes only what TPU needs:
 * ``enable_sleep_mode=False``: vllm-torchtpu has no sleep mode.
 * With ``checkpoint_engine.backend=tpu-sync``, vLLM's workers load the tpu-sync worker extension
   (``tpu_sync_worker_extension.py``), which receives the trainer's weights over the network.
+* On TPU 7x, TP=2 and TP=4 replicas share their host with other replicas (e.g. 16 x TP=2 on four hosts):
+  each engine takes a slot of the host's devices and its own fixed ports (see ``subhost_engine_env``).
 
 The same logic previously lived behind ``get_resource_name() == "TPU"`` branches in verl's
 ``vllm_async_server.py`` and ``replica.py``.
@@ -22,15 +24,25 @@ The same logic previously lived behind ``get_resource_name() == "TPU"`` branches
 
 import asyncio
 import logging
+import os
 
 import ray
 
 from verl.plugin.platform import get_platform
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
-from verl_hardware_plugin.accelerators.tpu.platform_tpu import ray_tpu_accelerator_name, single_host_tpu_topology
+from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
+    TPU_V7X_DEVICES_PER_HOST,
+    TPU_V7X_SUBHOST_TOPOLOGY_MAP,
+    is_tpu_v7x,
+    ray_tpu_accelerator_name,
+    single_host_tpu_topology,
+)
 from verl_hardware_plugin.accelerators.tpu.profilers.tpu_vllm_timeline import vLLMServerTimelineMixin
-from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import patch_vllm_for_tpu
+from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import (
+    SUBHOST_MEGASCALE_PORT_ENV,
+    patch_vllm_for_tpu,
+)
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import TPU_SYNC_BACKEND, canonical_backend
 
 logger = logging.getLogger(__name__)
@@ -39,6 +51,98 @@ logger = logging.getLogger(__name__)
 TPU_SYNC_WORKER_EXTENSION_CLS = (
     "verl_hardware_plugin.accelerators.tpu.rollout.tpu_sync_worker_extension.vLLMTPUSyncWorkerExtension"
 )
+
+# Engines that share a host listen on fixed ports below Linux's ephemeral range (32768-60999). Otherwise
+# vllm-torchtpu draws MASTER_PORT and the slice-builder ports from that range with portpicker, which several engines
+# and Ray workers starting at once on one host can race for ("bind ... Address already in use"). The engine at
+# device offset ``o`` takes the block that starts at ``base + 20 * o``.
+SUBHOST_PORT_BASE_ENV = "VERL_TPU_ROLLOUT_SUBHOST_PORT_BASE"
+DEFAULT_SUBHOST_PORT_BASE = 19000
+_PORTS_PER_DEVICE = 20
+
+# {node id: {engine: slot}} and {node id: devices per engine} of the engines that share a host. Every replica of a
+# job is launched from this process (asyncio.gather), so the table sees all the engines of a host. A slot, once
+# given, never moves, whatever order the replicas arrive in, and an engine launched again under the same name (a
+# restarted replica) gets its slot back.
+_HOST_SLOTS: dict[str, dict[str, int]] = {}
+_HOST_ENGINE_DEVICES: dict[str, int] = {}
+
+
+def allocate_host_slot(node_id: str, engine: str, devices_per_engine: int, devices_per_host: int) -> int:
+    """The slot of ``engine`` on host ``node_id``: the one it holds, else the lowest free one.
+
+    Slot ``s`` holds the host's devices ``[s * devices_per_engine, (s + 1) * devices_per_engine)``.
+
+    Raises:
+        ValueError: if ``devices_per_engine`` does not divide the host, differs from the size of the engines
+            already on the host, or every slot of the host is taken.
+    """
+    if devices_per_engine <= 0 or devices_per_host % devices_per_engine:
+        raise ValueError(f"Engines of {devices_per_engine} devices do not tile a host of {devices_per_host} devices")
+    if _HOST_ENGINE_DEVICES.setdefault(node_id, devices_per_engine) != devices_per_engine:
+        raise ValueError(
+            f"Host {node_id} already runs engines of {_HOST_ENGINE_DEVICES[node_id]} devices; cannot add {engine!r} "
+            f"with {devices_per_engine}"
+        )
+    slots = _HOST_SLOTS.setdefault(node_id, {})
+    if engine not in slots:
+        free = sorted(set(range(devices_per_host // devices_per_engine)) - set(slots.values()))
+        if not free:
+            raise ValueError(
+                f"Host {node_id} has no free slot for {engine!r}: its {devices_per_host // devices_per_engine} "
+                f"slots of {devices_per_engine} devices are taken by {slots}"
+            )
+        slots[engine] = free[0]
+    return slots[engine]
+
+
+def release_host_slot(node_id: str, engine: str) -> None:
+    """Free the slot of ``engine`` on ``node_id``, e.g. for a replacement engine under another name."""
+    slots = _HOST_SLOTS.get(node_id, {})
+    slots.pop(engine, None)
+    if not slots:
+        reset_host_slots(node_id)
+
+
+def reset_host_slots(node_id: str | None = None) -> None:
+    """Forget the slots of ``node_id``, or of every host."""
+    if node_id is None:
+        _HOST_SLOTS.clear()
+        _HOST_ENGINE_DEVICES.clear()
+    else:
+        _HOST_SLOTS.pop(node_id, None)
+        _HOST_ENGINE_DEVICES.pop(node_id, None)
+
+
+def subhost_engine_env(slot: int, devices_per_engine: int, replica_rank: int) -> dict[str, str]:
+    """The environment of a vLLM engine in slot ``slot`` of a host it shares with other engines.
+
+    Everything here is per engine; the per-worker part (MegaScale ports, libtpu log dir) is set in each worker by
+    ``tpu_vllm_patches.patch_tpu_worker_subhost_env``, which ``SUBHOST_MEGASCALE_PORT_ENV`` switches on.
+    """
+    offset = slot * devices_per_engine
+    block = int(os.environ.get(SUBHOST_PORT_BASE_ENV, DEFAULT_SUBHOST_PORT_BASE)) + _PORTS_PER_DEVICE * offset
+    return {
+        # vllm-torchtpu binds worker r to device offset + r: TPU_LOCAL_RANK_OFFSET in its spawn-time worker binding,
+        # DEBUG_TPU_LOCAL_RANK_OFFSET where TPUWorker.init_device sets LOCAL_RANK. Neither is part of its compile
+        # cache key.
+        "TPU_LOCAL_RANK_OFFSET": str(offset),
+        "DEBUG_TPU_LOCAL_RANK_OFFSET": str(offset),
+        "ALLOW_MULTIPLE_LIBTPU_LOAD": "1",
+        # torch_tpu's rendezvous and slice builder on this engine's ports.
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": str(block + 200),
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(f"localhost:{block + 300 + r}" for r in range(devices_per_engine)),
+        # libtpu's MegaScale coordinator of this engine alone: the GKE TPU webhook's container-level value names the
+        # pod, so every engine in the container would share it.
+        "MEGASCALE_COORDINATOR_ADDRESS": f"127.0.0.1:{block}",
+        SUBHOST_MEGASCALE_PORT_ENV: str(block),
+        # Compile caches of their own: a cache keyed by the replica alone hands one TP size's executables to another
+        # ("local device count is 0" when a TP=8 engine loaded TP=4 executables).
+        "VLLM_CACHE_ROOT": f"/tmp/vllm_cache_tp{devices_per_engine}_r{replica_rank}",
+        "TORCHINDUCTOR_CACHE_DIR": f"/tmp/inductor_cache_tp{devices_per_engine}_r{replica_rank}",
+        "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": f"/tmp/tpu_tier3_tp{devices_per_engine}_r{replica_rank}",
+    }
 
 
 async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
@@ -70,6 +174,7 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
         # vllm-torchtpu's default; set so that a job-level value cannot switch the replica to the Ray backend.
         "TPU_MULTIHOST_BACKEND": "mp",
     }
+    shares_host = False
     if replica.nnodes == 1:
         # A replica on one host (e.g. one of several replicas on a multi-host rollout slice) is its own mesh; it
         # must not inherit the slice's TORCH_TPU_TOPOLOGY. Multi-host replicas get theirs from vllm-torchtpu's
@@ -87,6 +192,9 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
                 chips_per_host,
                 pod_type,
             )
+        # Such a replica uses part of its host and shares it with other replicas (auto_assign_accelerator_type
+        # spreads them over the rollout slices), so it takes a slot of the host's devices and ports of its own.
+        shares_host = is_tpu_v7x(pod_type) and chips_per_host in TPU_V7X_SUBHOST_TOPOLOGY_MAP
     prefix = replica._get_server_name_prefix()
     for node_rank, node_id in enumerate(node_ids):
         if replica.is_reward_model:
@@ -95,12 +203,24 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
             name = f"{prefix}server_teacher_{replica.replica_rank}_{node_rank}{replica.name_suffix}"
         else:
             name = f"{prefix}server_{replica.replica_rank}_{node_rank}{replica.name_suffix}"
+        server_env_vars = env_vars
+        if shares_host:
+            slot = allocate_host_slot(node_id, name, chips_per_host, TPU_V7X_DEVICES_PER_HOST)
+            server_env_vars = {**env_vars, **subhost_engine_env(slot, chips_per_host, replica.replica_rank)}
+            logger.info(
+                "Rollout engine %s takes slot %d (devices %d-%d) of host %s",
+                name,
+                slot,
+                slot * chips_per_host,
+                (slot + 1) * chips_per_host - 1,
+                node_id,
+            )
         server = replica.server_class.options(
             scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                 node_id=node_id,
                 soft=False,
             ),
-            runtime_env={"env_vars": env_vars},
+            runtime_env={"env_vars": server_env_vars},
             name=name,
             max_concurrency=replica.config.ray_actor_max_concurrency,
         ).remote(
