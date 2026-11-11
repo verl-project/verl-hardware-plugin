@@ -10,10 +10,12 @@ tiny dense checkpoint, mocked device side). Requests go through the trainer work
 plugin's registration adds to verl's ``ActorRolloutRefWorker`` (``generate`` / ``abort_all_requests`` /
 ``resume_generation`` / ``inproc_server_info``), into verl's own server code on the in-process adapter and its pump.
 
-Case (env ``INPROC_TEST_CASE``, JSON): ``{"model_dir", "mode": "serve" | "lazy"}``. ``lazy``: three waves of
-concurrent requests, the self-check re-armed after each as every weight sync does; every final ``RequestOutput`` the
-pump hands to a request and every ``TokenOutput`` verl returns, recorded canonically (each float as its 8 bytes), and
-the lazy output path's window counts per wave. Prints one line ``RESULT <json>``.
+Case (env ``INPROC_TEST_CASE``, JSON): ``{"model_dir", "mode": "serve" | "lazy" | "timeline"}``. ``lazy``: three
+waves of concurrent requests, the self-check re-armed after each as every weight sync does; every final
+``RequestOutput`` the pump hands to a request and every ``TokenOutput`` verl returns, recorded canonically (each float
+as its 8 bytes), and the lazy output path's window counts per wave. ``timeline`` (``VERL_TPU_TIMELINE=1``):
+concurrent requests and the timeline records the server writes (its request spans and the replica record), with the
+first-token watch's counts. Prints one line ``RESULT <json>``.
 """
 
 from __future__ import annotations
@@ -248,7 +250,30 @@ def main_lazy(case: dict) -> dict:
     return out
 
 
-MODES = {"serve": main_serve, "lazy": main_lazy}
+def main_timeline(case: dict) -> dict:
+    from verl_hardware_plugin.accelerators.tpu.profilers import timeline
+
+    events: list = []
+    timeline._write = events.append  # the records the server writes (test: kept in memory)
+    r, wk, W, cap = build(case)
+    lengths = [30 + 10 * i for i in range(12)] + [1]
+
+    async def wave():
+        outs = await asyncio.gather(
+            *[W.generate(wk, prompt_of(i), params(i, n), f"t-{i}") for i, n in enumerate(lengths)]
+        )
+        return [len(o.token_ids) for o in outs]
+
+    out: dict = {"lengths": asyncio.run(wave())}
+    fw = r.engine.first_watch
+    out["watch"] = {"sink_set": fw.sink is not None, "stamped": fw.stamped, "late": fw.late, "pending": len(fw.pending)}
+    out["lazy_installed"] = bool(getattr(r.server._inproc_lazy, "installed", False))
+    out["spans"] = [e for e in events if e.get("name") == "request"]
+    out["replica"] = [e for e in events if e.get("name") == "rollout_replica"]
+    return out
+
+
+MODES = {"serve": main_serve, "lazy": main_lazy, "timeline": main_timeline}
 
 
 if __name__ == "__main__":
