@@ -279,9 +279,11 @@ def test_launch_tpu_vllm_servers_rejects_data_parallel(tpu_vllm):
         ("v7x-8", 8, "2,2,1,2"),
         ("v6e-8", 8, "2,4,1"),
         ("v5p-16", 4, "2,2,1"),
-        # TP=2 / TP=4 on TPU 7x: no known sub-host mesh, so the replica keeps the inherited value instead of failing.
-        ("v7x-8", 2, None),
-        ("v7x-8", 4, None),
+        # TP=2 / TP=4 on TPU 7x: the mesh of the replica's one or two chips.
+        ("v7x-8", 2, "1,1,1,2"),
+        ("v7x-8", 4, "1,2,1,2"),
+        # No known mesh: the replica keeps the inherited value instead of failing.
+        ("v7x-8", 6, None),
     ],
 )
 def test_launch_tpu_vllm_servers_single_host_topology_from_ray(tpu_vllm, monkeypatch, pod_type, chips, topology):

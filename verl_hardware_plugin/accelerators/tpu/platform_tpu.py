@@ -101,8 +101,8 @@ TPU_SINGLE_HOST_MAX_CHIPS = 4
 # (``gke_tpu_slice_topology``); this table covers a pool that uses part of a slice, keyed by device count:
 # a host holds 4 chips (``2x2x1``) = 8 devices, and the multi-host entries follow the GKE slice shapes
 # (``2x2x2`` = 2 hosts, ``2x2x4`` = 4, ``2x4x4`` = 8, ``4x4x4`` = 16). Only whole hosts (and a single
-# device) are listed: a standalone process can open only a chip's first core, so sub-host meshes have
-# no validated layout.
+# device) are listed: a standalone process can open only a chip's first core. Rollout engines that use part
+# of a host take ``TPU_V7X_SUBHOST_TOPOLOGY_MAP`` instead (see ``single_host_tpu_topology``).
 TPU_V7X_CORES_PER_CHIP = 2
 TPU_V7X_DEVICES_PER_HOST = 8
 TPU_V7X_TOPOLOGY_MAP = {
@@ -112,6 +112,14 @@ TPU_V7X_TOPOLOGY_MAP = {
     32: "2,2,4,2",
     64: "2,4,4,2",
     128: "4,4,4,2",
+}
+# The mesh of a rollout engine on part of one TPU 7x host, one process per TensorCore: TP=2 is one chip
+# (``1,1,1,2``), TP=4 two chips (``1,2,1,2``). Validated on ``2x2x1`` hosts running four TP=2 or two TP=4
+# vLLM engines side by side (tpu_dist init and all-reduce, then GRPO training). Only the single-host rollout
+# uses it; a trainer pool of 2 or 4 devices is not validated and still needs ``TORCH_TPU_TOPOLOGY``.
+TPU_V7X_SUBHOST_TOPOLOGY_MAP = {
+    2: "1,1,1,2",
+    4: "1,2,1,2",
 }
 # One process per TensorCore: every process is a ``1,1,1,1`` cell of the mesh.
 TPU_V7X_PROCESS_BOUNDS = "1,1,1,1"
@@ -281,12 +289,13 @@ def single_host_tpu_topology(num_chips: int, pod_type: str = "") -> str:
 
     Such a replica must not inherit the slice's ``TORCH_TPU_TOPOLOGY`` (set by the GKE TPU webhook or the job):
     vllm-torchtpu builds the slice-builder addresses of its local workers only, and libtpu then fails with
-    "Expected <slice chips> worker addresses, got <host chips>". Sizes without a known mesh (e.g. 2 or 4 TPU 7x
-    devices, a TP=2 / TP=4 replica: ``TPU_V7X_TOPOLOGY_MAP`` lists whole hosts only) return ``""`` so that the
+    "Expected <slice chips> worker addresses, got <host chips>". On TPU 7x a TP=2 / TP=4 replica, which uses part
+    of a host, takes ``TPU_V7X_SUBHOST_TOPOLOGY_MAP``. Sizes without a known mesh return ``""`` so that the
     caller keeps the inherited environment rather than failing.
     """
-    topology_map = TPU_V7X_TOPOLOGY_MAP if is_tpu_v7x(pod_type) else DEFAULT_TPU_TOPOLOGY_MAP
-    return topology_map.get(num_chips, "")
+    if is_tpu_v7x(pod_type):
+        return TPU_V7X_TOPOLOGY_MAP.get(num_chips) or TPU_V7X_SUBHOST_TOPOLOGY_MAP.get(num_chips, "")
+    return DEFAULT_TPU_TOPOLOGY_MAP.get(num_chips, "")
 
 
 def resolve_tpu_topology_bounds(
@@ -563,6 +572,7 @@ class PlatformTPU(PlatformBase):
         # torch.tpu itself is left untouched; the proxy adds what verl needs (see TPUDeviceModuleProxy).
         self._device_module = TPUDeviceModuleProxy(original_tpu)
         self._claimed_slices: set[str] = set()
+        self._shared_slice_pools = 0
 
     @property
     def vendor_name(self) -> str:
@@ -697,7 +707,9 @@ class PlatformTPU(PlatformBase):
         A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per slice. Without
         an affinity label a pool can straddle two slices, which the TPU mesh cannot span. Each pool
         gets the first slice that no earlier pool claimed, so the trainer and rollout pools land on
-        different slices; once every slice is claimed, further pools share the last one.
+        different slices. Once every slice is claimed, further pools (e.g. the 5th to 8th of eight TP=4
+        rollout replicas on four single-host rollout slices) go round-robin over the slices after the
+        first, which holds the first pool (the trainer's); with a single slice they share it.
         """
         if accelerator_type is not None:
             return accelerator_type
@@ -722,7 +734,12 @@ class PlatformTPU(PlatformBase):
                         self._claimed_slices.add(tpu_slice)
                         return tpu_slice
                 if slices:
-                    return slices[-1]
+                    # Stacking the remaining pools on one slice would ask it for more chips than it has, and
+                    # their placement groups would never be scheduled.
+                    shared = slices[1:] or slices
+                    tpu_slice = shared[self._shared_slice_pools % len(shared)]
+                    self._shared_slice_pools += 1
+                    return tpu_slice
         except Exception as e:
             logger.debug("Could not auto-assign a TPU slice for %r: %s", name_prefix, e)
 
