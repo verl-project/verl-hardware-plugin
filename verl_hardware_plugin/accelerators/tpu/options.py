@@ -408,8 +408,9 @@ class TPUSyncOptions:
         return_after_d2h: Return to the trainer as soon as its weights are copied to host memory, and finish the sync
             (the transfer to the rollout hosts, the install and the resume) in the background while training goes on.
             The next sync waits for it first. Applies from the second sync on and needs a ``tpu-sync-torch`` whose
-            ``WeightSynchronizer.d2h()`` returns a future. Off by default: it relies on verl waiting for a pending
-            update (``CheckpointEngineManager.wait_for_weight_update``) before validation and at the end of training.
+            ``WeightSynchronizer.d2h()`` returns a future (verl#8626); with an older ``tpu-sync-torch`` the sync runs
+            to the end as before. Relies on ``CheckpointEngineManager.wait_for_weight_update`` (verl#8530) before
+            validation and at the end of training.
         receive_into_vllm: The rollout receives every tensor straight into vLLM's parameters, with no HBM staging
             copy. The trainer exports its weights in vLLM's layout (fused, transposed, one virtual tensor per vLLM
             parameter), so each rollout rank's TP slice is its vLLM weight. Dense models with FSDP degree equal to
@@ -420,7 +421,7 @@ class TPUSyncOptions:
     verify_parity: str = "off"
     release_buffers_after_sync: bool = True
     tie_word_embeddings: Optional[bool] = None
-    return_after_d2h: bool = False
+    return_after_d2h: bool = True
     receive_into_vllm: bool = False
 
     @property

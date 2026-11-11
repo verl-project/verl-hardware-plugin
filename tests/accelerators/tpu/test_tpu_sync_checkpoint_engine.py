@@ -1079,8 +1079,10 @@ def test_update_tpu_sync_weights_end_to_end(fake_tpu_sync, worker_ext, caplog, t
     with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
         metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
     # The rollout keeps generating through the trainer send, the rollout init and the transfer, and is paused only
-    # for the install (whose H2D may write vLLM's parameters).
+    # for the install (whose H2D may write vLLM's parameters). return_after_d2h is on by default, so from step 1 on
+    # the driver enables set_stage_d2h (no-op here because the fake d2h() returns None unless enable_d2h_future is set).
     assert events == [
+        "set_stage_d2h",
         "update_weights",
         "init_tpu_sync_on_worker",
         "release_sync_buffers",
@@ -1617,7 +1619,8 @@ def _return_after_d2h_setup(worker_ext, **engine_kwargs):
 
 def test_return_after_d2h_finishes_the_sync_in_the_background(fake_tpu_sync, worker_ext, monkeypatch):
     fake_tpu_sync.enable_d2h_future(monkeypatch)
-    weights, engines, models, events, manager, server, tp = _return_after_d2h_setup(worker_ext, return_after_d2h=True)
+    # On by default: omit return_after_d2h here so the default is exercised.
+    weights, engines, models, events, manager, server, tp = _return_after_d2h_setup(worker_ext)
 
     # Step 0: the first transfer to this rollout keeps the trainer weights bound (tpu-sync may re-stage them).
     metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
