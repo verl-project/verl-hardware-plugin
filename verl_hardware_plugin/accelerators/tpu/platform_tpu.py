@@ -590,10 +590,9 @@ class PlatformTPU(PlatformBase):
         # torch.tpu itself is left untouched; the proxy adds what verl needs (see TPUDeviceModuleProxy).
         self._device_module = TPUDeviceModuleProxy(original_tpu)
         self._claimed_slices: set[str] = set()
-        # Per rollout replica kind (see rollout_replica_kind): the slices its replicas claimed, and how many of its
-        # replicas have been spread over them once every slice was claimed.
-        self._rollout_slices: dict[str, list[str]] = {}
-        self._shared_slice_pools: dict[str, int] = {}
+        # Per rollout replica kind (see rollout_replica_kind): {slice: replicas placed on it} for the slices its
+        # replicas claimed, in claim order.
+        self._rollout_slices: dict[str, dict[str, int]] = {}
 
     @property
     def vendor_name(self) -> str:
@@ -729,11 +728,15 @@ class PlatformTPU(PlatformBase):
         an affinity label a pool can straddle two slices, which the TPU mesh cannot span. Each pool
         gets the first slice that no earlier pool claimed, so the trainer and rollout pools land on
         different slices. Once every slice is claimed, the pool of a rollout replica (e.g. the 5th to 8th
-        of eight TP=4 replicas on four single-host rollout slices) goes round-robin over the slices that
-        replicas of its own kind (policy, reward or teacher; ``rollout_replica_kind``) claimed. It never
-        lands on a slice that a dedicated pool (the trainer's ``global_pool``, ``reward_pool``,
-        ``teacher_pool``) or a replica of another kind holds. Other pools, and rollout replicas whose
-        kind holds no slice, share the last slice.
+        of eight TP=4 replicas on four single-host rollout slices) goes to the least loaded of the slices
+        that replicas of its own kind (policy, reward or teacher; ``rollout_replica_kind``) claimed: the
+        one with the fewest of those replicas per TPU device, the first claimed on a tie. On equal slices
+        that is round-robin; a 2-host slice takes twice the replicas of a 1-host one. This assumes that
+        every replica of a kind asks for the same number of devices (the pool name carries no demand),
+        which holds for verl's rollout replicas of one model. A replica never lands on a slice that a
+        dedicated pool (the trainer's ``global_pool``, ``reward_pool``, ``teacher_pool``) or a replica of
+        another kind holds. Other pools, and rollout replicas whose kind holds no slice, share the last
+        slice.
         """
         if accelerator_type is not None:
             return accelerator_type
@@ -741,11 +744,15 @@ class PlatformTPU(PlatformBase):
         try:
             if ray.is_initialized():
                 tpu_slices = set()
+                # TPU devices per slice: the "TPU" resource of its alive hosts, which placement-group bundles ask for.
+                slice_devices: dict[str, float] = {}
                 for node in ray.nodes():
                     if node.get("Alive"):
-                        for res in node.get("Resources", {}):
+                        resources = node.get("Resources", {})
+                        for res in resources:
                             if res.startswith("tpu-group-"):
                                 tpu_slices.add(res)
+                                slice_devices[res] = slice_devices.get(res, 0.0) + float(resources.get("TPU", 0.0))
                 slices = sorted(
                     tpu_slices,
                     key=lambda s: (
@@ -758,15 +765,16 @@ class PlatformTPU(PlatformBase):
                     if tpu_slice not in self._claimed_slices:
                         self._claimed_slices.add(tpu_slice)
                         if kind is not None:
-                            self._rollout_slices.setdefault(kind, []).append(tpu_slice)
+                            self._rollout_slices.setdefault(kind, {})[tpu_slice] = 1
                         return tpu_slice
-                own_slices = [s for s in self._rollout_slices.get(kind, []) if s in tpu_slices]
-                if kind is not None and own_slices:
-                    # Stacking the remaining replicas on one slice would ask it for more chips than it has, and
-                    # their placement groups would never be scheduled.
-                    shared = self._shared_slice_pools.get(kind, 0)
-                    self._shared_slice_pools[kind] = shared + 1
-                    return own_slices[shared % len(own_slices)]
+                if kind is not None:
+                    own_slices = {s: n for s, n in self._rollout_slices.get(kind, {}).items() if s in tpu_slices}
+                    if own_slices:
+                        # Stacking the remaining replicas on one slice would ask it for more devices than it has,
+                        # and their placement groups would never be scheduled. min() keeps the first claimed on a tie.
+                        tpu_slice = min(own_slices, key=lambda s: own_slices[s] / (slice_devices.get(s) or 1.0))
+                        self._rollout_slices[kind][tpu_slice] += 1
+                        return tpu_slice
                 if slices:
                     return slices[-1]
         except Exception as e:
