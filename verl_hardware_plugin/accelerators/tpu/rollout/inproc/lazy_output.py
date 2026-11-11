@@ -82,6 +82,7 @@ class LazyFinalOutputs:
         self.enabled = lazy_output_enabled(environ)
         self.installed = False
         self.why_not: Optional[str] = None
+        self.first_watch: Any = None  # the engine's FirstTokenWatch: first tokens are found in this loop
         self.verify_left = 0
         self.verify_rows = LAZY_VERIFY_ROWS
         self.mismatch: Optional[str] = None
@@ -132,8 +133,12 @@ class LazyFinalOutputs:
         self, engine_core_outputs, engine_core_timestamp=None, iteration_stats=None, weight_version=None
     ):
         states = self.proc.request_states
+        fw = self.first_watch
+        fpend = fw.pending if fw is not None else None
         if iteration_stats is not None:  # vLLM's stats on: every output its own way, each request's deferred rows first
             for o in engine_core_outputs:
+                if fpend and o.new_token_ids and o.request_id in fpend:
+                    fw.hits.append(fpend.pop(o.request_id))
                 st = states.get(o.request_id)
                 if st is not None and _LAZY_Q in st.__dict__:
                     self._flush(st)
@@ -145,6 +150,8 @@ class LazyFinalOutputs:
         for o in engine_core_outputs:
             rid = o.request_id
             toks = o.new_token_ids
+            if fpend and toks and rid in fpend:  # the first-token watch, on this output (no separate scan)
+                fw.hits.append(fpend.pop(rid))
             st = states.get(rid)
             if st is None:
                 continue  # an output of an already-aborted request: vLLM ignores it too

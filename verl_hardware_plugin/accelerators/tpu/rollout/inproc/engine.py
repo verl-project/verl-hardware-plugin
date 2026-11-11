@@ -20,7 +20,7 @@ import os
 import time
 from collections.abc import Mapping
 from types import SimpleNamespace
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc import compat
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.boundary import (
@@ -67,13 +67,68 @@ def _aborted_output(external_id: str) -> Any:
     )
 
 
+class FirstTokenWatch:
+    """Each request's first-token time for the timeline's ``request`` span.
+
+    The adapter's ``add_request`` sets FINAL_ONLY output (one RequestOutput per request, at the end), so the timeline
+    mixin's output hook sees only the final output and would record first == the end of the request. Instead, the
+    engine step that emits a request's first new token reports it here (:meth:`scan`, on the step's
+    ``EngineCoreOutput``s: the lazy output loop, else a scan-only wrapper of ``process_outputs``), and the pump, right
+    after that ``engine.step()`` returns and before it resolves the step's finished outputs, writes one wall-clock
+    stamp per such request into ``sink`` (the mixin's first-output dict) with ``setdefault``. Armed only while ``sink``
+    is set (the timeline is on); a request leaves the watch at its first token, abort, a step failure, or its final
+    output."""
+
+    __slots__ = ("pending", "hits", "sink", "stamped", "late")
+
+    def __init__(self):
+        self.pending: dict = {}  # vLLM's internal request id -> the caller's request id, until the first token
+        self.hits: list = []  # caller request ids whose first token the current engine step emitted
+        self.sink: Optional[dict] = None  # the timeline mixin's first-output dict while the timeline is on
+        self.stamped = 0
+        self.late = 0  # first tokens of requests no longer in flight (aborted)
+
+    def scan(self, outputs: Iterable) -> None:
+        """The engine step's per-request outputs: a pending request with new tokens emitted its first one."""
+        pend = self.pending
+        if not pend:
+            return
+        for o in outputs:
+            rid = getattr(o, "request_id", None)
+            if rid in pend and getattr(o, "new_token_ids", None):
+                self.hits.append(pend.pop(rid))
+
+    def forget(self, internal_ids: Iterable) -> None:
+        for rid in internal_ids:
+            self.pending.pop(rid, None)
+
+
+def scan_first_tokens(eng: Any, watch: FirstTokenWatch) -> bool:
+    """With the lazy output path off: a scan-only wrapper on the output processor's ``process_outputs`` that reports
+    first tokens to ``watch`` (one truthiness test per step while no request awaits its first token). False when the
+    engine has no output processor to wrap."""
+    proc = getattr(eng, "output_processor", None)
+    orig = getattr(proc, "process_outputs", None)
+    if proc is None or not callable(orig):
+        return False
+
+    def process_outputs(*a, **k):
+        if watch.pending:  # engine_core_outputs: vLLM's first positional parameter
+            watch.scan(a[0] if a else (k.get("engine_core_outputs") or ()))
+        return orig(*a, **k)
+
+    proc.process_outputs = process_outputs
+    return True
+
+
 class InProcAsyncEngine:
     """``AsyncLLM``'s surface that ``vLLMHttpServer`` uses, over a synchronous in-process engine.
 
     ``add_request`` registers the request in the engine (FINAL_ONLY output: one RequestOutput per request, at the end,
     the same final value AsyncLLM's cumulative stream ends with) and starts the stepping pump if it is not running.
     The pump runs on the caller's event loop: one ``engine.step()`` per iteration inside the engine scope, finished
-    outputs resolved, then ``await asyncio.sleep(0)`` so new requests and RPCs get the loop between steps.
+    outputs resolved, then ``await asyncio.sleep(0)`` so new requests and RPCs get the loop between steps. With the
+    timeline on, the pump also stamps each request's first-token time (:class:`FirstTokenWatch`).
     """
 
     def __init__(self, engine: Any, rank: int):
@@ -94,6 +149,7 @@ class InProcAsyncEngine:
         self.window_failed = 0
         self.warm = False  # set at the end of the build: the pump then samples its audit-only checks
         self.lazy: Optional[LazyFinalOutputs] = None  # the lazy final-only output path (set by the build)
+        self.first_watch = FirstTokenWatch()  # armed by the in-process server's launch_server (timeline on)
 
     async def add_request(
         self, request_id, prompt, sampling_params, lora_request=None, priority=0, data_parallel_rank=None, **_
@@ -111,11 +167,29 @@ class InProcAsyncEngine:
             )
         col = _Collector(internal if isinstance(internal, str) else request_id, request_id, loop)
         self._collectors[request_id] = col
+        if self.first_watch.sink is not None:  # the timeline is on: stamp this request's first token
+            self.first_watch.pending[col.request_id] = request_id
         if self._pump_task is None or self._pump_task.done():
             self._pump_task = loop.create_task(self._pump())
         return col
 
+    def _stamp_first_tokens(self) -> None:
+        """The first-token stamps of the engine step that just returned: one wall-clock time for all, into the
+        timeline mixin's first-output dict (setdefault), for the requests still in flight; called before the step's
+        finished outputs are resolved, so a request whose first token is also its last gets the same stamp."""
+        w = self.first_watch
+        t = time.time()
+        sink, cols = w.sink, self._collectors
+        for ext in w.hits:
+            if sink is not None and ext in cols:
+                sink.setdefault(ext, t)
+                w.stamped += 1
+            else:
+                w.late += 1
+        w.hits.clear()
+
     async def _pump(self) -> None:
+        fw = self.first_watch
         lean = self.warm
         k = 0
         GC_DEFER.enter()
@@ -130,11 +204,15 @@ class InProcAsyncEngine:
                 self.steps += 1
                 if RECOMPILES.tripped is not None:  # the recompile guard tripped in this step's compile: fail closed
                     RECOMPILES.check()
+                if fw.hits:  # before the finished outputs below wake their consumers
+                    self._stamp_first_tokens()
                 for out in outs:
                     if getattr(out, "finished", False):
                         col = self._collectors.pop(out.request_id, None)
                         if col is not None:
                             col.put(out)
+                            if fw.pending:  # a finished request leaves the watch even without a first token seen
+                                fw.pending.pop(col.request_id, None)
                 await asyncio.sleep(0)
         except BaseException as e:  # noqa: BLE001 - fail every waiting request instead of hanging it
             self._error = e
@@ -147,6 +225,8 @@ class InProcAsyncEngine:
             self.failed += nfail
             self.window_failed += nfail
             self._collectors.clear()
+            fw.pending.clear()
+            fw.hits.clear()
             raise
         finally:
             GC_DEFER.exit()
@@ -174,6 +254,7 @@ class InProcAsyncEngine:
         self.window_aborted += len(cols)
         for col in cols:
             self._collectors.pop(col.external_id, None)
+            self.first_watch.forget((col.request_id,))
             col.put(_aborted_output(col.external_id))
 
     async def pause_generation(self, mode: str = "abort", clear_cache: bool = True, **_) -> None:
@@ -184,6 +265,7 @@ class InProcAsyncEngine:
                 self._engine.abort_request([c.request_id for c in cols], internal=True)
             self.aborted += len(cols)
             self.window_aborted += len(cols)
+            self.first_watch.forget(c.request_id for c in cols)
             for col in cols:
                 self._collectors.pop(col.external_id, None)
                 col.put(_aborted_output(col.external_id))
@@ -257,11 +339,27 @@ def make_server(
             self._inproc_build(args)
 
         async def launch_server(self, *args, **kwargs):
-            # verl's vLLMHttpServer.launch_server (its CLI arguments; run_server above builds the engine), without
-            # the timeline mixin's sampler thread
+            # verl's vLLMHttpServer.launch_server (its CLI arguments; run_server above builds the engine), then the
+            # timeline mixin's request hooks and replica record, without its device-memory sampler thread (the
+            # trainer's own sampler already polls every chip of the host)
             from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+            from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 
-            return await vLLMHttpServer.launch_server(self, *args, **kwargs)
+            result = await vLLMHttpServer.launch_server(self, *args, **kwargs)
+            if timeline.enabled() and getattr(self, "engine", None) is not None:
+                self._tl_install_engine_hooks()
+                fw = getattr(self.engine, "first_watch", None)
+                if fw is not None and isinstance(getattr(self, "_tl_first", None), dict):
+                    fw.sink = self._tl_first
+                timeline.meta(
+                    "rollout_replica",
+                    group=self._tl_group(),
+                    max_num_seqs=getattr(self.config, "max_num_seqs", None),
+                    tp=1,
+                    nnodes=1,
+                    host=f"inproc-rank{self._inproc_rank}",
+                )
+            return result
 
     from verl.workers.rollout.replica import RolloutMode
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
@@ -364,6 +462,11 @@ def _build_engine_into(srv: Any, args: Any) -> None:
     srv._inproc_lazy.arm_verify()
     srv.engine = InProcAsyncEngine(eng, srv._inproc_rank)
     srv.engine.lazy = srv._inproc_lazy
+    # where the engine step reports first tokens: inside the lazy output loop, else a scan-only process_outputs wrapper
+    if srv._inproc_lazy.installed:
+        srv._inproc_lazy.first_watch = srv.engine.first_watch
+    else:
+        scan_first_tokens(eng, srv.engine.first_watch)
 
 
 def preinit_vllm_parallel_state(local_rank: int = 0) -> dict:
