@@ -42,7 +42,9 @@ from verl_hardware_plugin.accelerators.tpu.rollout.inproc.common import (
     warn,
 )
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.compile_guard import (
+    CALL_PINS,
     LOGITS_AT_LOAD,
+    RECOMPILES,
     install_call_pins_and_watch,
 )
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.engine import (
@@ -145,6 +147,11 @@ class TPUInProcRollout(BaseRollout):
                 "shares the device memory with the trainer, so its KV budget is explicit"
             )
         self.kv_bytes = kv
+        # the recompile accounting before anything of the engine compiles; an armed guard without its hook refuses
+        if not RECOMPILES.install() and RECOMPILES.armed:
+            raise RuntimeError(
+                f"the recompile guard cannot be installed ({RECOMPILES.unavailable}): refusing to build without it"
+            )
         self._check_runtime_up()
         self._patch_vllm_in_process()
         install_call_pins_and_watch()
@@ -189,9 +196,21 @@ class TPUInProcRollout(BaseRollout):
         self._mark_warm()
 
     def _mark_warm(self) -> None:
-        """The build is over: the warm-up baselines every later engine call is held to."""
+        """The build is over: the warm-up baselines every later engine call is held to (the recompile guard is armed
+        from here on), logged in the warm-up line."""
+        guard = RECOMPILES.mark_warm(self.rank)
+        entries = guard.pop("entries")
+        pins = CALL_PINS.mark_warm()
         snapshot_engine_global_state()
         self.engine.warm = True
+        warm = {
+            "guard": {k: guard[k] for k in ("installed", "armed", "guard_n", "fresh_mode", "shape_rule")},
+            "entries": entries,
+            "fresh_before_warm": guard["fresh_before_warm"],
+            "resets_before_warm": guard["resets_before_warm"],
+            "pins": {k: pins[k] for k in ("pinned_functions", "required_missing", "runner_loaded", "frozen")},
+        }
+        log(f"warm-up rank {self.rank}: {json.dumps(warm, sort_keys=True, default=str)}")
 
     def _build(self) -> None:
         """verl's init_model on every trainer rank. The same two agreements on every path (:func:`all_ranks_ok`), so a
@@ -453,8 +472,10 @@ class TPUInProcRollout(BaseRollout):
         return None
 
     def _health_record(self, step: int, window: dict) -> dict:
-        """The per-sync health line: the device-thread and collective invariants and the rollout window."""
+        """The per-sync health line: the recompile record, the device-thread and collective invariants and the rollout
+        window."""
         return {
+            "compile": RECOMPILES.compile_record(),
             "threads": {
                 "device_threads": len(DEVICE_THREADS.counts),
                 "collectives_world_gt1": sum(COLLECTIVES.big.values()),
@@ -697,7 +718,7 @@ class TPUInProcRollout(BaseRollout):
                 warn(f"rank {self.rank} step {step}: {stale} (reported: {INTEGRITY_ENV}=report)")
         health = self._health_record(step, window)
         log(f"health step {step} rank {self.rank}: {json.dumps(health, sort_keys=True, default=str)}")
-        problems = self._sync_problems()
+        problems = self._sync_problems(health)
         if problems:
             raise RuntimeError(f"rank {self.rank}: " + "; ".join(problems))
         if integrity:  # after every line of this sync is out (the evidence)
@@ -716,14 +737,22 @@ class TPUInProcRollout(BaseRollout):
         else:
             self._gc_rss_guard(step)
 
-    def _sync_problems(self) -> list:
+    def _sync_problems(self, health: dict) -> list:
         """The invariants every sync re-checks (fatal): device work on one thread, no world-group collective during
-        engine steps."""
+        engine steps, the recompile guard not tripped and no engine cache entry that no compile hook accounts for."""
         problems = []
         if not DEVICE_THREADS.single():
             problems.append(f"device work ran on more than one thread: {dict(DEVICE_THREADS.counts)}")
         if sum(COLLECTIVES.big.values()):
             problems.append(f"vLLM world-group collectives during engine steps: {dict(COLLECTIVES.big)}")
+        if RECOMPILES.tripped is not None:
+            problems.append(RECOMPILES.tripped)
+        unaccounted = (health.get("compile") or {}).get("unaccounted") or {}
+        if unaccounted and RECOMPILES.armed:
+            problems.append(
+                f"RECOMPILE GUARD rank {self.rank}: engine cache entries no recompile / fresh-compile hook accounts "
+                f"for {unaccounted}"
+            )
         return problems
 
     def _gc_rss_guard(self, step: int) -> Optional[float]:

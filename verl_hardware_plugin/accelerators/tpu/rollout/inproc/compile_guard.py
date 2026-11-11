@@ -12,22 +12,36 @@ from failing:
   runner's required functions are pinned);
 * :class:`GradFlipWatch` puts grad mode back off when a garbage collection inside an engine call flips it;
 * :class:`LogitsAtLoad` installs verl's sampling mask on the vLLM model at model load, before anything compiles, and
-  freezes verl's ``monkey_patch_model`` RPC afterwards (a mask set after the precompile recompiles every bucket).
+  freezes verl's ``monkey_patch_model`` RPC afterwards (a mask set after the precompile recompiles every bucket);
+* :class:`RecompileLedger` counts every recompile and fails the run closed when an engine function recompiles after
+  warm-up beyond what its precompiled grid allows.
 """
 
 from __future__ import annotations
 
 import functools
+import inspect
+import json
 import os
+import re
 import sys
+import traceback
 import types
 import weakref
+from collections import Counter
+from collections.abc import Mapping
 from typing import Any, Callable, Optional
 
 import torch
 
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.boundary import _SET_GRAD, ENGINE_TLS
-from verl_hardware_plugin.accelerators.tpu.rollout.inproc.common import dist_rank_world, warn
+from verl_hardware_plugin.accelerators.tpu.rollout.inproc.common import (
+    dist_rank_world,
+    log,
+    register_switch,
+    register_switch_check,
+    warn,
+)
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.compat import RUNNER_MOD
 
 # A dynamo-compiled code object is the engine's when its file lies under one of these.
@@ -86,9 +100,12 @@ def engine_cache_entries() -> dict:
 
 
 def guard_trip(what: str) -> str:
-    """The recompile guard's marker line for a cause outside dynamo's recompile accounting; returns the line (the
-    caller raises)."""
-    line = f"RECOMPILE GUARD rank {dist_rank_world()[0]}: {what}"
+    """The recompile guard's marker line for a cause outside dynamo's recompile accounting, kept as the guard's trip
+    when it is armed; returns the line (the caller raises)."""
+    r = RECOMPILES
+    line = f"RECOMPILE GUARD rank {r.rank if r.rank >= 0 else dist_rank_world()[0]}: {what}"
+    if r.armed and r.tripped is None:
+        r.tripped = line
     warn(line)
     return line
 
@@ -495,3 +512,381 @@ class LogitsAtLoad:
 
 
 LOGITS_AT_LOAD = LogitsAtLoad()
+
+
+# ------------------------------------------------------------------------------------------------ the recompile guard
+
+RECOMPILE_GUARD_ENV = register_switch("VERL_TPU_INPROC_RECOMPILE_GUARD")  # "fatal" (default) | "report"
+RECOMPILE_GUARD_N = 8  # an engine function recompiling more than 8 times after warm-up (non-shape classes) trips
+SHAPE_CLASSES = ("size",)  # the reason class of a new input shape
+
+
+def recompile_guard_mode(environ: Optional[Mapping[str, str]] = None) -> str:
+    """``fatal`` (default): the guard trips and the run stops; ``report``: recompiles are counted and logged only."""
+    env = os.environ if environ is None else environ
+    raw = (env.get(RECOMPILE_GUARD_ENV) or "").strip()
+    value = raw or "fatal"
+    if value not in ("fatal", "report"):
+        raise RuntimeError(f"{RECOMPILE_GUARD_ENV}={raw!r}: expected one of ['fatal', 'report']")
+    return value
+
+
+register_switch_check(recompile_guard_mode)
+
+
+def _dynamo_limit() -> Optional[int]:
+    """dynamo's recompile_limit as this context sees it (torch keeps config overrides in a ContextVar)."""
+    try:
+        import torch._dynamo.config as dc
+
+        return int(dc.recompile_limit)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _reason_class(reason: str, grad_only: bool = False) -> str:
+    """The class of one recompile: 'grad_mode' when an existing cache entry serves this very call under the other
+    grad mode; otherwise from dynamo's first failed guard: a tensor size mismatch is 'size' (a new input shape), other
+    global state 'global_state:<what>', a dict-contains guard 'dict_absent:<attr>' / 'dict_present:<attr>', a
+    constant guard 'equals:<expr>'."""
+    if grad_only:
+        return "grad_mode"
+    r = str(reason or "").strip()
+    head, sep, tail = r.partition(": ")
+    if sep and "/" in head and len(head) < 24:
+        r = tail
+    if r.startswith("GLOBAL_STATE changed:"):
+        what = r[len("GLOBAL_STATE changed:") :].strip()
+        return "new_input+grad_mode" if what == "grad_mode" else f"global_state:{what}"
+    for key, cls in (
+        ("size mismatch", "size"),
+        ("stride mismatch", "stride"),
+        ("dtype mismatch", "dtype"),
+        ("device mismatch", "device"),
+        ("requires_grad mismatch", "requires_grad"),
+        ("dispatch key set mismatch", "dispatch_keys"),
+        ("___check_obj_id", "id_match"),
+        ("___check_type_id", "type_match"),
+    ):
+        if key in r:
+            return cls
+    m = re.match(r"(not )?___dict_contains\('([^']+)', ([^)]+?)\.__dict__\)", r)
+    if m:
+        return f"{'dict_absent' if m.group(1) else 'dict_present'}:{m.group(2)}@{m.group(3)}"
+    m = re.match(r"([A-Za-z_][\w\[\]'.]*) == \S+", r)
+    if m:
+        return f"equals:{m.group(1)[:60]}"
+    return r[:80] or "unknown"
+
+
+def _grad_only(cache_entries: Any, frame: Any) -> bool:
+    """True when an existing cache entry's guards pass for this call under the other grad mode. Evaluated only on a
+    recompile: the thread's grad mode is flipped around the entries' guard checks and put back."""
+    try:
+        f_locals = frame.f_locals
+        cur = torch.is_grad_enabled()
+        t = ENGINE_TLS
+        audit0, t.audit = t.audit, True  # a flip on purpose: the GC watch leaves it alone
+        _SET_GRAD(not cur)
+        try:
+            for e in cache_entries or ():
+                gm = getattr(e, "guard_manager", None)
+                if gm is None or type(gm).__name__ == "DeletedGuardManagerWrapper":
+                    continue
+                try:
+                    if gm.check(f_locals):
+                        return True
+                except Exception:  # noqa: BLE001
+                    continue
+            return False
+        finally:
+            _SET_GRAD(cur)
+            t.audit = audit0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class RecompileLedger:
+    """dynamo recompile accounting per compiled function, and the fail-closed guard on the engine's functions.
+
+    A wrapper around ``convert_frame.get_and_maybe_log_recompilation_reasons`` (called once per recompile attempt,
+    before dynamo's own limit check) counts each recompile with its reason class; :meth:`mark_warm` (the end of the
+    build) snapshots the engine functions' cache entries. After warm-up the guard trips on the first engine function
+    whose recompiles exceed what its class allows: a shape-class recompile (its own class and every entry's: 'size')
+    up to the function's precompiled count (its cache entries at warm-up), any other class up to
+    :data:`RECOMPILE_GUARD_N`; or whose recompile meets dynamo's limit. It also trips on a fresh compile of an engine
+    function after warm-up (no cache entry to recompile: dynamo's recompile accounting never sees it) and refuses
+    ``torch._dynamo.reset`` after warm-up (it would discard every compiled engine program). A trip logs
+    ``RECOMPILE GUARD rank r:``; the pump raises it after the step and the sync at the sync. Nothing is raised inside
+    dynamo; the trainer's own recompiles are counted, never guarded.
+    """
+
+    def __init__(self):
+        self.installed = False
+        self.unavailable: Optional[str] = None
+        self.armed = True  # set from VERL_TPU_INPROC_RECOMPILE_GUARD by install()
+        self.n = RECOMPILE_GUARD_N
+        self.rank = -1
+        self.warm = False
+        self.counts: dict = {}  # key -> recompile attempts, all phases
+        self.post: dict = {}  # key -> recompile attempts after warm-up
+        self.reasons: dict = {}  # key -> Counter(reason class) after warm-up
+        self.grad_at: dict = {}  # key -> Counter('on' / 'off'): the grad mode of the call being recompiled
+        self.engine_keys: set = set()
+        self.warm_entries: dict = {}
+        self.tripped: Optional[str] = None
+        self.fresh_pre: Counter = Counter()  # engine key -> fresh compiles before warm-up (the build's)
+        self.fresh_post: dict = {}  # engine key -> fresh compiles after warm-up
+        self.resets: list = []  # {"warm": bool, "caller": site, "refused": bool} per torch._dynamo.reset call
+        self.compile_hooked = False
+        self.reset_hooked = False
+        self.post_shape: dict = {}  # key -> post-warm-up shape-class recompiles
+        self.post_other: dict = {}  # key -> post-warm-up recompiles of every other class
+        self.shape_first: dict = {}  # key -> the one-off line of its first shape-class recompile
+
+    @property
+    def fresh_mode(self) -> str:
+        return "fatal" if self.armed else "report"
+
+    def install(self) -> bool:
+        self.armed = recompile_guard_mode() == "fatal"
+        if self.installed:
+            return True
+        try:
+            import torch._dynamo.convert_frame as cf
+
+            orig = cf.get_and_maybe_log_recompilation_reasons
+        except Exception as e:  # noqa: BLE001
+            self.unavailable = f"{type(e).__name__}: {e}"[:200]
+            return False
+        if not getattr(orig, "_inproc_ledger", False):
+            ledger = self
+
+            @functools.wraps(orig)
+            def hooked(cache_entries, frame, *a, **k):
+                reasons = orig(cache_entries, frame, *a, **k)
+                try:
+                    code = frame.f_code
+                    eng = EngineCode.is_engine(code)  # the grad-only check only for the engine's code
+                    ledger.on_recompile(
+                        code,
+                        reasons,
+                        len(cache_entries) if cache_entries is not None else None,
+                        _grad_only(cache_entries, frame) if eng else False,
+                    )
+                except Exception:  # noqa: BLE001 - the accounting never breaks a compile
+                    pass
+                return reasons
+
+            hooked._inproc_ledger = True  # type: ignore[attr-defined]
+            cf.get_and_maybe_log_recompilation_reasons = hooked
+        self._install_fresh(cf)
+        self.installed = True
+        return True
+
+    def _install_fresh(self, cf: Any) -> None:
+        """Two more hooks, each never in the way of a compile: ``convert_frame._compile`` (a compile that is not a
+        recompilation in dynamo's sense is a fresh compile, counted per engine function) and ``torch._dynamo.reset``
+        (recorded; refused after warm-up)."""
+        ledger = self
+        orig_c = getattr(cf, "_compile", None)
+        is_rc = getattr(cf, "is_recompilation", None)
+        if orig_c is not None and is_rc is not None and not getattr(orig_c, "_inproc_fresh", False):
+            try:
+                sig = inspect.signature(orig_c)
+            except (TypeError, ValueError):
+                sig = None
+            if sig is not None and "code" in sig.parameters and "cache_size" in sig.parameters:
+
+                @functools.wraps(orig_c)
+                def compile_hooked(*a, **k):
+                    try:
+                        b = sig.bind_partial(*a, **k).arguments
+                        code, cs = b.get("code"), b.get("cache_size")
+                        if code is not None and cs is not None and not is_rc(cs):
+                            ledger.on_fresh(code)
+                    except Exception:  # noqa: BLE001 - the accounting never breaks a compile
+                        pass
+                    return orig_c(*a, **k)
+
+                compile_hooked._inproc_fresh = True  # type: ignore[attr-defined]
+                cf._compile = compile_hooked
+                self.compile_hooked = True
+        elif orig_c is not None and getattr(orig_c, "_inproc_fresh", False):
+            self.compile_hooked = True
+        try:
+            import torch._dynamo as tdyn
+
+            orig_r = tdyn.reset
+            if not getattr(orig_r, "_inproc_reset", False):
+
+                @functools.wraps(orig_r)
+                def reset_hooked(*a, **k):
+                    ledger.on_reset()
+                    return orig_r(*a, **k)
+
+                reset_hooked._inproc_reset = True  # type: ignore[attr-defined]
+                tdyn.reset = reset_hooked
+            self.reset_hooked = True
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_fresh(self, code: Any) -> None:
+        if not EngineCode.is_engine(code):
+            return
+        key = EngineCode.key(code)
+        self.engine_keys.add(key)
+        if not self.warm:
+            self.fresh_pre[key] += 1
+            return
+        self.fresh_post[key] = self.fresh_post.get(key, 0) + 1
+        if self.armed:
+            if self.tripped is None:
+                self.tripped = (
+                    f"RECOMPILE GUARD rank {self.rank}: engine function {key} compiled fresh after warm-up (no cache "
+                    "entry "
+                    "to recompile: a multi-second compile inside an engine call)"
+                )
+                warn(self.tripped)
+        elif self.fresh_post[key] == 1:
+            warn(f"fresh compile after warm-up rank {self.rank}: {key} (counted; {RECOMPILE_GUARD_ENV}=report)")
+
+    def on_reset(self) -> None:
+        """``torch._dynamo.reset`` was called: recorded with its caller; after warm-up refused (fatal: raises, so the
+        caches stay) or performed (report)."""
+        caller = "?"
+        try:
+            fr = [
+                f
+                for f in traceback.extract_stack(limit=8)[:-2]
+                if "torch/_dynamo" not in f.filename and "torch/compiler" not in f.filename
+            ]
+            if fr:
+                caller = f"{os.path.basename(fr[-1].filename)}:{fr[-1].lineno}:{fr[-1].name}"
+        except Exception:  # noqa: BLE001
+            pass
+        refuse = self.warm and self.armed
+        self.resets.append({"warm": self.warm, "caller": caller, "refused": refuse})
+        if not self.warm:
+            return
+        line = (
+            f"RECOMPILE GUARD rank {self.rank}: torch._dynamo.reset() called after warm-up by {caller}: it discards "
+            "every "
+            "compiled engine program (each would compile again inside the decode steps)"
+            + ("; refused (the caches stay)" if refuse else f"; performed ({RECOMPILE_GUARD_ENV}=report)")
+        )
+        warn(line)
+        if refuse:
+            if self.tripped is None:
+                self.tripped = line
+            raise RuntimeError(line)
+
+    def on_recompile(self, code: Any, reasons: Any, n_entries: Optional[int], grad_only: bool = False) -> None:
+        key = EngineCode.key(code)
+        eng = EngineCode.is_engine(code)
+        cls = _reason_class(reasons[0] if reasons else "", grad_only)
+        every = Counter(_reason_class(r) for r in (reasons or ()))  # every entry's first failed guard, classed
+        self.counts[key] = self.counts.get(key, 0) + 1
+        if eng:
+            self.engine_keys.add(key)
+        if not self.warm:
+            return
+        self.post[key] = self.post.get(key, 0) + 1
+        self.reasons.setdefault(key, Counter())[cls] += 1
+        self.grad_at.setdefault(key, Counter())["on" if torch.is_grad_enabled() else "off"] += 1
+        limit = _dynamo_limit()
+        at_limit = n_entries is not None and limit is not None and n_entries >= limit
+        # shape-class recompiles are allowed up to the function's precompiled count, one more is fatal; any other class
+        # keeps the plain count N; dynamo's limit stays fatal
+        shape = not grad_only and cls in SHAPE_CLASSES and bool(every) and all(c in SHAPE_CLASSES for c in every)
+        cap = int(self.warm_entries.get(key, 0) or 0) if isinstance(self.warm_entries, dict) else 0
+        if shape:
+            self.post_shape[key] = self.post_shape.get(key, 0) + 1
+        else:
+            self.post_other[key] = self.post_other.get(key, 0) + 1
+        over = self.post_shape[key] > cap if shape else self.post_other[key] > self.n
+        if eng and shape and not over and key not in self.shape_first:
+            line = (
+                f"size-class recompile after warm-up rank {self.rank}: engine function {key} (1 of its precompiled "
+                "count "
+                f"{cap}: reported only); this recompile's entries by reason class "
+                f"{json.dumps(dict(every), sort_keys=True)}; "
+                f"cache entries {n_entries}; dynamo recompile_limit {limit}"
+            )
+            self.shape_first[key] = line
+            log(line)
+        if eng and self.armed and self.tripped is None and (over or at_limit):
+            pin = CALL_PINS.keys.get(key)
+            self.tripped = (
+                f"RECOMPILE GUARD rank {self.rank}: engine function {key} recompiled {self.post[key]} times after "
+                "warm-up "
+                f"(guard N {self.n}{'; at dynamo recompile_limit' if at_limit else ''}; "
+                + (
+                    f"size-class recompiles {self.post_shape[key]} > its precompiled count {cap}"
+                    if shape and over
+                    else f"non-shape recompiles {self.post_other.get(key, 0)}, "
+                    f"size-class {self.post_shape.get(key, 0)} (allowed up to {cap})"
+                )
+                + f"); reasons {json.dumps(dict(self.reasons[key]), sort_keys=True)}; grad mode at compile "
+                f"{json.dumps(dict(self.grad_at[key]), sort_keys=True)}; cache entries {n_entries}; dynamo "
+                "recompile_limit "
+                f"{limit}; call-site pin "
+                + (f"yes (calls with the thread's grad on/off {pin[1]}/{pin[0]})" if pin is not None else "no")
+                + f"; this recompile's entries by reason class {json.dumps(dict(every), sort_keys=True)}"
+            )
+            warn(self.tripped)
+
+    def mark_warm(self, rank: int) -> dict:
+        """The warm-up record: the engine functions' cache entries (the baseline every later recompile is held to)."""
+        self.rank = rank
+        self.warm_entries = engine_cache_entries()
+        self.warm = True
+        return {
+            "installed": self.installed,
+            "unavailable": self.unavailable,
+            "armed": self.armed,
+            "guard_n": self.n,
+            "fresh_mode": self.fresh_mode,
+            "shape_rule": {
+                "mode": "cap",
+                "classes": list(SHAPE_CLASSES),
+                "cap": "the function's entries at warm-up",
+                "other_classes_n": self.n,
+            },
+            "entries": self.warm_entries,
+            "fresh_before_warm": dict(sorted(self.fresh_pre.items())),
+            "resets_before_warm": len(self.resets),
+        }
+
+    def compile_record(self) -> dict:
+        """The per-sync record: post-warm-up recompiles split by class, fresh compiles, resets, and the cache entries no
+        hook accounts for (entries now > warm + recompiles + fresh compiles: a compile path that bypassed both hooks)
+        or that are gone."""
+        now = engine_cache_entries() if self.warm else {}
+        extra, lost = {}, {}
+        if isinstance(now, dict) and "error" not in now:
+            for k, n in now.items():
+                exp = int(self.warm_entries.get(k, 0) or 0) + int(self.post.get(k, 0)) + int(self.fresh_post.get(k, 0))
+                if n > exp:
+                    extra[k] = n - exp
+            for k, n in (self.warm_entries or {}).items():
+                if isinstance(n, int) and now.get(k, 0) < n:
+                    lost[k] = n - now.get(k, 0)
+        return {
+            "post_warm_shape": {k: self.post_shape[k] for k in sorted(self.post_shape) if k in self.engine_keys},
+            "post_warm_other": {k: self.post_other[k] for k in sorted(self.post_other) if k in self.engine_keys},
+            "fresh_post_warm": dict(sorted(self.fresh_post.items())),
+            "resets_after_warm": sum(1 for r in self.resets if r["warm"]),
+            "entries": now,
+            "entries_warm": self.warm_entries,
+            "unaccounted": extra,
+            "lost": lost,
+            "tripped": self.tripped is not None,
+        }
+
+    def check(self) -> None:
+        if self.tripped is not None:
+            raise RuntimeError(self.tripped)
+
+
+RECOMPILES = RecompileLedger()

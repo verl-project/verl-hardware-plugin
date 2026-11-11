@@ -31,7 +31,7 @@ from verl_hardware_plugin.accelerators.tpu.rollout.inproc.boundary import (
     engine_mode_ctx,
 )
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.common import integrity_mode, log, warn
-from verl_hardware_plugin.accelerators.tpu.rollout.inproc.compile_guard import LOGITS_AT_LOAD
+from verl_hardware_plugin.accelerators.tpu.rollout.inproc.compile_guard import LOGITS_AT_LOAD, RECOMPILES
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.gc_policy import GC_DEFER
 
 AUDIT_EVERY = 64  # after warm-up the device-thread record and the collective counter run on every 64th pump step
@@ -126,6 +126,8 @@ class InProcAsyncEngine:
                         DEVICE_THREADS.record("step")
                     outs = self._engine.step()
                 self.steps += 1
+                if RECOMPILES.tripped is not None:  # the recompile guard tripped in this step's compile: fail closed
+                    RECOMPILES.check()
                 for out in outs:
                     if getattr(out, "finished", False):
                         col = self._collectors.pop(out.request_id, None)
