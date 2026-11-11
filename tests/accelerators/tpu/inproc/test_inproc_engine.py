@@ -247,6 +247,7 @@ def test_rollout_n_comes_from_the_trainer_config():
 
 
 def test_fast_poll_sampler_serves_sync_mode_only():
+    pytest.importorskip("transfer_queue")  # verl's replay buffer module imports it (the inproc-test extra)
     cls = sampler.FastPollReplayBufferSync
     assert cls.__name__ == "FastPollReplayBufferSync" and cls.__module__ == sampler.__name__
     with pytest.raises(RuntimeError, match="serves trainer_mode=sync only"):
@@ -359,3 +360,63 @@ def test_replica_no_ops_and_server_check(caplog):
     worker.inproc_server_info = Remote({"engine_ready": False, "replica_rank": 3})
     with pytest.raises(RuntimeError, match="replica 3: worker reports"):
         asyncio.run(r.launch_servers())
+
+
+# vLLMHttpServer methods that reach the engine only through replica calls the in-process replica answers itself (no
+# sleep mode, no profiler, no snapshot of vLLM's metrics, no single-request abort): server method -> replica method
+INTERCEPTED_SERVER_METHODS = {
+    "sleep": "sleep",
+    "_sleep_hybrid": "sleep",
+    "wake_up": "wake_up",
+    "release_kv_cache": "release_kv_cache",
+    "resume_kv_cache": "resume_kv_cache",
+    "clear_kv_cache": "clear_kv_cache",
+    "start_profile": "start_profile",
+    "stop_profile": "stop_profile",
+    "snapshot": "snapshot",
+    "_prometheus_logger": "snapshot",
+    "abort_request": "abort_request",
+}
+# engine attributes verl's server uses only with a configuration the in-process rollout refuses before any request
+REFUSED_BEFORE_ANY_REQUEST = {
+    "list_loras": "generate lists LoRA adapters only with an unmerged adapter; the first sync refuses its peft_config",
+}
+
+
+def test_the_adapter_covers_every_engine_call_of_verls_server():
+    """Every ``self.engine.X`` of verl's vLLMHttpServer is implemented by the adapter, sits in a server method reached
+    only through a replica call the in-process replica answers itself, or needs a configuration refused before any
+    request."""
+    import ast
+    import inspect
+    import textwrap
+
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+
+    uses: dict = {}
+    for fn in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(vLLMHttpServer)))):
+        if isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+            for n in ast.walk(fn):
+                if (
+                    isinstance(n, ast.Attribute)
+                    and isinstance(n.value, ast.Attribute)
+                    and n.value.attr == "engine"
+                    and isinstance(n.value.value, ast.Name)
+                    and n.value.value.id == "self"
+                ):
+                    uses.setdefault(n.attr, set()).add(fn.name)
+    assert {"add_request", "abort"} <= set(uses), uses  # positive control: the scan sees the serving path
+    adapter = E.InProcAsyncEngine(FakeEngine(), 0)
+    missing = {}
+    for attr, methods in sorted(uses.items()):
+        if hasattr(adapter, attr) or attr in REFUSED_BEFORE_ANY_REQUEST:
+            continue
+        reached = sorted(m for m in methods if m not in INTERCEPTED_SERVER_METHODS)
+        if reached:
+            missing[attr] = reached
+    assert missing == {}, f"verl's server calls engine attributes the adapter lacks, from {missing}"
+    for replica_method in set(INTERCEPTED_SERVER_METHODS.values()):
+        assert replica_method in vars(E.TPUInProcReplica), f"{replica_method} is not answered by the in-process replica"
+    r = TPUInProcRollout.__new__(TPUInProcRollout)
+    with pytest.raises(NotImplementedError, match="LoRA adapters are not supported in process"):
+        asyncio.run(r.update_weights(iter(()), peft_config={"r": 8}))

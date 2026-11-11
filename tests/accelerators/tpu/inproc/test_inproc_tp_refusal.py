@@ -110,7 +110,7 @@ def test_rollout_refuses_pipeline_layout_given_directly(inproc):
 @pytest.mark.xfail(
     strict=True,
     reason="the constructor checks the product of the three sizes, so negative sizes whose product is 1 pass it; "
-    "the engine build's check of vLLM's resolved parallel config still refuses such a layout",
+    "the engine build still refuses such a layout (test_engine_build_refuses_negative_sizes)",
 )
 def test_rollout_refuses_each_size_not_their_product(inproc):
     cfg = types.SimpleNamespace(
@@ -205,6 +205,16 @@ def test_engine_build_accepts_tp1(engine_build):
         engine_build(1, 1, 1)
     pc = err.value.args[0]
     assert (pc.tensor_parallel_size, pc.pipeline_parallel_size, pc.data_parallel_size) == (1, 1, 1)
+
+
+@pytest.mark.parametrize("tp,pp,dp", [(-1, 1, -1), (-1, -1, 1), (1, -1, -1)])
+def test_engine_build_refuses_negative_sizes(engine_build, tp, pp, dp):
+    """Negative sizes whose product is 1 pass the constructor's product check (the strict xfail above). The engine build
+    refuses them before any engine exists: vLLM's parallel config rejects a size below 1, and the build's own
+    TP=PP=DP=1 check refuses whatever vLLM resolves instead."""
+    with pytest.raises((ValueError, RuntimeError)) as err:
+        engine_build(tp, pp, dp)
+    assert "greater than or equal to 1" in str(err.value) or ENGINE_MSG in str(err.value), err.value
 
 
 # --------------------------------------------------------------------------------------------- the replica

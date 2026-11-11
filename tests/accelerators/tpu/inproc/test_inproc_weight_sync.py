@@ -671,6 +671,71 @@ def test_check_switches_names_unread_variables(monkeypatch):
     assert common.check_switches(env) == sorted(WEAKENING)
 
 
+def test_integrity_report_leaves_every_install_check_on(installs, monkeypatch):
+    """VERL_TPU_INPROC_INTEGRITY=report covers only the staleness checks and the KV capacity check. With it set, and
+    with the variables that once switched the install checks off, every install refusal still fires: a missing fused
+    shard at a verified and at an unverified sync, a corrupted fused parameter, a whole tensor missing on the direct
+    path, a direct install that raises at the first sync (no loader fallback), and a table entry whose not-exported
+    pattern matches a received tensor. The unread variables are named and INTEGRITY is not; staleness is reported."""
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc import common
+
+    monkeypatch.setenv(common.INTEGRITY_ENV, "report")
+    for k, v in WEAKENING.items():
+        monkeypatch.setenv(k, v)
+    assert common.check_switches({common.INPROC_ENV: "1", common.INTEGRITY_ENV: "report", **WEAKENING}) == sorted(
+        WEAKENING
+    )
+
+    def rollout(model, **kw):
+        r = _rollout(model, **kw)
+        r.integrity = common.integrity_mode()  # as the rollout's constructor reads it
+        assert r.integrity == "report"
+        return r
+
+    def direct():
+        return rollout(
+            _installed(_export(0), False), layout=DIRECT, cfg=SimpleNamespace(model_type="x"), mode="dense-test direct"
+        )
+
+    k = "model.layers.0.self_attn.k_proj.weight"
+    r = rollout(_installed(_export(0), False))
+    with pytest.raises(RuntimeError, match="parity FAILED at step 0"):  # a missing fused shard at a verified sync
+        _sync(r, {n: t for n, t in _export(1).items() if n != k}, 0)
+    _sync(r, _export(2), 1)
+    with pytest.raises(RuntimeError, match="EXPORT CHANGED"):  # a missing fused shard at an unverified sync
+        _sync(r, {n: t for n, t in _export(3).items() if n != k}, 2)
+
+    stand_in = ws.InProcInstaller._install_once  # the fixture's stand-in of the install's writes
+
+    def corrupting(self, staging_hf, verify, pre):
+        out = stand_in(self, staging_hf, verify, pre)
+        with torch.no_grad():
+            self._model().model.layers[0].self_attn.qkv_proj.weight.view(-1)[H * H + 1] += 1.0  # a k row element
+        return out
+
+    monkeypatch.setattr(ws.InProcInstaller, "_install_once", corrupting)
+    with pytest.raises(RuntimeError, match="parity FAILED at step 0"):  # a corrupted fused parameter
+        _sync(rollout(_installed(_export(0), False)), _export(1), 0)
+    monkeypatch.setattr(ws.InProcInstaller, "_install_once", stand_in)
+
+    with pytest.raises(RuntimeError, match="coverage: 1 engine parameter"):  # a whole tensor missing, direct path
+        _sync(direct(), {n: t for n, t in _export(1).items() if n != "model.norm.weight"}, 0)
+    installs.fail_direct = True
+    with pytest.raises(RuntimeError, match="install raised at step 0"):  # the first sync: no loader fallback
+        _sync(direct(), _export(1), 0)
+    installs.fail_direct = False
+
+    wrong = compat.LayoutEntry("qwen3", "X", "tests.X", "vllm loaders", (r"qkv_proj",), ())
+    with pytest.raises(RuntimeError, match="not-exported patterns match received tensors"):
+        _sync(rollout(_installed(_export(0), False), layout=wrong), _export(1), 0)
+
+    s = rollout(_installed(_export(0), False))  # positive control: report mode is on, for staleness only
+    _sync(s, _export(1), 0)
+    _sync(s, _export(2), 1)
+    _sync(s, _export(2), 5)
+    assert s.sync_log[-1]["stale"] is True
+
+
 # ---------------------------------------------------------------------------------- staleness (skipped optimizer steps)
 
 
