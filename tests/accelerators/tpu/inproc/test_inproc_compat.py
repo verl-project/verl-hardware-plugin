@@ -482,6 +482,22 @@ def test_quantized_weights_refuse(quant, dtype):
     assert got is None and "UNTESTED LAYOUT" in problem and "quantized weights are not tested" in problem
 
 
+def test_a_loader_layout_needs_the_models_shard_mapping():
+    """A row on vLLM's loaders is refused at build when the instantiated model exposes neither vLLM's stacked-shard
+    table nor packed_modules_mapping: the install's parity check could not rebuild its fused parameters."""
+    row = next(r for r in compat.TESTED_LAYOUTS if r.family == "vllm loaders")
+    module, name = row.model_class.rsplit(".", 1)
+    cfg, mc = SimpleNamespace(model_type=row.model_type), SimpleNamespace(quantization=None)
+    got, problem = compat.layout_after_build(_model_of(module, name), mc, cfg)
+    assert got is None and "UNTESTED LAYOUT" in problem and "stacked-shard table or packed_modules_mapping" in problem
+    packed = _model_of(module, name)
+    packed.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    assert compat.layout_after_build(packed, mc, cfg) == (row, None)
+    stacked = _model_of(module, name)
+    stacked.hf_to_vllm_mapper = SimpleNamespace(orig_to_new_stacked={".q_proj": (".qkv_proj", "q")})
+    assert compat.layout_after_build(stacked, mc, cfg) == (row, None)
+
+
 def test_every_table_entry_names_tests_that_exist():
     """A tested layout without a test is not a tested layout: each entry's covering tests must exist."""
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))

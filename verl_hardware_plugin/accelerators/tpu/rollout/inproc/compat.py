@@ -494,7 +494,9 @@ def layout_after_build(
     model: Any, model_config: Any, hf_text_config: Any
 ) -> tuple[Optional[LayoutEntry], Optional[str]]:
     """The full key after the build: the HF text config's model_type, the instantiated vLLM model class, unquantized
-    weights (no quantization config, every parameter bfloat16 or float32). (row, None), else (None, the refusal)."""
+    weights (no quantization config, every parameter bfloat16 or float32). A row on vLLM's loaders also needs the
+    model's stacked-shard table (``hf_to_vllm_mapper``) or its ``packed_modules_mapping``: the install's parity check
+    rebuilds every fused parameter from them. (row, None), else (None, the refusal)."""
     cls = type(model)
     model_class = f"{cls.__module__}.{cls.__qualname__}"
     model_type = getattr(hf_text_config, "model_type", None)
@@ -507,4 +509,13 @@ def layout_after_build(
     if quant is not None or any(d not in UNQUANTIZED_DTYPES for d in dtypes):
         return None, _untested(key + " (quantized weights are not tested)")
     row = next((r for r in TESTED_LAYOUTS if r.model_type == model_type and r.model_class == model_class), None)
-    return (row, None) if row is not None else (None, _untested(key))
+    if row is None:
+        return None, _untested(key)
+    if row.family == "vllm loaders":
+        mapper = getattr(model, "hf_to_vllm_mapper", None)
+        if not (getattr(mapper, "orig_to_new_stacked", None) or getattr(model, "packed_modules_mapping", None)):
+            return None, _untested(
+                key + " (a vLLM-loader layout needs the model's stacked-shard table or packed_modules_mapping, which "
+                "its covering tests rely on)"
+            )
+    return row, None
