@@ -164,7 +164,8 @@ A pool that uses part of a slice, and a Ray trainer pool, whose mesh is resolved
 The generation comes from the `ray.io/tpu-pod-type` node label of the pool's hosts or
 from `TPU_ACCELERATOR_TYPE`; set `TORCH_TPU_TOPOLOGY='x,y,z,cores'` to override. Rollout engines on TPU 7x
 use one worker per TensorCore, e.g. a TP=8 engine per host; on every generation an engine's mesh is its
-own worker count.
+own worker count. A TP=2 or TP=4 rollout engine on one TPU 7x host takes `1,1,1,2` (one chip) or `1,2,1,2`
+(two chips) from `TPU_V7X_SUBHOST_TOPOLOGY_MAP`.
 
 ### Device memory
 
