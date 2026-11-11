@@ -352,9 +352,10 @@ def test_single_host_tpu_topology_for_one_host_replicas():
         assert single_host_tpu_topology(3) == ""  # unknown size: the caller keeps the inherited environment
     with mock.patch.dict(os.environ, {"TPU_ACCELERATOR_TYPE": "tpu7x"}):
         assert single_host_tpu_topology(8) == "2,2,1,2"  # 4 chips x 2 TensorCores
-        # TP=2 / TP=4 replicas: no validated sub-host 7x mesh, so no override (no error either).
-        assert single_host_tpu_topology(2) == ""
-        assert single_host_tpu_topology(4) == ""
+        # TP=2 / TP=4 replicas on part of a host: 1 chip x 2 TensorCores, 2 chips x 2 TensorCores.
+        assert single_host_tpu_topology(2) == "1,1,1,2"
+        assert single_host_tpu_topology(4) == "1,2,1,2"
+        assert single_host_tpu_topology(6) == ""  # unknown size: the caller keeps the inherited environment
 
 
 def test_resolve_tpu_topology_bounds_single_host():
@@ -417,7 +418,7 @@ def test_resolve_tpu_topology_bounds_tpu7x_one_process_per_core():
         assert resolve_tpu_topology_bounds(total_chips=64, num_nodes=8) == ("2,4,4,2", "2,4,4,2", "1,1,1,1", "8")
         with pytest.raises(ValueError, match="TPU 7x mesh"):
             resolve_tpu_topology_bounds(total_chips=24, num_nodes=3)
-        with pytest.raises(ValueError, match="TPU 7x mesh"):  # sub-host sizes have no validated layout
+        with pytest.raises(ValueError, match="TPU 7x mesh"):  # a sub-host trainer pool: not validated
             resolve_tpu_topology_bounds(total_chips=4, num_nodes=1)
     # The pod type alone selects the TPU 7x path too.
     with mock.patch.dict(os.environ, env, clear=True):
@@ -606,6 +607,21 @@ def test_auto_assign_accelerator_type_single_slice_shares_slice():
     nodes = [{"Alive": True, "Resources": {"TPU": 4.0, "tpu-group-0": 1.0}}]
     with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
         assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-0"
+        assert platform.auto_assign_accelerator_type("rollout_pool_1", None) == "tpu-group-0"
+
+
+@pytest.mark.parametrize("tp, replicas", [(8, 4), (4, 8), (2, 16)])
+def test_auto_assign_accelerator_type_spreads_extra_rollout_pools_round_robin(tp, replicas):
+    # A 4-host trainer slice (tpu-group-0) and four single-host rollout slices of 8 TPU 7x devices: 4 x TP=8,
+    # 8 x TP=4 or 16 x TP=2 rollout replicas, one pool each. Every rollout host gets 8 // tp replicas, and none
+    # lands on the trainer's slice.
+    platform = PlatformTPU()
+    nodes = [{"Alive": True, "Resources": {"TPU": 8.0, f"tpu-group-{g}": 1.0}} for g in (0, 0, 0, 0, 3, 1, 4, 2)]
+    with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
+        assert platform.auto_assign_accelerator_type("global_pool", None) == "tpu-group-0"
+        claimed = [platform.auto_assign_accelerator_type(f"rollout_pool_{r}", None) for r in range(replicas)]
+    assert claimed == [f"tpu-group-{1 + r % 4}" for r in range(replicas)]
+    assert {s: claimed.count(s) for s in set(claimed)} == {f"tpu-group-{g}": 8 // tp for g in (1, 2, 3, 4)}
 
 
 def _clear_forwarded_tpu_env(monkeypatch):

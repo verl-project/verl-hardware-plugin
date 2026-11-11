@@ -74,8 +74,8 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
         # A replica on one host (e.g. one of several replicas on a multi-host rollout slice) is its own mesh; it
         # must not inherit the slice's TORCH_TPU_TOPOLOGY. Multi-host replicas get theirs from vllm-torchtpu's
         # rendezvous. The TPU type comes from the replica's host, not from this process's environment, which
-        # may be a CPU Ray head without TPU_ACCELERATOR_TYPE. Sizes without a known mesh (e.g. TP=2 / TP=4 on TPU
-        # 7x) keep the inherited environment, as before.
+        # may be a CPU Ray head without TPU_ACCELERATOR_TYPE. On TPU 7x a TP=2 / TP=4 replica gets the mesh of
+        # its one or two chips; sizes without a known mesh keep the inherited environment, as before.
         pod_type = ray_tpu_accelerator_name(node_ids=list(node_ids))
         topology = single_host_tpu_topology(chips_per_host, pod_type=pod_type)
         if topology:
