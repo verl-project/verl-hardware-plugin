@@ -22,8 +22,9 @@ engine's KV pool is set explicitly (``rollout.engine_kwargs.vllm.kv_cache_memory
   :mod:`.compile_guard`); a step whose rollout lost requests fails before ``update_actor`` on every rank
   (:func:`step_guard`, :mod:`.sampler`).
 
-Scope: rollout TP=1, a single host, verl's sync trainer mode, the model families of the tested-layout table
-(:data:`.compat.TESTED_LAYOUTS`). Anything else is refused at build.
+Scope: rollout TP=1 (other parallel sizes are refused at build), verl's sync trainer mode (the package's sampler
+serves no other), and the model families of the tested-layout table (:data:`.compat.TESTED_LAYOUTS`; any other
+layout is refused at build). Only single-host runs have been tested; more hosts are not refused.
 """
 
 from __future__ import annotations
