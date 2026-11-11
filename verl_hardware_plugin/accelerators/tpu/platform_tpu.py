@@ -16,6 +16,7 @@ defined here rather than inherited from another vendor's platform.
 import logging
 import math
 import os
+import re
 from contextlib import contextmanager
 from typing import Any, Mapping, Optional
 
@@ -67,9 +68,22 @@ TRAINER_EXTRA_XLA_FLAGS_ENV = "VERL_TPU_TRAINER_XLA_FLAGS"
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471
 
-# verl names the resource pool of each standalone rollout replica ``rollout_[reward_|teacher_]standalone_<rank>``
-# (``verl.workers.rollout.replica``); the dedicated pools are ``global_pool``, ``reward_pool`` and ``teacher_pool``.
+# verl names the resource pool of each standalone rollout replica ``rollout_pool[_reward|_teacher]_<rank>[_<model
+# key>]`` (``verl.workers.rollout.replica``); the dedicated pools are ``global_pool``, ``reward_pool`` and
+# ``teacher_pool``. A replica's kind is its pool name without the rank, so policy, reward and teacher replicas (and the
+# replicas of different teacher models) are told apart.
 ROLLOUT_REPLICA_POOL_PREFIX = "rollout_"
+_ROLLOUT_POOL_RANK = re.compile(r"^(rollout_pool(?:_reward|_teacher)?)_\d+(.*)$")
+
+
+def rollout_replica_kind(name_prefix: Optional[str]) -> Optional[str]:
+    """The kind of rollout replica whose resource pool this is (its name without the rank), or None for other pools."""
+    name = name_prefix or ""
+    if not name.startswith(ROLLOUT_REPLICA_POOL_PREFIX):
+        return None
+    match = _ROLLOUT_POOL_RANK.match(name)
+    return match.group(1) + match.group(2) if match else re.sub(r"_\d+$", "", name)
+
 
 # TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice. The vLLM
 # rollout (``rollout/tpu_vllm_patches.py``) resolves its mesh here too, so the trainer and the
@@ -576,8 +590,10 @@ class PlatformTPU(PlatformBase):
         # torch.tpu itself is left untouched; the proxy adds what verl needs (see TPUDeviceModuleProxy).
         self._device_module = TPUDeviceModuleProxy(original_tpu)
         self._claimed_slices: set[str] = set()
-        self._rollout_slices: list[str] = []
-        self._shared_slice_pools = 0
+        # Per rollout replica kind (see rollout_replica_kind): the slices its replicas claimed, and how many of its
+        # replicas have been spread over them once every slice was claimed.
+        self._rollout_slices: dict[str, list[str]] = {}
+        self._shared_slice_pools: dict[str, int] = {}
 
     @property
     def vendor_name(self) -> str:
@@ -714,9 +730,10 @@ class PlatformTPU(PlatformBase):
         gets the first slice that no earlier pool claimed, so the trainer and rollout pools land on
         different slices. Once every slice is claimed, the pool of a rollout replica (e.g. the 5th to 8th
         of eight TP=4 replicas on four single-host rollout slices) goes round-robin over the slices that
-        rollout replicas claimed, never onto one that a dedicated pool (the trainer's ``global_pool``,
-        ``reward_pool``, ``teacher_pool``) holds whole. Other pools, and rollout replicas when no rollout
-        replica holds a slice, share the last slice.
+        replicas of its own kind (policy, reward or teacher; ``rollout_replica_kind``) claimed. It never
+        lands on a slice that a dedicated pool (the trainer's ``global_pool``, ``reward_pool``,
+        ``teacher_pool``) or a replica of another kind holds. Other pools, and rollout replicas whose
+        kind holds no slice, share the last slice.
         """
         if accelerator_type is not None:
             return accelerator_type
@@ -736,20 +753,20 @@ class PlatformTPU(PlatformBase):
                         s,
                     ),
                 )
-                is_rollout_replica = (name_prefix or "").startswith(ROLLOUT_REPLICA_POOL_PREFIX)
+                kind = rollout_replica_kind(name_prefix)
                 for tpu_slice in slices:
                     if tpu_slice not in self._claimed_slices:
                         self._claimed_slices.add(tpu_slice)
-                        if is_rollout_replica:
-                            self._rollout_slices.append(tpu_slice)
+                        if kind is not None:
+                            self._rollout_slices.setdefault(kind, []).append(tpu_slice)
                         return tpu_slice
-                rollout_slices = [s for s in self._rollout_slices if s in tpu_slices]
-                if is_rollout_replica and rollout_slices:
+                own_slices = [s for s in self._rollout_slices.get(kind, []) if s in tpu_slices]
+                if kind is not None and own_slices:
                     # Stacking the remaining replicas on one slice would ask it for more chips than it has, and
                     # their placement groups would never be scheduled.
-                    tpu_slice = rollout_slices[self._shared_slice_pools % len(rollout_slices)]
-                    self._shared_slice_pools += 1
-                    return tpu_slice
+                    shared = self._shared_slice_pools.get(kind, 0)
+                    self._shared_slice_pools[kind] = shared + 1
+                    return own_slices[shared % len(own_slices)]
                 if slices:
                     return slices[-1]
         except Exception as e:
