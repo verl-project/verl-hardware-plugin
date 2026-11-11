@@ -619,9 +619,22 @@ def test_auto_assign_accelerator_type_spreads_extra_rollout_pools_round_robin(tp
     nodes = [{"Alive": True, "Resources": {"TPU": 8.0, f"tpu-group-{g}": 1.0}} for g in (0, 0, 0, 0, 3, 1, 4, 2)]
     with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
         assert platform.auto_assign_accelerator_type("global_pool", None) == "tpu-group-0"
-        claimed = [platform.auto_assign_accelerator_type(f"rollout_pool_{r}", None) for r in range(replicas)]
+        claimed = [platform.auto_assign_accelerator_type(f"rollout_standalone_{r}", None) for r in range(replicas)]
     assert claimed == [f"tpu-group-{1 + r % 4}" for r in range(replicas)]
     assert {s: claimed.count(s) for s in set(claimed)} == {f"tpu-group-{g}": 8 // tp for g in (1, 2, 3, 4)}
+
+
+def test_auto_assign_accelerator_type_never_shares_a_dedicated_pool_slice():
+    # Three slices of 8 devices: the trainer (8) and a dedicated reward model pool (8) take one each, so the second
+    # TP=4 rollout replica must join the first on tpu-group-2, not the full reward slice (its placement group would
+    # never be scheduled).
+    platform = PlatformTPU()
+    nodes = [{"Alive": True, "Resources": {"TPU": 8.0, f"tpu-group-{g}": 1.0}} for g in (0, 1, 2)]
+    with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
+        assert platform.auto_assign_accelerator_type("global_pool", None) == "tpu-group-0"
+        assert platform.auto_assign_accelerator_type("reward_pool", None) == "tpu-group-1"
+        assert platform.auto_assign_accelerator_type("rollout_standalone_0", None) == "tpu-group-2"
+        assert platform.auto_assign_accelerator_type("rollout_standalone_1", None) == "tpu-group-2"
 
 
 def _clear_forwarded_tpu_env(monkeypatch):

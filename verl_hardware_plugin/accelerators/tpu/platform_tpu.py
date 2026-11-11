@@ -67,6 +67,10 @@ TRAINER_EXTRA_XLA_FLAGS_ENV = "VERL_TPU_TRAINER_XLA_FLAGS"
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471
 
+# verl names the resource pool of each standalone rollout replica ``rollout_[reward_|teacher_]standalone_<rank>``
+# (``verl.workers.rollout.replica``); the dedicated pools are ``global_pool``, ``reward_pool`` and ``teacher_pool``.
+ROLLOUT_REPLICA_POOL_PREFIX = "rollout_"
+
 # TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice. The vLLM
 # rollout (``rollout/tpu_vllm_patches.py``) resolves its mesh here too, so the trainer and the
 # rollout agree on the physical layout of a given slice size.
@@ -572,6 +576,7 @@ class PlatformTPU(PlatformBase):
         # torch.tpu itself is left untouched; the proxy adds what verl needs (see TPUDeviceModuleProxy).
         self._device_module = TPUDeviceModuleProxy(original_tpu)
         self._claimed_slices: set[str] = set()
+        self._rollout_slices: list[str] = []
         self._shared_slice_pools = 0
 
     @property
@@ -707,9 +712,11 @@ class PlatformTPU(PlatformBase):
         A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per slice. Without
         an affinity label a pool can straddle two slices, which the TPU mesh cannot span. Each pool
         gets the first slice that no earlier pool claimed, so the trainer and rollout pools land on
-        different slices. Once every slice is claimed, further pools (e.g. the 5th to 8th of eight TP=4
-        rollout replicas on four single-host rollout slices) go round-robin over the slices after the
-        first, which holds the first pool (the trainer's); with a single slice they share it.
+        different slices. Once every slice is claimed, the pool of a rollout replica (e.g. the 5th to 8th
+        of eight TP=4 replicas on four single-host rollout slices) goes round-robin over the slices that
+        rollout replicas claimed, never onto one that a dedicated pool (the trainer's ``global_pool``,
+        ``reward_pool``, ``teacher_pool``) holds whole. Other pools, and rollout replicas when no rollout
+        replica holds a slice, share the last slice.
         """
         if accelerator_type is not None:
             return accelerator_type
@@ -729,17 +736,22 @@ class PlatformTPU(PlatformBase):
                         s,
                     ),
                 )
+                is_rollout_replica = (name_prefix or "").startswith(ROLLOUT_REPLICA_POOL_PREFIX)
                 for tpu_slice in slices:
                     if tpu_slice not in self._claimed_slices:
                         self._claimed_slices.add(tpu_slice)
+                        if is_rollout_replica:
+                            self._rollout_slices.append(tpu_slice)
                         return tpu_slice
-                if slices:
-                    # Stacking the remaining pools on one slice would ask it for more chips than it has, and
+                rollout_slices = [s for s in self._rollout_slices if s in tpu_slices]
+                if is_rollout_replica and rollout_slices:
+                    # Stacking the remaining replicas on one slice would ask it for more chips than it has, and
                     # their placement groups would never be scheduled.
-                    shared = slices[1:] or slices
-                    tpu_slice = shared[self._shared_slice_pools % len(shared)]
+                    tpu_slice = rollout_slices[self._shared_slice_pools % len(rollout_slices)]
                     self._shared_slice_pools += 1
                     return tpu_slice
+                if slices:
+                    return slices[-1]
         except Exception as e:
             logger.debug("Could not auto-assign a TPU slice for %r: %s", name_prefix, e)
 
