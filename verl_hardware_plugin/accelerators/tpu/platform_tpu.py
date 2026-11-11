@@ -848,10 +848,20 @@ class PlatformTPU(PlatformBase):
         unique_hostnames = list(dict.fromkeys(bundle_ips))
 
         # Derive the mesh from the pod type Ray reports for this pool's hosts, falling back to the chip count.
+        # A single-host rollout replica's worker group (rollout_[reward_|teacher_]standalone_<rank>) may be TP=2 or
+        # TP=4 on TPU 7x, whose mesh comes from single_host_tpu_topology (TPU_V7X_SUBHOST_TOPOLOGY_MAP).
         tpu_type = ray_tpu_accelerator_name(node_ips=unique_hostnames)
-        topology, _, _, chips_per_host = resolve_tpu_topology_bounds(
-            total_chips=world_size, num_nodes=len(unique_hostnames), pod_type=tpu_type
+        topology = (
+            single_host_tpu_topology(world_size, pod_type=tpu_type)
+            if len(unique_hostnames) == 1 and (name_prefix or "").startswith(ROLLOUT_REPLICA_POOL_PREFIX)
+            else ""
         )
+        if topology:
+            chips_per_host = str(tpu_chips_per_host_override() or max(1, world_size))
+        else:
+            topology, _, _, chips_per_host = resolve_tpu_topology_bounds(
+                total_chips=world_size, num_nodes=len(unique_hostnames), pod_type=tpu_type
+            )
 
         return {
             "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(sb_addresses),
