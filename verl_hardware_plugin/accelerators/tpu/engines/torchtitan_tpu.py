@@ -75,7 +75,7 @@ from verl.workers.engine.utils import (
 )
 from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import no_padding_2_padding
-from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels, tpu_ragged_ep
+from verl_hardware_plugin.accelerators.tpu.engines import graph_trainer_mode, tpu_model_kernels, tpu_ragged_ep
 from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
@@ -894,6 +894,53 @@ def _splash_and_routing_selective_ac_config() -> Any:
     return _SPLASH_ROUTING_SELECTIVE_AC_CLS.Config()
 
 
+def _add_rollout_consistency_metrics(
+    loss_function: Callable, loss_model_output: dict[str, Any], loss_data: TensorDict, metrics: dict[str, Any]
+) -> None:
+    """Adds the trainer-vs-rollout log-prob gap metrics (KL, k3, |gap|) of verl's PPO loss to ``metrics``.
+
+    Shared by the eager and ``trainer_mode=graph_trainer`` step paths so both log the same metrics.
+    """
+    names = (
+        "actor/ppo_kl_token_mean",
+        "actor/ppo_k3_token_mean",
+        "actor/logprob_gap_abs_token_mean",
+    )
+    if (
+        isinstance(loss_function, partial)
+        and loss_function.func is ppo_loss
+        and any(name not in metrics for name in names)
+    ):
+        config = loss_function.keywords.get("config")
+        if config is None and loss_function.args:
+            config = loss_function.args[0]
+        if config is not None and config.global_batch_info.get("batch_num_tokens") is not None:
+            mode = config.policy_loss.get("loss_mode", "vanilla")
+            correction = config.policy_loss.get("rollout_correction") or {}
+            # Rejection sampling and other losses use a different token denominator.
+            if mode == "vanilla" or (
+                mode == "bypass_mode"
+                and correction.get("loss_type", "ppo_clip") == "ppo_clip"
+                and correction.get("rollout_rs") is None
+            ):
+                with torch.no_grad():
+                    log_prob = no_padding_2_padding(loss_model_output["log_probs"], loss_data)
+                    fields = loss_data.select("old_log_probs", "response_mask").to_padded_tensor()
+                    mask = fields["response_mask"]
+                    gap = torch.where(mask.bool(), log_prob.float() - fields["old_log_probs"].float(), 0.0)
+                    ratio = gap.clamp(-20.0, 20.0)
+                    values = (-ratio, (ratio.exp() - ratio - 1.0).clamp_min(0.0), gap.abs())
+                    # SUM micro-batches, then MEAN DP ranks: global token means.
+                    for name, value in zip(names, values, strict=True):
+                        metrics.setdefault(
+                            name,
+                            Metric(
+                                AggregationType.SUM,
+                                agg_loss(value, mask, "token-mean", **config.global_batch_info),
+                            ),
+                        )
+
+
 class TorchTitanTPUEngine(BaseEngine):
     """Standalone TorchTitan engine for Google TPU with ``tpu_dist`` / PJRT SPMD execution."""
 
@@ -959,6 +1006,15 @@ class TorchTitanTPUEngine(BaseEngine):
         self._tpu_kernels = tpu_model_kernels.resolve_tpu_model_kernels(torchtitan_name, tpu_options.model_kernels)
         if self._tpu_kernels:
             logger.info("Optional torchtitan TPU kernels of %s: %s", torchtitan_name, sorted(self._tpu_kernels))
+        # engine_kwargs.tpu.trainer_mode=graph_trainer: TorchTitan's TpuGraphTrainer traces and compiles the whole
+        # training step (engines/graph_trainer_mode.py).
+        self._graph_trainer_mode = graph_trainer_mode.is_graph_trainer_mode(tpu_options)
+        if self._graph_trainer_mode:
+            graph_trainer_mode.validate_graph_trainer_engine(
+                engine_config, tpu_options, use_simple_fsdp=self._use_simple_fsdp, tpu_kernels=self._tpu_kernels
+            )
+        self._graph_policy_loss_spec: Optional[graph_trainer_mode.GraphPolicyLossSpec] = None
+        self._graph_trainer_traced_len: Optional[int] = None
         registry_params = inspect.signature(model_module.model_registry).parameters
         fuse_qkv_kwargs = (
             {"fuse_qkv": False}
@@ -1150,7 +1206,7 @@ class TorchTitanTPUEngine(BaseEngine):
             }[ac_mode]()
 
         # Construct Torchtitan's Trainer.Config
-        self.config = Trainer.Config(
+        trainer_config_kwargs: dict[str, Any] = dict(
             model_spec=model_spec,
             hf_assets_path=self.model_config.path,
             optimizer=optimizer,
@@ -1166,6 +1222,14 @@ class TorchTitanTPUEngine(BaseEngine):
             # verl uses its own loss function and ignores this one.
             loss=CrossEntropyLoss.Config(),
         )
+        if self._graph_trainer_mode:
+            # TpuGraphTrainer.Config: the same fields, a GraphTrainerCompileConfig (aot_fx_trace), the TPU graph-trainer
+            # settings and no eager activation checkpointing (the graph's memory policy replaces it).
+            self.config = graph_trainer_mode.build_graph_trainer_config(
+                trainer_config_kwargs, tpu_options, activation_checkpoint=ac_mode
+            )
+        else:
+            self.config = Trainer.Config(**trainer_config_kwargs)
         if self._use_fused_linear_cross_entropy:
             self._enable_fused_logprob_head()
         logger.warning(
@@ -1185,7 +1249,10 @@ class TorchTitanTPUEngine(BaseEngine):
         for override_import in tpu_model_kernels.override_imports(self._tpu_kernels):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
-        self.trainer = Trainer(self.config)
+        if self._graph_trainer_mode:
+            self.trainer = graph_trainer_mode.build_rl_graph_trainer(self.config)
+        else:
+            self.trainer = Trainer(self.config)
         if engine_config.use_torch_compile:
             tpu_model_kernels.patch_torchtitan_tpu_dynamo_caches()
         self.parallel_dims = self.trainer.parallel_dims
@@ -1233,6 +1300,10 @@ class TorchTitanTPUEngine(BaseEngine):
                 n_barriers = tpu_model_kernels.install_ep_chunk_barriers(model_parts)
                 if n_barriers:
                     logger.info("Installed EP chunk window barriers on %d routed-experts modules", n_barriers)
+
+        if self._graph_trainer_mode:
+            # After every module swap above: annotate the final module tree for the graph passes.
+            graph_trainer_mode.prepare_model_for_graph_trainer(model_parts)
 
         if engine_config.use_torch_compile:
             n_compiled = sum(
@@ -1511,6 +1582,11 @@ class TorchTitanTPUEngine(BaseEngine):
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only: bool = False):
         """Perform forward and optionally backward pass with host-side token counting and XLA graph break."""
+        graph_mode = getattr(self, "_graph_trainer_mode", False)
+        if graph_mode and forward_only:
+            # Phase 1 runs in bypass mode with the KL loss off, so the actor never needs a forward-only pass. Without
+            # per-block compile there is no fast eager forward to fall back to (TODO-3).
+            raise graph_trainer_mode.forward_only_error()
         tu.assign_non_tensor(
             data, sp_size=self.engine_config.tensor_parallel_size * self.engine_config.context_parallel_size
         )
@@ -1548,6 +1624,9 @@ class TorchTitanTPUEngine(BaseEngine):
             updated = tpu_model_kernels.set_packed_document_budget(self.module, budget)
             if updated:
                 logger.info("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)
+
+        if graph_mode:
+            return self._graph_trainer_forward_backward(data, micro_batches, indices, loss_function, batch_num_tokens)
 
         output_lst = []
         ctx = torch.no_grad() if forward_only else nullcontext()
@@ -1588,6 +1667,126 @@ class TorchTitanTPUEngine(BaseEngine):
                 output_lst.append(output)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+
+    def _graph_trainer_forward_backward(
+        self,
+        data: TensorDict,
+        micro_batches: list[TensorDict],
+        indices: Any,
+        loss_function: Callable,
+        batch_num_tokens: Any,
+    ) -> dict[str, Any]:
+        """``trainer_mode=graph_trainer``: the mini-batch's micro-batch through TorchTitan's traced training step.
+
+        The micro-batch is prepared as in the eager engine (packed, bucket-padded to ``static_micro_batch_len``, same
+        shape on every rank), so the one traced, compiled step serves every step.
+        ``TpuGraphTrainer.forward_backward_step`` runs the model, the fused LM-head log-prob, the PPO policy loss and
+        the backward as one executable and writes the gradients to ``param.grad`` for the unchanged
+        ``optimizer_step``. It assigns rather than accumulates ``param.grad``, so exactly one micro-batch per mini-batch
+        per rank is supported (TODO-1). The loss is normalized by the mini-batch's GLOBAL token count, as in the eager
+        engine. verl's ``ppo_loss`` then runs eagerly under ``no_grad`` on the per-token log-probs the graph returns,
+        so the reported loss and metrics are the eager engine's.
+        """
+        if len(micro_batches) != 1:
+            raise graph_trainer_mode.multi_micro_batch_error(len(micro_batches))
+        self._ensure_graph_policy_loss(loss_function, micro_batches[0])
+        timeline_ctx = timeline.span(
+            "fwd_bwd",
+            group=timeline.TRAINER_WORKERS,
+            lane=timeline.trainer_lane(),
+            micro_batches=len(micro_batches),
+            tokens=batch_num_tokens,
+        )
+        output_lst = []
+        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode):
+            for micro_batch_idx, micro_batch in enumerate(micro_batches):
+                output_lst.append(
+                    self._graph_trainer_micro_batch(micro_batch, micro_batch_idx, loss_function, batch_num_tokens)
+                )
+        return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+
+    def _graph_trainer_micro_batch(
+        self, micro_batch: TensorDict, micro_batch_idx: int, loss_function: Callable, batch_num_tokens: Any
+    ) -> dict[str, Any]:
+        """One micro-batch of ``_graph_trainer_forward_backward``: the traced step, then verl's loss and metrics."""
+        input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+        if extra_kwargs or set(extra_inputs) != {"positions"} or "orig_seq_len" not in output_args:
+            raise NotImplementedError(
+                "trainer_mode=graph_trainer supports packed text-only inputs (use_remove_padding=True, no "
+                f"multi-modal or CP inputs), got {sorted(extra_inputs)} / {sorted(extra_kwargs)}"
+            )
+        padded_len = int(input_ids.shape[-1])
+        if self._graph_trainer_traced_len is None:
+            self._graph_trainer_traced_len = padded_len
+        elif padded_len != self._graph_trainer_traced_len:
+            raise graph_trainer_mode.shape_change_error(self._graph_trainer_traced_len, padded_len)
+
+        # Fixed pytree with fixed shapes every step: the packed [T] RL loss inputs and a 0-d tensor token count (the
+        # mini-batch's global count, the same for every micro-batch).
+        old_log_probs, advantages, loss_mask = graph_trainer_mode.pack_rl_loss_targets(micro_batch, padded_len)
+        device = input_ids.device
+        labels = (
+            output_args["labels"],
+            old_log_probs.to(device),
+            advantages.to(device),
+            loss_mask.to(device),
+        )
+        global_valid_tokens = torch.tensor(float(batch_num_tokens), dtype=torch.float32, device=device)
+        input_dict = {"input": input_ids, "labels": labels, "positions": extra_inputs["positions"]}
+        # bf16 autocast as in the eager engine; it must be active while the step is traced (step 1), which records the
+        # casts into the graph.
+        with (
+            torch.profiler.record_function(f"micro_batch{micro_batch_idx}"),
+            torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16),
+        ):
+            graph_loss = self.trainer.forward_backward_step(
+                input_dict=input_dict, global_valid_tokens=global_valid_tokens
+            )
+        (log_probs,) = self.trainer.last_loss_aux
+
+        # verl's loss and metrics, eagerly on the graph's log-probs (same code path as the eager engine's outputs).
+        with (
+            torch.no_grad(),
+            torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16),
+            spmd_no_typecheck_context(),
+        ):
+            model_output = {
+                "log_probs": _to_jagged(log_probs, micro_batch["input_ids"].offsets(), output_args["orig_seq_len"])
+            }
+            loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
+            loss, metrics = loss_function(
+                model_output=loss_model_output, data=loss_data, dp_group=self.get_data_parallel_group()
+            )
+            _add_rollout_consistency_metrics(loss_function, loss_model_output, loss_data, metrics)
+            for value in model_output.values():
+                if hasattr(value, TPU_PADDED_VALUES_ATTR):
+                    delattr(value, TPU_PADDED_VALUES_ATTR)
+        verl_loss = loss.detach().item()
+        graph_trainer_mode.check_loss_consistency(
+            graph_loss.detach().float().item(), verl_loss, self.get_data_parallel_size()
+        )
+        return {"model_output": detach_tree(model_output), "loss": verl_loss, "metrics": metrics}
+
+    def _ensure_graph_policy_loss(self, loss_function: Callable, micro_batch: TensorDict) -> None:
+        """Installs the traced PPO loss as ``TpuGraphTrainer.loss_fn`` on the first step; later steps must match it.
+
+        Its constants (clip ratios, temperature) are baked into the traced graph, so a change would be silently ignored.
+        """
+        spec = graph_trainer_mode.GraphPolicyLossSpec.from_loss_function(
+            loss_function,
+            temperature=float(unwrap_metadata(micro_batch["temperature"])),
+            calculate_entropy=bool(
+                unwrap_metadata(tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False))
+            ),
+            has_rollout_is_weights="rollout_is_weights" in micro_batch.keys(),
+        )
+        if self._graph_policy_loss_spec is None:
+            self.trainer.loss_fn = graph_trainer_mode.GraphPolicyLoss(spec, self._tpu_kernels)
+            self._graph_policy_loss_spec = spec
+        elif spec != self._graph_policy_loss_spec:
+            raise RuntimeError(
+                f"trainer_mode=graph_trainer traced the policy loss with {self._graph_policy_loss_spec}, got {spec}"
+            )
 
     def model_forward_step(
         self,
@@ -2521,46 +2720,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                         data=loss_data,
                         dp_group=self.get_data_parallel_group(),
                     )
-                    names = (
-                        "actor/ppo_kl_token_mean",
-                        "actor/ppo_k3_token_mean",
-                        "actor/logprob_gap_abs_token_mean",
-                    )
-                    if (
-                        isinstance(loss_function, partial)
-                        and loss_function.func is ppo_loss
-                        and any(name not in metrics for name in names)
-                    ):
-                        config = loss_function.keywords.get("config")
-                        if config is None and loss_function.args:
-                            config = loss_function.args[0]
-                        if config is not None and config.global_batch_info.get("batch_num_tokens") is not None:
-                            mode = config.policy_loss.get("loss_mode", "vanilla")
-                            correction = config.policy_loss.get("rollout_correction") or {}
-                            # Rejection sampling and other losses use a different token denominator.
-                            if mode == "vanilla" or (
-                                mode == "bypass_mode"
-                                and correction.get("loss_type", "ppo_clip") == "ppo_clip"
-                                and correction.get("rollout_rs") is None
-                            ):
-                                with torch.no_grad():
-                                    log_prob = no_padding_2_padding(loss_model_output["log_probs"], loss_data)
-                                    fields = loss_data.select("old_log_probs", "response_mask").to_padded_tensor()
-                                    mask = fields["response_mask"]
-                                    gap = torch.where(
-                                        mask.bool(), log_prob.float() - fields["old_log_probs"].float(), 0.0
-                                    )
-                                    ratio = gap.clamp(-20.0, 20.0)
-                                    values = (-ratio, (ratio.exp() - ratio - 1.0).clamp_min(0.0), gap.abs())
-                                    # SUM micro-batches, then MEAN DP ranks: global token means.
-                                    for name, value in zip(names, values, strict=True):
-                                        metrics.setdefault(
-                                            name,
-                                            Metric(
-                                                AggregationType.SUM,
-                                                agg_loss(value, mask, "token-mean", **config.global_batch_info),
-                                            ),
-                                        )
+                    _add_rollout_consistency_metrics(loss_function, loss_model_output, loss_data, metrics)
                 else:
                     assert forward_only, "loss_function must be provided when not forward_only"
                     loss = torch.tensor(1.0, device=device_name)

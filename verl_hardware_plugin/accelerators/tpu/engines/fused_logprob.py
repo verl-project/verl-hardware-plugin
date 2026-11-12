@@ -43,10 +43,59 @@ def require_tokamax() -> None:
         ) from e
 
 
+_PALLAS_FAKE_LIB: Any = None
+_VERIFIED_FORWARD_OPS: set[str] = set()
+
+
+def _ensure_per_row_fake(fwd_name: str, op: Any, b_block: int, h_block: int, v_block: int) -> None:
+    """Ensure ``pallas::<fwd_name>`` reports shape ``(rows,)`` on meta tensors for ``reduction="none"``.
+
+    TorchTitan's ``linear_softmax_cross_entropy_loss`` registers a ``(1,)`` fake loss for every reduction, which
+    eager runs never call, whereas ``make_fx`` tracing (``trainer_mode=graph_trainer``) would silently broadcast a
+    ``(1,)`` log-prob across the batch. Override the op's fake registration with the per-row shape when needed.
+
+    TODO(torchtitan): register the ``(rows,)`` fake for ``reduction="none"`` in torchtitan's
+    ``linear_softmax_cross_entropy_loss``, then remove this shim (and ``_PALLAS_FAKE_LIB`` /
+    ``_VERIFIED_FORWARD_OPS``) once verl's TPU image pins a torchtitan with the fix.
+    """
+    global _PALLAS_FAKE_LIB
+    if fwd_name in _VERIFIED_FORWARD_OPS:
+        return
+    with torch._C._DisableTorchDispatch():
+        x = torch.empty(b_block, h_block, dtype=torch.bfloat16, device="meta")
+        labels = torch.empty(b_block, dtype=torch.int32, device="meta")
+        weight_t = torch.empty(h_block, v_block, dtype=torch.bfloat16, device="meta")
+        loss, _ = op(x, labels, weight_t)
+    if tuple(loss.shape) != (b_block,):
+        qualname = f"pallas::{fwd_name}"
+        if torch._C._dispatch_has_kernel_for_dispatch_key(qualname, "Meta"):
+            if _PALLAS_FAKE_LIB is None:
+                _PALLAS_FAKE_LIB = torch.library.Library("pallas", "IMPL")
+            torch.library.register_fake(
+                qualname,
+                lambda x, labels, weights: (
+                    torch.empty(x.shape[0], dtype=torch.float32, device=x.device),
+                    torch.empty(x.shape[0], dtype=torch.float32, device=x.device),
+                ),
+                lib=_PALLAS_FAKE_LIB,
+            )
+            with torch._C._DisableTorchDispatch():
+                loss, _ = op(x, labels, weight_t)
+        if tuple(loss.shape) != (b_block,):
+            raise RuntimeError(
+                "torchtitan's fused linear-softmax-CE forward op reports a fake loss of shape "
+                f"{tuple(loss.shape)} instead of ({b_block},) for reduction='none', so a graph_trainer trace of "
+                "the fused log-prob would be wrong; set use_fused_linear_cross_entropy=False."
+            )
+    _VERIFIED_FORWARD_OPS.add(fwd_name)
+
+
 def _forward_op(b_block: int, h_block: int, v_block: int) -> Any:
     """torchtitan's forward custom op ``(x, labels, weight_t) -> (loss, lse)`` for ``reduction="none"``."""
     fwd_name, _ = _loss_module()._get_loss_op_names("none", "mosaic_tpu", b_block, h_block, v_block)
-    return getattr(torch.ops.pallas, fwd_name)
+    op = getattr(torch.ops.pallas, fwd_name)
+    _ensure_per_row_fake(fwd_name, op, b_block, h_block, v_block)
+    return op
 
 
 class _FusedLogprob(torch.autograd.Function):
@@ -94,6 +143,42 @@ class _FusedLogprob(torch.autograd.Function):
         return grad_x.to(x.dtype), None, grad_w, None
 
 
+class _FusedLogprobFunctional(_FusedLogprob):
+    """``_FusedLogprob`` with an out-of-place backward, for whole-step tracing (``trainer_mode=graph_trainer``).
+
+    TorchTitan's graph trainer traces the backward with ``make_fx`` without functionalization, so the in-place writes
+    above (``scatter_add_``, ``*=``, ``grad_x.addmm_``, ``grad_w[:, cols] = ...``) would land in the graph as mutations
+    of intermediates. Same math and vocab chunking; ``grad_x`` is summed and the ``grad_w`` column blocks are
+    concatenated instead. The trace unrolls the chunk loop.
+    """
+
+    @staticmethod
+    def backward(ctx: Any, grad):  # type: ignore[override]
+        # Same math as _FusedLogprob.backward (one vocab chunk of FP32 logits at a time), without in-place ops.
+        x, labels, weight_t, lse = ctx.saved_tensors
+        num_tokens, vocab = x.shape[0], weight_t.shape[1]
+        x32 = x.float()
+        scale = grad.float().unsqueeze(-1)
+        lse_col = lse.unsqueeze(-1)
+        labels = labels.long()
+        grad_x = None
+        grad_w_chunks = []
+        chunk = backward_vocab_chunk(num_tokens, vocab)
+        for start in range(0, vocab, chunk):
+            cols = slice(start, min(start + chunk, vocab))
+            w32 = weight_t[:, cols].float()
+            g = -torch.exp(x32 @ w32 - lse_col)  # -softmax over this chunk's columns
+            in_chunk = (labels >= cols.start) & (labels < cols.stop)
+            local = (labels - cols.start).clamp(0, cols.stop - cols.start - 1).unsqueeze(-1)
+            g = g.scatter_add(-1, local, in_chunk.to(g.dtype).unsqueeze(-1))
+            g = g * scale
+            chunk_grad_x = g @ w32.t()
+            grad_x = chunk_grad_x if grad_x is None else grad_x + chunk_grad_x
+            grad_w_chunks.append((x32.t() @ g).to(weight_t.dtype))
+        assert grad_x is not None
+        return grad_x.to(x.dtype), None, torch.cat(grad_w_chunks, dim=1), None
+
+
 def fused_linear_logprobs_tpu(
     hidden_states: torch.Tensor,
     labels: torch.Tensor,
@@ -103,12 +188,14 @@ def fused_linear_logprobs_tpu(
     b_block_size: int = 1024,
     h_block_size: int = 512,
     v_block_size: int = 2048,
+    functional_backward: bool = False,
 ) -> torch.Tensor:
     """Per-token ``log_softmax(hidden_states @ weight_t / temperature)[labels]`` in FP32, shape ``(T,)``.
 
     ``hidden_states`` ``(..., H)`` and ``labels`` ``(...)`` are flattened to ``T`` tokens; ``weight_t`` is the
     ``(H, V)`` transposed LM-head weight (BF16), passed as is. ``T`` is zero-padded to whole ``b_block_size`` row
-    blocks for the kernel; padded rows get no gradient.
+    blocks for the kernel; padded rows get no gradient. ``functional_backward`` selects the out-of-place backward
+    for whole-step tracing (see ``_FusedLogprobFunctional``).
     """
     x = hidden_states.reshape(-1, hidden_states.shape[-1])
     if temperature != 1.0:
@@ -118,4 +205,5 @@ def fused_linear_logprobs_tpu(
     if pad:
         x, labels = F.pad(x, (0, 0, 0, pad)), F.pad(labels, (0, pad))
     blocks = (b_block_size, h_block_size, v_block_size)
-    return _FusedLogprob.apply(x.contiguous(), labels.contiguous(), weight_t, blocks)[:num_tokens]
+    fn = _FusedLogprobFunctional if functional_backward else _FusedLogprob
+    return fn.apply(x.contiguous(), labels.contiguous(), weight_t, blocks)[:num_tokens]
