@@ -6,14 +6,24 @@
 from functools import wraps
 
 import torch
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
+
+
+def _sharded_parameters(model):
+    # Forward-only passes can leave child FSDP groups unsharded, even after
+    # resharding the root. Snapshots must read and restore the FP32 master shards.
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            module.reshard()
+    return dict(model.named_parameters())
 
 
 def save_model_parts(model_parts):
     snapshots = []
     for module in model_parts:
         snapshot = {}
-        for name, parameter in module.named_parameters():
+        for name, parameter in _sharded_parameters(module).items():
             local = parameter.to_local() if isinstance(parameter, DTensor) else parameter
             spec = parameter._spec if isinstance(parameter, DTensor) else None
             snapshot[name] = (local.detach().to("cpu", copy=True), spec)
@@ -24,7 +34,7 @@ def save_model_parts(model_parts):
 @torch.no_grad()
 def restore_model_parts(model_parts, snapshots):
     for module, snapshot in zip(model_parts, snapshots, strict=True):
-        parameters = dict(module.named_parameters())
+        parameters = _sharded_parameters(module)
         if parameters.keys() != snapshot.keys():
             raise ValueError("Policy snapshot parameter names changed")
         for name, parameter in parameters.items():
