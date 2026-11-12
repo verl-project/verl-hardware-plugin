@@ -16,6 +16,7 @@ defined here rather than inherited from another vendor's platform.
 import logging
 import math
 import os
+import re
 from contextlib import contextmanager
 from typing import Any, Mapping, Optional
 
@@ -67,6 +68,23 @@ TRAINER_EXTRA_XLA_FLAGS_ENV = "VERL_TPU_TRAINER_XLA_FLAGS"
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471
 
+# verl names the resource pool of each standalone rollout replica ``rollout_pool[_reward|_teacher]_<rank>[_<model
+# key>]`` (``verl.workers.rollout.replica``); the dedicated pools are ``global_pool``, ``reward_pool`` and
+# ``teacher_pool``. A replica's kind is its pool name without the rank, so policy, reward and teacher replicas (and the
+# replicas of different teacher models) are told apart.
+ROLLOUT_REPLICA_POOL_PREFIX = "rollout_"
+_ROLLOUT_POOL_RANK = re.compile(r"^(rollout_pool(?:_reward|_teacher)?)_\d+(.*)$")
+
+
+def rollout_replica_kind(name_prefix: Optional[str]) -> Optional[str]:
+    """The kind of rollout replica whose resource pool this is (its name without the rank), or None for other pools."""
+    name = name_prefix or ""
+    if not name.startswith(ROLLOUT_REPLICA_POOL_PREFIX):
+        return None
+    match = _ROLLOUT_POOL_RANK.match(name)
+    return match.group(1) + match.group(2) if match else re.sub(r"_\d+$", "", name)
+
+
 # TPU slice topology (an ``x,y,z`` chip mesh) keyed by the number of chips in the slice. The vLLM
 # rollout (``rollout/tpu_vllm_patches.py``) resolves its mesh here too, so the trainer and the
 # rollout agree on the physical layout of a given slice size.
@@ -101,8 +119,8 @@ TPU_SINGLE_HOST_MAX_CHIPS = 4
 # (``gke_tpu_slice_topology``); this table covers a pool that uses part of a slice, keyed by device count:
 # a host holds 4 chips (``2x2x1``) = 8 devices, and the multi-host entries follow the GKE slice shapes
 # (``2x2x2`` = 2 hosts, ``2x2x4`` = 4, ``2x4x4`` = 8, ``4x4x4`` = 16). Only whole hosts (and a single
-# device) are listed: a standalone process can open only a chip's first core, so sub-host meshes have
-# no validated layout.
+# device) are listed: a standalone process can open only a chip's first core. Rollout engines that use part
+# of a host take ``TPU_V7X_SUBHOST_TOPOLOGY_MAP`` instead (see ``single_host_tpu_topology``).
 TPU_V7X_CORES_PER_CHIP = 2
 TPU_V7X_DEVICES_PER_HOST = 8
 TPU_V7X_TOPOLOGY_MAP = {
@@ -112,6 +130,14 @@ TPU_V7X_TOPOLOGY_MAP = {
     32: "2,2,4,2",
     64: "2,4,4,2",
     128: "4,4,4,2",
+}
+# The mesh of a rollout engine on part of one TPU 7x host, one process per TensorCore: TP=2 is one chip
+# (``1,1,1,2``), TP=4 two chips (``1,2,1,2``). Validated on ``2x2x1`` hosts running four TP=2 or two TP=4
+# vLLM engines side by side (tpu_dist init and all-reduce, then GRPO training). Only the single-host rollout
+# uses it; a trainer pool of 2 or 4 devices is not validated and still needs ``TORCH_TPU_TOPOLOGY``.
+TPU_V7X_SUBHOST_TOPOLOGY_MAP = {
+    2: "1,1,1,2",
+    4: "1,2,1,2",
 }
 # One process per TensorCore: every process is a ``1,1,1,1`` cell of the mesh.
 TPU_V7X_PROCESS_BOUNDS = "1,1,1,1"
@@ -281,12 +307,13 @@ def single_host_tpu_topology(num_chips: int, pod_type: str = "") -> str:
 
     Such a replica must not inherit the slice's ``TORCH_TPU_TOPOLOGY`` (set by the GKE TPU webhook or the job):
     vllm-torchtpu builds the slice-builder addresses of its local workers only, and libtpu then fails with
-    "Expected <slice chips> worker addresses, got <host chips>". Sizes without a known mesh (e.g. 2 or 4 TPU 7x
-    devices, a TP=2 / TP=4 replica: ``TPU_V7X_TOPOLOGY_MAP`` lists whole hosts only) return ``""`` so that the
+    "Expected <slice chips> worker addresses, got <host chips>". On TPU 7x a TP=2 / TP=4 replica, which uses part
+    of a host, takes ``TPU_V7X_SUBHOST_TOPOLOGY_MAP``. Sizes without a known mesh return ``""`` so that the
     caller keeps the inherited environment rather than failing.
     """
-    topology_map = TPU_V7X_TOPOLOGY_MAP if is_tpu_v7x(pod_type) else DEFAULT_TPU_TOPOLOGY_MAP
-    return topology_map.get(num_chips, "")
+    if is_tpu_v7x(pod_type):
+        return TPU_V7X_TOPOLOGY_MAP.get(num_chips) or TPU_V7X_SUBHOST_TOPOLOGY_MAP.get(num_chips, "")
+    return DEFAULT_TPU_TOPOLOGY_MAP.get(num_chips, "")
 
 
 def resolve_tpu_topology_bounds(
@@ -563,6 +590,9 @@ class PlatformTPU(PlatformBase):
         # torch.tpu itself is left untouched; the proxy adds what verl needs (see TPUDeviceModuleProxy).
         self._device_module = TPUDeviceModuleProxy(original_tpu)
         self._claimed_slices: set[str] = set()
+        # Per rollout replica kind (see rollout_replica_kind): {slice: replicas placed on it} for the slices its
+        # replicas claimed, in claim order.
+        self._rollout_slices: dict[str, dict[str, int]] = {}
 
     @property
     def vendor_name(self) -> str:
@@ -697,7 +727,16 @@ class PlatformTPU(PlatformBase):
         A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per slice. Without
         an affinity label a pool can straddle two slices, which the TPU mesh cannot span. Each pool
         gets the first slice that no earlier pool claimed, so the trainer and rollout pools land on
-        different slices; once every slice is claimed, further pools share the last one.
+        different slices. Once every slice is claimed, the pool of a rollout replica (e.g. the 5th to 8th
+        of eight TP=4 replicas on four single-host rollout slices) goes to the least loaded of the slices
+        that replicas of its own kind (policy, reward or teacher; ``rollout_replica_kind``) claimed: the
+        one with the fewest of those replicas per TPU device, the first claimed on a tie. On equal slices
+        that is round-robin; a 2-host slice takes twice the replicas of a 1-host one. This assumes that
+        every replica of a kind asks for the same number of devices (the pool name carries no demand),
+        which holds for verl's rollout replicas of one model. A replica never lands on a slice that a
+        dedicated pool (the trainer's ``global_pool``, ``reward_pool``, ``teacher_pool``) or a replica of
+        another kind holds. Other pools, and rollout replicas whose kind holds no slice, share the last
+        slice.
         """
         if accelerator_type is not None:
             return accelerator_type
@@ -705,11 +744,15 @@ class PlatformTPU(PlatformBase):
         try:
             if ray.is_initialized():
                 tpu_slices = set()
+                # TPU devices per slice: the "TPU" resource of its alive hosts, which placement-group bundles ask for.
+                slice_devices: dict[str, float] = {}
                 for node in ray.nodes():
                     if node.get("Alive"):
-                        for res in node.get("Resources", {}):
+                        resources = node.get("Resources", {})
+                        for res in resources:
                             if res.startswith("tpu-group-"):
                                 tpu_slices.add(res)
+                                slice_devices[res] = slice_devices.get(res, 0.0) + float(resources.get("TPU", 0.0))
                 slices = sorted(
                     tpu_slices,
                     key=lambda s: (
@@ -717,9 +760,20 @@ class PlatformTPU(PlatformBase):
                         s,
                     ),
                 )
+                kind = rollout_replica_kind(name_prefix)
                 for tpu_slice in slices:
                     if tpu_slice not in self._claimed_slices:
                         self._claimed_slices.add(tpu_slice)
+                        if kind is not None:
+                            self._rollout_slices.setdefault(kind, {})[tpu_slice] = 1
+                        return tpu_slice
+                if kind is not None:
+                    own_slices = {s: n for s, n in self._rollout_slices.get(kind, {}).items() if s in tpu_slices}
+                    if own_slices:
+                        # Stacking the remaining replicas on one slice would ask it for more devices than it has,
+                        # and their placement groups would never be scheduled. min() keeps the first claimed on a tie.
+                        tpu_slice = min(own_slices, key=lambda s: own_slices[s] / (slice_devices.get(s) or 1.0))
+                        self._rollout_slices[kind][tpu_slice] += 1
                         return tpu_slice
                 if slices:
                     return slices[-1]
@@ -794,10 +848,20 @@ class PlatformTPU(PlatformBase):
         unique_hostnames = list(dict.fromkeys(bundle_ips))
 
         # Derive the mesh from the pod type Ray reports for this pool's hosts, falling back to the chip count.
+        # A single-host rollout replica's worker group (rollout_[reward_|teacher_]standalone_<rank>) may be TP=2 or
+        # TP=4 on TPU 7x, whose mesh comes from single_host_tpu_topology (TPU_V7X_SUBHOST_TOPOLOGY_MAP).
         tpu_type = ray_tpu_accelerator_name(node_ips=unique_hostnames)
-        topology, _, _, chips_per_host = resolve_tpu_topology_bounds(
-            total_chips=world_size, num_nodes=len(unique_hostnames), pod_type=tpu_type
+        topology = (
+            single_host_tpu_topology(world_size, pod_type=tpu_type)
+            if len(unique_hostnames) == 1 and (name_prefix or "").startswith(ROLLOUT_REPLICA_POOL_PREFIX)
+            else ""
         )
+        if topology:
+            chips_per_host = str(tpu_chips_per_host_override() or max(1, world_size))
+        else:
+            topology, _, _, chips_per_host = resolve_tpu_topology_bounds(
+                total_chips=world_size, num_nodes=len(unique_hostnames), pod_type=tpu_type
+            )
 
         return {
             "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(sb_addresses),
