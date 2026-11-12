@@ -28,6 +28,7 @@ include = ["verl_hardware_plugin*"]
 
 [tool.setuptools.package-data]
 verl_hardware_plugin = ["**/*.html", "**/*.yaml"]
+"verl_hardware_plugin.accelerators.neuron" = ["worker_launcher.sh"]
 
 [tool.ruff]
 line-length = 120

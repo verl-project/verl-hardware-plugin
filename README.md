@@ -32,6 +32,7 @@ The platforms and engines in this repository are **reference implementations** �
 | Iluvatar | BI-V150 (CUDA-compatible) | IXCCL | ✅ Supported | [User Guide](docs/accelerators/iluvatar/README.md) |
 | Moore Threads | MUSA | MCCL | ✅ Supported | [User Guide](docs/accelerators/musa/README.md) |
 | Google TPU | v6e | tpu_dist | ✅ Supported | [User Guide](docs/accelerators/tpu/README.md), [GRPO example](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) |
+| AWS Trainium | Trainium2 | Neuron collectives / NIXL | Experimental | [User Guide](docs/accelerators/neuron/README.md) |
 | Biren | SUPA (CUDA-compatible) | BCCL | ✅ Example (requires vendor support) | [User Guide](docs/accelerators/supa/README.md) |
 | AMD ROCm | MI300X / MI355X | RCCL; MoRI-IO weight sync | Platform built-in (verl core); Primus Megatron / MaxText engines and `mori` checkpoint engine here | [User Guide](docs/accelerators/rocm/README.md) |
 
@@ -74,7 +75,8 @@ verl_hardware_plugin/
 │   ├── rocm/       # AMD ROCm (platform built into verl; Primus engines, checkpoint engine)
 │   ├── supa/       # Biren SUPA
 │   ├── tpu/        # Google TPU
-│   ├── trainium/   # Reserved for a future AWS Trainium integration
+│   ├── neuron/     # AWS Trainium: TorchTitan, vLLM-Neuron and NIXL
+│   ├── trainium/   # Inert compatibility placeholder
 │   └── xpu/        # Intel XPU
 ├── integrations/
 │   └── flagos/     # Software integration spanning accelerator backends
@@ -84,8 +86,8 @@ verl_hardware_plugin/
 User guides mirror this layout under `docs/accelerators/<backend>/` and
 `docs/integrations/flagos/`. Accelerator-specific tests and scripts live under
 `tests/accelerators/<backend>/` and `scripts/accelerators/<backend>/`; shared tests
-and scripts stay at their existing top level. The `trainium` directories reserve
-space for future work and do not provide or register AWS Trainium support.
+and scripts stay at their existing top level. AWS Trainium support lives under
+`neuron`.
 
 Add each backend package once to `BACKEND_MODULES` in the plugin's root
 `__init__.py`. `load_backends()` first imports these packages to register their
@@ -111,6 +113,7 @@ verl (main framework)
             ├── PlatformRegistry.register("musa")     → PlatformMUSA
             ├── PlatformRegistry.register("tpu")      → PlatformTPU
             ├── PlatformRegistry.register("biren")    → PlatformSupa
+            ├── PlatformRegistry.register("aws")      → PlatformNeuron
             │
             ├── EngineRegistry.register(device="cuda", vendor="flagos")
             ├── EngineRegistry.register(device="xpu", vendor="intel")
@@ -121,14 +124,17 @@ verl (main framework)
             ├── EngineRegistry.register(device="musa", vendor="moore_threads")
             ├── EngineRegistry.register(device="tpu", vendor="google")
             ├── EngineRegistry.register(device="supa", vendor="biren")
+            ├── EngineRegistry.register(device="neuron", vendor="aws")
             │
             ├── CheckpointEngineRegistry.register("ray-plasma-store" / "tpu-sync") → Google TPU
+            ├── CheckpointEngineRegistry.register("neuron_nixl") → AWS Trainium
             │
             └── RolloutReplicaRegistry.register("vllm")  → TPUvLLMReplica on TPU
 ```
 
 FlagOS registers engines on the CUDA platform rather than a separate platform. The `vllm` rollout
-loader returns the TPU rollout on TPU and verl's own vLLM rollout on every other platform.
+loader selects the TPU or Neuron adapter on its platform and preserves verl's own
+vLLM rollout on other platforms.
 
 The plugin uses verl's decorator-based registration:
 - `@PlatformRegistry.register(platform="vendor_name")` for platform classes
@@ -165,8 +171,7 @@ Each hardware platform provides a standalone user guide (following the structure
 - **[Biren SUPA](docs/accelerators/supa/README.md)** — Biren SUPA accelerator user guide
 - **[AMD ROCm](docs/accelerators/rocm/README.md)** — Primus Megatron / MaxText (JAX) trainers and MoRI-IO weight sync on AMD GPUs
 
-Future integration location: [AWS Trainium](docs/accelerators/trainium/README.md)
-(placeholder only; no implementation).
+- **[AWS Trainium](docs/accelerators/neuron/README.md)** — Experimental native TorchTitan/vLLM-Neuron integration on stable verl 0.9.1.
 
 ### Developer Guides
 

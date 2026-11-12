@@ -41,6 +41,7 @@ PLATFORMS = {
     "iluvatar": "platform_cuda_iluvatar",
     "musa": "platform_musa",
     "tpu": "platform_tpu",
+    "neuron": "platform_neuron",
     "supa": "platform_supa",
 }
 ENGINES = {
@@ -116,11 +117,14 @@ def implementation_stubs(*, failures=(), real_profiler=False):
             "verl.workers.rollout.replica",
             "verl.utils",
             "verl.utils.device",
+            "verl.plugin",
+            "verl.plugin.platform",
         )
     )
     modules["verl.workers.rollout.replica"].RolloutReplicaRegistry = RolloutRegistry
     device = modules["verl.utils.device"]
     device.get_resource_name = mock.Mock(return_value="GPU")
+    modules["verl.plugin.platform"].get_platform = mock.Mock(return_value=SimpleNamespace(vendor_name="nvidia"))
     real_import = builtins.__import__
 
     def load_leaf(name):
@@ -128,6 +132,8 @@ def implementation_stubs(*, failures=(), real_profiler=False):
             return
         record(name)
         module = ModuleType(name)
+        if name.endswith(".platform_neuron"):
+            module.PlatformNeuron = type("PlatformNeuron", (), {})
         if name == profiler_name:
             module._patch_tool_config = lambda: record("profiler:config")
             module._patch_get_torch_profiler = lambda: record("profiler:torch")
@@ -147,7 +153,9 @@ def implementation_stubs(*, failures=(), real_profiler=False):
         yield SimpleNamespace(events=events, registry=RolloutRegistry, device=device)
 
 
-def test_one_backend_entry_loads_package_then_registration(plugin):
+@pytest.mark.parametrize("platform", ["nvidia", "aws"])
+def test_one_backend_entry_loads_package_then_registration(plugin, monkeypatch, platform):
+    monkeypatch.setenv("VERL_PLATFORM", platform)
     with (
         mock.patch.object(plugin, "BACKEND_MODULES", ("new_backend",)),
         mock.patch.object(importlib, "import_module") as load,
@@ -228,7 +236,10 @@ def test_optional_component_failure_does_not_stop_other_registration(plugin, fai
         assert all(f"{package}.registration" in sys.modules for package in plugin.BACKEND_MODULES)
 
 
-def test_missing_backend_does_not_stop_following_backends(plugin):
+@pytest.mark.parametrize("platform", ["nvidia", "aws"])
+def test_missing_backend_does_not_stop_following_backends(plugin, monkeypatch, platform):
+    monkeypatch.setenv("VERL_PLATFORM", platform)
+
     def load(name):
         if name.startswith("missing"):
             raise RuntimeError("Broken optional backend")
