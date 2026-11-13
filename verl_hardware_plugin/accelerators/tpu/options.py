@@ -67,8 +67,8 @@ def _parse(name: str, kind: type, value: Any, source: str, label: str = "TPU") -
         if value == "":
             return None
     try:
-        if kind is ParityMode:
-            return ParityMode.parse(value)
+        if hasattr(kind, "parse"):
+            return kind.parse(value)
         if kind is bool:
             if isinstance(value, bool):
                 return value
@@ -391,6 +391,32 @@ class ParityMode:
         return mode
 
 
+class ReceiveIntoVllmMode:
+    """Values of ``engine_kwargs.tpu-sync.receive_into_vllm`` (see ``weight_sync/vllm_layout.py``).
+
+    * ``auto`` (default): receive straight into vLLM's parameters when the rollout is vLLM and the trainer's
+      weights can be exported in vLLM's layout without cross-rank exchange; fall back to rollout staging buffers
+      otherwise (e.g. SGLang, MoE / hybrid linear-attention models, ``FSDP != TP``, or replicated GQA KV heads).
+    * ``on``: require direct receive into vLLM's parameters; raise when unsupported.
+    * ``off``: always use rollout staging buffers.
+
+    A bool is accepted for compatibility: ``True`` means ``on``, ``False`` means ``off``.
+    """
+
+    MODES = ("auto", "on", "off")
+    _ALIASES = {"false": "off", "0": "off", "no": "off", "none": "off", "true": "on", "1": "on", "yes": "on"}
+
+    @classmethod
+    def parse(cls, value: Any) -> str:
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        mode = str(value).strip().lower()
+        mode = cls._ALIASES.get(mode, mode)
+        if mode not in cls.MODES:
+            raise ValueError(value)
+        return mode
+
+
 @dataclasses.dataclass(frozen=True)
 class TPUSyncOptions:
     """Options of the ``tpu-sync`` checkpoint engine.
@@ -411,10 +437,12 @@ class TPUSyncOptions:
             ``WeightSynchronizer.d2h()`` returns a future (verl#8626); with an older ``tpu-sync-torch`` the sync runs
             to the end as before. Relies on ``CheckpointEngineManager.wait_for_weight_update`` (verl#8530) before
             validation and at the end of training.
-        receive_into_vllm: The rollout receives every tensor straight into vLLM's parameters, with no HBM staging
-            copy. The trainer exports its weights in vLLM's layout (fused, transposed, one virtual tensor per vLLM
-            parameter), so each rollout rank's TP slice is its vLLM weight. Dense models with FSDP degree equal to
-            the rollout TP degree only, for now (see ``weight_sync/vllm_layout.py``).
+        receive_into_vllm: One of ``ReceiveIntoVllmMode.MODES`` (``auto`` by default). When active, the rollout
+            receives every tensor straight into vLLM's parameters with no HBM staging copy: the trainer exports its
+            weights in vLLM's layout (fused, transposed, one virtual tensor per vLLM parameter), so each rollout rank's
+            TP slice is its vLLM weight. ``auto`` enables it for dense vLLM models whose trainer layout needs no
+            cross-rank exchange (e.g. ``FSDP == TP``) and falls back to staging otherwise; ``on`` (``True``) requires
+            it and ``off`` (``False``) disables it.
     """
 
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM
@@ -422,7 +450,7 @@ class TPUSyncOptions:
     release_buffers_after_sync: bool = True
     tie_word_embeddings: Optional[bool] = None
     return_after_d2h: bool = True
-    receive_into_vllm: bool = False
+    receive_into_vllm: str = "auto"
 
     @property
     def verify_norms(self) -> bool:
@@ -440,7 +468,7 @@ _SYNC_KINDS: dict[str, type] = {
     "verify_parity": ParityMode,
     "release_buffers_after_sync": bool,
     "tie_word_embeddings": bool,
-    "receive_into_vllm": bool,
+    "receive_into_vllm": ReceiveIntoVllmMode,
     "return_after_d2h": bool,
 }
 assert set(_SYNC_KINDS) == {f.name for f in dataclasses.fields(TPUSyncOptions)}

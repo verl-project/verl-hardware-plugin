@@ -177,6 +177,20 @@ def build_vllm_layout_export(
         VllmLayoutError: a tensor cannot be exported without communication, or does not match vLLM's shape or dtype.
     """
     weights = dict(named_weights)
+    for hf_name, tensor in weights.items():
+        if ".experts." in hf_name or ".linear_attn." in hf_name or tensor.dim() > 2:
+            raise VllmLayoutError(
+                f"{hf_name} (shape {tuple(tensor.shape)}): MoE and hybrid linear-attention weights are not supported "
+                "by receive_into_vllm yet"
+            )
+    for vllm_name, param in vllm_params.items():
+        # 0-D scalar buffers in vLLM's state_dict() (e.g. Attention._k_scale / _v_scale) are unreferenced and harmless;
+        # >=3-D stacked expert weights, .experts. and .linear_attn. modules need model-specific layouts.
+        if ".experts." in vllm_name or ".linear_attn." in vllm_name or len(param.local_shape) > 2:
+            raise VllmLayoutError(
+                f"{vllm_name} (shape {param.local_shape}): MoE and hybrid linear-attention weights are not supported "
+                "by receive_into_vllm yet"
+            )
     export = VllmLayoutExport()
     consumed: set[str] = set()
 
