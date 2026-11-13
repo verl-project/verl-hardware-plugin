@@ -52,9 +52,16 @@ class _FakeReplica:
         self.args = args
         self.kwargs = kwargs
         self.server_class = None
+        self.launched = False
 
     def _get_server_name_prefix(self):
         return "vllm_"
+
+    def _get_server_env_vars(self, node_ids):
+        return {"FROM_UPSTREAM": "1"}
+
+    async def launch_servers(self):
+        self.launched = True
 
 
 @pytest.fixture
@@ -160,117 +167,39 @@ def test_replica_uses_tpu_server(tpu_vllm):
 
 
 # ---------------------------------------------------------------------------
-# launch_tpu_vllm_servers
+# TPUvLLMReplica._get_server_env_vars / launch_servers
 # ---------------------------------------------------------------------------
-
-
-class _FakeRemoteMethod:
-    def __init__(self, result):
-        self._result = result
-
-    def remote(self, *args, **kwargs):
-        return _done(self._result(*args, **kwargs) if callable(self._result) else self._result)
-
-
-class _FakeWorker:
-    def __init__(self, node_id):
-        self._node_id = node_id
-        self.__ray_call__ = _FakeRemoteMethod(self._call)
-
-    def _call(self, fn):
-        # launch_tpu_vllm_servers asks the first worker for its node id.
-        with mock.patch("ray.get_runtime_context", return_value=SimpleNamespace(get_node_id=lambda: self._node_id)):
-            return fn(self)
-
-
-class _FakeServer:
-    get_master_address = _FakeRemoteMethod(("10.0.0.1", 1234, 5678))
-    get_server_address = _FakeRemoteMethod(("10.0.0.1", 8000))
-
-    def __init__(self):
-        self.launch_kwargs = None
-        self.launch_server = _FakeRemoteMethod(self._launch)
-
-    def _launch(self, **kwargs):
-        self.launch_kwargs = kwargs
-
-
-class _FakeServerClass:
-    def __init__(self):
-        self.options_kwargs = []
-        self.init_kwargs = []
-        self.servers = []
-
-    def options(self, **kwargs):
-        self.options_kwargs.append(kwargs)
-        return self
-
-    def remote(self, **kwargs):
-        self.init_kwargs.append(kwargs)
-        self.servers.append(_FakeServer())
-        return self.servers[-1]
-
 
 NODE_A = "a" * 56
 NODE_B = "b" * 56
 
 
-def _fake_replica(data_parallel_size=1):
-    workers = [_FakeWorker(node) for node in (NODE_A, NODE_B) for _ in range(4)]
-    return SimpleNamespace(
-        config=SimpleNamespace(
-            data_parallel_size=data_parallel_size, tensor_model_parallel_size=8, ray_actor_max_concurrency=1234
-        ),
-        model_config="model_config",
-        rollout_mode="standalone",
-        workers=workers,
-        replica_rank=3,
-        name_suffix="",
-        is_reward_model=False,
-        is_teacher_model=False,
-        gpus_per_replica_node=4,
-        nnodes=2,
-        servers=[],
-        server_class=_FakeServerClass(),
-        _get_server_name_prefix=lambda: "vllm_",
+def _make_tpu_replica(tpu_vllm, *, data_parallel_size=1, nnodes=2, chips_per_host=4):
+    replica = tpu_vllm.TPUvLLMReplica(0, "config", "model_config")
+    replica.config = SimpleNamespace(
+        data_parallel_size=data_parallel_size,
+        tensor_model_parallel_size=chips_per_host * nnodes,
     )
+    replica.nnodes = nnodes
+    replica.gpus_per_replica_node = chips_per_host
+    return replica
 
 
-def test_launch_tpu_vllm_servers_one_server_per_host(tpu_vllm):
-    replica = _fake_replica()
-    platform = SimpleNamespace(ray_noset_envvars=lambda: ["RAY_NOSET"], rollout_env_vars=lambda: {})
-
-    async def run():
-        with mock.patch.object(tpu_vllm, "get_platform", return_value=platform):
-            await tpu_vllm.launch_tpu_vllm_servers(replica)
-
-    asyncio.run(run())
-
-    server_class = replica.server_class
-    assert [o["name"] for o in server_class.options_kwargs] == ["vllm_server_3_0", "vllm_server_3_1"]
-    assert [o["scheduling_strategy"].node_id for o in server_class.options_kwargs] == [NODE_A, NODE_B]
-    for options in server_class.options_kwargs:
-        assert options["max_concurrency"] == 1234
-        assert options["runtime_env"] == {"env_vars": {"RAY_NOSET": "1", "TPU_MULTIHOST_BACKEND": "mp"}}
-
-    for node_rank, init in enumerate(server_class.init_kwargs):
-        assert init["workers"] == replica.workers[node_rank * 4 : (node_rank + 1) * 4]
-        assert init["node_rank"] == node_rank
-        assert init["nnodes"] == 2
-        assert init["gpus_per_node"] == 4
-        assert init["cuda_visible_devices"] == ""
-
-    # Every host joins the engine at the master address of node 0.
-    for server in server_class.servers:
-        assert server.launch_kwargs == {"master_address": "10.0.0.1", "master_port": 1234, "dp_rpc_port": 5678}
-    assert replica.servers == server_class.servers
-    assert replica._server_handle is server_class.servers[0]
-    assert replica._server_address == "10.0.0.1:8000"
+def test_replica_server_env_vars_chains_upstream_and_sets_mp_backend(tpu_vllm):
+    replica = _make_tpu_replica(tpu_vllm, nnodes=2, chips_per_host=4)
+    assert replica._get_server_env_vars([NODE_A, NODE_B]) == {
+        "FROM_UPSTREAM": "1",
+        "TPU_MULTIHOST_BACKEND": "mp",
+    }
 
 
-def test_launch_tpu_vllm_servers_rejects_data_parallel(tpu_vllm):
+def test_replica_launch_servers_delegates_to_upstream_and_rejects_data_parallel(tpu_vllm):
+    replica = _make_tpu_replica(tpu_vllm, data_parallel_size=1)
+    asyncio.run(replica.launch_servers())
+    assert replica.launched is True
+
     with pytest.raises(NotImplementedError, match="data_parallel_size"):
-        asyncio.run(tpu_vllm.launch_tpu_vllm_servers(_fake_replica(data_parallel_size=2)))
+        asyncio.run(_make_tpu_replica(tpu_vllm, data_parallel_size=2).launch_servers())
 
 
 @pytest.mark.parametrize(
@@ -284,32 +213,20 @@ def test_launch_tpu_vllm_servers_rejects_data_parallel(tpu_vllm):
         ("v7x-8", 4, None),
     ],
 )
-def test_launch_tpu_vllm_servers_single_host_topology_from_ray(tpu_vllm, monkeypatch, pod_type, chips, topology):
+def test_replica_single_host_topology_from_ray(tpu_vllm, monkeypatch, pod_type, chips, topology):
     # The launcher may run on a CPU Ray head: no TPU_ACCELERATOR_TYPE, but the slice's TORCH_TPU_TOPOLOGY may leak.
     monkeypatch.delenv("TPU_ACCELERATOR_TYPE", raising=False)
     monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "2,2,4")
-    replica = _fake_replica()
-    replica.workers = [_FakeWorker(NODE_A) for _ in range(chips)]
-    replica.gpus_per_replica_node = chips
-    replica.nnodes = 1
+    replica = _make_tpu_replica(tpu_vllm, nnodes=1, chips_per_host=chips)
     nodes = [
         {"Alive": True, "Resources": {"TPU": 4.0}, "NodeID": NODE_B, "Labels": {"ray.io/tpu-pod-type": "v6e-4"}},
         {"Alive": True, "Resources": {"TPU": 4.0}, "NodeID": NODE_A, "Labels": {"ray.io/tpu-pod-type": pod_type}},
     ]
-    platform = SimpleNamespace(ray_noset_envvars=lambda: [], rollout_env_vars=lambda: {})
-
-    async def run():
-        with (
-            mock.patch.object(tpu_vllm, "get_platform", return_value=platform),
-            mock.patch("ray.is_initialized", return_value=True),
-            mock.patch("ray.nodes", return_value=nodes),
-        ):
-            await tpu_vllm.launch_tpu_vllm_servers(replica)
-
-    asyncio.run(run())
-
-    [options] = replica.server_class.options_kwargs
-    assert options["runtime_env"]["env_vars"].get("TORCH_TPU_TOPOLOGY") == topology
+    with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
+        env_vars = replica._get_server_env_vars([NODE_A])
+    assert env_vars.get("TORCH_TPU_TOPOLOGY") == topology
+    assert env_vars["FROM_UPSTREAM"] == "1"
+    assert env_vars["TPU_MULTIHOST_BACKEND"] == "mp"
 
 
 # ---------------------------------------------------------------------------
