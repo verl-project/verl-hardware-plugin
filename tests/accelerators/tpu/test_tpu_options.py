@@ -150,6 +150,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
         release_buffers_after_sync=True,
         tie_word_embeddings=None,
         return_after_d2h=True,
+        receive_into_vllm="auto",
     )
     # Command-line overrides may arrive as strings.
     options = get_tpu_sync_options(
@@ -159,6 +160,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
             "release_buffers_after_sync": "0",
             "tie_word_embeddings": 1,
             "return_after_d2h": "false",
+            "receive_into_vllm": "false",
         }
     )
     assert options == TPUSyncOptions(
@@ -167,7 +169,27 @@ def test_tpu_sync_options_are_parsed_and_typed():
         release_buffers_after_sync=False,
         tie_word_embeddings=True,
         return_after_d2h=False,
+        receive_into_vllm="off",
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "auto"),
+        ("auto", "auto"),
+        (" AUTO ", "auto"),
+        (True, "on"),
+        ("true", "on"),
+        ("on", "on"),
+        (False, "off"),
+        ("false", "off"),
+        ("off", "off"),
+    ],
+)
+def test_tpu_sync_receive_into_vllm_modes(value, expected):
+    options = get_tpu_sync_options({} if value is None else {"receive_into_vllm": value})
+    assert options.receive_into_vllm == expected
 
 
 @pytest.mark.parametrize(
