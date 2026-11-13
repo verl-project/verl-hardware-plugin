@@ -1,7 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Licensed under the Apache License, Version 2.0.
 
-"""CPU tests of the in-process rollout's feature detection (``rollout/inproc/compat.py``).
+"""CPU tests of the in-process rollout's feature detection and tested-layout table (``rollout/inproc/compat.py``).
 
 Optional input: ``INPROC_TEST_VLLM_TORCHTPU_SRC`` = a vllm-torchtpu source directory (holding
 ``vllm_torchtpu/env_override.py``); the tests that compare the installed structure with the reviewed one need it.
@@ -13,8 +13,10 @@ import os
 import re
 import sys
 import types
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc import boundary, compat
 
@@ -293,6 +295,58 @@ def test_env_after_build_needs_the_platform_import_snapshot():
     )
 
 
+# ---------------------------------------------------------------------------------------- the tpu-sync install contract
+
+
+def test_tpu_sync_contract_holds_on_the_plugin():
+    pytest.importorskip("vllm")  # the tpu-sync worker extension imports vLLM
+    assert compat.tpu_sync_contract() is None
+
+
+def _fake_ext(install_src: str, epc_global: bool = True):
+    mod = types.ModuleType("fake_tpu_sync_ext")
+    if epc_global:
+        mod.ExactParityCheck = object
+    ns = mod.__dict__
+    exec(textwrap_dedent(install_src), ns)
+    mod.vLLMTPUSyncWorkerExtension = type(
+        "vLLMTPUSyncWorkerExtension", (), {"install_tpu_sync_weights": ns["install_tpu_sync_weights"]}
+    )
+    return mod
+
+
+def textwrap_dedent(s: str) -> str:
+    import textwrap
+
+    return textwrap.dedent(s)
+
+
+def test_tpu_sync_contract_refuses(monkeypatch):
+    src_ok = """
+    def install_tpu_sync_weights(self, exact_parity=False):
+        parity = ExactParityCheck() if exact_parity else None
+        return self._tpu_sync_staging, getattr(self, "_tpu_sync_layout", None), parity
+    """
+    monkeypatch.setattr(inspect, "getsource", lambda obj: textwrap_dedent(src_ok))
+    assert compat.tpu_sync_contract(_fake_ext(src_ok)) is None
+    no_global = _fake_ext(src_ok)
+    no_global.vLLMTPUSyncWorkerExtension.install_tpu_sync_weights.__globals__.pop("ExactParityCheck")
+    assert "does not read ExactParityCheck" in compat.tpu_sync_contract(no_global)
+    src_bad = """
+    def install_tpu_sync_weights(self, exact_parity=False):
+        return ExactParityCheck, self._tpu_sync_staging, self._new_attribute
+    """
+    monkeypatch.setattr(inspect, "getsource", lambda obj: textwrap_dedent(src_bad))
+    assert "['_new_attribute']" in compat.tpu_sync_contract(_fake_ext(src_bad))
+    src_other = """
+    def install_tpu_sync_weights(self, exact_parity=False):
+        return self._tpu_sync_staging
+    """
+    monkeypatch.setattr(inspect, "getsource", lambda obj: textwrap_dedent(src_other))
+    assert "does not read ExactParityCheck" in compat.tpu_sync_contract(_fake_ext(src_other))
+    assert "not reachable" in compat.tpu_sync_contract(types.ModuleType("empty"))
+
+
 # ---------------------------------------------------------------------------------------------------- verl contracts
 
 
@@ -358,3 +412,119 @@ def test_runner_features_report_only():
     assert out["deferred_logprobs"] == "on" and out["fast_token_substitution"]["env"] == "1"
     assert out["sampler_skip"] in ("present", "unknown")  # the source of an exec'd class is not readable
     assert compat.runner_features({}, {})["sampler_skip"] == "runner not imported"
+
+
+# ---------------------------------------------------------------------------------------------- the tested-layout table
+
+
+@pytest.mark.parametrize("row", compat.TESTED_LAYOUTS, ids=lambda r: r.architecture)
+def test_tested_layouts_build(row):
+    got, problem = compat.layout_before_build(
+        SimpleNamespace(architectures=[row.architecture], model_type=row.model_type)
+    )
+    assert problem is None and got == row
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        SimpleNamespace(architectures=["Qwen3MoeForCausalLM"], model_type="qwen3_moe"),
+        SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"], model_type="qwen3_5_moe_text"),
+        SimpleNamespace(
+            architectures=["Qwen3_5ForConditionalGeneration"],
+            model_type="qwen3_5",
+            text_config=SimpleNamespace(model_type="qwen3_5_text"),
+        ),
+        SimpleNamespace(architectures=["Phi3ForCausalLM"], model_type="phi3"),
+        SimpleNamespace(architectures=["MistralForCausalLM"], model_type="llama"),  # a known class, another model type
+        SimpleNamespace(architectures=["Qwen3ForCausalLM", "LlamaForCausalLM"], model_type="qwen3"),
+        SimpleNamespace(architectures=None, model_type="qwen3"),
+        None,
+    ],
+)  # fmt: skip
+def test_untested_layouts_refuse_before_the_build(cfg):
+    row, problem = compat.layout_before_build(cfg)
+    assert row is None and problem.startswith("UNTESTED LAYOUT:") and "Qwen3_5ForCausalLM (qwen3_5 direct)" in problem
+    assert "Add a test and a table entry" in problem
+
+
+def _model_of(module: str, name: str, dtype=torch.bfloat16):
+    cls = type(name, (torch.nn.Module,), {"__module__": module})
+    m = cls()
+    m.w = torch.nn.Parameter(torch.zeros(2, dtype=dtype), requires_grad=False)
+    return m
+
+
+def test_layout_after_build_keys_on_the_instantiated_class():
+    row = compat.TESTED_LAYOUTS[0]
+    module, name = row.model_class.rsplit(".", 1)
+    cfg = SimpleNamespace(model_type=row.model_type)
+    assert compat.layout_after_build(_model_of(module, name), SimpleNamespace(quantization=None), cfg) == (row, None)
+    assert (
+        compat.layout_after_build(_model_of(module, name, torch.float32), SimpleNamespace(quantization=None), cfg)[0]
+        == row
+    )
+    other = compat.layout_after_build(_model_of("vllm_torchtpu.models", name), SimpleNamespace(quantization=None), cfg)
+    assert other[0] is None and "UNTESTED LAYOUT" in other[1]
+    wrong_type = compat.layout_after_build(
+        _model_of(module, name), SimpleNamespace(quantization=None), SimpleNamespace(model_type="qwen3")
+    )
+    assert wrong_type[0] is None
+
+
+@pytest.mark.parametrize("quant, dtype", [("fp8", torch.bfloat16), (None, torch.float8_e4m3fn), (None, torch.float16)])
+def test_quantized_weights_refuse(quant, dtype):
+    row = compat.TESTED_LAYOUTS[0]
+    module, name = row.model_class.rsplit(".", 1)
+    got, problem = compat.layout_after_build(
+        _model_of(module, name, dtype), SimpleNamespace(quantization=quant), SimpleNamespace(model_type=row.model_type)
+    )
+    assert got is None and "UNTESTED LAYOUT" in problem and "quantized weights are not tested" in problem
+
+
+def test_a_loader_layout_needs_the_models_shard_mapping():
+    """A row on vLLM's loaders is refused at build when the instantiated model exposes neither vLLM's stacked-shard
+    table nor packed_modules_mapping: the install's parity check could not rebuild its fused parameters."""
+    row = next(r for r in compat.TESTED_LAYOUTS if r.family == "vllm loaders")
+    module, name = row.model_class.rsplit(".", 1)
+    cfg, mc = SimpleNamespace(model_type=row.model_type), SimpleNamespace(quantization=None)
+    got, problem = compat.layout_after_build(_model_of(module, name), mc, cfg)
+    assert got is None and "UNTESTED LAYOUT" in problem and "stacked-shard table or packed_modules_mapping" in problem
+    packed = _model_of(module, name)
+    packed.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    assert compat.layout_after_build(packed, mc, cfg) == (row, None)
+    stacked = _model_of(module, name)
+    stacked.hf_to_vllm_mapper = SimpleNamespace(orig_to_new_stacked={".q_proj": (".qkv_proj", "q")})
+    assert compat.layout_after_build(stacked, mc, cfg) == (row, None)
+
+
+def test_every_table_entry_names_tests_that_exist():
+    """A tested layout without a test is not a tested layout: each entry's covering tests must exist."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    for row in compat.TESTED_LAYOUTS:
+        assert row.tests, row
+        for t in row.tests:
+            path, _, test = t.partition("::")
+            fn, _, param = test.partition("[")
+            full = os.path.join(os.path.dirname(root), path)
+            assert os.path.isfile(full), t
+            src = open(full, encoding="utf-8").read()
+            assert re.search(rf"^def {re.escape(fn)}\(", src, re.M), t
+            assert f'"{param.rstrip("]")}"' in src, t
+
+
+def test_prepare_refuses_an_untested_layout_before_the_build(monkeypatch):
+    """The refusal is raised in _prepare, before the collective build (the agreement after it carries it to every "
+    "rank)."""
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc.rollout import TPUInProcRollout
+
+    monkeypatch.setattr(boundary, "LIBTPU_PROBLEMS", [])
+    hf_config = SimpleNamespace(architectures=["Qwen3MoeForCausalLM"], model_type="qwen3_moe")
+    fake = TPUInProcRollout.__new__(TPUInProcRollout)
+    fake.config = {"engine_kwargs": {"vllm": {"kv_cache_memory_bytes": 1}}}
+    fake.model_config = SimpleNamespace(hf_config=hf_config)
+    fake.rank = 0
+    with pytest.raises(
+        RuntimeError, match="UNTESTED LAYOUT: model_type 'qwen3_moe', architectures \\['Qwen3MoeForCausalLM'\\]"
+    ):
+        fake._prepare()

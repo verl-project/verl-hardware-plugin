@@ -5,7 +5,9 @@
 the end-to-end CPU suites exercise without asserting it, so that removing the decision fails a test.
 
 * the call-site grad pins are frozen after the build's scan: a later scan reports a new compiled engine function and
-  replaces no attribute (replacing it after the engine compiled would change the object its programs guard on).
+  replaces no attribute (replacing it after the engine compiled would change the object its programs guard on);
+* a direct weight install that raises stops the run (there is no fallback to vLLM's loaders), and no environment
+  variable brings a fallback back.
 
 Each scenario runs in a fresh interpreter (``python <this file> --child <name>``): the guards are process-wide
 singletons.
@@ -112,8 +114,64 @@ def scenario_pin_freeze() -> dict:
     }
 
 
+def _tiny_model():
+    import torch
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.embed_tokens = torch.nn.Embedding(32, 8)
+            self.lm_head = torch.nn.Linear(8, 32, bias=False)
+
+    torch.manual_seed(0)
+    return Tiny().requires_grad_(False)
+
+
+def scenario_direct_install_raises() -> dict:
+    """a direct install that raises at an unverified sync, with and without the old fallback variable set"""
+    import types
+
+    import torch
+
+    ws = _mod("weight_sync")
+    common = _mod("common")
+    out = {}
+    for policy in ("default", "allow"):
+        if policy == "allow":
+            os.environ["VERL_TPU_INPROC_LOADER_FALLBACK"] = "allow"
+        inst = ws.InProcInstaller(
+            types.SimpleNamespace(model_runner=types.SimpleNamespace(model=_tiny_model())),
+            types.SimpleNamespace(model_type="qwen3_5_text"),
+            0,
+        )
+        inst.mode = "qwen3_5 direct"  # what plan_once selects for a Qwen3.5 model with a direct layout
+        calls = []
+
+        def install_once(staging, verify, pre, _inst=inst, _calls=calls):
+            _calls.append({"mode": _inst.mode, "verify": verify})
+            if _inst.mode != ws.LOADER_FAMILY:
+                raise RuntimeError("direct install failed (injected)")
+            return {"mode": _inst.mode, "tensors": len(staging)}
+
+        inst._install_once = install_once
+        staging = {"lm_head.weight": torch.zeros(32, 8)}
+        rec = {}
+        for step in (3, 4):
+            try:
+                res = inst.install(staging, verify=False, pre=False, step=step)
+                rec[step] = {"mode": res["mode"]}
+            except RuntimeError as exc:
+                rec[step] = {"error": str(exc)[:300]}
+        unread = common.check_switches({**os.environ, common.INPROC_ENV: "1"})
+        out[policy] = {"steps": rec, "calls": calls, "mode_after": inst.mode, "unread": unread}
+        os.environ.pop("VERL_TPU_INPROC_LOADER_FALLBACK", None)
+    return out
+
+
 SCENARIOS = {
     "pin_freeze": scenario_pin_freeze,
+    "direct_install_raises": scenario_direct_install_raises,
 }
 
 
@@ -160,6 +218,19 @@ def test_pins_are_frozen_after_the_build_scan(results):
     assert res["late_reported"] and res["warm_reported"], (
         "the frozen scan did not report the unpinned compiled function"
     )
+
+
+@pytest.mark.parametrize("policy", ["default", "allow"])
+def test_failing_direct_install_stops_the_run(results, policy):
+    """No fallback to vLLM's loaders, whatever the environment says: the first raising direct install is fatal, the
+    install mode stays the planned one, and the old fallback variable is named as not read."""
+    res = _ok(results["direct_install_raises"])[policy]
+    for step in ("3", "4"):
+        err = res["steps"][step].get("error", "")
+        assert "INTEGRITY FAILED rank 0" in err and f"the qwen3_5 direct install raised at step {step}" in err, res
+    assert [c["mode"] for c in res["calls"]] == ["qwen3_5 direct", "qwen3_5 direct"], res
+    assert res["mode_after"] == "qwen3_5 direct", res
+    assert res["unread"] == (["VERL_TPU_INPROC_LOADER_FALLBACK"] if policy == "allow" else []), res
 
 
 if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--child":

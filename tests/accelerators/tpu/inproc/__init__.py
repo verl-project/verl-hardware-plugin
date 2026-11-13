@@ -15,7 +15,7 @@ Optional inputs; a test that needs one is skipped without it:
 * ``INPROC_TEST_VLLM_TORCHTPU_SRC``: a vllm-torchtpu source directory (the one holding ``vllm_torchtpu``): the
   env_override review, and the tests that run vllm-torchtpu's runner code (the call-site pins, the engine entry);
 * ``INPROC_TEST_CPU_E2E=1`` with ``INPROC_TEST_TOKENIZER`` (a local HF tokenizer directory whose vocabulary covers
-  token ids 1000-41000): the serving tests that build real vLLM engines on CPU (minutes);
+  token ids 1000-41000): the end-to-end and serving tests that build real vLLM engines on CPU (minutes);
 * ``INPROC_DEFAULT_OFF_BASELINE``: a plugin tree without the feature, for the default-off differential.
 
 ``INPROC_TEST_WORKERS`` (default 2) sets how many child interpreters run at once; ``INPROC_TEST_EVIDENCE_DIR`` and

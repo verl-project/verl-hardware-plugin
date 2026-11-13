@@ -1,20 +1,27 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Licensed under the Apache License, Version 2.0.
 
-"""Feature detection for the in-process rollout.
+"""Feature detection for the in-process rollout, and the table of tested install layouts.
 
 The in-process engine couples to vllm-torchtpu, vLLM, verl and this plugin at a few points. Each coupling is
 probed instead of pinned to a file hash, with one rule: a coupling that correctness depends on refuses at build with a
 clear message; an optional fast path disables itself; a feature that only labels what ran is reported. The decisions
 are logged once per rank in the ``inproc compat rank r`` line. Probes read sources (``inspect`` / ``ast``) or state the
 module already has; they never call the probed code.
+
+The tested-layout table (:data:`TESTED_LAYOUTS`) is the install-layout policy: the engine builds only for a
+(model type, instantiated vLLM model class, unquantized weights) key that a test of this package covers, and the
+first weight sync must install it with the table's install family. Anything else is refused at build. To support
+another model: add its CPU test first, then its table entry.
 """
 
 from __future__ import annotations
 
 import ast
 import copy
+import dataclasses
 import hashlib
+import importlib
 import importlib.metadata
 import importlib.util
 import inspect
@@ -314,6 +321,63 @@ def runner_features(modules: Optional[dict] = None, environ: Optional[Mapping[st
     return out
 
 
+# -------------------------------------------------------------------------------------------- tpu-sync install contract
+
+# The attributes the in-process install shim provides (weight_sync._InstallShim).
+SHIM_ATTRS = frozenset(
+    {
+        "worker", "rank", "_tpu_sync_ws", "_tpu_sync_staging", "_tpu_sync_staging_sharded", "_tpu_sync_layout",
+        "_tpu_sync_plan", "_tpu_sync_use_vllm_loaders", "_tpu_sync_hf_text_config", "_get_vllm_model",
+        "_install_with_vllm_loaders", "_tpu_sync_bound_names",
+    }
+)  # fmt: skip
+EXTENSION_MOD = "verl_hardware_plugin.accelerators.tpu.rollout.tpu_sync_worker_extension"
+
+
+def tpu_sync_contract(ext: Any = None) -> Optional[str]:
+    """The in-process install calls the plugin's ``install_tpu_sync_weights`` with a shim as ``self`` and swaps
+    the extension module's ``ExactParityCheck`` for a recorder of every write. Both work only while the install is
+    reachable, reads ``ExactParityCheck`` as a global of that same module, and reads no ``self`` attribute the shim
+    lacks. None when the contract holds, else why (the build refuses: a recorder that does not engage would leave
+    the direct install's parity check comparing nothing)."""
+    try:
+        ext = ext if ext is not None else importlib.import_module(EXTENSION_MOD)
+        cls = ext.vLLMTPUSyncWorkerExtension
+        install = inspect.unwrap(cls.install_tpu_sync_weights)
+    except Exception as e:  # noqa: BLE001
+        return f"install_tpu_sync_weights not reachable ({type(e).__name__}: {e})"[:240]
+    if (
+        "ExactParityCheck" not in vars(ext)
+        or "ExactParityCheck" not in install.__code__.co_names
+        or install.__globals__ is not vars(ext)
+    ):
+        return "install_tpu_sync_weights does not read ExactParityCheck as a global of the extension module"
+    src = _source_or_none(install)
+    if src is None:
+        return "install_tpu_sync_weights source unreadable"
+    reads = {
+        n.attr
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self"
+    }
+    reads |= {
+        n.args[1].value
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "getattr"
+        and len(n.args) >= 2
+        and isinstance(n.args[0], ast.Name)
+        and n.args[0].id == "self"
+        and isinstance(n.args[1], ast.Constant)
+        and isinstance(n.args[1].value, str)
+    }
+    missing = sorted(reads - SHIM_ATTRS)
+    if missing:
+        return f"install_tpu_sync_weights reads self attributes the in-process shim lacks: {missing}"
+    return None
+
+
 # ------------------------------------------------------------------------------------------------------- verl contracts
 
 # vLLMHttpServer.__init__ attributes the in-process path never reaches (multi-node / data-parallel sockets).
@@ -365,3 +429,93 @@ def worker_methods_problem(worker_cls: Any) -> Optional[str]:
         elif inspect.iscoroutinefunction(inspect.unwrap(fn)):
             bad.append(f"{name} is a coroutine")
     return f"{worker_cls.__name__}: {', '.join(bad)}" if bad else None
+
+
+# ----------------------------------------------------------------------------------------------- tested install layouts
+
+QWEN3_5_NOT_EXPORTED = (r"(^|\.)visual\.", r"(^|\.)vision_tower\.", r"(^|\.)multi_modal_projector\.", r"(^|\.)mtp\.")
+_E2E = "tests/accelerators/tpu/inproc/test_inproc_cpu_e2e.py"
+
+
+@dataclasses.dataclass(frozen=True)
+class LayoutEntry:
+    """One tested install layout: the key, the install family the first sync must plan, the engine parameters a
+    text-only trainer does not export (the only exemption the coverage and parity checks accept: patterns that must
+    match no received tensor), and the tests that cover it."""
+
+    model_type: str  # the HF text config's model_type
+    architecture: str  # the HF config's architectures[0]
+    model_class: str  # the instantiated vLLM model class, module + qualified name
+    family: str  # the install mode the first sync must plan
+    not_exported: tuple[str, ...]
+    tests: tuple[str, ...]
+
+
+def _row(
+    model_type: str, module: str, cls: str, family: str, key: str, not_exported: tuple[str, ...] = ()
+) -> LayoutEntry:
+    tests = (f"{_E2E}::test_tested_layout[{key}]", f"{_E2E}::test_tested_layout[{key}_tied]")
+    return LayoutEntry(model_type, cls, f"vllm.model_executor.models.{module}.{cls}", family, not_exported, tests)
+
+
+TESTED_LAYOUTS: tuple[LayoutEntry, ...] = (
+    _row("qwen3_5_text", "qwen3_5", "Qwen3_5ForCausalLM", "qwen3_5 direct", "qwen3_5", QWEN3_5_NOT_EXPORTED),
+    _row("qwen3", "qwen3", "Qwen3ForCausalLM", "vllm loaders", "qwen3"),
+    _row("llama", "llama", "LlamaForCausalLM", "vllm loaders", "llama"),
+    _row("gemma3_text", "gemma3", "Gemma3ForCausalLM", "vllm loaders", "gemma3"),
+    _row("mistral", "mistral", "MistralForCausalLM", "vllm loaders", "mistral"),
+    _row("qwen2", "qwen2", "Qwen2ForCausalLM", "vllm loaders", "qwen2"),
+)
+UNQUANTIZED_DTYPES = ("torch.bfloat16", "torch.float32")
+
+
+def _text_config(hf_config: Any) -> Any:
+    return getattr(hf_config, "text_config", None) or hf_config
+
+
+def _untested(key: str) -> str:
+    rows = ", ".join(f"{r.architecture} ({r.family})" for r in TESTED_LAYOUTS)
+    return f"UNTESTED LAYOUT: {key}; tested: {rows}. Add a test and a table entry (inproc/compat.py TESTED_LAYOUTS)"
+
+
+def layout_before_build(hf_config: Any) -> tuple[Optional[LayoutEntry], Optional[str]]:
+    """The table row for the model's HF config, checked before the engine build (every rank reads the same config):
+    (row, None), else (None, the refusal)."""
+    archs = [str(a) for a in (getattr(hf_config, "architectures", None) or [])]
+    model_type = getattr(_text_config(hf_config), "model_type", None)
+    key = f"model_type {model_type!r}, architectures {archs}"
+    if len(archs) != 1:
+        return None, _untested(key + " (exactly one architecture is required)")
+    row = next((r for r in TESTED_LAYOUTS if r.model_type == model_type and r.architecture == archs[0]), None)
+    return (row, None) if row is not None else (None, _untested(key))
+
+
+def layout_after_build(
+    model: Any, model_config: Any, hf_text_config: Any
+) -> tuple[Optional[LayoutEntry], Optional[str]]:
+    """The full key after the build: the HF text config's model_type, the instantiated vLLM model class, unquantized
+    weights (no quantization config, every parameter bfloat16 or float32). A row on vLLM's loaders also needs the
+    model's stacked-shard table (``hf_to_vllm_mapper``) or its ``packed_modules_mapping``: the install's parity check
+    rebuilds every fused parameter from them. (row, None), else (None, the refusal)."""
+    cls = type(model)
+    model_class = f"{cls.__module__}.{cls.__qualname__}"
+    model_type = getattr(hf_text_config, "model_type", None)
+    quant = getattr(model_config, "quantization", None)
+    try:
+        dtypes = sorted({str(p.dtype) for _, p in model.named_parameters()})
+    except Exception as e:  # noqa: BLE001
+        return None, _untested(f"{model_class}: parameters unreadable ({type(e).__name__})")
+    key = f"model_type {model_type!r}, model class {model_class}, quantization {quant!r}, parameter dtypes {dtypes}"
+    if quant is not None or any(d not in UNQUANTIZED_DTYPES for d in dtypes):
+        return None, _untested(key + " (quantized weights are not tested)")
+    row = next((r for r in TESTED_LAYOUTS if r.model_type == model_type and r.model_class == model_class), None)
+    if row is None:
+        return None, _untested(key)
+    if row.family == "vllm loaders":
+        mapper = getattr(model, "hf_to_vllm_mapper", None)
+        if not (getattr(mapper, "orig_to_new_stacked", None) or getattr(model, "packed_modules_mapping", None)):
+            return None, _untested(
+                key + " (a vLLM-loader layout needs the model's stacked-shard table or packed_modules_mapping, which "
+                "its covering tests rely on)"
+            )
+    return row, None

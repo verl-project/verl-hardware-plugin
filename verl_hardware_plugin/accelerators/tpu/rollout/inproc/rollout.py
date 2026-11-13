@@ -22,15 +22,19 @@ from verl_hardware_plugin.accelerators.tpu.rollout.inproc.boundary import (
     GlobalEagerMode,
     IdentityEnv,
     engine_grad_ctx,
+    engine_mode_ctx,
     full_determinism_problem,
     prefix_caching_problem,
     snapshot_engine_global_state,
 )
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.common import (
+    INTEGRITY_TAG,
     all_ranks_ok,
     cfg_get,
     check_switches,
     dist_rank_world,
+    gc_rss_limit_bytes,
+    last_step,
     log,
     say_build_failure,
     warn,
@@ -46,13 +50,29 @@ from verl_hardware_plugin.accelerators.tpu.rollout.inproc.engine import (
     make_server,
     preinit_vllm_parallel_state,
 )
-from verl_hardware_plugin.accelerators.tpu.rollout.inproc.gc_policy import freeze_heap, gib, rss_bytes
+from verl_hardware_plugin.accelerators.tpu.rollout.inproc.gc_policy import freeze_heap, gib, rss_bytes, rss_freeze_due
+from verl_hardware_plugin.accelerators.tpu.rollout.inproc.weight_sync import (
+    CHECKSUM_EVERY,
+    FULL_PARITY_STEPS,
+    LOADER_FAMILY,
+    InProcInstaller,
+    checksum_names,
+    export_pin_problem,
+    export_signature,
+    tensor_checksums,
+    verify_reason,
+)
 
 
 class TPUInProcRollout(BaseRollout):
     """verl's ``("vllm", "async")`` rollout with ``VERL_TPU_ROLLOUT_INPROC=1``: one in-process TP=1 engine per trainer
     rank, built by ``ActorRolloutRefWorker.init_model`` on every rank in one worker-group call."""
 
+    # defaults of the per-instance state ``__init__`` sets, for instances made without it
+    _rss_base: Optional[int] = None
+    _export_pin: Optional[tuple] = None  # (step, export signature) of the first verified sync that passed
+    layout_entry: Optional[compat.LayoutEntry] = None
+    last_step: Optional[int] = None
     # tests inject an engine here: (server, parsed CLI args) -> (engine, worker, vllm_config, engine_args); None = vLLM
     engine_factory: Optional[Callable] = None
 
@@ -73,7 +93,14 @@ class TPUInProcRollout(BaseRollout):
         self.local_rank = int(os.environ.get("LOCAL_RANK", self.rank % 8) or 0)
         self.kv_bytes: Optional[int] = None
         self.global_steps: Optional[int] = None
+        self.sync_log: list[dict] = []
         self.preinit: dict = {}
+        # the start of the trainer's export, set at verl's update_weights entry (before get_per_tensor_param)
+        self._pending_export_t0: Optional[float] = None
+        self._syncs_started = 0  # the first sync of this process is verified
+        self.last_step = last_step()
+        self.rss_limit = gc_rss_limit_bytes()
+        self._rss_base: Optional[int] = None
         if not defer_build:
             self._build()
 
@@ -90,6 +117,12 @@ class TPUInProcRollout(BaseRollout):
         for problem in (full_determinism_problem(self.config), prefix_caching_problem(self.config)):
             if problem:
                 raise RuntimeError(problem)
+        # the install layout must be a tested one (every rank reads the same config: the agreement after this carries
+        # a refusal to all of them, before the collective build)
+        hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
+        self.layout_entry, problem = compat.layout_before_build(hf_config)
+        if problem:
+            raise RuntimeError(problem)
         engine_kwargs = dict(cfg_get(cfg_get(self.config, "engine_kwargs", {}), "vllm", {}) or {})
         kv = int(engine_kwargs.get("kv_cache_memory_bytes") or 0)
         if kv <= 0:
@@ -124,6 +157,18 @@ class TPUInProcRollout(BaseRollout):
         COLLECTIVES.install()
         self.engine = self.server.engine
         self.worker = self.server._inproc_worker
+        self.hf_text_config = getattr(self.model_config.hf_config, "text_config", None) or self.model_config.hf_config
+        model = getattr(getattr(self.worker, "model_runner", None), "model", None)
+        vc = self.server._inproc_vllm_config
+        self.layout_entry, problem = compat.layout_after_build(
+            model, getattr(vc, "model_config", None), self.hf_text_config
+        )
+        if problem:
+            raise RuntimeError(problem)
+        problem = compat.tpu_sync_contract()
+        if problem:
+            raise RuntimeError(f"tpu-sync install contract: {problem}: refusing to build")
+        self.installer = InProcInstaller(self.worker, self.hf_text_config, self.rank, layout=self.layout_entry)
         self.build_s = time.time() - self._t0
         self._report_build()
         log_hbm("post_engine", self.rank)
@@ -219,12 +264,26 @@ class TPUInProcRollout(BaseRollout):
             )
 
     def _compat_record(self, env_problems: list) -> dict:
+        model = getattr(getattr(self.worker, "model_runner", None), "model", None)
+        cls = type(model)
+        entry = self.layout_entry
         return {
             "runner": compat.runner_features(),
             "env_override": {
                 "structure": (boundary.ENV_OVERRIDE_PROBE or {}).get("fingerprint"),
                 "reviewed": (boundary.ENV_OVERRIDE_PROBE or {}).get("reviewed"),
                 "after_build": env_problems or "unchanged within the reviewed effects",
+            },
+            "tpu_sync_contract": "ok",
+            "layout": {
+                "model_type": getattr(self.hf_text_config, "model_type", None),
+                "model_class": f"{cls.__module__}.{cls.__qualname__}",
+                "quantization": getattr(
+                    getattr(self.server._inproc_vllm_config, "model_config", None), "quantization", None
+                ),
+                "family": entry.family if entry is not None else None,
+                "tested": entry is not None,
+                "tests": list(entry.tests) if entry is not None else [],
             },
         }
 
@@ -375,22 +434,246 @@ class TPUInProcRollout(BaseRollout):
             return f"{e.window_aborted} request(s) aborted in this step's rollout (a sync-mode rollout aborts none)"
         return None
 
+    def _health_record(self, step: int, window: dict) -> dict:
+        """The per-sync health line: the device-thread and collective invariants and the rollout window."""
+        return {
+            "threads": {
+                "device_threads": len(DEVICE_THREADS.counts),
+                "collectives_world_gt1": sum(COLLECTIVES.big.values()),
+                "collectives_size1": COLLECTIVES.small,
+            },
+            "window": window,
+        }
+
     async def update_weights(self, weights, wire_format: str = "named_tensors", **kwargs):
         if wire_format != "named_tensors":
             raise NotImplementedError(f"wire_format {wire_format!r}")
         if kwargs.get("peft_config") is not None:
             raise NotImplementedError("LoRA adapters are not supported in process")
-        raise NotImplementedError(
-            "weight sync into the in-process engine is not available yet (the verified in-place install is a separate "
-            "change): refusing the sync, nothing was installed"
+        raw_step = kwargs.get("global_steps")
+        # an unlabelled sync (global_steps=None) keeps the label of the previous sync (0 before any) and is never
+        # pre-verified (the pre-install comparison holds only at the initial sync)
+        step = int(raw_step) if raw_step is not None else (self.global_steps if self.global_steps is not None else 0)
+        first_sync = self._syncs_started == 0
+        self._syncs_started += 1
+        if self.engine._collectors or self.engine._engine.has_unfinished_requests():
+            raise RuntimeError(f"weight update at step {step} with requests in flight")
+        t_iter = time.time()
+        if self._pending_export_t0 is not None:
+            t0, clock = float(self._pending_export_t0), "the update_weights entry"
+        else:
+            t0, clock = t_iter, "the tensor iteration"
+        self._pending_export_t0 = None
+        t0 = min(t0, t_iter)
+        DEVICE_THREADS.record("export")
+        staging: dict[str, torch.Tensor] = {}
+        for name, tensor in weights:  # the trainer's export: FSDP all-gathers, in the trainer's own eager mode
+            staging[name] = tensor
+        t1 = time.time()
+        # the export must be the one the first verified sync of this process passed with, checked before the install
+        # and at every sync (after the export's collectives: every rank exports the same names)
+        sig = export_signature(staging)
+        line = export_pin_problem(self._export_pin, sig, step, self.rank)
+        if line is not None:
+            warn(line)
+            raise RuntimeError(line)
+        why = verify_reason(step, first_sync, self.last_step)
+        if why is None and self._export_pin is None:  # until a verified sync has passed, every sync is verified
+            why = "until a verified sync pins the export"
+        verify = why is not None
+        full_sha = step in FULL_PARITY_STEPS or first_sync
+        pre = raw_step is not None and step == 0  # only an explicit step 0 holds the checkpoint vLLM loaded
+        with engine_mode_ctx("install"):
+            DEVICE_THREADS.record("install")
+            res = self.installer.install(staging, verify=verify, pre=pre, step=step)
+        t2 = time.time()
+        family = self.installer.family
+        if family is not None and res.get("mode") != family:
+            line = (
+                f"{INTEGRITY_TAG} rank {self.rank} step {step}: the install ran in mode {res.get('mode')!r}, "
+                f"not the tested family {family!r}"
+            )
+            warn(line)
+            raise RuntimeError(line)
+        self.server.global_steps = step
+        self.global_steps = step
+        # checks timed apart from the sync: the strided checksum at the verified syncs and every few syncs, the full
+        # sha256 at steps 0 / 1 and the first sync, the parity and the coverage
+        model = self.worker.model_runner.model
+        named = dict(model.named_parameters())
+        names = checksum_names(list(named))
+        par = cov = None
+        with engine_mode_ctx("checksum"):
+            DEVICE_THREADS.record("checksum")
+            sha_due = verify or full_sha or step % CHECKSUM_EVERY == 0
+            wsum, wbytes = tensor_checksums(named, names, full=False) if sha_due else ("deferred", 0)
+            full = tensor_checksums(named, names, full=True)[0] if full_sha else None
+            t3 = time.time()
+            if res.get("_verify") is not None:
+                par = self.installer.finish_parity(res, staging)
+                cov = self.installer.coverage(res, staging)
+        t4 = time.time()
+        direct = res["mode"] != LOADER_FAMILY
+        window = self.engine.window_take()
+        rec = {
+            "step": step,
+            "export_s": round(t1 - t0, 4),
+            "install_s": round(t2 - t1, 4),
+            "sync_s": round(t2 - t0, 4),
+            "checksum_s": round(t3 - t2, 4),
+            "tensors": len(staging),
+            "mode": res["mode"],
+            "wsum": wsum[:16],
+            "verified": why,
+            "parity_s": round(t4 - t3, 4),
+            "label_kept": raw_step is None,
+            "first_sync": first_sync,
+            "rollout_window": window,
+            "sha": sha_due,
+        }
+        log(
+            f"sync step {step} rank {self.rank}: mode {res['mode']}, {len(staging)} tensors, export+gather "
+            f"{t1 - t0:.4f} s, "
+            f"install {t2 - t1:.4f} s, checksum {t3 - t2:.4f} s (not in the sync), wsum {wsum[:16]} over {len(names)} "
+            f"tensors {wbytes / 2**20:.1f} MiB sampled; export clock from {clock}; verified {why or 'no'} (parity + "
+            "coverage "
+            f"{t4 - t3:.4f} s, not in the sync); label {'kept (global_steps=None)' if raw_step is None else 'given'}; "
+            "first "
+            f"sync in process {first_sync}; rollout window "
+            f"{json.dumps(window, sort_keys=True)}; "
+            f"strided sha256 {'run' if sha_due else f'deferred (every {CHECKSUM_EVERY} syncs)'}"
         )
+        integrity = []
+        parity_failed = False
+        if verify and par is not None:
+            post_bad = par.get("post_mismatched") or []
+            pre_bad = par.get("pre_mismatched") or []
+            unresolved = par.get("unresolved") or []
+            exact = not post_bad and not pre_bad and not unresolved and (par.get("post_checked") or 0) > 0
+            parity_failed = not exact
+            coverage_bad = bool(cov is not None and cov.get("checked") and not cov.get("ok"))
+            cv = cov or {}
+            coverage = (
+                "direct"
+                if direct
+                else f"loaders {par.get('post_checked') or 0}/{par.get('params')} engine parameters, packed-aware"
+            )
+            rec.update(
+                {
+                    "parity": {
+                        "pre_checked": par.get("pre_checked"),
+                        "pre_mismatched": len(pre_bad),
+                        "post_checked": par.get("post_checked"),
+                        "post_mismatched": len(post_bad),
+                        "unresolved": len(unresolved),
+                        "coverage": coverage,
+                    },
+                    "wsha": full[:16] if full else None,
+                }
+            )
+            # the coverage check is part of the verdict: an exact comparison of the written parameters is not an exact
+            # install when some engine parameter was never written
+            verdict_ok = exact and not coverage_bad
+            log_fn = log if verdict_ok else warn
+            log_fn(
+                f"parity step {step} rank {self.rank}: {'PARITY EXACT' if verdict_ok else 'PARITY FAILED'}: "
+                f"pre-install {par.get('pre_checked')} checked {len(pre_bad)} mismatched, post-install "
+                f"{par.get('post_checked')} "
+                f"checked {len(post_bad)} mismatched, {len(unresolved)} unresolved; coverage {coverage}"
+                + (
+                    f", {cv.get('not_written_n')} not written {(cv.get('not_written') or [])[:4]}"
+                    if coverage_bad
+                    else ""
+                )
+                + (
+                    f", not-exported patterns match received {cv.get('not_exported_received')}"
+                    if coverage_bad and cv.get("not_exported_received")
+                    else ""
+                )
+                + f"; full sha256 {(full or '')[:16]}"
+                + (f"; first {(pre_bad + post_bad + unresolved)[:4]}" if not exact else "")
+            )
+        if cov is not None:
+            rec["install_coverage"] = {
+                k: cov.get(k) for k in ("checked", "via", "params", "written", "allowlisted", "not_written_n", "ok")
+            }
+            (log if cov.get("ok") else warn)(
+                f"coverage step {step} rank {self.rank}: "
+                + (
+                    f"{'COVERAGE OK' if cov.get('ok') else 'COVERAGE FAILED'}: "
+                    f"{cov.get('written')}/{cov.get('params')} engine "
+                    f"parameters written ({cov.get('via')}), {cov.get('allowlisted')} not exported by the trainer "
+                    f"{cov.get('allowlisted_first')}, tied copy {cov.get('tied_copy')}, not written "
+                    f"{cov.get('not_written_n')} "
+                    f"{(cov.get('not_written') or [])[:6]}, not-exported patterns matching received tensors "
+                    f"{cov.get('not_exported_received')}"
+                    if cov.get("checked")
+                    else f"not checked: {cov.get('why')}"
+                )
+            )
+            if not cov.get("ok"):
+                if cov.get("not_written_n"):
+                    integrity.append(
+                        f"coverage: {cov.get('not_written_n')} engine parameter(s) never written by the install "
+                        "(they keep the checkpoint's values while the trainer moves on), "
+                        f"first {(cov.get('not_written') or [])[:4]}"
+                    )
+                if cov.get("not_exported_received"):
+                    integrity.append(
+                        "the tested layout's not-exported patterns match received tensors "
+                        f"{cov.get('not_exported_received')}: "
+                        "the table entry is wrong for this trainer"
+                    )
+                if not cov.get("checked"):
+                    integrity.append(f"coverage not checked: {cov.get('why')}")
+        if parity_failed:
+            raise RuntimeError(f"in-process weight parity FAILED at step {step} on rank {self.rank}")
+        health = self._health_record(step, window)
+        log(f"health step {step} rank {self.rank}: {json.dumps(health, sort_keys=True, default=str)}")
+        problems = self._sync_problems()
+        if problems:
+            raise RuntimeError(f"rank {self.rank}: " + "; ".join(problems))
+        if integrity:  # after every line of this sync is out (the evidence)
+            line = f"{INTEGRITY_TAG} rank {self.rank} step {step}: " + "; ".join(integrity)
+            warn(line)
+            raise RuntimeError(line)
+        log_hbm(f"post_sync_{step}", self.rank)
+        if (
+            verify and self._export_pin is None
+        ):  # a verified sync passed: its export is the one every later sync must send
+            self._export_pin = (step, sig)
+        rec["export_pin"] = self._export_pin[0] if self._export_pin is not None else None
+        self.sync_log.append(rec)
+        if step == 1:  # after the first update: the optimizer state and the trainer's compiled programs exist
+            self._gc_freeze(step)
+        else:
+            self._gc_rss_guard(step)
+
+    def _sync_problems(self) -> list:
+        """The invariants every sync re-checks (fatal): device work on one thread, no world-group collective during
+        engine steps."""
+        problems = []
+        if not DEVICE_THREADS.single():
+            problems.append(f"device work ran on more than one thread: {dict(DEVICE_THREADS.counts)}")
+        if sum(COLLECTIVES.big.values()):
+            problems.append(f"vLLM world-group collectives during engine steps: {dict(COLLECTIVES.big)}")
+        return problems
+
+    def _gc_rss_guard(self, step: int) -> Optional[float]:
+        due, now, why = rss_freeze_due(step, self._rss_base, self.rss_limit)
+        if not due:
+            if now is not None and self._rss_base is None:
+                self._rss_base = now
+            return None
+        return self._gc_freeze(step, why=why)
 
     def _gc_freeze(self, step: int, warm: bool = False, why: Optional[str] = None) -> float:
-        """Collect and freeze the heap (vLLM's ``freeze_gc_heap``) at the end of the build. Later collections never
-        traverse it."""
+        """Collect and freeze the heap (vLLM's ``freeze_gc_heap``): at the end of the build, at the step-1 sync, and at
+        an aligned sync when the RSS grew past ``VERL_TPU_INPROC_GC_RSS_GIB``. Later collections never traverse it."""
         counts0, frozen0, rss0 = list(gc.get_count()), gc.get_freeze_count(), rss_bytes()
         how, dt = freeze_heap()
         rss1 = rss_bytes()
+        self._rss_base = rss1
         where = "warm-up" if warm else f"step {step}"
         log(
             f"gc freeze rank {self.rank} {where}: {how} in {dt:.3f} s; frozen objects {gc.get_freeze_count()}"

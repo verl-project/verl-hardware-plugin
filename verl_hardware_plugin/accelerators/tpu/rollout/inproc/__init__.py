@@ -16,19 +16,22 @@ engine's KV pool is set explicitly (``rollout.engine_kwargs.vllm.kv_cache_memory
 * The replica's server is the trainer worker actor itself (``inproc://<rank>``); ``generate`` /
   ``abort_all_requests`` / ``resume_generation`` / ``inproc_server_info`` are added to ``ActorRolloutRefWorker`` as
   direct rollout methods (:func:`install_worker_methods`; verl itself is not patched).
-* Weight sync is not part of the package yet: ``update_weights`` refuses, so a run builds and serves, and stops
-  at its first weight sync, before anything is installed.
+* Weight sync: verl's ``naive`` checkpoint-engine path calls ``update_weights`` with the trainer's export, which is
+  installed in place through the tpu-sync worker extension's own install and verified (:mod:`.weight_sync`).
 * The engine's process-global side effects are contained and its compiled programs kept valid (:mod:`.boundary`,
   :mod:`.compile_guard`).
 
-Scope: rollout TP=1 (other parallel sizes are refused at build). Only single-host runs have been tested; more
-hosts are not refused.
+Scope: rollout TP=1 (other parallel sizes are refused at build) and the model families of the tested-layout table
+(:data:`.compat.TESTED_LAYOUTS`; any other layout is refused at build). Only single-host runs have been tested;
+more hosts are not refused.
 """
 
 from __future__ import annotations
 
 import functools
+import inspect
 import os
+import time
 from typing import Any, Callable
 
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.common import (
@@ -138,6 +141,20 @@ def install_worker_methods() -> list[str]:
         setattr(W, fn.__name__, fn)
     for name in unwrapped:
         setattr(W, name, _wrap_worker_method(W.__dict__[name], name))
+    # verl's update_weights (a coroutine): the start of the trainer's export, recorded at its entry so the sync time
+    # includes get_per_tensor_param (the state dict and its all-gathers)
+    orig_uw = W.__dict__.get("update_weights")
+    if orig_uw is not None and inspect.iscoroutinefunction(orig_uw) and not getattr(orig_uw, _MARK, False):
+
+        @functools.wraps(orig_uw)
+        async def update_weights(self, *args, **kwargs):
+            r = _inproc_rollout(self)
+            if r is not None:
+                r._pending_export_t0 = time.time()
+            return await orig_uw(self, *args, **kwargs)
+
+        setattr(update_weights, _MARK, True)
+        W.update_weights = update_weights
     return list(WRAPPED_WORKER_METHODS)
 
 

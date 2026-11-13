@@ -343,11 +343,3 @@ def test_the_adapter_covers_every_engine_call_of_verls_server():
     r = TPUInProcRollout.__new__(TPUInProcRollout)
     with pytest.raises(NotImplementedError, match="LoRA adapters are not supported in process"):
         asyncio.run(r.update_weights(iter(()), peft_config={"r": 8}))
-
-
-def test_update_weights_refuses_until_the_verified_install_lands():
-    """Weight sync is not part of this change: the first sync refuses before anything is installed, so a training run
-    with the switch on stops there instead of rolling out on weights the trainer never synced."""
-    r = TPUInProcRollout.__new__(TPUInProcRollout)
-    with pytest.raises(NotImplementedError, match="weight sync into the in-process engine is not available yet"):
-        asyncio.run(r.update_weights(iter(())))
