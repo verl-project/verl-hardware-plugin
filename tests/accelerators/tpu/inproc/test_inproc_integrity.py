@@ -9,11 +9,14 @@
 * the engine entry puts the caller's thread state right for every call (a ``torch.device`` context or another
   TorchFunctionMode, inference mode, num_threads, the default dtype, deterministic algorithms, the float32 matmul
   precision): vllm-torchtpu's real ``compute_selected_logits`` keeps its precompiled programs for every bucket, and the
-  caller's state is back after every call (needs ``INPROC_TEST_VLLM_TORCHTPU_SRC``).
+  caller's state is back after every call (needs ``INPROC_TEST_VLLM_TORCHTPU_SRC``);
+* verl's real ``vLLMHttpServer.abort_all_requests(abort_only=True)`` on the in-process adapter removes the requests
+  from an engine with vLLM's request-id semantics (internal ids only).
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import importlib.util
 import json
@@ -21,6 +24,7 @@ import os
 import subprocess
 import sys
 import types
+import uuid
 
 import pytest
 import torch
@@ -246,6 +250,65 @@ def test_the_engine_entry_puts_the_callers_state_right_for_every_bucket(case, tm
     assert scoped["caller_state_kept"] is True, scoped
     # the control (no engine scope) shows that this caller state does break the precompiled programs
     assert control["entries_after"] > control["entries_build"] or control["errors"] > 0, control
+
+
+# ------------------------------------------------------------------------------------------------ abort by internal id
+
+
+@needs_vllm
+def test_abort_only_removes_the_requests_from_an_engine_with_vllms_request_ids():
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc import engine
+
+    class StrictEngine:
+        """vLLM's request ids: add_request returns '{external}-{uuid8}' and abort_request(ids, internal=True) matches
+        internal ids only; nothing finishes (long requests)"""
+
+        def __init__(self):
+            self.model_config, self.reqs = types.SimpleNamespace(), {}
+
+        def add_request(self, rid, prompt, params, **_):
+            internal = f"{rid}-{uuid.uuid4().hex[:8]}"
+            self.reqs[internal] = rid
+            return internal
+
+        def abort_request(self, ids, internal=False):
+            for i in list(ids):
+                if internal:
+                    self.reqs.pop(i, None)
+                else:
+                    for k in [k for k, v in self.reqs.items() if v == i]:
+                        self.reqs.pop(k, None)
+
+        def has_unfinished_requests(self):
+            return bool(self.reqs)
+
+        def get_num_unfinished_requests(self):
+            return len(self.reqs)
+
+        def step(self):
+            return []
+
+    eng = StrictEngine()
+    aeng = engine.InProcAsyncEngine(eng, 0)
+    srv = types.SimpleNamespace(node_rank=0, engine=aeng)
+
+    async def go():
+        cols = [
+            await aeng.add_request(f"req-{i}", {"prompt_token_ids": [1, 2]}, types.SimpleNamespace(output_kind=None))
+            for i in range(3)
+        ]
+        for _ in range(3):
+            await asyncio.sleep(0)  # the pump steps
+        res = await vLLMHttpServer.abort_all_requests(srv, abort_only=True)  # verl's own abort_only path
+        outs = [await c.get() for c in cols]
+        await asyncio.sleep(0)
+        return res, outs
+
+    res, outs = asyncio.run(go())
+    assert res["aborted_count"] == 3 and eng.get_num_unfinished_requests() == 0
+    assert all(o.finished and o.outputs == [] for o in outs) and not aeng._collectors
+    assert aeng.aborted == 3 and aeng.window_take() == {"aborted": 3, "failed": 0}
 
 
 if __name__ == "__main__" and len(sys.argv) >= 3 and sys.argv[1] == "--child":

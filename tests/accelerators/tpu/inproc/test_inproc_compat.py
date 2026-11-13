@@ -8,6 +8,7 @@ Optional input: ``INPROC_TEST_VLLM_TORCHTPU_SRC`` = a vllm-torchtpu source direc
 """
 
 import ast
+import inspect
 import os
 import re
 import sys
@@ -290,6 +291,34 @@ def test_env_after_build_needs_the_platform_import_snapshot():
         compat.env_after_build_problems(None, {})
         and "snapshot is missing" in compat.env_after_build_problems(None, {})[0]
     )
+
+
+# ---------------------------------------------------------------------------------------------------- verl contracts
+
+
+def test_server_contract():
+    class Server:
+        def __init__(self):
+            self.a = 1
+            self.b: int = 2
+            self._master_sock = None
+
+    assert compat.init_assigned_attrs(Server) == {"a", "b", "_master_sock"}
+    assert compat.server_contract_problem(Server, {"a", "b"}) is None
+    assert "['b']" in compat.server_contract_problem(Server, {"a"})
+
+
+def test_server_contract_holds_for_verls_server():
+    """The attributes the in-process server sets (engine.make_server) cover verl's vLLMHttpServer.__init__."""
+    pytest.importorskip("vllm")
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc import engine
+
+    src = inspect.getsource(engine.make_server)
+    built = set(re.findall(r"srv\.(\w+)\s*=", src)) | {
+        a for t in re.findall(r"srv\.(\w+), srv\.(\w+), srv\.(\w+), srv\.(\w+) =", src) for a in t
+    }
+    assert compat.server_contract_problem(vLLMHttpServer, built) is None
 
 
 # ---------------------------------------------------------------------------------------- runner features (report only)

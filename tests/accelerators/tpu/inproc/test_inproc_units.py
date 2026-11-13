@@ -180,9 +180,12 @@ def _worker_cls(device="cpu"):
 
 @pytest.fixture
 def logits(monkeypatch):
-    """A fresh hook object in place of the package's one."""
+    """A fresh hook object in place of the package's one (the engine module holds its own reference)."""
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc import engine
+
     la = cg.LogitsAtLoad()
     monkeypatch.setattr(cg, "LOGITS_AT_LOAD", la)
+    monkeypatch.setattr(engine, "LOGITS_AT_LOAD", la)
     return la
 
 
@@ -252,3 +255,54 @@ def test_logits_banned_ids_move_to_the_model_device_before_anything_compiles(log
     plain = _Model()
     monkey_patch_compute_logits(plain, 12, [])
     assert logits._place_banned(plain.__dict__["compute_logits"], plain).startswith("none")
+
+
+def _engine_args_stub(monkeypatch):
+    """vLLM's EngineArgs resolving to a TP=1 config without a model (the factory's checks only read these)."""
+    from vllm.engine.arg_utils import EngineArgs
+
+    one = SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1)
+    vc = SimpleNamespace(parallel_config=one)
+    args = SimpleNamespace(create_engine_config=lambda usage_context=None: vc, disable_log_stats=True)
+    monkeypatch.setattr(EngineArgs, "from_cli_args", classmethod(lambda cls, cli: args))
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    return SimpleNamespace(model_config=SimpleNamespace(tokenizer=[0] * 20, processor=None))
+
+
+@needs_vllm
+def test_build_arms_the_mask_before_the_engine_and_disarms_it_after(logits, monkeypatch):
+    """The in-process engine factory arms verl's mask (the arguments of verl's monkey_patch_model RPC) before vLLM's
+    LLMEngine is constructed, so the hook applies it inside the worker's load_model, and disarms it in a finally."""
+    import vllm.v1.engine.llm_engine as llm_engine
+    import vllm.v1.executor as vexec
+
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc import engine
+
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_llm_engine(*a, **k):
+        seen["spec_at_construction"] = dict(logits.spec or {})
+        raise Stop
+
+    srv = _engine_args_stub(monkeypatch)
+    monkeypatch.setattr(vexec.Executor, "get_class", staticmethod(lambda vllm_config: object))
+    monkeypatch.setattr(llm_engine, "LLMEngine", fake_llm_engine)
+    logits.hooked = True
+    with pytest.raises(Stop):
+        engine.build_vllm_engine(srv, SimpleNamespace())
+    assert seen["spec_at_construction"] == {"vocab_size": 20, "banned_token_ids": []}
+    assert logits.spec is None
+
+
+@needs_vllm
+def test_build_refuses_without_the_load_model_hook(logits, monkeypatch):
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc import engine
+
+    srv = _engine_args_stub(monkeypatch)
+    assert not logits.hooked
+    with pytest.raises(RuntimeError, match="hook is not installed"):
+        engine.build_vllm_engine(srv, SimpleNamespace())
+    assert logits.spec is None

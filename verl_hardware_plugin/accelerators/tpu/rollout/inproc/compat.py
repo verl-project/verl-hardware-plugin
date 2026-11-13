@@ -312,3 +312,41 @@ def runner_features(modules: Optional[dict] = None, environ: Optional[Mapping[st
     except Exception:  # noqa: BLE001
         out["vllm_torchtpu"] = "unknown"
     return out
+
+
+# ------------------------------------------------------------------------------------------------------- verl contracts
+
+# vLLMHttpServer.__init__ attributes the in-process path never reaches (multi-node / data-parallel sockets).
+SERVER_UNUSED_ATTRS = frozenset({"_dp_master_sock", "_dp_rpc_sock", "_master_sock"})
+
+
+def init_assigned_attrs(cls: Any) -> set[str]:
+    """The ``self.X`` names ``cls.__init__`` assigns (from its source)."""
+    src = _source_or_none(cls.__init__)
+    if src is None:
+        raise RuntimeError(f"{cls.__name__}.__init__ source unreadable")
+    out = set()
+    for n in ast.walk(ast.parse(src)):
+        targets = (
+            n.targets
+            if isinstance(n, ast.Assign)
+            else ([n.target] if isinstance(n, ast.AnnAssign | ast.AugAssign) else [])
+        )
+        for t in targets:
+            for sub in ast.walk(t):
+                if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) and sub.value.id == "self":
+                    out.add(sub.attr)
+    return out
+
+
+def server_contract_problem(server_cls: Any, built: set[str]) -> Optional[str]:
+    """The in-process server is built with ``object.__new__`` plus the attributes verl's ``__init__`` would set;
+    a new attribute of ``vLLMHttpServer.__init__`` that it does not set refuses at build, naming it."""
+    try:
+        want = init_assigned_attrs(server_cls)
+    except Exception as e:  # noqa: BLE001
+        return f"cannot read {getattr(server_cls, '__name__', server_cls)}.__init__: {type(e).__name__}: {e}"[:240]
+    missing = sorted(want - set(built) - SERVER_UNUSED_ATTRS)
+    if missing:
+        return f"vLLMHttpServer.__init__ sets {missing}, which the in-process server does not set"
+    return None
