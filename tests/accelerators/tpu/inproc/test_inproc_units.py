@@ -3,13 +3,15 @@
 
 """CPU unit tests of the in-process rollout's small decisions that the other suites rely on without asserting:
 the trainer's eager-mode snapshot and its restore after the build, the engine scope's resolution of torch_tpu's API,
-the collective counter's scope, the cross-rank agreement without a process group, and the GC deferral around the
-pump.
+the collective counter's scope, the cross-rank agreement without a process group, the GC deferral around the pump,
+and the logits-at-load hook (verl's sampling mask installed when the model loads, before anything compiles, and
+verified on the served model).
 """
 
 from __future__ import annotations
 
 import gc
+import importlib.util
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +19,9 @@ import torch
 
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc import boundary as b
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc import common, gc_policy
+from verl_hardware_plugin.accelerators.tpu.rollout.inproc import compile_guard as cg
+
+needs_vllm = pytest.mark.skipif(importlib.util.find_spec("vllm") is None, reason="vLLM is not installed")
 
 
 class _EagerMode:
@@ -140,3 +145,110 @@ def test_gc_deferral_is_reentrant_and_keeps_a_threshold_set_meanwhile(monkeypatc
         assert gc.get_threshold() == (700, 10, 77)
     finally:
         gc.set_threshold(*t0)
+
+
+# ------------------------------------------------------------------------------------------------ logits at load
+
+
+class _Model(torch.nn.Module):
+    def __init__(self, device="cpu"):
+        super().__init__()
+        self.lm_head = torch.nn.Linear(4, 16, bias=False, device=device)
+
+    def compute_logits(self, hidden):
+        return self.lm_head(hidden)
+
+
+def _worker_cls(device="cpu"):
+    """vllm-torchtpu's TPUWorker shape: load_model builds the model; verl's extension method sets the mask."""
+    from verl.workers.rollout.vllm_rollout.utils import monkey_patch_compute_logits
+
+    class Worker:
+        def __init__(self):
+            self.model_runner = SimpleNamespace(model=None)
+            self.loads = 0
+
+        def load_model(self):
+            self.loads += 1
+            self.model_runner.model = _Model(device)
+
+        def monkey_patch_model(self, vocab_size, banned_token_ids=None):
+            monkey_patch_compute_logits(self.model_runner.model, vocab_size, banned_token_ids)
+
+    return Worker
+
+
+@pytest.fixture
+def logits(monkeypatch):
+    """A fresh hook object in place of the package's one."""
+    la = cg.LogitsAtLoad()
+    monkeypatch.setattr(cg, "LOGITS_AT_LOAD", la)
+    return la
+
+
+@needs_vllm
+def test_logits_hook_is_installed_once_and_inert_until_armed(logits):
+    W = _worker_cls()
+    assert logits.install(W) and logits.install(W)
+    hook = W.__dict__["load_model"]
+    assert getattr(hook, "_inproc_logits", False)
+    w = W()
+    w.load_model()  # not armed: nothing applied
+    assert logits.applied is None and "compute_logits" not in w.model_runner.model.__dict__
+    assert w.loads == 1
+
+
+@needs_vllm
+def test_logits_mask_is_applied_at_load_and_freezes_the_rpc(logits):
+    W = _worker_cls()
+    logits.install(W)
+    logits.arm({"vocab_size": 12, "banned_token_ids": [3, 5]})
+    w = W()
+    try:
+        w.load_model()
+    finally:
+        logits.disarm()
+    logits.verify_built(w)
+    model = w.model_runner.model
+    assert logits.applied["via"] == "the worker's monkey_patch_model" and logits.applied["rpc_frozen"] == "frozen"
+    out = model.compute_logits(torch.ones(2, 4))
+    assert torch.isinf(out[:, 12:]).all() and torch.isinf(out[:, [3, 5]]).all() and not torch.isinf(out[:, 7]).any()
+    assert getattr(w.monkey_patch_model, "_inproc_frozen", False)
+
+
+@needs_vllm
+def test_logits_verify_refuses_when_the_mask_never_landed(logits):
+    W = _worker_cls()
+    logits.install(W)
+    w = W()
+    w.load_model()  # loaded while not armed
+    with pytest.raises(RuntimeError, match="refusing to serve") as err:
+        logits.verify_built(w)
+    assert "never applied" in str(err.value)
+
+
+@needs_vllm
+def test_logits_verify_refuses_another_model_object(logits):
+    W = _worker_cls()
+    logits.install(W)
+    logits.arm({"vocab_size": 12, "banned_token_ids": []})
+    w = W()
+    w.load_model()
+    logits.disarm()
+    w.model_runner.model = _Model()  # the runner serves another object than the one patched at load
+    with pytest.raises(RuntimeError, match="not the object patched at load"):
+        logits.verify_built(w)
+
+
+@needs_vllm
+def test_logits_banned_ids_move_to_the_model_device_before_anything_compiles(logits):
+    from verl.workers.rollout.vllm_rollout.utils import monkey_patch_compute_logits
+
+    model = _Model(device="meta")
+    monkey_patch_compute_logits(model, 12, [3, 5])
+    cl = model.__dict__["compute_logits"]
+    assert logits._place_banned(cl, model) == "cpu -> meta"
+    assert logits._place_banned(cl, model) == "already on meta"
+    plain = _Model()
+    monkey_patch_compute_logits(plain, 12, [])
+    assert logits._place_banned(plain.__dict__["compute_logits"], plain).startswith("none")
