@@ -7,8 +7,8 @@ Run them one file per process (several start child interpreters or patch process
 
     for f in tests/accelerators/tpu/inproc/test_*.py; do VLLM_TARGET_DEVICE=cpu pytest -q "$f"; done
 
-Dependencies: the ``dev`` extra, and the ``inproc-test`` extra (vLLM on its CPU platform) for every test that builds
-or drives vLLM; without it those tests are skipped.
+Dependencies: the ``dev`` extra, and the ``inproc-test`` extra (vLLM on its CPU platform, TransferQueue) for every
+test that builds or drives vLLM or verl's replay buffer; without it those tests are skipped.
 
 Optional inputs; a test that needs one is skipped without it:
 

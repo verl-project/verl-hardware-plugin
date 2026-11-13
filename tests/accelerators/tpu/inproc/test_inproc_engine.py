@@ -1,9 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Licensed under the Apache License, Version 2.0.
 
-"""CPU tests of the in-process engine adapter, the replica, the rollout's step health and the GC policy
-(``rollout/inproc/engine.py``, ``gc_policy.py``, the package's worker hooks). The engine is a small fake of vLLM's
-``LLMEngine`` surface; no device, no Ray."""
+"""CPU tests of the in-process engine adapter, the step guards and the GC policy (``rollout/inproc/engine.py``,
+``sampler.py``, ``gc_policy.py``, the package's worker hooks). The engine is a small fake of vLLM's ``LLMEngine``
+surface; no device, no Ray."""
 
 import asyncio
 import gc
@@ -14,7 +14,7 @@ import pytest
 
 from verl_hardware_plugin.accelerators.tpu.rollout import inproc
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc import engine as E
-from verl_hardware_plugin.accelerators.tpu.rollout.inproc import gc_policy
+from verl_hardware_plugin.accelerators.tpu.rollout.inproc import gc_policy, sampler
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.rollout import TPUInProcRollout
 
 pytest.importorskip("vllm.sampling_params")
@@ -174,7 +174,84 @@ def test_step_health():
     assert "2 request(s) failed" in r.step_health()
     eng.window_failed, eng._error = 0, RuntimeError("x")
     assert "the in-process engine failed" in r.step_health()
+    eng._error = None
+    r.stale = SimpleNamespace(fatal_pending="STALE WEIGHTS rank 0: sync step 3")
+    assert r.step_health().startswith("STALE WEIGHTS")
     assert _shell(None).step_health() == "the in-process engine is not built"
+
+
+def test_step_guard_refuses_update_actor_before_anything_trains(caplog):
+    eng = E.InProcAsyncEngine(FakeEngine(), 0)
+    worker = SimpleNamespace(rollout=_shell(eng))
+    inproc.step_guard(worker)  # healthy: nothing
+    inproc.step_guard(SimpleNamespace(rollout=object()))  # not an in-process rollout: nothing
+    eng.window_failed = 1
+    with pytest.raises(RuntimeError, match="STEP FAILED before update_actor rank 0: 1 request\\(s\\) failed"):
+        inproc.step_guard(worker)
+
+
+def _batch(n_groups: int, n: int, missing: int = 0, aborted: int = 0, steps=(4, 4), status="success"):
+    keys, tags = [], []
+    for g in range(n_groups):
+        for s in range(n - (missing if g == 0 else 0)):
+            keys.append(f"u{g}_{s}")
+            tags.append(
+                {
+                    "response_len": 0 if len(tags) < aborted else 5,
+                    "status": status,
+                    "min_global_steps": steps[0],
+                    "max_global_steps": steps[1],
+                }
+            )
+    return SimpleNamespace(keys=keys, tags=tags)
+
+
+def _rb(n=None):
+    rb = SimpleNamespace(failure_keys={})
+    if n is not None:
+        rb.sampler_kwargs = {"rollout_n": n}
+    return rb
+
+
+@pytest.mark.parametrize(
+    "batch, rb, want",
+    [
+        (_batch(4, 2), _rb(2), []),
+        (_batch(4, 2, missing=1), _rb(2), ["miss 1 of their rollout.n=2"]),
+        (_batch(3, 2), _rb(2), ["3 prompt groups carry trajectories, 4 were sampled"]),
+        (_batch(4, 2, aborted=1), _rb(2), ["1 aborted trajectories"]),
+        (_batch(4, 2, steps=(3, 3)), _rb(2), ["trajectory_staleness min 1 max 1"]),
+        (_batch(4, 2, steps=(3, 4)), _rb(2), ["trajectory_spans max 2"]),
+        (_batch(4, 2, status="failure"), _rb(2), ["trajectory status ['failure']"]),
+        (_batch(4, 2, missing=1), _rb(None), ["rollout.n cannot be resolved for this training batch"]),
+    ],
+)
+def test_batch_guard(batch, rb, want):
+    problems, info = sampler.batch_guard(rb, batch, 5, "train", 4)
+    assert len(problems) == len(want) and all(w in p for w, p in zip(want, problems, strict=True)), problems
+
+
+def test_batch_guard_val_without_a_resolved_n_is_not_refused():
+    problems, info = sampler.batch_guard(_rb(None), _batch(4, 2), 5, "val", 4)
+    assert problems == [] and info["rollout_n"] is None
+
+
+def test_rollout_n_comes_from_the_trainer_config():
+    owner = SimpleNamespace(
+        config=SimpleNamespace(
+            actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(n=16, val_kwargs=SimpleNamespace(n=1)))
+        )
+    )
+    rb = SimpleNamespace(refill_fn=SimpleNamespace(__self__=owner))
+    assert sampler.expected_rollout_n(rb, False) == 16 and sampler.expected_rollout_n(rb, True) == 1
+
+
+def test_fast_poll_sampler_serves_sync_mode_only():
+    pytest.importorskip("transfer_queue")  # verl's replay buffer module imports it (the inproc-test extra)
+    cls = sampler.FastPollReplayBufferSync
+    assert cls.__name__ == "FastPollReplayBufferSync" and cls.__module__ == sampler.__name__
+    with pytest.raises(RuntimeError, match="serves trainer_mode=sync only"):
+        cls(trainer_mode="separate_async")
 
 
 def test_worker_methods_are_refused_when_absent_or_coroutines(monkeypatch):

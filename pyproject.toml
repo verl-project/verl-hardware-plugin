@@ -23,6 +23,7 @@ dev = [
 # need them are skipped. They run vLLM on its CPU platform (VLLM_TARGET_DEVICE=cpu).
 inproc-test = [
     "vllm==0.32.0",
+    "TransferQueue==0.1.11",  # verl's sync replay buffer (the batch-guard tests)
 ]
 
 [project.entry-points."verl.plugins"]

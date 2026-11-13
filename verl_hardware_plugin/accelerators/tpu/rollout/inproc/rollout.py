@@ -28,12 +28,14 @@ from verl_hardware_plugin.accelerators.tpu.rollout.inproc.boundary import (
     snapshot_engine_global_state,
 )
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.common import (
+    INTEGRITY_ENV,
     INTEGRITY_TAG,
     all_ranks_ok,
     cfg_get,
     check_switches,
     dist_rank_world,
     gc_rss_limit_bytes,
+    integrity_mode,
     last_step,
     log,
     say_build_failure,
@@ -55,10 +57,13 @@ from verl_hardware_plugin.accelerators.tpu.rollout.inproc.weight_sync import (
     CHECKSUM_EVERY,
     FULL_PARITY_STEPS,
     LOADER_FAMILY,
+    OPT_STEPS,
     InProcInstaller,
+    StaleProbe,
     checksum_names,
     export_pin_problem,
     export_signature,
+    no_update_between,
     tensor_checksums,
     verify_reason,
 )
@@ -69,6 +74,7 @@ class TPUInProcRollout(BaseRollout):
     rank, built by ``ActorRolloutRefWorker.init_model`` on every rank in one worker-group call."""
 
     # defaults of the per-instance state ``__init__`` sets, for instances made without it
+    stale: Optional[StaleProbe] = None
     _rss_base: Optional[int] = None
     _export_pin: Optional[tuple] = None  # (step, export signature) of the first verified sync that passed
     layout_entry: Optional[compat.LayoutEntry] = None
@@ -98,8 +104,16 @@ class TPUInProcRollout(BaseRollout):
         # the start of the trainer's export, set at verl's update_weights entry (before get_per_tensor_param)
         self._pending_export_t0: Optional[float] = None
         self._syncs_started = 0  # the first sync of this process is verified
+        self._last_wsum: Optional[tuple] = None  # (step, wsum, optimizer-step mark) of the last sync whose sha256 ran
+        self.integrity = integrity_mode()
         self.last_step = last_step()
         self.rss_limit = gc_rss_limit_bytes()
+        probe = StaleProbe(
+            self.rank, mode=self.integrity, barrier_after=bool(getattr(self.config, "free_cache_engine", False))
+        )
+        if probe.demoted:
+            log(f"stale probe rank {self.rank}: verdicts reported, not raised ({probe.demoted})")
+        self.stale: Optional[StaleProbe] = probe
         self._rss_base: Optional[int] = None
         if not defer_build:
             self._build()
@@ -422,7 +436,8 @@ class TPUInProcRollout(BaseRollout):
 
     def step_health(self) -> Optional[str]:
         """Why this rank's rollout since the last weight sync must not be trained on, or None: the engine failed (every
-        request in flight failed), or requests failed or were aborted (a sync-mode rollout aborts none)."""
+        request in flight failed), requests failed or were aborted (a sync-mode rollout aborts none), or this step's
+        sync served stale weights."""
         e = getattr(self, "engine", None)
         if e is None:
             return "the in-process engine is not built"
@@ -432,6 +447,9 @@ class TPUInProcRollout(BaseRollout):
             return f"{e.window_failed} request(s) failed in this step's rollout"
         if e.window_aborted:
             return f"{e.window_aborted} request(s) aborted in this step's rollout (a sync-mode rollout aborts none)"
+        st = getattr(self, "stale", None)
+        if st is not None and st.fatal_pending is not None:
+            return st.fatal_pending
         return None
 
     def _health_record(self, step: int, window: dict) -> dict:
@@ -458,6 +476,11 @@ class TPUInProcRollout(BaseRollout):
         self._syncs_started += 1
         if self.engine._collectors or self.engine._engine.has_unfinished_requests():
             raise RuntimeError(f"weight update at step {step} with requests in flight")
+        if self.stale is not None and self.stale.pending is not None:  # the previous sync's probe, before this install
+            self.stale.resolve("sync")
+        opt_mark = (
+            OPT_STEPS.mark()
+        )  # the trainer's optimizer steps so far (every update_actor of this interval returned)
         t_iter = time.time()
         if self._pending_export_t0 is not None:
             t0, clock = float(self._pending_export_t0), "the update_weights entry"
@@ -470,6 +493,8 @@ class TPUInProcRollout(BaseRollout):
         for name, tensor in weights:  # the trainer's export: FSDP all-gathers, in the trainer's own eager mode
             staging[name] = tensor
         t1 = time.time()
+        if self.stale is not None:  # a stale verdict of an earlier sync, raised after the export's collectives
+            self.stale.check_fatal()
         # the export must be the one the first verified sync of this process passed with, checked before the install
         # and at every sync (after the export's collectives: every rank exports the same names)
         sig = export_signature(staging)
@@ -497,15 +522,18 @@ class TPUInProcRollout(BaseRollout):
             raise RuntimeError(line)
         self.server.global_steps = step
         self.global_steps = step
-        # checks timed apart from the sync: the strided checksum at the verified syncs and every few syncs, the full
-        # sha256 at steps 0 / 1 and the first sync, the parity and the coverage
+        # checks timed apart from the sync: the staleness probe at every sync, the strided checksum at the verified
+        # syncs and every few syncs, the full sha256 at steps 0 / 1 and the first sync, the parity and the coverage
         model = self.worker.model_runner.model
         named = dict(model.named_parameters())
         names = checksum_names(list(named))
         par = cov = None
         with engine_mode_ctx("checksum"):
             DEVICE_THREADS.record("checksum")
-            sha_due = verify or full_sha or step % CHECKSUM_EVERY == 0
+            probe_s = self.stale.dispatch(step, named, names, mark=opt_mark) if self.stale is not None else None
+            if probe_s is not None and full_sha and self.stale is not None:
+                self.stale.host_reference(step, named, names)
+            sha_due = verify or full_sha or probe_s is None or step % CHECKSUM_EVERY == 0
             wsum, wbytes = tensor_checksums(named, names, full=False) if sha_due else ("deferred", 0)
             full = tensor_checksums(named, names, full=True)[0] if full_sha else None
             t3 = time.time()
@@ -514,6 +542,22 @@ class TPUInProcRollout(BaseRollout):
                 cov = self.installer.coverage(res, staging)
         t4 = time.time()
         direct = res["mode"] != LOADER_FAMILY
+        # staleness on the strided checksum: compared only between syncs whose checksum ran; unchanged weights are
+        # expected only when the trainer provably took no optimizer step in between (all skipped)
+        prev = self._last_wsum
+        stale = None
+        unchanged_expected = False
+        if sha_due:
+            if prev is not None and step > prev[0] and wsum == prev[1]:
+                if no_update_between(prev[2], opt_mark):
+                    unchanged_expected = True
+                else:
+                    stale = (
+                        f"the engine's weights are unchanged since sync {prev[0]} (wsum {wsum[:16]} at both): the "
+                        "trainer's "
+                        "update or this install did not land"
+                    )
+            self._last_wsum = (step, wsum, opt_mark)
         window = self.engine.window_take()
         rec = {
             "step": step,
@@ -528,9 +572,21 @@ class TPUInProcRollout(BaseRollout):
             "parity_s": round(t4 - t3, 4),
             "label_kept": raw_step is None,
             "first_sync": first_sync,
+            "stale": stale is not None,
             "rollout_window": window,
             "sha": sha_due,
+            "opt_mark": opt_mark,
+            "unchanged_expected": unchanged_expected,
         }
+        staleness = (
+            "UNCHANGED"
+            if stale
+            else (
+                f"unchanged as expected (no optimizer step since sync {prev[0] if prev is not None else None})"
+                if unchanged_expected
+                else ("changed" if sha_due and prev is not None and step > prev[0] else "n/a")
+            )
+        )
         log(
             f"sync step {step} rank {self.rank}: mode {res['mode']}, {len(staging)} tensors, export+gather "
             f"{t1 - t0:.4f} s, "
@@ -539,9 +595,15 @@ class TPUInProcRollout(BaseRollout):
             "coverage "
             f"{t4 - t3:.4f} s, not in the sync); label {'kept (global_steps=None)' if raw_step is None else 'given'}; "
             "first "
-            f"sync in process {first_sync}; rollout window "
+            f"sync in process {first_sync}; staleness {staleness}; optimizer steps real/skipped/unknown "
+            f"{list(opt_mark) if opt_mark is not None else 'not counted'}; rollout window "
             f"{json.dumps(window, sort_keys=True)}; "
-            f"strided sha256 {'run' if sha_due else f'deferred (every {CHECKSUM_EVERY} syncs)'}"
+            f"strided sha256 {'run' if sha_due else f'deferred (every {CHECKSUM_EVERY} syncs)'}, staleness probe "
+            + (
+                f"dispatched in {1e3 * probe_s:.3f} ms"
+                if probe_s is not None
+                else f"off ({getattr(self.stale, 'unavailable', None)})"
+            )
         )
         integrity = []
         parity_failed = False
@@ -628,6 +690,11 @@ class TPUInProcRollout(BaseRollout):
                     integrity.append(f"coverage not checked: {cov.get('why')}")
         if parity_failed:
             raise RuntimeError(f"in-process weight parity FAILED at step {step} on rank {self.rank}")
+        if stale is not None:
+            if self.integrity == "fatal":
+                integrity.append(stale)
+            else:
+                warn(f"rank {self.rank} step {step}: {stale} (reported: {INTEGRITY_ENV}=report)")
         health = self._health_record(step, window)
         log(f"health step {step} rank {self.rank}: {json.dumps(health, sort_keys=True, default=str)}")
         problems = self._sync_problems()

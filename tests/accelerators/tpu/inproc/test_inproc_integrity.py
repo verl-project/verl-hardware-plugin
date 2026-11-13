@@ -12,6 +12,10 @@
   caller's state is back after every call (needs ``INPROC_TEST_VLLM_TORCHTPU_SRC``);
 * verl's real ``vLLMHttpServer.abort_all_requests(abort_only=True)`` on the in-process adapter removes the requests
   from an engine with vLLM's request-id semantics (internal ids only);
+* a failed or aborted rollout on one trainer rank makes ``update_actor`` refuse on every rank (a gloo world of three
+  rank processes), so nothing trains on a partial batch;
+* verl's real sync ``ReplayBuffer.sample`` through ``FastPollReplayBufferSync``: a batch with lost, partially failed,
+  aborted, stale or spanning groups fails the step before ``update_actor``; healthy train and validation batches pass;
 * verl's full-determinism mode is refused at the build, and is shown to reseed the process's RNG (the hazard).
 """
 
@@ -22,6 +26,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import socket
 import subprocess
 import sys
 import types
@@ -38,6 +43,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sup
 
 import inproc_vt_runner as vt  # noqa: E402
 
+PKG = "verl_hardware_plugin.accelerators.tpu.rollout.inproc"
 needs_vllm = pytest.mark.skipif(importlib.util.find_spec("vllm") is None, reason="vLLM is not installed")
 needs_vt = pytest.mark.skipif(vt.skip_reason() is not None, reason=str(vt.skip_reason()))
 ENTRY_CASES = ("device", "tfmode", "inference", "num_threads", "default_dtype", "deterministic", "matmul")
@@ -312,6 +318,260 @@ def test_abort_only_removes_the_requests_from_an_engine_with_vllms_request_ids()
     assert aeng.aborted == 3 and aeng.window_take() == {"aborted": 3, "failed": 0}
 
 
+# --------------------------------------------------------------------------------------------- the step guard, 3 ranks
+
+WORLD = 3
+
+
+def child_rank(scenario: dict) -> dict:
+    import torch.distributed as dist
+
+    rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{os.environ['INPROC_TEST_PORT']}", rank=rank, world_size=world
+    )
+    import importlib
+
+    inproc = importlib.import_module(PKG)
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc import engine
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc.rollout import TPUInProcRollout
+
+    class StepEngine:
+        """an LLMEngine-shaped engine without a model: every request finishes at its 3rd step; on the failing rank
+        the 2nd step raises"""
+
+        def __init__(self, fail: bool):
+            self.model_config, self.reqs, self.n, self.fail = types.SimpleNamespace(), {}, 0, fail
+
+        def add_request(self, rid, prompt, params, **_):
+            self.reqs[f"{rid}-int"] = [rid, 0]
+            return f"{rid}-int"
+
+        def has_unfinished_requests(self):
+            return bool(self.reqs)
+
+        def get_num_unfinished_requests(self):
+            return len(self.reqs)
+
+        def abort_request(self, ids, internal=False):
+            for i in ids:
+                self.reqs.pop(i, None)
+
+        def step(self):
+            self.n += 1
+            if self.fail and self.n == 2:
+                raise RuntimeError("injected engine-step failure")
+            fin = []
+            for k, v in list(self.reqs.items()):
+                v[1] += 1
+                if v[1] >= 3:
+                    fin.append(types.SimpleNamespace(request_id=v[0], finished=True, outputs=[types.SimpleNamespace()]))
+                    self.reqs.pop(k)
+            return fin
+
+    aeng = engine.InProcAsyncEngine(StepEngine(fail=rank == scenario.get("fail_rank")), rank)
+    r = TPUInProcRollout.__new__(TPUInProcRollout)
+    r.rank, r.engine = rank, aeng
+    worker = types.SimpleNamespace(rollout=r)
+
+    async def rollout():
+        cols = [
+            await aeng.add_request(f"r{rank}-{i}", {"prompt_token_ids": [1]}, types.SimpleNamespace(output_kind=None))
+            for i in range(4)
+        ]
+        if scenario.get("abort_rank") == rank:
+            await aeng.abort([f"r{rank}-0"])  # the external id verl passes
+        res = []
+        for c in cols:
+            try:
+                res.append("ok" if (await c.get()).outputs else "aborted")
+            except Exception as exc:  # noqa: BLE001
+                res.append(f"failed: {type(exc).__name__}")
+        return res
+
+    gen = asyncio.run(rollout())
+    trained = []
+    wrapped = inproc._wrap_worker_method(lambda self, data: trained.append(rank) or {"metrics": {}}, "update_actor")
+    try:
+        wrapped(worker, {"batch": rank})
+        outcome = "trained"
+    except RuntimeError as exc:
+        outcome = str(exc)
+    dist.barrier()
+    dist.destroy_process_group()
+    return {"rank": rank, "gen": gen, "outcome": outcome, "trained": bool(trained)}
+
+
+def _free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _step_guard_world(tmp_path, **scenario) -> list:
+    port = _free_port()
+    procs = []
+    for rank in range(WORLD):
+        env = _clean_env(RANK=str(rank), WORLD_SIZE=str(WORLD), INPROC_TEST_PORT=str(port))
+        procs.append(
+            subprocess.Popen(
+                [sys.executable, "-B", os.path.abspath(__file__), "--child", "rank", json.dumps(scenario)],
+                env=env,
+                cwd=str(tmp_path),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        )
+    out = []
+    for p in procs:
+        so, se = p.communicate(timeout=900)
+        lines = [x for x in so.splitlines() if x.startswith("RESULT ")]
+        out.append(json.loads(lines[-1][7:]) if lines else {"error": f"rc {p.returncode}: {se[-1500:]}"})
+    return out
+
+
+@needs_vllm  # the adapter sets vLLM's output kind on every request
+def test_a_failed_engine_step_on_one_rank_refuses_update_actor_on_every_rank(tmp_path):
+    res = _step_guard_world(tmp_path, fail_rank=1)
+    assert len(res) == WORLD and all("error" not in r for r in res), res
+    assert not any(r["trained"] for r in res), res
+    assert all("STEP FAILED before update_actor rank" in r["outcome"] for r in res), res
+    assert "the in-process engine failed" in res[1]["outcome"]
+    assert all("another rank's rollout failed" in r["outcome"] for i, r in enumerate(res) if i != 1)
+    assert all(g.startswith("failed") for g in res[1]["gen"]) and all(g == "ok" for g in res[0]["gen"] + res[2]["gen"])
+
+
+@needs_vllm  # the adapter sets vLLM's output kind on every request
+def test_healthy_rollouts_train_on_every_rank(tmp_path):
+    res = _step_guard_world(tmp_path)
+    assert [r.get("outcome") for r in res] == ["trained"] * WORLD and all(r["trained"] for r in res), res
+
+
+@needs_vllm  # the adapter sets vLLM's output kind on every request
+def test_an_aborted_request_on_one_rank_refuses_update_actor_on_every_rank(tmp_path):
+    res = _step_guard_world(tmp_path, abort_rank=2)
+    assert all("error" not in r for r in res), res
+    assert not any(r["trained"] for r in res) and "1 request(s) aborted" in res[2]["outcome"], res
+
+
+# ------------------------------------------------------------------------------------------------ the batch guard
+
+
+class _FakeTQ:
+    """TransferQueue's kv surface verl's sync ReplayBuffer.sample reads (kv_list / kv_clear), on one dict"""
+
+    def __init__(self, data: dict):
+        self.data = data
+
+    def kv_list(self):
+        return {p: dict(items) for p, items in self.data.items()}
+
+    def kv_clear(self, keys, partition_id):
+        for k in keys:
+            self.data.get(partition_id, {}).pop(k, None)
+
+
+def _tq_state(step: int, part="train", prompts=32, n=16, failed=None, aborted=0, stale=0, spans=1) -> dict:
+    """prompt groups (status finished / failure) and their trajectories' tags as verl's agent loop writes them"""
+    failed = failed or {}
+    d: dict = {}
+    for p in range(prompts):
+        uid = f"u{p:03d}"
+        d[uid] = {"is_prompt": True, "status": "failure" if p in failed else "finished", "global_steps": step}
+        for s in range(failed.get(p, n)):
+            mx = step - 1 - stale
+            d[f"{uid}_{s}_0"] = {
+                "status": "success",
+                "prompt_len": 30,
+                "response_len": 0 if (p == 0 and s < aborted) else 40,
+                "seq_len": 70,
+                "global_steps": step,
+                "min_global_steps": mx - (spans - 1),
+                "max_global_steps": mx,
+            }
+    return {part: d}
+
+
+@pytest.fixture
+def replay(monkeypatch):
+    pytest.importorskip("transfer_queue")
+    import verl.trainer.ppo.v1.replay_buffer as rbm
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc import sampler
+
+    trainer = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            actor_rollout_ref=types.SimpleNamespace(
+                rollout=types.SimpleNamespace(n=16, val_kwargs=types.SimpleNamespace(n=1))
+            )
+        )
+    )
+    refills: list = []
+    refill = types.MethodType(lambda self, k: refills.append(k), trainer)  # verl passes the trainer's bound method
+
+    def make(cls, data: dict):
+        monkeypatch.setattr(rbm, "tq", _FakeTQ(data))
+        return cls(
+            trainer_mode="sync",
+            trainer_config={},
+            max_off_policy_threshold=None,
+            max_off_policy_strategy="drop",
+            sampler_kwargs={},
+            refill_fn=refill,
+        )
+
+    def guarded(data: dict, step: int, part: str = "train", bs: int = 32):
+        rb = make(sampler.FastPollReplayBufferSync, data)
+        try:
+            batch, _ = rb.sample(global_steps=step, partition_id=part, batch_size=bs)
+            return {"keys": len(batch.keys), "err": None}
+        except RuntimeError as exc:
+            return {"err": str(exc)}
+
+    def verl_only(data: dict, step: int, part: str = "train", bs: int = 32) -> int:
+        batch, _ = make(rbm.ReplayBuffer, data).sample(global_steps=step, partition_id=part, batch_size=bs)
+        return len(batch.keys)
+
+    return types.SimpleNamespace(guarded=guarded, verl_only=verl_only, refills=refills)
+
+
+def test_a_healthy_sync_batch_passes_verls_sampler_and_the_guard(replay):
+    assert replay.guarded(_tq_state(4), 4) == {"keys": 512, "err": None}
+    assert replay.refills == []
+
+
+def test_lost_groups_pass_verls_sampler_and_fail_the_guard(replay):
+    lost = dict.fromkeys(range(12, 32), 0)  # 20 of 32 groups lost every trajectory
+    assert replay.verl_only(_tq_state(4, failed=lost), 4) == 192  # what update_actor would train on
+    err = replay.guarded(_tq_state(4, failed=lost), 4)["err"]
+    assert "STEP FAILED before update_actor: the train batch of step 4" in err
+    assert "12 prompt groups carry trajectories, 32 were sampled" in err
+
+
+@pytest.mark.parametrize(
+    "kw, want",
+    [
+        ({"failed": {3: 8, 7: 15}}, "2 group(s) miss 9 of their rollout.n=16 sessions"),
+        ({"failed": {3: 8}}, "status 'failure'"),
+        ({"aborted": 2}, "2 aborted trajectories"),
+        ({"stale": 1}, "trajectory_staleness min 1 max 1"),
+        ({"spans": 2}, "trajectory_spans max 2"),
+    ],
+)
+def test_partial_aborted_stale_and_spanning_batches_fail_the_step(replay, kw, want):
+    err = replay.guarded(_tq_state(4, **kw), 4)["err"]
+    assert err and "STEP FAILED before update_actor" in err and want in err, err
+
+
+def test_validation_batches(replay):
+    ok = replay.guarded(_tq_state(0, part="val", prompts=8, n=1), 0, part="val", bs=8)
+    assert ok == {"keys": 8, "err": None}
+    bad = replay.guarded(_tq_state(0, part="val", prompts=8, n=1, failed={2: 0}), 0, part="val", bs=8)
+    assert "7 prompt groups carry trajectories, 8 were sampled" in bad["err"]
+
+
 # ------------------------------------------------------------------------------------------------ full determinism
 
 
@@ -369,5 +629,8 @@ def test_verls_full_determinism_would_reseed_the_trainers_rng(tmp_path):
 
 
 if __name__ == "__main__" and len(sys.argv) >= 3 and sys.argv[1] == "--child":
-    res = child_entry(sys.argv[3], sys.argv[4] == "scoped")
+    if sys.argv[2] == "entry":
+        res = child_entry(sys.argv[3], sys.argv[4] == "scoped")
+    else:
+        res = child_rank(json.loads(sys.argv[3]))
     print("RESULT " + json.dumps(res, sort_keys=True, default=str), flush=True)

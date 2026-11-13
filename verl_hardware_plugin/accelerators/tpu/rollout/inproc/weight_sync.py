@@ -14,28 +14,35 @@ model family's layout, or vLLM's own loaders. Around it:
 * verified syncs (steps 0 and 1, the first sync of a process, every ``VERL_TPU_INPROC_PARITY_EVERY`` steps, the run's
   last step, and every sync until one has passed) compare every installed parameter bit for bit with what the
   trainer sent (the direct install's recorded writes; on the loader path every engine parameter rebuilt from the
-  received tensors), and check that every engine parameter was written (:meth:`InProcInstaller.coverage`).
+  received tensors), and check that every engine parameter was written (:meth:`InProcInstaller.coverage`);
+* every sync dispatches an exact on-device staleness probe, read back at the trainer's next entry
+  (:class:`StaleProbe`), and the strided host checksum runs every few syncs.
 """
 
 from __future__ import annotations
 
 import hashlib
 import math
+import struct
+import time
 from collections.abc import Mapping
 from typing import Any, Optional
 
 import torch
 
+from verl_hardware_plugin.accelerators.tpu.rollout.inproc.boundary import DEVICE_THREADS, engine_mode_ctx
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.common import (
     INTEGRITY_TAG,
+    log,
     matches_any,
     parity_every,
+    warn,
 )
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.compat import LayoutEntry
 
 FULL_PARITY_STEPS = (0, 1)  # exact parity + the full sha256 at these global steps
 CHECKSUM_MAX_BYTES = 4 * 2**20  # strided sample per tensor
-CHECKSUM_EVERY = 5  # the strided sha256 at every 5th sync besides the verified ones
+CHECKSUM_EVERY = 5  # the strided sha256 at every 5th sync besides the verified ones (every sync while the probe is off)
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"  # vllm-torchtpu's marker of a dense weight stored (n_in, n_out)
 LOADER_FAMILY = "vllm loaders"
 
@@ -537,3 +544,279 @@ def verify_reason(
     if last is not None and step == last:
         return "the run's last step"
     return None
+
+
+def _dispatch_nowait(t: torch.Tensor) -> None:
+    """Materialize and dispatch a deferred device result without waiting for it (nothing on CPU)."""
+    if t.device.type == "cpu":
+        return
+    try:
+        from verl_hardware_plugin.accelerators.tpu.device_api import tpu_synchronize
+
+        tpu_synchronize(t, wait=False)
+    except Exception:  # noqa: BLE001 - left deferred: it is read back before the next install either way
+        pass
+
+
+@torch.no_grad()
+def stale_reduction(named: dict, names: list) -> torch.Tensor:
+    """One int32 per checksum tensor, on the tensors' device: the same strided sample as the host checksum, its bit
+    patterns (16-bit floats viewed as int16, 32-bit as int32) widened to int32, times the odd position weights 2i+1,
+    summed mod 2^32. Exact (wrapping integer arithmetic on bit patterns): any single changed element changes its sum,
+    and so does a permutation inside the sample (up to 2^-32 collisions); a float sum would not see a bf16 weight that
+    moved by one ulp among millions. No host transfer: the caller reads it back later."""
+    vals = []
+    for name in names:
+        t = named[name]
+        t = t.to_local() if hasattr(t, "to_local") else t
+        flat = t.detach().reshape(-1)
+        stride = max(1, math.ceil(flat.numel() * flat.element_size() / CHECKSUM_MAX_BYTES))
+        flat = flat[::stride].contiguous()
+        if flat.element_size() == 2:
+            bits = flat.view(torch.int16).to(torch.int32)
+        elif flat.element_size() == 4:
+            bits = flat.view(torch.int32)
+        else:
+            bits = flat.to(torch.float32).view(torch.int32)
+        w = torch.arange(bits.numel(), device=bits.device, dtype=torch.int32) * 2 + 1
+        vals.append((bits * w).sum(dtype=torch.int32))
+    return torch.stack(vals)
+
+
+class OptimizerSteps:
+    """The trainer engine's optimizer steps in this process, counted at their source: an instance-level wrap of
+    ``worker.actor.engine.optimizer_step``. verl's engines call it once per mini-batch and the TPU engine skips the
+    step when the global grad norm is not finite, returning that norm: a finite return is a real step, a non-finite
+    one a skipped step, anything else unknown. A skipped step leaves the trainer's weights, and so the served ones,
+    unchanged: that is not staleness. Fail-safe: no wrap, or an unknown return, keeps the plain staleness rule."""
+
+    def __init__(self) -> None:
+        self.real = 0
+        self.skipped = 0
+        self.unknown = 0
+        self.installed: Optional[bool] = None
+
+    def install(self, worker: Any) -> None:
+        """Idempotent; never raises (a failure leaves the counter off)."""
+        if self.installed is not None:
+            return
+        try:
+            eng: Any = getattr(getattr(worker, "actor", None), "engine", None)
+            fn = getattr(eng, "optimizer_step", None)
+            if fn is None or not callable(fn):
+                self.installed = False
+                return
+            if getattr(fn, "_inproc_counted", False):
+                self.installed = True
+                return
+            counter = self
+
+            def optimizer_step(*a, **k):
+                ret = fn(*a, **k)
+                counter.record(ret)
+                return ret
+
+            optimizer_step._inproc_counted = True  # type: ignore[attr-defined]
+            eng.optimizer_step = optimizer_step  # an instance attribute: train_batch's self.optimizer_step() finds it
+            self.installed = True
+        except Exception:  # noqa: BLE001
+            self.installed = False
+
+    def record(self, ret: Any) -> None:
+        try:
+            v = float(ret.item() if hasattr(ret, "item") else ret)
+        except Exception:  # noqa: BLE001 - a non-numeric return: unknown (judged as a real step)
+            self.unknown += 1
+            return
+        if math.isfinite(v):
+            self.real += 1
+        else:
+            self.skipped += 1
+
+    def mark(self) -> Optional[tuple]:
+        return (self.real, self.skipped, self.unknown) if self.installed else None
+
+
+OPT_STEPS = OptimizerSteps()
+
+
+def no_update_between(prev_mark: Optional[tuple], mark: Optional[tuple]) -> bool:
+    """True when the trainer provably took no optimizer step between two syncs: both marks known, no real and no
+    unknown step in between, and at least one skipped (an interval with no optimizer call at all keeps the plain
+    staleness rule)."""
+    return (
+        prev_mark is not None
+        and mark is not None
+        and mark[0] == prev_mark[0]
+        and mark[2] == prev_mark[2]
+        and mark[1] > prev_mark[1]
+    )
+
+
+class StaleProbe:
+    """The per-sync staleness check without a per-sync host checksum.
+
+    Every sync calls :meth:`dispatch` right after the install: :func:`stale_reduction` on the device (no host wait).
+    :meth:`resolve` reads it back later, off the generation's critical path: at the trainer's next entry
+    (compute_log_prob / update_actor) or, failing that, at the next sync before its install. Each resolved probe is
+    compared with the previous one: none of the sampled tensors changed although the trainer moved to a later step,
+    with a real optimizer step in between -> ``STALE WEIGHTS``, logged at once and, in ``fatal`` mode, raised at the
+    next sync right after its export (:meth:`check_fatal`): the trainer entries are collective, so the raise waits until
+    every rank is past the step's collectives. The step guard refuses update_actor earlier on a stale verdict.
+    ``barrier_after`` (verl's update_weights then barriers after this rollout's): a raise would strand ranks, so the
+    verdict is only logged. The device lowering is cross-checked against a host reduction of the same sample at the
+    full-sha syncs; a difference switches the probe off for the run (the strided sha256 then runs at every sync).
+    """
+
+    def __init__(self, rank: int, mode: str = "fatal", barrier_after: bool = False):
+        self.fatal = mode == "fatal" and not barrier_after
+        self.demoted = (
+            "free_cache_engine: verl's update_weights barriers after the rollout's"
+            if (mode == "fatal" and barrier_after)
+            else None
+        )
+        self.rank = rank
+        self.pending: Optional[tuple] = (
+            None  # (step, device int32 vector, names, dispatch seconds, optimizer-step mark)
+        )
+        self.last: Optional[tuple] = None  # (step, names, [ints], optimizer-step mark) of the last resolved probe
+        self.unavailable: Optional[str] = None
+        self.fatal_pending: Optional[str] = None
+        self.host_check: dict = {}
+        self.cross_checks: list = []
+
+    def on(self) -> bool:
+        return self.unavailable is None
+
+    def _off(self, what: str, e: BaseException) -> None:
+        self.unavailable = f"{what}: {type(e).__name__}: {e}"[:240]
+        self.pending = None
+        warn(
+            f"stale probe rank {self.rank}: OFF for this run ({self.unavailable}); the strided sha256 runs at every "
+            "sync"
+        )
+
+    def dispatch(self, step: int, named: dict, names: list, mark: Optional[tuple] = None) -> Optional[float]:
+        """After the install of sync ``step`` (inside the caller's engine scope): the reduction dispatched, not waited
+        for. Seconds, or None when the probe is off (the caller then runs the strided sha256)."""
+        if not self.on():
+            return None
+        if self.pending is not None:  # not read back since the last sync: in order, first
+            self.resolve("sync")
+            if not self.on():
+                return None
+        t0 = time.perf_counter()
+        try:
+            vec = stale_reduction(named, names)
+            _dispatch_nowait(vec)
+        except Exception as e:  # noqa: BLE001
+            self._off("dispatch", e)
+            return None
+        dt = time.perf_counter() - t0
+        self.pending = (int(step), vec, tuple(names), dt, mark)
+        return dt
+
+    def host_reference(self, step: int, named: dict, names: list) -> None:
+        """At a full-sha sync, right after :meth:`dispatch`: the same reduction on a host copy of the same strided
+        sample, kept for :meth:`resolve`'s comparison. Never raises."""
+        if not self.on() or self.pending is None or self.pending[0] != int(step):
+            return
+        try:
+            host = {}
+            for name in names:
+                t = named[name]
+                t = t.to_local() if hasattr(t, "to_local") else t
+                flat = t.detach().reshape(-1)
+                stride = max(1, math.ceil(flat.numel() * flat.element_size() / CHECKSUM_MAX_BYTES))
+                host[name] = flat[::stride].contiguous().to("cpu")
+            self.host_check[int(step)] = [int(x) for x in stale_reduction(host, list(names)).tolist()]
+        except Exception as e:  # noqa: BLE001
+            self.host_check[int(step)] = f"host failed: {type(e).__name__}: {e}"[:160]
+
+    def resolve(self, where: str) -> Optional[dict]:
+        """Read the pending probe back and judge it against the previous one (never raises: a stale verdict is kept
+        for :meth:`check_fatal`)."""
+        p, self.pending = self.pending, None
+        if p is None or not self.on():
+            return None
+        step, vec, names, disp, mark = p
+        t0 = time.perf_counter()
+        try:
+            with engine_mode_ctx("stale"):
+                DEVICE_THREADS.record("stale")
+                vals = [int(x) for x in vec.to("cpu").tolist()]
+        except Exception as e:  # noqa: BLE001
+            self._off(f"read back at {where}", e)
+            return None
+        dt = time.perf_counter() - t0
+        ref = self.host_check.pop(step, None)
+        if ref is not None:
+            if isinstance(ref, str):
+                self.cross_checks.append((step, ref))
+            elif ref != vals:
+                self.cross_checks.append((step, "MISMATCH"))
+                self._off(
+                    f"cross-check at sync {step}",
+                    RuntimeError(
+                        f"the device reduction {vals[:3]}... != the host reduction {ref[:3]}... of the same sample"
+                    ),
+                )
+                return None
+            else:
+                self.cross_checks.append((step, "equal"))
+        digest = hashlib.sha256(struct.pack(f"<{len(vals)}q", *vals)).hexdigest()[:16]
+        prev = self.last
+        unchanged = (
+            [n for n, a, b in zip(names, vals, prev[2], strict=False) if a == b]
+            if prev is not None and prev[1] == names
+            else None
+        )
+        all_unchanged = bool(
+            prev is not None and unchanged is not None and len(unchanged) == len(names) and step > prev[0]
+        )
+        expected = all_unchanged and no_update_between(prev[3] if prev is not None else None, mark)
+        stale = all_unchanged and not expected
+        rec = {
+            "step": step,
+            "digest": digest,
+            "tensors": len(names),
+            "prev_step": prev[0] if prev is not None else None,
+            "changed": (len(names) - len(unchanged)) if unchanged is not None else None,
+            "stale": stale,
+            "unchanged_expected": expected,
+            "read_at": where,
+        }
+        self.last = (step, names, vals, mark)
+        log(
+            f"stale probe step {step} rank {self.rank}: digest {digest} over {len(names)} tensors; "
+            + (f"host cross-check {self.cross_checks[-1][1]}; " if ref is not None else "")
+            + (
+                f"changed {rec['changed']}/{len(names)} vs step {rec['prev_step']}"
+                if unchanged is not None
+                else "first probe"
+            )
+            + (f"; UNCHANGED {unchanged}" if unchanged else "")
+            + (
+                f"; unchanged as expected: no optimizer step since step {rec['prev_step']} (optimizer steps "
+                f"real/skipped/unknown {list(mark)})"
+                if expected
+                else ""
+            )
+            + f"; read back at {where} in {1e3 * dt:.3f} ms (dispatched in {1e3 * disp:.3f} ms at the sync)"
+        )
+        if stale:
+            msg = (
+                f"STALE WEIGHTS rank {self.rank}: sync step {step}: none of the {len(names)} sampled tensors changed "
+                f"since step {rec['prev_step']} (the served weights are those of the previous sync)"
+                + ("; the run stops at the next sync, after its export" if self.fatal else "; reported")
+            )
+            warn(msg)
+            if self.fatal and self.fatal_pending is None:
+                self.fatal_pending = msg
+        return rec
+
+    def check_fatal(self) -> None:
+        """The next sync, right after its export: raise a kept stale verdict."""
+        if self.fatal_pending is not None:
+            msg, self.fatal_pending = self.fatal_pending, None
+            raise RuntimeError(msg)

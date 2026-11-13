@@ -19,11 +19,12 @@ engine's KV pool is set explicitly (``rollout.engine_kwargs.vllm.kv_cache_memory
 * Weight sync: verl's ``naive`` checkpoint-engine path calls ``update_weights`` with the trainer's export, which is
   installed in place through the tpu-sync worker extension's own install and verified (:mod:`.weight_sync`).
 * The engine's process-global side effects are contained and its compiled programs kept valid (:mod:`.boundary`,
-  :mod:`.compile_guard`).
+  :mod:`.compile_guard`); a step whose rollout lost requests fails before ``update_actor`` on every rank
+  (:func:`step_guard`, :mod:`.sampler`).
 
-Scope: rollout TP=1 (other parallel sizes are refused at build) and the model families of the tested-layout table
-(:data:`.compat.TESTED_LAYOUTS`; any other layout is refused at build). Only single-host runs have been tested;
-more hosts are not refused.
+Scope: rollout TP=1 (other parallel sizes are refused at build), verl's sync trainer mode (the package's sampler
+serves no other), and the model families of the tested-layout table (:data:`.compat.TESTED_LAYOUTS`; any other
+layout is refused at build). Only single-host runs have been tested; more hosts are not refused.
 """
 
 from __future__ import annotations
@@ -36,13 +37,15 @@ from typing import Any, Callable
 
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc.common import (
     INPROC_ENV,
+    all_ranks_ok,
     check_switches,
     inproc_enabled,
     log,
     logger,
+    warn,
 )
 
-__all__ = ["INPROC_ENV", "check_switches", "inproc_enabled", "logger", "register"]
+__all__ = ["INPROC_ENV", "check_switches", "inproc_enabled", "logger", "register", "step_guard"]
 
 ROLLOUT_FQN = "verl_hardware_plugin.accelerators.tpu.rollout.inproc.rollout.TPUInProcRollout"
 _WORKER_METHODS = ("generate", "abort_all_requests", "resume_generation", "inproc_server_info")
@@ -56,15 +59,57 @@ def _inproc_rollout(worker: Any):
     return r if isinstance(r, TPUInProcRollout) else None
 
 
+def step_guard(worker: Any) -> None:
+    """At the entry of update_actor on every trainer rank, before anything trains: this rank's rollout since the last
+    weight sync is healthy (:meth:`TPUInProcRollout.step_health`), agreed across the trainer's ranks (one gloo
+    all-reduce per step), so a failure on one rank makes every rank raise 'STEP FAILED before update_actor' instead of
+    training on a partial batch (and no rank is left alone in the FSDP collectives)."""
+    r = _inproc_rollout(worker)
+    if r is None:
+        return
+    local = r.step_health()
+    if all_ranks_ok(local is None):
+        return
+    line = (
+        f"STEP FAILED before update_actor rank {r.rank}: "
+        + (local or "another rank's rollout failed or aborted requests in this step")
+        + "; update_actor refused on every rank"
+    )
+    warn(line)
+    raise RuntimeError(line)
+
+
+def trainer_entry(worker: Any, kind: str) -> None:
+    """At the trainer's first entry after a sync (compute_log_prob / update_actor; the rollout is over, the device
+    idle): read back that sync's staleness probe. Never raises here (these entries are collective): a stale verdict is
+    logged at once, refused by the step guard and raised at the next sync."""
+    r = _inproc_rollout(worker)
+    if r is not None and r.stale is not None and r.stale.pending is not None:
+        r.stale.resolve(kind)
+
+
 def _wrap_worker_method(orig_fn: Callable, kind: str) -> Callable:
-    """A synchronous ActorRolloutRefWorker method with the device-thread record and the eager guard at every entry."""
+    """A synchronous ActorRolloutRefWorker method with the device-thread record and the eager guard at every entry;
+    compute_log_prob / update_actor read the last sync's staleness probe back first, and update_actor runs the step
+    guard before anything trains. The trainer engine's optimizer-step counter is installed once init_model built it."""
     from verl_hardware_plugin.accelerators.tpu.rollout.inproc.boundary import DEVICE_THREADS, EAGER_GUARD
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc.weight_sync import OPT_STEPS
 
     @functools.wraps(orig_fn)
     def wrapper(*args, **kwargs):
+        worker = args[0] if args else None
         DEVICE_THREADS.record(kind)
         EAGER_GUARD.check(kind)
-        return orig_fn(*args, **kwargs)
+        if kind == "update_actor":
+            OPT_STEPS.install(worker)
+        if kind != "init_model":
+            trainer_entry(worker, kind)
+        if kind == "update_actor":
+            step_guard(worker)
+        out = orig_fn(*args, **kwargs)
+        if kind == "init_model":
+            OPT_STEPS.install(worker)
+        return out
 
     setattr(wrapper, _MARK, True)
     return wrapper

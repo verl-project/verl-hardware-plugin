@@ -3,9 +3,9 @@
 
 """CPU unit tests of the in-process rollout's small decisions that the other suites rely on without asserting:
 the trainer's eager-mode snapshot and its restore after the build, the engine scope's resolution of torch_tpu's API,
-the collective counter's scope, the cross-rank agreement without a process group, the GC deferral around the pump,
-and the logits-at-load hook (verl's sampling mask installed when the model loads, before anything compiles, and
-verified on the served model).
+the collective counter's scope, the cross-rank agreement without a process group, the staleness checksum's tensor
+subset, the GC deferral around the pump, and the logits-at-load hook (verl's sampling mask installed when the model
+loads, before anything compiles, and verified on the served model).
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import torch
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc import boundary as b
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc import common, gc_policy
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc import compile_guard as cg
+from verl_hardware_plugin.accelerators.tpu.rollout.inproc import weight_sync as ws
 
 needs_vllm = pytest.mark.skipif(importlib.util.find_spec("vllm") is None, reason="vLLM is not installed")
 
@@ -127,6 +128,26 @@ def test_collective_counter_scope_is_reusable_and_never_swallows_an_exception():
 
 def test_agreement_without_a_process_group_is_the_local_flag():
     assert common.all_ranks_ok(True) is True and common.all_ranks_ok(False) is False
+
+
+def test_staleness_checksum_samples_embed_head_layer0_and_the_last_mlp():
+    names = [
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.linear_attn.in_proj_qkvz.weight",
+        "model.layers.0.mlp.down_proj.weight",
+        "model.layers.3.mlp.down_proj.weight",
+        "model.layers.3.mlp.gate_proj.weight",
+        "model.norm.weight",
+    ]
+    assert ws.checksum_names(names) == [
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "model.layers.0.linear_attn.in_proj_qkvz.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.3.mlp.down_proj.weight",
+    ]
 
 
 def test_gc_deferral_is_reentrant_and_keeps_a_threshold_set_meanwhile(monkeypatch):

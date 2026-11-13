@@ -18,7 +18,8 @@ What the tests pin:
   must match no received tensor; a verified direct install whose recorder recorded nothing fails;
 * ``TPUInProcRollout.update_weights`` itself on a rollout shell (an idle engine, the real installer, a stand-in of the
   install's writes): the export pin, verify-until-pinned, the mode pin at every sync, the coverage check folded into
-  the parity verdict, and that no environment variable weakens any of it.
+  the parity verdict, the staleness check with skipped optimizer steps, and that no environment variable weakens any
+  of it.
 """
 
 import asyncio
@@ -414,8 +415,8 @@ def _rollout(model, layout=LOADERS, cfg=None, mode=None):
         r.installer.mode = mode
     r.server = SimpleNamespace(global_steps=None)
     r.global_steps, r.sync_log, r._pending_export_t0 = None, [], None
-    r._syncs_started = 0
-    r.last_step, r.rss_limit = None, 0
+    r._syncs_started, r._last_wsum = 0, None
+    r.integrity, r.last_step, r.rss_limit = "fatal", None, 0
     return r
 
 
@@ -668,6 +669,149 @@ def test_check_switches_names_unread_variables(monkeypatch):
 
     env = {"VERL_TPU_ROLLOUT_INPROC": "1", **WEAKENING, "VERL_TPU_INPROC_PARITY_EVERY": "5"}
     assert common.check_switches(env) == sorted(WEAKENING)
+
+
+def test_integrity_report_leaves_every_install_check_on(installs, monkeypatch):
+    """VERL_TPU_INPROC_INTEGRITY=report covers only the staleness checks and the KV capacity check. With it set, and
+    with the variables that once switched the install checks off, every install refusal still fires: a missing fused
+    shard at a verified and at an unverified sync, a corrupted fused parameter, a whole tensor missing on the direct
+    path, a direct install that raises at the first sync (no loader fallback), and a table entry whose not-exported
+    pattern matches a received tensor. The unread variables are named and INTEGRITY is not; staleness is reported."""
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc import common
+
+    monkeypatch.setenv(common.INTEGRITY_ENV, "report")
+    for k, v in WEAKENING.items():
+        monkeypatch.setenv(k, v)
+    assert common.check_switches({common.INPROC_ENV: "1", common.INTEGRITY_ENV: "report", **WEAKENING}) == sorted(
+        WEAKENING
+    )
+
+    def rollout(model, **kw):
+        r = _rollout(model, **kw)
+        r.integrity = common.integrity_mode()  # as the rollout's constructor reads it
+        assert r.integrity == "report"
+        return r
+
+    def direct():
+        return rollout(
+            _installed(_export(0), False), layout=DIRECT, cfg=SimpleNamespace(model_type="x"), mode="dense-test direct"
+        )
+
+    k = "model.layers.0.self_attn.k_proj.weight"
+    r = rollout(_installed(_export(0), False))
+    with pytest.raises(RuntimeError, match="parity FAILED at step 0"):  # a missing fused shard at a verified sync
+        _sync(r, {n: t for n, t in _export(1).items() if n != k}, 0)
+    _sync(r, _export(2), 1)
+    with pytest.raises(RuntimeError, match="EXPORT CHANGED"):  # a missing fused shard at an unverified sync
+        _sync(r, {n: t for n, t in _export(3).items() if n != k}, 2)
+
+    stand_in = ws.InProcInstaller._install_once  # the fixture's stand-in of the install's writes
+
+    def corrupting(self, staging_hf, verify, pre):
+        out = stand_in(self, staging_hf, verify, pre)
+        with torch.no_grad():
+            self._model().model.layers[0].self_attn.qkv_proj.weight.view(-1)[H * H + 1] += 1.0  # a k row element
+        return out
+
+    monkeypatch.setattr(ws.InProcInstaller, "_install_once", corrupting)
+    with pytest.raises(RuntimeError, match="parity FAILED at step 0"):  # a corrupted fused parameter
+        _sync(rollout(_installed(_export(0), False)), _export(1), 0)
+    monkeypatch.setattr(ws.InProcInstaller, "_install_once", stand_in)
+
+    with pytest.raises(RuntimeError, match="coverage: 1 engine parameter"):  # a whole tensor missing, direct path
+        _sync(direct(), {n: t for n, t in _export(1).items() if n != "model.norm.weight"}, 0)
+    installs.fail_direct = True
+    with pytest.raises(RuntimeError, match="install raised at step 0"):  # the first sync: no loader fallback
+        _sync(direct(), _export(1), 0)
+    installs.fail_direct = False
+
+    wrong = compat.LayoutEntry("qwen3", "X", "tests.X", "vllm loaders", (r"qkv_proj",), ())
+    with pytest.raises(RuntimeError, match="not-exported patterns match received tensors"):
+        _sync(rollout(_installed(_export(0), False), layout=wrong), _export(1), 0)
+
+    s = rollout(_installed(_export(0), False))  # positive control: report mode is on, for staleness only
+    _sync(s, _export(1), 0)
+    _sync(s, _export(2), 1)
+    _sync(s, _export(2), 5)
+    assert s.sync_log[-1]["stale"] is True
+
+
+# ---------------------------------------------------------------------------------- staleness (skipped optimizer steps)
+
+
+def test_staleness_unchanged_weights_fail_at_a_checksum_sync(installs):
+    model = _installed(_export(0), False)
+    r = _rollout(model)
+    _sync(r, _export(1), 0)
+    _sync(r, _export(2), 1)
+    with pytest.raises(
+        RuntimeError, match="INTEGRITY FAILED rank 0 step 5: the engine's weights are unchanged since sync 1"
+    ):
+        _sync(r, _export(2), 5)  # step 5 is verified: the checksum runs; the same export as step 1
+
+
+def test_staleness_reported_only_in_report_mode(installs):
+    model = _installed(_export(0), False)
+    r = _rollout(model)
+    r.integrity = "report"
+    _sync(r, _export(1), 0)
+    _sync(r, _export(2), 1)
+    _sync(r, _export(2), 5)
+    assert r.sync_log[-1]["stale"] is True
+
+
+def test_staleness_not_judged_when_every_optimizer_step_was_skipped(installs, monkeypatch):
+    """A non-finite grad norm skips the optimizer step: the trainer's weights, and so the served ones, stay the same.
+    That is not staleness when the counter shows only skipped steps since the last checksum."""
+    marks = iter([(1, 0, 0), (2, 0, 0), (2, 3, 0)])
+    monkeypatch.setattr(ws.OPT_STEPS, "mark", lambda: next(marks))
+    model = _installed(_export(0), False)
+    r = _rollout(model)
+    _sync(r, _export(1), 0)
+    _sync(r, _export(2), 1)
+    _sync(r, _export(2), 5)
+    assert r.sync_log[-1]["stale"] is False and r.sync_log[-1]["unchanged_expected"] is True
+
+
+def test_no_update_between():
+    assert ws.no_update_between((3, 0, 0), (3, 2, 0))
+    assert not ws.no_update_between((3, 0, 0), (4, 2, 0))  # a real step in between
+    assert not ws.no_update_between((3, 0, 0), (3, 0, 0))  # no optimizer call at all: the plain rule
+    assert not ws.no_update_between((3, 0, 0), (3, 1, 1))  # an unknown step
+    assert not ws.no_update_between(None, (3, 1, 0))
+
+
+def test_optimizer_steps_counter_classifies_returns():
+    engine = SimpleNamespace(optimizer_step=lambda: next(rets))
+    rets = iter([torch.tensor(1.5), float("inf"), None, float("nan"), 0.3])
+    counter = ws.OptimizerSteps()
+    counter.install(SimpleNamespace(actor=SimpleNamespace(engine=engine)))
+    for _ in range(5):
+        engine.optimizer_step()
+    assert counter.mark() == (2, 2, 1)
+    assert ws.OptimizerSteps().mark() is None
+
+
+def test_stale_probe_verdicts():
+    named = {"a": torch.arange(64, dtype=torch.float32), "b": torch.ones(8, dtype=torch.bfloat16)}
+    probe = ws.StaleProbe(0)
+    probe.dispatch(0, named, ["a", "b"], mark=(0, 0, 0))
+    assert probe.resolve("test")["changed"] is None
+    named["a"] = named["a"] + 1
+    probe.dispatch(1, named, ["a", "b"], mark=(1, 0, 0))
+    assert probe.resolve("test")["changed"] == 1
+    probe.dispatch(2, named, ["a", "b"], mark=(1, 2, 0))  # unchanged, every step since skipped: expected
+    rec = probe.resolve("test")
+    assert rec["stale"] is False and rec["unchanged_expected"] is True
+    probe.dispatch(3, named, ["a", "b"], mark=(2, 2, 0))  # unchanged after a real step: stale
+    assert probe.resolve("test")["stale"] is True and probe.fatal_pending is not None
+    with pytest.raises(RuntimeError, match="STALE WEIGHTS rank 0: sync step 3"):
+        probe.check_fatal()
+
+
+def test_stale_probe_is_reported_only_when_verl_barriers_after_the_sync():
+    probe = ws.StaleProbe(0, mode="fatal", barrier_after=True)
+    assert not probe.fatal and probe.demoted
 
 
 def test_verify_reason(monkeypatch):
