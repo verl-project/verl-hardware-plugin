@@ -96,9 +96,12 @@ class NeuronVLLMHttpServer(vLLMHttpServer):
             async_scheduling=False,
             compilation_config={"cudagraph_mode": "NONE"},
         )
-        engine_kwargs.setdefault("additional_config", {}).setdefault("neuron_config", {})[
-            "enable_structured_outputs"
-        ] = True
+        # Return logits from Neuron and use vLLM's host sampler. The pinned
+        # device sampler silently caps candidates even when top_k=-1.
+        engine_kwargs.setdefault("additional_config", {}).setdefault("neuron_config", {}).update(
+            enable_structured_outputs=True,
+            on_device_sampling_config=None,
+        )
 
     def _get_worker_extension_cls(self):
         return "verl_hardware_plugin.accelerators.neuron.rollout.worker_extension.NeuronWorkerExtension"

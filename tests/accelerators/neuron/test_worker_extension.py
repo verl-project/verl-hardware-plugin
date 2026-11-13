@@ -194,7 +194,10 @@ def test_native_logprobs_with_real_vllm_sampler(sampling_runner, topk, greedy, n
 
 @pytest.mark.parametrize("greedy", [True, False])
 @pytest.mark.parametrize("num_requests", range(1, 9))
-def test_cpu_sampling_scores_the_selected_token_and_preserves_batch(sampling_runner, greedy, num_requests, monkeypatch):
+@pytest.mark.parametrize("top_k,top_p", [(2, None), (None, None), (None, 0.9)])
+def test_cpu_sampling_scores_the_selected_token_and_preserves_batch(
+    sampling_runner, greedy, num_requests, top_k, top_p, monkeypatch
+):
     from vllm.v1.sample.ops import topk_topp_sampler
 
     # Exercise the production dispatch hazard, independent of test-host Triton.
@@ -209,7 +212,7 @@ def test_cpu_sampling_scores_the_selected_token_and_preserves_batch(sampling_run
         num_requests,
         greedy,
         temperature=0.5,
-        top_k=2,
+        top_k=top_k,
         neuron_config=SimpleNamespace(enable_structured_outputs=True, on_device_sampling_config=None),
         use_async_scheduling=False,
         on_device_sampling=False,
@@ -222,6 +225,8 @@ def test_cpu_sampling_scores_the_selected_token_and_preserves_batch(sampling_run
         _get_grammar_bitmask=lambda scheduler_output: None,
     )
     device, metadata = runner.device, runner.input_batch.sampling_metadata
+    if top_p is not None:
+        metadata.top_p = torch.full((num_requests,), top_p, device=device)
 
     def original_sample(model_output_tensor, spec_decode_metadata=None):
         return runner.sampler(model_output_tensor, runner.input_batch.sampling_metadata)
@@ -243,13 +248,22 @@ def test_cpu_sampling_scores_the_selected_token_and_preserves_batch(sampling_run
     output = runner._sample(logits)
     tokens = output.sampled_token_ids.reshape(-1)
     assert tokens.numel() == num_requests
-    assert set(tokens.tolist()) <= {0, 1}
+    assert set(tokens.tolist()) <= {0, 1, 3}
     if greedy:
         expected = torch.tensor([3.0, 1.0, -torch.inf, 0.0, -torch.inf]).log_softmax(-1)
         assert tokens.tolist() == [0] * num_requests
+    elif top_k is not None:
+        expected = torch.tensor([6.0, 2.0, -torch.inf, -torch.inf]).log_softmax(-1)
+    elif top_p is not None:
+        expected = torch.tensor([6.0, -torch.inf, -torch.inf, -torch.inf]).log_softmax(-1)
     else:
-        expected = torch.tensor([6.0, 2.0]).log_softmax(-1)
+        expected = torch.tensor([6.0, 2.0, -torch.inf, 0.0]).log_softmax(-1)
     torch.testing.assert_close(output.logprobs_tensors.logprobs[:, 0], expected[tokens])
     assert runner.input_batch.sampling_metadata is metadata
-    assert str(metadata.top_k.device) == device
+    for name, value in (("top_k", top_k), ("top_p", top_p)):
+        restored = getattr(metadata, name)
+        if value is None:
+            assert restored is None
+        else:
+            assert str(restored.device) == device
     torch.testing.assert_close(logits, original_logits)

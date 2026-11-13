@@ -1,8 +1,9 @@
 # Run verl on AWS Trainium
 
 This experimental backend runs **verl 0.9.1** with native Neuron TorchTitan
-training and vLLM-Neuron rollout. This guide covers environment setup and a small
-GRPO example using Qwen3-0.6B and GSM8K on one Trainium2 host.
+training and vLLM-Neuron rollout, with token sampling on CPU. This guide covers
+environment setup and a small GRPO example using Qwen3-0.6B and GSM8K on one
+Trainium2 host.
 
 ## 1. Set up the environment
 
@@ -205,7 +206,7 @@ actor_rollout_ref:
     load_format: auto
     n: 2
     temperature: 1.0
-    top_k: 256
+    top_k: -1
     top_p: 1.0
     max_model_len: 1024
     max_num_batched_tokens: 1024
@@ -254,6 +255,9 @@ The training sequence length is `512 + 512 = 1024`. Keep
 inputs. CP, EP, and PP remain one; packed inputs, offloading, MoE, quantization,
 learned critics, multimodal inputs, colocated rollout, and multi-node jobs are
 outside the supported configuration.
+
+We use CPU sampling because vLLM-Neuron's current on-device sampler limits
+sampling to at most 256 candidates, even with `top_k: -1`.
 
 ### Launch and inspect the run
 

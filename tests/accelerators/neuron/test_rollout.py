@@ -65,13 +65,16 @@ def test_rollout_environment_does_not_autoload_training_backend(neuron_vllm):
     assert environment["VLLM_USE_V2_MODEL_RUNNER"] == "0"
 
 
-def test_server_translates_ray_core_allocation_for_vllm_children(monkeypatch, neuron_vllm):
+@pytest.mark.parametrize(
+    "neuron_config", [{}, {"on_device_sampling_config": None}, {"on_device_sampling_config": {"max_top_k": 256}}]
+)
+def test_server_translates_ray_core_allocation_for_vllm_children(monkeypatch, neuron_vllm, neuron_config):
     import os
 
     monkeypatch.setenv("NEURON_RT_VISIBLE_CORES", "6,7")
     monkeypatch.setenv("NEURON_VISIBLE_DEVICES", "0,1")
     instance = object.__new__(neuron_vllm.NeuronVLLMHttpServer)
-    kwargs = {}
+    kwargs = {"additional_config": {"neuron_config": neuron_config}}
     instance._preprocess_engine_kwargs(kwargs)
     assert "NEURON_RT_VISIBLE_CORES" not in os.environ
     assert os.environ["NEURON_VISIBLE_DEVICES"] == "6,7"
@@ -79,6 +82,7 @@ def test_server_translates_ray_core_allocation_for_vllm_children(monkeypatch, ne
     assert kwargs["async_scheduling"] is False
     assert kwargs["worker_cls"] == "verl_hardware_plugin.accelerators.neuron.rollout.worker.NeuronRLWorker"
     assert kwargs["additional_config"]["neuron_config"]["enable_structured_outputs"] is True
+    assert kwargs["additional_config"]["neuron_config"]["on_device_sampling_config"] is None
 
 
 def test_server_rejects_sampling_options_native_generation_cannot_honor(neuron_vllm):
