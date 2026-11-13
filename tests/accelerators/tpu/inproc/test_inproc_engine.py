@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Licensed under the Apache License, Version 2.0.
 
-"""CPU tests of the in-process engine adapter, the replica and the GC policy (``rollout/inproc/engine.py``,
-``gc_policy.py``). The engine is a small fake of vLLM's ``LLMEngine`` surface; no device, no Ray."""
+"""CPU tests of the in-process engine adapter, the replica, the rollout's step health and the GC policy
+(``rollout/inproc/engine.py``, ``gc_policy.py``, the package's worker hooks). The engine is a small fake of vLLM's
+``LLMEngine`` surface; no device, no Ray."""
 
 import asyncio
 import gc
@@ -14,6 +15,7 @@ import pytest
 from verl_hardware_plugin.accelerators.tpu.rollout import inproc
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc import engine as E
 from verl_hardware_plugin.accelerators.tpu.rollout.inproc import gc_policy
+from verl_hardware_plugin.accelerators.tpu.rollout.inproc.rollout import TPUInProcRollout
 
 pytest.importorskip("vllm.sampling_params")
 
@@ -156,6 +158,66 @@ def test_collective_rpc_runs_in_the_engine_scope():
     assert asyncio.run(E.InProcAsyncEngine(Rpc(), 0).collective_rpc("ping")) == ["ping"] and seen == ["rpc"]
 
 
+def _shell(engine) -> TPUInProcRollout:
+    r = TPUInProcRollout.__new__(TPUInProcRollout)
+    r.engine, r.rank = engine, 0
+    return r
+
+
+def test_step_health():
+    eng = E.InProcAsyncEngine(FakeEngine(), 0)
+    r = _shell(eng)
+    assert r.step_health() is None
+    eng.window_aborted = 1
+    assert "aborted" in r.step_health()
+    eng.window_aborted, eng.window_failed = 0, 2
+    assert "2 request(s) failed" in r.step_health()
+    eng.window_failed, eng._error = 0, RuntimeError("x")
+    assert "the in-process engine failed" in r.step_health()
+    assert _shell(None).step_health() == "the in-process engine is not built"
+
+
+def test_worker_methods_are_refused_when_absent_or_coroutines(monkeypatch):
+    import verl.workers.engine_workers as ew
+
+    class W:
+        def init_model(self):
+            return "built"
+
+        async def update_actor(self):
+            pass
+
+        def compute_log_prob(self):
+            pass
+
+    monkeypatch.setattr(ew, "ActorRolloutRefWorker", W)
+    with pytest.raises(RuntimeError, match="update_actor is a coroutine"):
+        inproc.install_worker_methods()
+    assert "generate" not in vars(W)
+
+    class Ok:
+        def init_model(self):
+            return "built"
+
+        def update_actor(self):
+            return "trained"
+
+        def compute_log_prob(self):
+            return "lp"
+
+        async def update_weights(self, *a, **k):
+            return "synced"
+
+    monkeypatch.setattr(ew, "ActorRolloutRefWorker", Ok)
+    assert inproc.install_worker_methods() == ["init_model", "update_actor", "compute_log_prob"]
+    wrapped = vars(Ok)["update_actor"]
+    assert inproc.install_worker_methods() and vars(Ok)["update_actor"] is wrapped  # idempotent
+    w = Ok()
+    assert w.init_model() == "built" and w.update_actor() == "trained" and w.compute_log_prob() == "lp"
+    assert asyncio.run(w.update_weights()) == "synced"
+    assert asyncio.run(w.inproc_server_info()) == {"engine_ready": False, "rollout": "NoneType"}
+
+
 def test_kv_capacity_check():
     vc = SimpleNamespace(
         cache_config=SimpleNamespace(kv_cache_max_concurrency=200.0, num_gpu_blocks=10, block_size=16),
@@ -221,3 +283,71 @@ def test_replica_no_ops_and_server_check(caplog):
     worker.inproc_server_info = Remote({"engine_ready": False, "replica_rank": 3})
     with pytest.raises(RuntimeError, match="replica 3: worker reports"):
         asyncio.run(r.launch_servers())
+
+
+# vLLMHttpServer methods that reach the engine only through replica calls the in-process replica answers itself (no
+# sleep mode, no profiler, no snapshot of vLLM's metrics, no single-request abort): server method -> replica method
+INTERCEPTED_SERVER_METHODS = {
+    "sleep": "sleep",
+    "_sleep_hybrid": "sleep",
+    "wake_up": "wake_up",
+    "release_kv_cache": "release_kv_cache",
+    "resume_kv_cache": "resume_kv_cache",
+    "clear_kv_cache": "clear_kv_cache",
+    "start_profile": "start_profile",
+    "stop_profile": "stop_profile",
+    "snapshot": "snapshot",
+    "_prometheus_logger": "snapshot",
+    "abort_request": "abort_request",
+}
+# engine attributes verl's server uses only with a configuration the in-process rollout refuses before any request
+REFUSED_BEFORE_ANY_REQUEST = {
+    "list_loras": "generate lists LoRA adapters only with an unmerged adapter; the first sync refuses its peft_config",
+}
+
+
+def test_the_adapter_covers_every_engine_call_of_verls_server():
+    """Every ``self.engine.X`` of verl's vLLMHttpServer is implemented by the adapter, sits in a server method reached
+    only through a replica call the in-process replica answers itself, or needs a configuration refused before any
+    request."""
+    import ast
+    import inspect
+    import textwrap
+
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+
+    uses: dict = {}
+    for fn in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(vLLMHttpServer)))):
+        if isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+            for n in ast.walk(fn):
+                if (
+                    isinstance(n, ast.Attribute)
+                    and isinstance(n.value, ast.Attribute)
+                    and n.value.attr == "engine"
+                    and isinstance(n.value.value, ast.Name)
+                    and n.value.value.id == "self"
+                ):
+                    uses.setdefault(n.attr, set()).add(fn.name)
+    assert {"add_request", "abort"} <= set(uses), uses  # positive control: the scan sees the serving path
+    adapter = E.InProcAsyncEngine(FakeEngine(), 0)
+    missing = {}
+    for attr, methods in sorted(uses.items()):
+        if hasattr(adapter, attr) or attr in REFUSED_BEFORE_ANY_REQUEST:
+            continue
+        reached = sorted(m for m in methods if m not in INTERCEPTED_SERVER_METHODS)
+        if reached:
+            missing[attr] = reached
+    assert missing == {}, f"verl's server calls engine attributes the adapter lacks, from {missing}"
+    for replica_method in set(INTERCEPTED_SERVER_METHODS.values()):
+        assert replica_method in vars(E.TPUInProcReplica), f"{replica_method} is not answered by the in-process replica"
+    r = TPUInProcRollout.__new__(TPUInProcRollout)
+    with pytest.raises(NotImplementedError, match="LoRA adapters are not supported in process"):
+        asyncio.run(r.update_weights(iter(()), peft_config={"r": 8}))
+
+
+def test_update_weights_refuses_until_the_verified_install_lands():
+    """Weight sync is not part of this change: the first sync refuses before anything is installed, so a training run
+    with the switch on stops there instead of rolling out on weights the trainer never synced."""
+    r = TPUInProcRollout.__new__(TPUInProcRollout)
+    with pytest.raises(NotImplementedError, match="weight sync into the in-process engine is not available yet"):
+        asyncio.run(r.update_weights(iter(())))

@@ -26,7 +26,7 @@ from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
 from verl_hardware_plugin.accelerators.tpu import device_api as tpu_device_api
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import extend_torchtitan_engine_config
-from verl_hardware_plugin.accelerators.tpu.options import tpu_chips_per_host_override
+from verl_hardware_plugin.accelerators.tpu.options import inproc_rollout_enabled, tpu_chips_per_host_override
 from verl_hardware_plugin.accelerators.tpu.patches import reduce_avg_allreduce_patch
 
 extend_torchtitan_engine_config()
@@ -468,6 +468,35 @@ class TPUDeviceModuleProxy:
         """Nothing to release; see the class docstring (never ``torch.tpu._clear_cache()``)."""
 
 
+# In-process colocation (rollout/inproc): the trainer ranks also host the vLLM engine.
+INPROC_ROLE_ENV = "VERL_TPU_INPROC_ROLE"
+
+
+def inproc_on() -> bool:
+    """The trainer ranks host an in-process vLLM engine (``VERL_TPU_ROLLOUT_INPROC=1``, read by the switch's one
+    parser, :func:`~verl_hardware_plugin.accelerators.tpu.options.inproc_rollout_enabled`)."""
+    return inproc_rollout_enabled()
+
+
+def inproc_trainer_env() -> dict[str, str]:
+    """The colocated trainer workers' extra variables (every worker group but verl's rollout groups).
+
+    vllm-torchtpu's env_override, imported in these processes after the trainer created the PJRT client, would
+    setdefault ``TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS`` and add SparseCore offload thresholds: the first
+    is pinned here to the trainer's effective value (this process's, else torch_tpu's default), the second is turned off
+    (``SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES=0``), so the trainer's collective flags stay exactly its own.
+    ``VERL_TPU_INPROC_ROLE=trainer`` arms the trainer-side libtpu check at the worker's platform import.
+    """
+    return {
+        "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS": os.environ.get(
+            "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"
+        )
+        or "1",
+        "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": "0",
+        INPROC_ROLE_ENV: "trainer",
+    }
+
+
 def driver_tpu_env_for_workers() -> dict[str, str]:
     """The forwarded variables (``TPU_FORWARDED_ENV_VARS`` and ``*_PREFIXES``) that are set and not empty."""
     return {
@@ -842,4 +871,17 @@ class PlatformTPU(PlatformBase):
             pgs=pgs,
         )
         env_vars.update(tpu_env)
+        if inproc_on() and not name_prefix.startswith("rollout"):
+            env_vars.update(inproc_trainer_env())
         return env_vars
+
+
+# In-process colocation: on a trainer rank, before vllm_torchtpu is imported and before the first device touch
+# (libtpu reads LIBTPU_INIT_ARGS once, when the trainer creates the PJRT client): env_override must have nothing to add
+# and the trainer's global eager mode is snapshotted. Never raises here (the plugin's backend loader swallows import
+# errors, so a raise would only unregister the TPU platform): a failure is logged and kept, and the engine build raises
+# on it.
+if inproc_on() and os.environ.get(INPROC_ROLE_ENV, "") == "trainer":
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc import boundary as _inproc_boundary
+
+    _inproc_boundary.check_trainer_libtpu_env(strict=False)

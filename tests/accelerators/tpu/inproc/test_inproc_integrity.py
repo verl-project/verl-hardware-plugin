@@ -11,7 +11,8 @@
   precision): vllm-torchtpu's real ``compute_selected_logits`` keeps its precompiled programs for every bucket, and the
   caller's state is back after every call (needs ``INPROC_TEST_VLLM_TORCHTPU_SRC``);
 * verl's real ``vLLMHttpServer.abort_all_requests(abort_only=True)`` on the in-process adapter removes the requests
-  from an engine with vLLM's request-id semantics (internal ids only).
+  from an engine with vLLM's request-id semantics (internal ids only);
+* verl's full-determinism mode is refused at the build, and is shown to reseed the process's RNG (the hazard).
 """
 
 from __future__ import annotations
@@ -309,6 +310,62 @@ def test_abort_only_removes_the_requests_from_an_engine_with_vllms_request_ids()
     assert res["aborted_count"] == 3 and eng.get_num_unfinished_requests() == 0
     assert all(o.finished and o.outputs == [] for o in outs) and not aeng._collectors
     assert aeng.aborted == 3 and aeng.window_take() == {"aborted": 3, "failed": 0}
+
+
+# ------------------------------------------------------------------------------------------------ full determinism
+
+
+@pytest.mark.parametrize(
+    "env, config, refused",
+    [
+        ("1", {}, True),
+        ("true", {}, True),
+        ("0", {}, False),  # what verl forwards to every actor when the mode is off
+        (None, {}, False),
+        ("0", {"full_determinism": True}, True),
+    ],
+)
+def test_the_build_refuses_verls_full_determinism_mode(monkeypatch, env, config, refused):
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc import boundary
+    from verl_hardware_plugin.accelerators.tpu.rollout.inproc.rollout import TPUInProcRollout
+
+    monkeypatch.setattr(boundary, "LIBTPU_PROBLEMS", [])
+    if env is None:
+        monkeypatch.delenv("VERL_FULL_DETERMINISM", raising=False)
+    else:
+        monkeypatch.setenv("VERL_FULL_DETERMINISM", env)
+    r = TPUInProcRollout.__new__(TPUInProcRollout)
+    r.config, r.rank = dict(config), 0
+    try:
+        r._prepare()
+        msg = ""
+    except RuntimeError as exc:  # a later check of the build may refuse too (no model config here)
+        msg = str(exc)
+    assert ("full_determinism" in msg and "refusing to build" in msg) is refused, msg
+
+
+def test_verls_full_determinism_would_reseed_the_trainers_rng(tmp_path):
+    """Why it is refused: verl's worker extension runs enable_full_determinism in the process that builds the engine,
+    which in process is the trainer's (a fresh interpreter here: the call changes process-wide state)."""
+    code = (
+        "import json, os, torch\n"
+        "from verl.workers.engine.utils import enable_full_determinism\n"
+        "torch.manual_seed(1234); torch.rand(5)\n"
+        "before, det, env = torch.random.get_rng_state().clone(), torch.are_deterministic_algorithms_enabled(), "
+        "dict(os.environ)\n"
+        "enable_full_determinism(seed=7)\n"
+        "print('RESULT ' + json.dumps({'reseeded': not torch.equal(before, torch.random.get_rng_state()), "
+        "'det_before': det, 'det_after': torch.are_deterministic_algorithms_enabled(), "
+        "'env_changed': sorted(k for k in os.environ if os.environ.get(k) != env.get(k))}))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-B", "-c", code], env=_clean_env(), cwd=str(tmp_path), capture_output=True, text=True
+    )
+    lines = [x for x in proc.stdout.splitlines() if x.startswith("RESULT ")]
+    assert lines, proc.stderr[-2000:]
+    res = json.loads(lines[-1][7:])
+    assert res["reseeded"] and not res["det_before"] and res["det_after"], res
+    assert "PYTHONHASHSEED" in res["env_changed"], res
 
 
 if __name__ == "__main__" and len(sys.argv) >= 3 and sys.argv[1] == "--child":

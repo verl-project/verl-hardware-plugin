@@ -350,3 +350,18 @@ def server_contract_problem(server_cls: Any, built: set[str]) -> Optional[str]:
     if missing:
         return f"vLLMHttpServer.__init__ sets {missing}, which the in-process server does not set"
     return None
+
+
+WRAPPED_WORKER_METHODS = ("init_model", "update_actor", "compute_log_prob")
+
+
+def worker_methods_problem(worker_cls: Any) -> Optional[str]:
+    """The trainer worker methods the in-process rollout wraps must exist as synchronous methods."""
+    bad = []
+    for name in WRAPPED_WORKER_METHODS:
+        fn = worker_cls.__dict__.get(name)
+        if fn is None:
+            bad.append(f"{name} absent")
+        elif inspect.iscoroutinefunction(inspect.unwrap(fn)):
+            bad.append(f"{name} is a coroutine")
+    return f"{worker_cls.__name__}: {', '.join(bad)}" if bad else None

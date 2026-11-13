@@ -321,6 +321,29 @@ def test_server_contract_holds_for_verls_server():
     assert compat.server_contract_problem(vLLMHttpServer, built) is None
 
 
+def test_worker_methods_problem():
+    class W:
+        def init_model(self):
+            pass
+
+        async def update_actor(self):
+            pass
+
+    assert compat.worker_methods_problem(W) == "W: update_actor is a coroutine, compute_log_prob absent"
+
+    class Ok:
+        def init_model(self):
+            pass
+
+        def update_actor(self):
+            pass
+
+        def compute_log_prob(self):
+            pass
+
+    assert compat.worker_methods_problem(Ok) is None
+
+
 # ---------------------------------------------------------------------------------------- runner features (report only)
 
 
