@@ -28,8 +28,9 @@ and the ``VERL_TPU_*`` / ``VERL_TPU_SYNC_RELEASE_BUFFERS`` environment variables
 config, as before).
 
 Process-wide settings that are not part of any verl config stay environment variables, forwarded to every worker by
-the platform: the libtpu / XLA flags (``LIBTPU_INIT_ARGS``, ``XLA_FLAGS``) and ``VERL_TPU_CHIPS_PER_HOST``
-(``tpu_chips_per_host_override``).
+the platform: the libtpu / XLA flags (``LIBTPU_INIT_ARGS``, ``XLA_FLAGS``), ``VERL_TPU_CHIPS_PER_HOST``
+(``tpu_chips_per_host_override``) and the in-process rollout's switch ``VERL_TPU_ROLLOUT_INPROC``
+(``inproc_rollout_enabled``).
 """
 
 from __future__ import annotations
@@ -475,3 +476,18 @@ def tpu_chips_per_host_override() -> Optional[int]:
     The platform resolves the TPU topology before any verl config exists, so this stays an environment variable.
     """
     return _parse("VERL_TPU_CHIPS_PER_HOST", int, os.environ.get("VERL_TPU_CHIPS_PER_HOST"), "VERL_TPU_CHIPS_PER_HOST")
+
+
+# The in-process colocated rollout (``rollout/inproc``): opt-in, default off.
+INPROC_ROLLOUT_ENV = "VERL_TPU_ROLLOUT_INPROC"
+
+
+def inproc_rollout_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """``VERL_TPU_ROLLOUT_INPROC``: the in-process colocated rollout is on only when it is exactly ``"1"``.
+
+    The only parser of the switch: the TPU registration, the platform's worker environment and the in-process rollout
+    package all call it, so a value means the same at every gate. Any other value, ``" 1"`` included, is off. It is an
+    environment variable because the registration reads it when verl imports the plugin, before any config exists.
+    """
+    env = os.environ if environ is None else environ
+    return env.get(INPROC_ROLLOUT_ENV, "") == "1"
