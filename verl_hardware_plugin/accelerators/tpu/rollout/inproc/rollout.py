@@ -63,6 +63,7 @@ from verl_hardware_plugin.accelerators.tpu.rollout.inproc.weight_sync import (
     checksum_names,
     export_pin_problem,
     export_signature,
+    nonzero_steps_between,
     tensor_checksums,
     unchanged_reason,
     verify_reason,
@@ -481,6 +482,7 @@ class TPUInProcRollout(BaseRollout):
         opt_mark = (
             OPT_STEPS.mark()
         )  # the trainer's optimizer steps so far (every update_actor of this interval returned)
+        norms = OPT_STEPS.take_norms()  # the grad norms they returned since the last sync, for the sync line
         t_iter = time.time()
         if self._pending_export_t0 is not None:
             t0, clock = float(self._pending_export_t0), "the update_weights entry"
@@ -549,8 +551,9 @@ class TPUInProcRollout(BaseRollout):
         t4 = time.time()
         direct = res["mode"] != LOADER_FAMILY
         # staleness on the strided checksum: compared only between syncs whose checksum ran; unchanged weights are
-        # expected when the same checksum of the trainer's export is unchanged too (a no-op sync), or, without it, when
-        # the trainer provably took no optimizer step in between (all skipped); see unchanged_reason
+        # expected when the trainer provably took no optimizer step in between (all skipped), or when the same checksum
+        # of the trainer's export is unchanged too after real steps that all returned a grad norm of exactly 0.0 (a
+        # no-op sync); see unchanged_reason
         prev = self._last_wsum
         stale = None
         unchanged_expected = False
@@ -561,10 +564,18 @@ class TPUInProcRollout(BaseRollout):
                 if excuse is not None:
                     unchanged_expected = True
                 else:
-                    stale = f"the engine's weights are unchanged since sync {prev[0]} (wsum {wsum[:16]} at both): " + (
-                        "the trainer's export of these tensors changed, so this install did not land"
-                        if xsum is not None and prev[3] is not None
-                        else "the trainer's update or this install did not land"
+                    moved = nonzero_steps_between(prev[2], opt_mark)
+                    if xsum is not None and prev[3] is not None and xsum != prev[3]:
+                        cause = "the trainer's export of these tensors changed, so this install did not land"
+                    elif xsum is not None and prev[3] is not None and moved:
+                        cause = (
+                            f"the trainer stepped ({moved} optimizer step(s) with a nonzero grad norm since sync "
+                            f"{prev[0]}) but its export of these tensors did not change"
+                        )
+                    else:
+                        cause = "the trainer's update or this install did not land"
+                    stale = (
+                        f"the engine's weights are unchanged since sync {prev[0]} (wsum {wsum[:16]} at both): {cause}"
                     )
             self._last_wsum = (step, wsum, opt_mark, xsum)
         export_unchanged = xsum == prev[3] if xsum is not None and prev is not None and prev[3] is not None else None
@@ -586,6 +597,7 @@ class TPUInProcRollout(BaseRollout):
             "rollout_window": window,
             "sha": sha_due,
             "opt_mark": opt_mark,
+            "grad_norms": norms,
             "unchanged_expected": unchanged_expected,
             "export_unchanged": export_unchanged,
         }
@@ -612,7 +624,8 @@ class TPUInProcRollout(BaseRollout):
             f"{t4 - t3:.4f} s, not in the sync); label {'kept (global_steps=None)' if raw_step is None else 'given'}; "
             "first "
             f"sync in process {first_sync}; staleness {staleness}; optimizer steps real/skipped/unknown "
-            f"{list(opt_mark) if opt_mark is not None else 'not counted'}; rollout window "
+            f"{list(opt_mark[:3]) if opt_mark is not None else 'not counted'}; grad norms since the last sync "
+            f"{json.dumps(norms) if opt_mark is not None else 'not counted'}; rollout window "
             f"{json.dumps(window, sort_keys=True)}; "
             f"strided sha256 {'run' if sha_due else f'deferred (every {CHECKSUM_EVERY} syncs)'}, staleness probe "
             + (

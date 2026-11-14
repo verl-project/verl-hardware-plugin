@@ -589,13 +589,16 @@ class OptimizerSteps:
     step when the global grad norm is not finite, returning that norm: a finite return is a real step, a non-finite
     one a skipped step, anything else unknown. A skipped step leaves the trainer's weights, and so the served ones,
     unchanged: that is not staleness. A finite return is a real step even at 0.0 (also returned when no parameter has
-    a gradient). The counts matter only without the trainer's export digest (:func:`unchanged_reason`). Fail-safe: no
-    wrap, or an unknown return, keeps the plain staleness rule."""
+    a gradient); the real steps whose norm is not exactly 0.0 are counted apart too (:func:`unchanged_reason`), and the
+    returns since the last sync are kept for the sync line (:meth:`take_norms`). Fail-safe: no wrap, or an unknown
+    return, keeps the plain staleness rule."""
 
     def __init__(self) -> None:
         self.real = 0
         self.skipped = 0
         self.unknown = 0
+        self.nonzero = 0  # real steps whose grad norm was not exactly 0.0
+        self.norms: list = []  # the returns since the last take_norms (None: unknown)
         self.installed: Optional[bool] = None
 
     def install(self, worker: Any) -> None:
@@ -629,14 +632,24 @@ class OptimizerSteps:
             v = float(ret.item() if hasattr(ret, "item") else ret)
         except Exception:  # noqa: BLE001 - a non-numeric return: unknown (judged as a real step)
             self.unknown += 1
+            self.norms.append(None)
             return
+        self.norms.append(v)
         if math.isfinite(v):
             self.real += 1
+            if v != 0.0:
+                self.nonzero += 1
         else:
             self.skipped += 1
 
     def mark(self) -> Optional[tuple]:
-        return (self.real, self.skipped, self.unknown) if self.installed else None
+        """(real, skipped, unknown, real with a nonzero grad norm) so far, or None: not counted."""
+        return (self.real, self.skipped, self.unknown, self.nonzero) if self.installed else None
+
+    def take_norms(self) -> list:
+        """The grad norms returned since the last call (None: an unknown return), for the sync line."""
+        out, self.norms = self.norms, []
+        return out
 
 
 OPT_STEPS = OptimizerSteps()
@@ -658,16 +671,31 @@ def no_update_between(prev_mark: Optional[tuple], mark: Optional[tuple]) -> bool
 def unchanged_reason(prev_export: Any, export: Any, prev_mark: Optional[tuple], mark: Optional[tuple]) -> Optional[str]:
     """Why sampled weights unchanged since the previous compared sync are not staleness, or None (stale).
 
-    The trainer's export digest of the same tensors decides when both syncs have one: unchanged too, the trainer did
-    not move them (a no-op sync, e.g. an AdamW step on an exactly zero gradient; a grad norm of 0.0 excuses nothing by
-    itself); changed, the install did not land. Without both digests, only an interval of skipped optimizer steps
-    excuses (:func:`no_update_between`)."""
+    Only skipped optimizer steps in between (:func:`no_update_between`): "no optimizer step". The trainer's export
+    digest of the same tensors unchanged too at both syncs, after real steps that all returned a grad norm of exactly
+    0.0 (at least one, and no unknown step; e.g. an AdamW first step on an exactly zero gradient): "no-op sync". A
+    changed export digest excuses nothing, nor does an unchanged one after a real step with a nonzero grad norm (the
+    trainer stepped but its export did not change), an unknown step, no optimizer call, or without the counter."""
     known = prev_export is not None and export is not None
     if known and prev_export != export:
         return None
     if no_update_between(prev_mark, mark):
         return "no optimizer step"
-    return "no-op sync" if known else None
+    if (
+        known
+        and prev_mark is not None
+        and mark is not None
+        and mark[0] > prev_mark[0]  # at least one real step
+        and mark[2] == prev_mark[2]  # no unknown one
+        and mark[3] == prev_mark[3]  # none with a nonzero grad norm
+    ):
+        return "no-op sync"
+    return None
+
+
+def nonzero_steps_between(prev_mark: Optional[tuple], mark: Optional[tuple]) -> int:
+    """The real optimizer steps between two syncs that returned a grad norm other than exactly 0.0 (0: not counted)."""
+    return mark[3] - prev_mark[3] if prev_mark is not None and mark is not None else 0
 
 
 class StaleProbe:
@@ -677,8 +705,8 @@ class StaleProbe:
     :meth:`resolve` reads it back later, off the generation's critical path: at the trainer's next entry
     (compute_log_prob / update_actor) or, failing that, at the next sync before its install. Each resolved probe is
     compared with the previous one: none of the sampled tensors changed although the trainer moved to a later step,
-    while the same reduction of the trainer's export of these tensors changed (without it: with a real optimizer step
-    in between; :func:`unchanged_reason`) -> ``STALE WEIGHTS``, logged at once and, in ``fatal`` mode, raised at the
+    and :func:`unchanged_reason` (with the same reduction of the trainer's export of these tensors and the optimizer
+    steps in between) does not excuse it -> ``STALE WEIGHTS``, logged at once and, in ``fatal`` mode, raised at the
     next sync right after its export (:meth:`check_fatal`): the trainer entries are collective, so the raise waits until
     every rank is past the step's collectives. The step guard refuses update_actor earlier on a stale verdict.
     ``barrier_after`` (verl's update_weights then barriers after this rollout's): a raise would strand ranks, so the
@@ -827,25 +855,32 @@ class StaleProbe:
             + (f"; UNCHANGED {unchanged}" if unchanged else "")
             + (
                 f"; unchanged as expected: no optimizer step since step {rec['prev_step']} (optimizer steps "
-                f"real/skipped/unknown {list(mark)})"
+                f"real/skipped/unknown {list(mark[:3])})"
                 if why == "no optimizer step"
                 else ""
             )
             + (
                 f"; unchanged as expected: a no-op sync (the trainer's export of these tensors is unchanged too since "
-                f"step {rec['prev_step']}; optimizer steps real/skipped/unknown "
-                f"{list(mark) if mark is not None else 'not counted'})"
+                f"step {rec['prev_step']}; optimizer steps real/skipped/unknown {list(mark[:3])}, every real one "
+                "with a grad norm of 0.0)"
                 if why == "no-op sync"
                 else ""
             )
             + f"; read back at {where} in {1e3 * dt:.3f} ms (dispatched in {1e3 * disp:.3f} ms at the sync)"
         )
         if stale:
+            moved = nonzero_steps_between(prev[3] if prev is not None else None, mark) if rec["export_unchanged"] else 0
             msg = (
                 f"STALE WEIGHTS rank {self.rank}: sync step {step}: none of the {len(names)} sampled tensors changed "
                 f"since step {rec['prev_step']}"
                 + (", although the trainer's export of them did" if rec["export_unchanged"] is False else "")
                 + " (the served weights are those of the previous sync)"
+                + (
+                    f"; the trainer stepped ({moved} optimizer step(s) with a nonzero grad norm since step "
+                    f"{rec['prev_step']}) but its export of these tensors did not change"
+                    if moved
+                    else ""
+                )
                 + ("; the run stops at the next sync, after its export" if self.fatal else "; reported")
             )
             warn(msg)

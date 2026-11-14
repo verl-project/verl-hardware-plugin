@@ -18,9 +18,11 @@ What the tests pin:
   must match no received tensor; a verified direct install whose recorder recorded nothing fails;
 * ``TPUInProcRollout.update_weights`` itself on a rollout shell (an idle engine, the real installer, a stand-in of the
   install's writes): the export pin, verify-until-pinned, the mode pin at every sync, the coverage check folded into
-  the parity verdict, the staleness check (judged against the trainer's export of the same tensors: a step that left
-  the export unchanged, such as one on an exactly zero gradient, is a no-op sync; an export that changed while the
-  engine did not still fails) with skipped optimizer steps, and that no environment variable weakens any of it.
+  the parity verdict, the staleness check (judged against the trainer's export of the same tensors and the optimizer
+  steps' grad norms: real steps that all returned 0.0 and left the export unchanged, such as one on an exactly zero
+  gradient, are a no-op sync; a real step with a nonzero grad norm whose export did not change, an unknown counter,
+  or an export that changed while the engine did not still fails) with skipped optimizer steps, and that no
+  environment variable weakens any of it.
 """
 
 import asyncio
@@ -816,11 +818,11 @@ def test_staleness_a_zero_gradient_step_is_a_noop_sync(installs, monkeypatch, ca
     sent = trainer.export()
     _sync(r, sent, 0)
     trainer.grads(0.0)
-    assert float(trainer.optimizer_step()) == 0.0 and counter.mark() == (1, 0, 0)
+    assert float(trainer.optimizer_step()) == 0.0 and counter.mark()[:3] == (1, 0, 0)
     assert all(torch.equal(t, sent[n]) for n, t in trainer.export().items())  # the step moved nothing
     _sync(r, trainer.export(), 1)
     rec = r.sync_log[-1]
-    assert rec["verified"] == "step 1" and rec["parity"]["post_mismatched"] == 0 and rec["opt_mark"] == (1, 0, 0)
+    assert rec["verified"] == "step 1" and rec["parity"]["post_mismatched"] == 0 and rec["opt_mark"][:3] == (1, 0, 0)
     assert rec["stale"] is False and rec["unchanged_expected"] is True and rec["export_unchanged"] is True
     assert any(
         "sync step 1 rank 0" in m and "staleness unchanged as expected (a no-op sync: " in m for m in caplog.messages
@@ -859,7 +861,7 @@ def test_staleness_a_skipped_non_finite_step_is_judged_as_before(installs, monke
     r.stale = ws.StaleProbe(0)
     _sync(r, trainer.export(), 0)
     trainer.grads(float("nan"))
-    assert torch.isnan(trainer.optimizer_step()) and counter.mark() == (0, 1, 0)
+    assert torch.isnan(trainer.optimizer_step()) and counter.mark()[:3] == (0, 1, 0)
     _sync(r, trainer.export(), 1)
     rec = r.sync_log[-1]
     assert rec["stale"] is False and rec["unchanged_expected"] is True
@@ -877,17 +879,17 @@ def test_staleness_a_skipped_non_finite_step_is_judged_as_before(installs, monke
 
 def test_staleness_a_zero_grad_norm_without_gradients_excuses_nothing_by_itself(installs, monkeypatch):
     """The TPU engine also returns a grad norm of 0.0 when no parameter has a gradient. The counter takes it as a real
-    step, and the norm is never read as 'nothing moved': the export decides. Unchanged, a no-op sync; changed while the
-    engine's weights did not, still fatal."""
+    step, and the norm alone is never read as 'nothing moved': the export must be unchanged too. Unchanged, a no-op
+    sync; changed while the engine's weights did not, still fatal."""
     trainer = _Trainer(_export(0))
     counter = _counted(monkeypatch, trainer)
     r = _rollout(_installed(_export(0), False))
     _sync(r, trainer.export(), 0)
     assert all(p.grad is None for p in trainer.params.values())
-    assert float(trainer.optimizer_step()) == 0.0 and counter.mark() == (1, 0, 0)
+    assert float(trainer.optimizer_step()) == 0.0 and counter.mark()[:3] == (1, 0, 0)
     _sync(r, trainer.export(), 1)
     assert r.sync_log[-1]["stale"] is False and r.sync_log[-1]["unchanged_expected"] is True
-    assert float(trainer.optimizer_step()) == 0.0 and counter.mark() == (2, 0, 0)
+    assert float(trainer.optimizer_step()) == 0.0 and counter.mark()[:3] == (2, 0, 0)
     installs.drop = True
     with pytest.raises(
         RuntimeError,
@@ -897,15 +899,94 @@ def test_staleness_a_zero_grad_norm_without_gradients_excuses_nothing_by_itself(
         _sync(r, _export(5), 2)  # after a step that returned 0.0, an export that changed
 
 
+def test_staleness_a_nonzero_norm_step_with_an_unchanged_export_fails_at_a_checksum_sync(installs, monkeypatch, caplog):
+    """A real optimizer step with a nonzero grad norm whose export did not change (here the export reads a stale copy:
+    sync 0's tensors again), so the engine's weights did not either: fatal, the trainer stepped but its export did not
+    change. The sync line shows the step's grad norm before the raise."""
+    trainer = _Trainer(_export(0))
+    counter = _counted(monkeypatch, trainer)
+    caplog.set_level(logging.INFO, logger="verl_hardware_plugin.accelerators.tpu.rollout.inproc")
+    r = _rollout(_installed(_export(0), False))
+    sent = trainer.export()
+    _sync(r, sent, 0)
+    trainer.grads(1.0)
+    norm = float(trainer.optimizer_step())
+    assert norm > 0 and counter.mark() == (1, 0, 0, 1)
+    with pytest.raises(
+        RuntimeError,
+        match=r"INTEGRITY FAILED rank 0 step 1: the engine's weights are unchanged since sync 0 .*: the trainer "
+        r"stepped \(1 optimizer step\(s\) with a nonzero grad norm since sync 0\) but its export of these tensors did "
+        "not change",
+    ):
+        _sync(r, sent, 1)
+    line = next(m for m in caplog.messages if "sync step 1 rank 0" in m)
+    assert "staleness UNCHANGED" in line and f"grad norms since the last sync [{norm!r}]" in line
+
+
+def test_staleness_probe_fails_after_a_nonzero_norm_step_with_an_unchanged_export(installs, monkeypatch):
+    """Between checksum syncs the probe judges alone: a real step with a nonzero grad norm, the export unchanged (a
+    stale copy) and so the engine -> STALE WEIGHTS, kept for the step guard and raised at the next sync."""
+    trainer = _Trainer(_export(0))
+    counter = _counted(monkeypatch, trainer)
+    r = _rollout(_installed(_export(0), False))
+    r.stale = ws.StaleProbe(0)
+    _sync(r, _export(1), 0)
+    _sync(r, _export(2), 1)
+    trainer.grads(1.0)
+    assert float(trainer.optimizer_step()) > 0 and counter.mark() == (1, 0, 0, 1)
+    _sync(r, _export(2), 2)  # sync 1's tensors again
+    assert r.sync_log[-1]["sha"] is False  # step 2: unverified, and the probe is on: no strided checksum
+    probe = r.stale.resolve("update_actor")
+    assert probe is not None and probe["changed"] == 0 and probe["export_unchanged"] is True and probe["stale"]
+    assert r.stale.fatal_pending is not None and (
+        "the trainer stepped (1 optimizer step(s) with a nonzero grad norm since step 1) but its export of these "
+        "tensors did not change" in r.stale.fatal_pending
+    )
+    with pytest.raises(RuntimeError, match="STALE WEIGHTS rank 0: sync step 2"):
+        _sync(r, _export(3), 3)
+
+
+def test_staleness_an_unknown_counter_with_an_unchanged_export_fails(installs, monkeypatch):
+    """No optimizer-step counter (no wrap), or a step whose return is unknown: unchanged weights with an unchanged
+    export are fatal, as before the export digest, at the checksum sync and at the probe."""
+    monkeypatch.setattr(rollout_mod, "OPT_STEPS", ws.OptimizerSteps())  # never installed: not counted
+    r = _rollout(_installed(_export(0), False))
+    r.stale = ws.StaleProbe(0)
+    _sync(r, _export(1), 0)
+    stale = "the engine's weights are unchanged since sync 0 .*: the trainer's update or this install did not land"
+    with pytest.raises(RuntimeError, match="INTEGRITY FAILED rank 0 step 1: " + stale):
+        _sync(r, _export(1), 1)
+    probe = r.stale.resolve("update_actor")
+    assert probe is not None and probe["export_unchanged"] is True and probe["stale"]
+    engine = SimpleNamespace(optimizer_step=lambda: "not a norm")
+    counter = ws.OptimizerSteps()
+    counter.install(SimpleNamespace(actor=SimpleNamespace(engine=engine)))
+    monkeypatch.setattr(rollout_mod, "OPT_STEPS", counter)
+    r = _rollout(_installed(_export(0), False))
+    _sync(r, _export(1), 0)
+    engine.optimizer_step()
+    assert counter.mark()[:3] == (0, 0, 1)
+    with pytest.raises(RuntimeError, match="INTEGRITY FAILED rank 0 step 1: " + stale):
+        _sync(r, _export(1), 1)
+
+
 def test_unchanged_reason():
-    """Both export digests known: they alone decide. Otherwise the optimizer-step rule, as before."""
-    assert ws.unchanged_reason("x", "x", (0, 0, 0), (1, 0, 0)) == "no-op sync"  # a real step that moved nothing
-    assert ws.unchanged_reason("x", "x", None, None) == "no-op sync"  # the counter is not needed
-    assert ws.unchanged_reason("x", "y", (0, 0, 0), (1, 0, 0)) is None  # the export moved, the engine did not
-    assert ws.unchanged_reason("x", "y", (1, 0, 0), (1, 2, 0)) is None  # even when every step was skipped
-    assert ws.unchanged_reason("x", "x", (1, 0, 0), (1, 2, 0)) == "no optimizer step"
-    assert ws.unchanged_reason(None, "x", (1, 0, 0), (1, 2, 0)) == "no optimizer step"  # no digest: the old rule
-    assert ws.unchanged_reason(None, None, (0, 0, 0), (1, 0, 0)) is None
+    """Marks: (real, skipped, unknown, real with a nonzero grad norm). An unchanged export excuses unchanged weights
+    only after real steps that all returned exactly 0.0; a changed one never; skipped steps only, as before."""
+    assert ws.unchanged_reason("x", "x", (0, 0, 0, 0), (1, 0, 0, 1)) is None  # stepped, the export did not change
+    assert ws.unchanged_reason("x", "x", (0, 0, 0, 0), (2, 0, 0, 1)) is None  # one of two real steps had a norm
+    assert ws.unchanged_reason("x", "x", (0, 0, 0, 0), (1, 0, 0, 0)) == "no-op sync"  # a real step that returned 0.0
+    assert ws.unchanged_reason("x", "x", (1, 0, 0, 0), (3, 1, 0, 0)) == "no-op sync"  # 0.0 and skipped steps
+    assert ws.unchanged_reason("x", "x", (0, 0, 0, 0), (1, 0, 1, 0)) is None  # an unknown step
+    assert ws.unchanged_reason("x", "x", (1, 0, 0, 0), (1, 0, 0, 0)) is None  # no optimizer call at all
+    assert ws.unchanged_reason("x", "x", None, None) is None  # no counter: the old rule
+    assert ws.unchanged_reason("x", "x", (0, 0, 0, 0), None) is None
+    assert ws.unchanged_reason("x", "y", (0, 0, 0, 0), (1, 0, 0, 0)) is None  # the export moved, the engine did not
+    assert ws.unchanged_reason("x", "y", (1, 0, 0, 0), (1, 2, 0, 0)) is None  # even when every step was skipped
+    assert ws.unchanged_reason("x", "x", (1, 0, 0, 0), (1, 2, 0, 0)) == "no optimizer step"
+    assert ws.unchanged_reason(None, "x", (1, 0, 0, 0), (1, 2, 0, 0)) == "no optimizer step"  # no digest: the old rule
+    assert ws.unchanged_reason(None, None, (0, 0, 0, 0), (1, 0, 0, 0)) is None  # a 0.0 norm needs the export digest
+    assert ws.nonzero_steps_between((0, 0, 0, 0), (3, 1, 0, 2)) == 2 and ws.nonzero_steps_between(None, None) == 0
 
 
 def test_export_checksum_subset_covers_the_fused_shards():
@@ -969,12 +1050,13 @@ def test_no_update_between():
 
 def test_optimizer_steps_counter_classifies_returns():
     engine = SimpleNamespace(optimizer_step=lambda: next(rets))
-    rets = iter([torch.tensor(1.5), float("inf"), None, float("nan"), 0.3])
+    rets = iter([torch.tensor(1.5), float("inf"), None, float("nan"), 0.3, torch.tensor(0.0)])
     counter = ws.OptimizerSteps()
     counter.install(SimpleNamespace(actor=SimpleNamespace(engine=engine)))
-    for _ in range(5):
+    for _ in range(6):
         engine.optimizer_step()
-    assert counter.mark() == (2, 2, 1)
+    assert counter.mark() == (3, 2, 1, 2)  # 0.0 is a real step without a nonzero grad norm
+    assert str(counter.take_norms()) == "[1.5, inf, None, nan, 0.3, 0.0]" and counter.take_norms() == []
     assert ws.OptimizerSteps().mark() is None
 
 
