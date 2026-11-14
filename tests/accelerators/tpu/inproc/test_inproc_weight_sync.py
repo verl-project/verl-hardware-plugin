@@ -18,8 +18,9 @@ What the tests pin:
   must match no received tensor; a verified direct install whose recorder recorded nothing fails;
 * ``TPUInProcRollout.update_weights`` itself on a rollout shell (an idle engine, the real installer, a stand-in of the
   install's writes): the export pin, verify-until-pinned, the mode pin at every sync, the coverage check folded into
-  the parity verdict, the staleness check with skipped optimizer steps, and that no environment variable weakens any
-  of it.
+  the parity verdict, the staleness check (judged against the trainer's export of the same tensors: a step that left
+  the export unchanged, such as one on an exactly zero gradient, is a no-op sync; an export that changed while the
+  engine did not still fails) with skipped optimizer steps, and that no environment variable weakens any of it.
 """
 
 import asyncio
@@ -462,8 +463,9 @@ def _direct_targets(model: nn.Module, staging: dict) -> list:
 def installs(monkeypatch):
     """InProcInstaller._install_once replaced by a stand-in of the install's writes: the loader path writes what vLLM's
     loaders would; the direct path what tpu-sync's direct install would (the LM head copied from the embedding when
-    the trainer sent none), with the recorder pairs a verified direct install leaves. Every call recorded."""
-    ctl = SimpleNamespace(calls=[], fail_direct=False)
+    the trainer sent none), with the recorder pairs a verified direct install leaves. Every call recorded. ``drop``:
+    an install that writes nothing (the engine keeps the previous sync's weights)."""
+    ctl = SimpleNamespace(calls=[], fail_direct=False, drop=False)
 
     def _install_once(self, staging_hf, verify, pre):
         direct = self.mode != ws.LOADER_FAMILY
@@ -471,10 +473,12 @@ def installs(monkeypatch):
             raise RuntimeError("stand-in: the direct install raised")
         ctl.calls.append("direct" if direct else "loaders")
         m = self._model()
-        _write(m, staging_hf)
+        if not ctl.drop:
+            _write(m, staging_hf)
         pairs = _direct_targets(m, staging_hf) if direct else None
         if (
             direct
+            and not ctl.drop
             and "lm_head.weight" not in staging_hf
             and m.lm_head.weight.data_ptr() != m.model.embed_tokens.weight.data_ptr()
         ):
@@ -732,22 +736,60 @@ def test_integrity_report_leaves_every_install_check_on(installs, monkeypatch):
     s = rollout(_installed(_export(0), False))  # positive control: report mode is on, for staleness only
     _sync(s, _export(1), 0)
     _sync(s, _export(2), 1)
-    _sync(s, _export(2), 5)
+    installs.drop = True  # the trainer's export changes, the engine keeps sync 1's weights
+    _sync(s, _export(3), 2)
     assert s.sync_log[-1]["stale"] is True
 
 
-# ---------------------------------------------------------------------------------- staleness (skipped optimizer steps)
+# ----------------------------------------------------- staleness (the trainer's export digest, skipped optimizer steps)
+
+
+class _Trainer:
+    """The trainer side of a sync: fp32 parameters with AdamW (a warm-up learning rate), an ``optimizer_step`` shaped
+    like the TPU engine's (the global grad norm over the parameters that have a gradient, 0.0 when none has; a
+    non-finite norm skips the step) and the bf16 HF-named export."""
+
+    def __init__(self, export: dict):
+        self.params = {n: nn.Parameter(t.float()) for n, t in export.items()}
+        self.opt = torch.optim.AdamW(list(self.params.values()), lr=2e-7, weight_decay=0.01)
+
+    def grads(self, value: float) -> None:
+        for p in self.params.values():
+            p.grad = torch.full_like(p, value)
+
+    def optimizer_step(self) -> torch.Tensor:
+        grads = [p.grad for p in self.params.values() if p.grad is not None]
+        norm = torch.stack([g.norm() for g in grads]).norm() if grads else torch.tensor(0.0)
+        if torch.isfinite(norm):
+            self.opt.step()
+        self.opt.zero_grad()
+        return norm
+
+    def export(self) -> dict:
+        return {n: p.detach().to(torch.bfloat16) for n, p in self.params.items()}
+
+
+def _counted(monkeypatch, trainer: _Trainer) -> ws.OptimizerSteps:
+    """The rollout's optimizer-step counter, installed on ``trainer`` as on the trainer engine."""
+    counter = ws.OptimizerSteps()
+    counter.install(SimpleNamespace(actor=SimpleNamespace(engine=trainer)))
+    monkeypatch.setattr(rollout_mod, "OPT_STEPS", counter)
+    return counter
 
 
 def test_staleness_unchanged_weights_fail_at_a_checksum_sync(installs):
+    """The trainer's export changed but the engine's weights did not (the install landed nothing): fatal."""
     model = _installed(_export(0), False)
     r = _rollout(model)
     _sync(r, _export(1), 0)
     _sync(r, _export(2), 1)
+    installs.drop = True
     with pytest.raises(
-        RuntimeError, match="INTEGRITY FAILED rank 0 step 5: the engine's weights are unchanged since sync 1"
+        RuntimeError,
+        match="INTEGRITY FAILED rank 0 step 2: the engine's weights are unchanged since sync 1 .*: the trainer's "
+        "export of these tensors changed, so this install did not land",
     ):
-        _sync(r, _export(2), 5)  # step 5 is verified: the checksum runs; the same export as step 1
+        _sync(r, _export(3), 2)  # step 2: unverified; the checksum runs (the shell has no probe)
 
 
 def test_staleness_reported_only_in_report_mode(installs):
@@ -756,8 +798,152 @@ def test_staleness_reported_only_in_report_mode(installs):
     r.integrity = "report"
     _sync(r, _export(1), 0)
     _sync(r, _export(2), 1)
-    _sync(r, _export(2), 5)
-    assert r.sync_log[-1]["stale"] is True
+    installs.drop = True
+    _sync(r, _export(3), 2)
+    assert r.sync_log[-1]["stale"] is True and r.sync_log[-1]["export_unchanged"] is False
+
+
+def test_staleness_a_zero_gradient_step_is_a_noop_sync(installs, monkeypatch, caplog):
+    """A first update on an exactly zero gradient (every advantage 0) is a real optimizer step that moves nothing:
+    AdamW's zero moments give a zero update and fp32(1 - lr * weight_decay) == 1. The trainer's export is bit-identical,
+    so the engine's unchanged weights at that verified sync (parity exact) are a no-op sync, for the strided checksum
+    and for the probe, and nothing is refused."""
+    trainer = _Trainer(_export(0))
+    counter = _counted(monkeypatch, trainer)
+    caplog.set_level(logging.INFO, logger="verl_hardware_plugin.accelerators.tpu.rollout.inproc")
+    r = _rollout(_installed(_export(0), False))  # the engine holds the checkpoint, the trainer's initial weights
+    r.stale = ws.StaleProbe(0)
+    sent = trainer.export()
+    _sync(r, sent, 0)
+    trainer.grads(0.0)
+    assert float(trainer.optimizer_step()) == 0.0 and counter.mark() == (1, 0, 0)
+    assert all(torch.equal(t, sent[n]) for n, t in trainer.export().items())  # the step moved nothing
+    _sync(r, trainer.export(), 1)
+    rec = r.sync_log[-1]
+    assert rec["verified"] == "step 1" and rec["parity"]["post_mismatched"] == 0 and rec["opt_mark"] == (1, 0, 0)
+    assert rec["stale"] is False and rec["unchanged_expected"] is True and rec["export_unchanged"] is True
+    assert any(
+        "sync step 1 rank 0" in m and "staleness unchanged as expected (a no-op sync: " in m for m in caplog.messages
+    )
+    probe = r.stale.resolve("compute_log_prob")
+    assert probe is not None and probe["changed"] == 0 and probe["stale"] is False
+    assert probe["unchanged_expected"] is True and probe["export_unchanged"] is True and r.stale.fatal_pending is None
+    assert any("stale probe step 1 rank 0" in m and "a no-op sync" in m for m in caplog.messages)
+
+
+def test_staleness_probe_fails_when_the_export_moved_but_the_engine_did_not(installs):
+    """Between checksum syncs the probe judges alone: the trainer's export changed and the install landed nothing ->
+    STALE WEIGHTS, kept for the step guard and raised at the next sync."""
+    r = _rollout(_installed(_export(0), False))
+    r.stale = ws.StaleProbe(0)
+    _sync(r, _export(1), 0)
+    _sync(r, _export(2), 1)
+    installs.drop = True
+    _sync(r, _export(3), 2)
+    assert r.sync_log[-1]["sha"] is False  # step 2: unverified, and the probe is on: no strided checksum
+    probe = r.stale.resolve("update_actor")
+    assert probe is not None and probe["changed"] == 0 and probe["export_unchanged"] is False and probe["stale"]
+    assert r.stale.fatal_pending is not None and "although the trainer's export of them did" in r.stale.fatal_pending
+    installs.drop = False
+    with pytest.raises(RuntimeError, match="STALE WEIGHTS rank 0: sync step 2"):
+        _sync(r, _export(4), 3)
+
+
+def test_staleness_a_skipped_non_finite_step_is_judged_as_before(installs, monkeypatch, caplog):
+    """A non-finite grad norm skips the step: the export stays the same and the unchanged weights are expected, logged
+    as before (no optimizer step since the last sync), for the strided checksum and for the probe."""
+    trainer = _Trainer(_export(0))
+    counter = _counted(monkeypatch, trainer)
+    caplog.set_level(logging.INFO, logger="verl_hardware_plugin.accelerators.tpu.rollout.inproc")
+    r = _rollout(_installed(_export(0), False))
+    r.stale = ws.StaleProbe(0)
+    _sync(r, trainer.export(), 0)
+    trainer.grads(float("nan"))
+    assert torch.isnan(trainer.optimizer_step()) and counter.mark() == (0, 1, 0)
+    _sync(r, trainer.export(), 1)
+    rec = r.sync_log[-1]
+    assert rec["stale"] is False and rec["unchanged_expected"] is True
+    assert any(
+        "sync step 1 rank 0" in m and "staleness unchanged as expected (no optimizer step since sync 0)" in m
+        for m in caplog.messages
+    )
+    probe = r.stale.resolve("compute_log_prob")
+    assert probe is not None and probe["stale"] is False and probe["unchanged_expected"] is True
+    assert any(
+        "stale probe step 1 rank 0" in m and "unchanged as expected: no optimizer step since step 0" in m
+        for m in caplog.messages
+    )
+
+
+def test_staleness_a_zero_grad_norm_without_gradients_excuses_nothing_by_itself(installs, monkeypatch):
+    """The TPU engine also returns a grad norm of 0.0 when no parameter has a gradient. The counter takes it as a real
+    step, and the norm is never read as 'nothing moved': the export decides. Unchanged, a no-op sync; changed while the
+    engine's weights did not, still fatal."""
+    trainer = _Trainer(_export(0))
+    counter = _counted(monkeypatch, trainer)
+    r = _rollout(_installed(_export(0), False))
+    _sync(r, trainer.export(), 0)
+    assert all(p.grad is None for p in trainer.params.values())
+    assert float(trainer.optimizer_step()) == 0.0 and counter.mark() == (1, 0, 0)
+    _sync(r, trainer.export(), 1)
+    assert r.sync_log[-1]["stale"] is False and r.sync_log[-1]["unchanged_expected"] is True
+    assert float(trainer.optimizer_step()) == 0.0 and counter.mark() == (2, 0, 0)
+    installs.drop = True
+    with pytest.raises(
+        RuntimeError,
+        match="INTEGRITY FAILED rank 0 step 2: the engine's weights are unchanged since sync 1 .*: the trainer's "
+        "export of these tensors changed",
+    ):
+        _sync(r, _export(5), 2)  # after a step that returned 0.0, an export that changed
+
+
+def test_unchanged_reason():
+    """Both export digests known: they alone decide. Otherwise the optimizer-step rule, as before."""
+    assert ws.unchanged_reason("x", "x", (0, 0, 0), (1, 0, 0)) == "no-op sync"  # a real step that moved nothing
+    assert ws.unchanged_reason("x", "x", None, None) == "no-op sync"  # the counter is not needed
+    assert ws.unchanged_reason("x", "y", (0, 0, 0), (1, 0, 0)) is None  # the export moved, the engine did not
+    assert ws.unchanged_reason("x", "y", (1, 0, 0), (1, 2, 0)) is None  # even when every step was skipped
+    assert ws.unchanged_reason("x", "x", (1, 0, 0), (1, 2, 0)) == "no optimizer step"
+    assert ws.unchanged_reason(None, "x", (1, 0, 0), (1, 2, 0)) == "no optimizer step"  # no digest: the old rule
+    assert ws.unchanged_reason(None, None, (0, 0, 0), (1, 0, 0)) is None
+
+
+def test_export_checksum_subset_covers_the_fused_shards():
+    """The export's subset (HF names) holds every tensor the engine's fused checksum tensors are installed from."""
+    hf = [
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.self_attn.q_norm.weight",
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.1.mlp.gate_proj.weight",
+        "model.layers.1.mlp.up_proj.weight",
+        "model.layers.1.mlp.down_proj.weight",
+        "model.norm.weight",
+    ]
+    assert ws.checksum_names(hf, shards=True) == [
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.1.mlp.down_proj.weight",
+        "model.layers.1.mlp.gate_proj.weight",
+        "model.layers.1.mlp.up_proj.weight",
+    ]
+    engine = [n for n, _ in _DenseVllmModel(tied=False).named_parameters()]
+    assert ws.checksum_names(engine, shards=True) == ws.checksum_names(engine)  # fused names: the engine's subset
+    assert ws.checksum_names(hf) == [
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.1.mlp.down_proj.weight",
+    ]
 
 
 def test_staleness_not_judged_when_every_optimizer_step_was_skipped(installs, monkeypatch):

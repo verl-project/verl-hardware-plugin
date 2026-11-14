@@ -63,8 +63,8 @@ from verl_hardware_plugin.accelerators.tpu.rollout.inproc.weight_sync import (
     checksum_names,
     export_pin_problem,
     export_signature,
-    no_update_between,
     tensor_checksums,
+    unchanged_reason,
     verify_reason,
 )
 
@@ -104,7 +104,7 @@ class TPUInProcRollout(BaseRollout):
         # the start of the trainer's export, set at verl's update_weights entry (before get_per_tensor_param)
         self._pending_export_t0: Optional[float] = None
         self._syncs_started = 0  # the first sync of this process is verified
-        self._last_wsum: Optional[tuple] = None  # (step, wsum, optimizer-step mark) of the last sync whose sha256 ran
+        self._last_wsum: Optional[tuple] = None  # (step, wsum, opt mark, export xsum) of the last sync whose sha256 ran
         self.integrity = integrity_mode()
         self.last_step = last_step()
         self.rss_limit = gc_rss_limit_bytes()
@@ -527,14 +527,20 @@ class TPUInProcRollout(BaseRollout):
         model = self.worker.model_runner.model
         named = dict(model.named_parameters())
         names = checksum_names(list(named))
+        xnames = checksum_names(list(staging), shards=True)  # the trainer's export of the same tensors
         par = cov = None
         with engine_mode_ctx("checksum"):
             DEVICE_THREADS.record("checksum")
-            probe_s = self.stale.dispatch(step, named, names, mark=opt_mark) if self.stale is not None else None
+            probe_s = (
+                self.stale.dispatch(step, named, names, mark=opt_mark, export=(staging, xnames))
+                if self.stale is not None
+                else None
+            )
             if probe_s is not None and full_sha and self.stale is not None:
                 self.stale.host_reference(step, named, names)
             sha_due = verify or full_sha or probe_s is None or step % CHECKSUM_EVERY == 0
             wsum, wbytes = tensor_checksums(named, names, full=False) if sha_due else ("deferred", 0)
+            xsum = tensor_checksums(staging, xnames, full=False)[0] if sha_due and xnames else None
             full = tensor_checksums(named, names, full=True)[0] if full_sha else None
             t3 = time.time()
             if res.get("_verify") is not None:
@@ -543,21 +549,25 @@ class TPUInProcRollout(BaseRollout):
         t4 = time.time()
         direct = res["mode"] != LOADER_FAMILY
         # staleness on the strided checksum: compared only between syncs whose checksum ran; unchanged weights are
-        # expected only when the trainer provably took no optimizer step in between (all skipped)
+        # expected when the same checksum of the trainer's export is unchanged too (a no-op sync), or, without it, when
+        # the trainer provably took no optimizer step in between (all skipped); see unchanged_reason
         prev = self._last_wsum
         stale = None
         unchanged_expected = False
+        excuse = None
         if sha_due:
             if prev is not None and step > prev[0] and wsum == prev[1]:
-                if no_update_between(prev[2], opt_mark):
+                excuse = unchanged_reason(prev[3], xsum, prev[2], opt_mark)
+                if excuse is not None:
                     unchanged_expected = True
                 else:
-                    stale = (
-                        f"the engine's weights are unchanged since sync {prev[0]} (wsum {wsum[:16]} at both): the "
-                        "trainer's "
-                        "update or this install did not land"
+                    stale = f"the engine's weights are unchanged since sync {prev[0]} (wsum {wsum[:16]} at both): " + (
+                        "the trainer's export of these tensors changed, so this install did not land"
+                        if xsum is not None and prev[3] is not None
+                        else "the trainer's update or this install did not land"
                     )
-            self._last_wsum = (step, wsum, opt_mark)
+            self._last_wsum = (step, wsum, opt_mark, xsum)
+        export_unchanged = xsum == prev[3] if xsum is not None and prev is not None and prev[3] is not None else None
         window = self.engine.window_take()
         rec = {
             "step": step,
@@ -577,14 +587,20 @@ class TPUInProcRollout(BaseRollout):
             "sha": sha_due,
             "opt_mark": opt_mark,
             "unchanged_expected": unchanged_expected,
+            "export_unchanged": export_unchanged,
         }
         staleness = (
             "UNCHANGED"
             if stale
             else (
                 f"unchanged as expected (no optimizer step since sync {prev[0] if prev is not None else None})"
-                if unchanged_expected
-                else ("changed" if sha_due and prev is not None and step > prev[0] else "n/a")
+                if excuse == "no optimizer step"
+                else (
+                    "unchanged as expected (a no-op sync: the trainer's export of these tensors is unchanged too since "
+                    f"sync {prev[0] if prev is not None else None})"
+                    if excuse == "no-op sync"
+                    else ("changed" if sha_due and prev is not None and step > prev[0] else "n/a")
+                )
             )
         )
         log(

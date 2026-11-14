@@ -476,10 +476,14 @@ def export_pin_problem(pin: Optional[tuple], sig: dict, step: int, rank: int) ->
     )
 
 
-def checksum_names(state_keys: list[str]) -> list[str]:
-    """The fixed tensor subset of the per-sync checksum: embedding, LM head, layer 0's projections, the last MLP."""
+def checksum_names(state_keys: list[str], shards: bool = False) -> list[str]:
+    """The fixed tensor subset of the per-sync checksum: embedding, LM head, layer 0's projections, the last MLP.
+    ``shards`` (the trainer's HF-named export): also the shards vLLM fuses into those parameters (k / v beside q,
+    gate / up beside down), so that the export's subset covers every tensor the engine's subset is installed from."""
     keys = sorted(state_keys)
     pick: list[str] = []
+    attn = ("in_proj", "qkv", "q_proj", "out_proj", "o_proj") + (("k_proj", "v_proj") if shards else ())
+    mlp = ("down_proj", "gate_up") + (("gate_proj", "up_proj") if shards else ())
 
     def add(pred):
         for k in keys:
@@ -488,11 +492,7 @@ def checksum_names(state_keys: list[str]) -> list[str]:
 
     add(lambda k: k.endswith("embed_tokens.weight"))
     add(lambda k: k.endswith("lm_head.weight"))
-    add(
-        lambda k: ".layers.0." in k
-        and k.endswith(".weight")
-        and any(s in k for s in ("in_proj", "qkv", "q_proj", "out_proj", "o_proj"))
-    )
+    add(lambda k: ".layers.0." in k and k.endswith(".weight") and any(s in k for s in attn))
     layers = sorted(
         {
             int(k.split(".layers.")[1].split(".")[0])
@@ -502,7 +502,7 @@ def checksum_names(state_keys: list[str]) -> list[str]:
     )
     if layers:
         last = f".layers.{layers[-1]}."
-        add(lambda k: last in k and ".mlp." in k and k.endswith(".weight") and ("down_proj" in k or "gate_up" in k))
+        add(lambda k: last in k and ".mlp." in k and k.endswith(".weight") and any(s in k for s in mlp))
     return pick
 
 
@@ -588,7 +588,9 @@ class OptimizerSteps:
     ``worker.actor.engine.optimizer_step``. verl's engines call it once per mini-batch and the TPU engine skips the
     step when the global grad norm is not finite, returning that norm: a finite return is a real step, a non-finite
     one a skipped step, anything else unknown. A skipped step leaves the trainer's weights, and so the served ones,
-    unchanged: that is not staleness. Fail-safe: no wrap, or an unknown return, keeps the plain staleness rule."""
+    unchanged: that is not staleness. A finite return is a real step even at 0.0 (also returned when no parameter has
+    a gradient). The counts matter only without the trainer's export digest (:func:`unchanged_reason`). Fail-safe: no
+    wrap, or an unknown return, keeps the plain staleness rule."""
 
     def __init__(self) -> None:
         self.real = 0
@@ -653,6 +655,21 @@ def no_update_between(prev_mark: Optional[tuple], mark: Optional[tuple]) -> bool
     )
 
 
+def unchanged_reason(prev_export: Any, export: Any, prev_mark: Optional[tuple], mark: Optional[tuple]) -> Optional[str]:
+    """Why sampled weights unchanged since the previous compared sync are not staleness, or None (stale).
+
+    The trainer's export digest of the same tensors decides when both syncs have one: unchanged too, the trainer did
+    not move them (a no-op sync, e.g. an AdamW step on an exactly zero gradient; a grad norm of 0.0 excuses nothing by
+    itself); changed, the install did not land. Without both digests, only an interval of skipped optimizer steps
+    excuses (:func:`no_update_between`)."""
+    known = prev_export is not None and export is not None
+    if known and prev_export != export:
+        return None
+    if no_update_between(prev_mark, mark):
+        return "no optimizer step"
+    return "no-op sync" if known else None
+
+
 class StaleProbe:
     """The per-sync staleness check without a per-sync host checksum.
 
@@ -660,7 +677,8 @@ class StaleProbe:
     :meth:`resolve` reads it back later, off the generation's critical path: at the trainer's next entry
     (compute_log_prob / update_actor) or, failing that, at the next sync before its install. Each resolved probe is
     compared with the previous one: none of the sampled tensors changed although the trainer moved to a later step,
-    with a real optimizer step in between -> ``STALE WEIGHTS``, logged at once and, in ``fatal`` mode, raised at the
+    while the same reduction of the trainer's export of these tensors changed (without it: with a real optimizer step
+    in between; :func:`unchanged_reason`) -> ``STALE WEIGHTS``, logged at once and, in ``fatal`` mode, raised at the
     next sync right after its export (:meth:`check_fatal`): the trainer entries are collective, so the raise waits until
     every rank is past the step's collectives. The step guard refuses update_actor earlier on a stale verdict.
     ``barrier_after`` (verl's update_weights then barriers after this rollout's): a raise would strand ranks, so the
@@ -677,9 +695,9 @@ class StaleProbe:
         )
         self.rank = rank
         self.pending: Optional[tuple] = (
-            None  # (step, device int32 vector, names, dispatch seconds, optimizer-step mark)
+            None  # (step, device int32 vector, names, dispatch seconds, optimizer-step mark, export vector, names)
         )
-        self.last: Optional[tuple] = None  # (step, names, [ints], optimizer-step mark) of the last resolved probe
+        self.last: Optional[tuple] = None  # (step, names, [ints], mark, export [ints], names): the last resolved probe
         self.unavailable: Optional[str] = None
         self.fatal_pending: Optional[str] = None
         self.host_check: dict = {}
@@ -696,24 +714,31 @@ class StaleProbe:
             "sync"
         )
 
-    def dispatch(self, step: int, named: dict, names: list, mark: Optional[tuple] = None) -> Optional[float]:
+    def dispatch(
+        self, step: int, named: dict, names: list, mark: Optional[tuple] = None, export: Optional[tuple] = None
+    ) -> Optional[float]:
         """After the install of sync ``step`` (inside the caller's engine scope): the reduction dispatched, not waited
-        for. Seconds, or None when the probe is off (the caller then runs the strided sha256)."""
+        for, and the same reduction of the trainer's export of these tensors (``export``: its tensors and their names).
+        Seconds, or None when the probe is off (the caller then runs the strided sha256)."""
         if not self.on():
             return None
         if self.pending is not None:  # not read back since the last sync: in order, first
             self.resolve("sync")
             if not self.on():
                 return None
+        xnames = tuple(export[1]) if export is not None and export[1] else None
         t0 = time.perf_counter()
         try:
             vec = stale_reduction(named, names)
-            _dispatch_nowait(vec)
+            xvec = stale_reduction(export[0], export[1]) if export is not None and xnames else None
+            for v in (vec, xvec):
+                if v is not None:
+                    _dispatch_nowait(v)
         except Exception as e:  # noqa: BLE001
             self._off("dispatch", e)
             return None
         dt = time.perf_counter() - t0
-        self.pending = (int(step), vec, tuple(names), dt, mark)
+        self.pending = (int(step), vec, tuple(names), dt, mark, xvec, xnames)
         return dt
 
     def host_reference(self, step: int, named: dict, names: list) -> None:
@@ -739,12 +764,13 @@ class StaleProbe:
         p, self.pending = self.pending, None
         if p is None or not self.on():
             return None
-        step, vec, names, disp, mark = p
+        step, vec, names, disp, mark, xvec, xnames = p
         t0 = time.perf_counter()
         try:
             with engine_mode_ctx("stale"):
                 DEVICE_THREADS.record("stale")
                 vals = [int(x) for x in vec.to("cpu").tolist()]
+                xvals = [int(x) for x in xvec.to("cpu").tolist()] if xvec is not None else None
         except Exception as e:  # noqa: BLE001
             self._off(f"read back at {where}", e)
             return None
@@ -774,7 +800,9 @@ class StaleProbe:
         all_unchanged = bool(
             prev is not None and unchanged is not None and len(unchanged) == len(names) and step > prev[0]
         )
-        expected = all_unchanged and no_update_between(prev[3] if prev is not None else None, mark)
+        xprev = prev[4] if prev is not None and prev[5] == xnames else None
+        why = unchanged_reason(xprev, xvals, prev[3] if prev is not None else None, mark) if all_unchanged else None
+        expected = why is not None
         stale = all_unchanged and not expected
         rec = {
             "step": step,
@@ -784,9 +812,10 @@ class StaleProbe:
             "changed": (len(names) - len(unchanged)) if unchanged is not None else None,
             "stale": stale,
             "unchanged_expected": expected,
+            "export_unchanged": xvals == xprev if xvals is not None and xprev is not None else None,
             "read_at": where,
         }
-        self.last = (step, names, vals, mark)
+        self.last = (step, names, vals, mark, xvals, xnames)
         log(
             f"stale probe step {step} rank {self.rank}: digest {digest} over {len(names)} tensors; "
             + (f"host cross-check {self.cross_checks[-1][1]}; " if ref is not None else "")
@@ -799,7 +828,14 @@ class StaleProbe:
             + (
                 f"; unchanged as expected: no optimizer step since step {rec['prev_step']} (optimizer steps "
                 f"real/skipped/unknown {list(mark)})"
-                if expected
+                if why == "no optimizer step"
+                else ""
+            )
+            + (
+                f"; unchanged as expected: a no-op sync (the trainer's export of these tensors is unchanged too since "
+                f"step {rec['prev_step']}; optimizer steps real/skipped/unknown "
+                f"{list(mark) if mark is not None else 'not counted'})"
+                if why == "no-op sync"
                 else ""
             )
             + f"; read back at {where} in {1e3 * dt:.3f} ms (dispatched in {1e3 * disp:.3f} ms at the sync)"
@@ -807,7 +843,9 @@ class StaleProbe:
         if stale:
             msg = (
                 f"STALE WEIGHTS rank {self.rank}: sync step {step}: none of the {len(names)} sampled tensors changed "
-                f"since step {rec['prev_step']} (the served weights are those of the previous sync)"
+                f"since step {rec['prev_step']}"
+                + (", although the trainer's export of them did" if rec["export_unchanged"] is False else "")
+                + " (the served weights are those of the previous sync)"
                 + ("; the run stops at the next sync, after its export" if self.fatal else "; reported")
             )
             warn(msg)
