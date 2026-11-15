@@ -30,6 +30,7 @@ class TpuSyncRendezvousState:
     def __init__(self) -> None:
         self.controller_address: Optional[str] = None
         self.global_shapes: dict[str, list[int]] = {}
+        self.vllm_params: Optional[dict[str, Any]] = None
         self.stats: dict[int, dict[str, Any]] = {}
 
     def set_controller_address(self, address: Optional[str]) -> None:
@@ -47,6 +48,14 @@ class TpuSyncRendezvousState:
     def get_global_shapes(self) -> dict[str, list[int]]:
         """Returns the shapes recorded by ``set_global_shapes`` (empty before the first sync)."""
         return self.global_shapes
+
+    def set_vllm_params(self, params: dict[str, Any]) -> None:
+        """Records the rollout's vLLM parameter description (``describe_vllm_params``) for ``receive_into_vllm``."""
+        self.vllm_params = dict(params)
+
+    def get_vllm_params(self) -> Optional[dict[str, Any]]:
+        """Returns what ``set_vllm_params`` recorded, or ``None``."""
+        return self.vllm_params
 
     def set_stats(self, step: int, stats: dict[str, Any]) -> None:
         """Records trainer rank 0's weight statistics for ``step`` (every rank sent the full weights)."""

@@ -59,7 +59,8 @@ per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 `+actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.use_simple_fsdp=False`. Supported keys:
 `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`,
 `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`,
-`mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `model_kernels`, `ep_capacity_factor` and
+`mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `model_kernels`, `ep_capacity_factor`,
+`qwen3_pallas_experts`, `moe_paired_gemm` and
 `context_parallel_strategy` (see `TPUEngineOptions` in `options.py`); an unknown key is an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
 deprecated and log a warning.
 
@@ -69,6 +70,11 @@ TPU token dispatcher and Pallas grouped matmul (required: torchtitan's default `
 backward on TPU). This needs `expert_parallel_size=1` and a `seq_bucket_size` that times `num_experts_per_tok` is a
 multiple of 256 (the default 256 is); otherwise the engine raises. `use_dynamic_bsz=True` works on TPU: the plugin runs
 its int64 MAX / MIN all-reduces in int32, which `tpu_dist` supports.
+
+For Qwen3-30B-A3B, actor and reference models also disable MoE and router auxiliary loss.
+The legacy `qwen3_pallas_experts=False` is rejected because Pallas is required. For this model,
+`moe_paired_gemm` is a fallback for `moe_paired_grouped_mm`; an explicitly set `moe_paired_grouped_mm`
+takes precedence. With neither set, paired matmul stays off.
 
 MoE models also require the fused LM-head log-prob (`use_fused_linear_cross_entropy`, on by default for them, with or
 without `use_torch_compile`): Tokamax's fused linear + softmax + cross-entropy Pallas kernel computes the per-token
