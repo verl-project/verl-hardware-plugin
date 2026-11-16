@@ -8,6 +8,7 @@ import importlib
 import importlib.abc
 import importlib.util
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -17,27 +18,37 @@ def process_role():
     role = os.environ.get("VERL_NEURON_PROCESS_ROLE", "trainer")
     if role not in ("controller", "trainer", "rollout"):
         raise ValueError(f"Unknown Neuron process role: {role}")
+    # Ray training workers inherit the controller's environment. Verl sets
+    # WG_BACKEND before importing their modules; an explicit rollout role wins.
+    if role != "rollout" and os.environ.get("WG_BACKEND") == "ray":
+        return "trainer"
     return role
 
 
 def public_runtime_env():
     """Launch every Ray worker in the shared Neuron Python environment.
 
-    Verl supplies WG_BACKEND/rank variables in each training worker's runtime_env.
-    A launcher inherited through Ray preserves those variables and selects the
-    process role before imports, so each worker loads only its native runtime.
+    Ray applies these environment variables before starting Python. Verl adds
+    WG_BACKEND/rank variables for training workers, which process_role() uses to
+    select the native runtime before importing it.
     """
     executable = os.environ.get("VERL_NEURON_PYTHON")
     if not executable:
         return {}
     if not Path(executable).is_absolute() or not os.access(executable, os.X_OK):
         raise ValueError(f"Neuron Python must be an absolute executable path: {executable}")
-    import shlex
-
-    launcher = Path(__file__).with_name("worker_launcher.sh")
+    executable_dir = Path(executable).parent
+    environment_paths = {
+        "PATH": str(executable_dir),
+        "LD_LIBRARY_PATH": str(executable_dir.parent / "lib"),
+    }
+    for name, directory in environment_paths.items():
+        if inherited := os.environ.get(name):
+            environment_paths[name] = os.pathsep.join(dict.fromkeys([directory, *inherited.split(os.pathsep)]))
     return {
-        "py_executable": f"/bin/bash {shlex.quote(str(launcher))}",
+        "py_executable": shlex.quote(executable),
         "env_vars": {
+            **environment_paths,
             "VERL_NEURON_PYTHON": executable,
             "VERL_NEURON_PROCESS_ROLE": "controller",
             "VERL_PLATFORM": "aws",

@@ -176,8 +176,6 @@ def test_all_platforms_are_registered_before_any_engine(plugin):
         assert state.events.count("rollout:vllm") == 1
         assert state.events.count("rollout:sglang") == 1
         assert all(f"{package}.registration" in sys.modules for package in plugin.BACKEND_MODULES)
-        assert not any("trainium" in name for name in plugin.BACKEND_MODULES)
-        assert not any(name.startswith("verl_hardware_plugin.accelerators.trainium") for name in sys.modules)
 
 
 @pytest.mark.parametrize("backend", ENGINES)

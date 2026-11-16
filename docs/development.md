@@ -927,7 +927,6 @@ verl-hardware-plugin/
 │   │   ├── tpu/                          # Google TPU
 │   │   ├── rocm/                         # AMD ROCm (no platform: built into verl; MoRI checkpoint engine)
 │   │   ├── neuron/                       # Native AWS Trainium integration
-│   │   ├── trainium/                     # Inert compatibility placeholder
 │   │   └── <backend>/                    # Each implemented backend owns these files
 │   │       ├── __init__.py               # Guarded platform registration only
 │   │       ├── registration.py           # Engine, profiler, and rollout registration

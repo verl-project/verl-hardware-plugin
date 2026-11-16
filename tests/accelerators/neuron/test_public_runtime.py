@@ -6,46 +6,76 @@
 import importlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from verl_hardware_plugin.accelerators.neuron.runtime import public_runtime_env
+from verl_hardware_plugin.accelerators.neuron.runtime import process_role, public_runtime_env
 
 
 @pytest.mark.parametrize(
     "worker_environment,role",
     [
-        ({}, "controller"),
+        ({}, "trainer"),
         ({"VERL_NEURON_PROCESS_ROLE": "controller"}, "controller"),
+        ({"VERL_NEURON_PROCESS_ROLE": "trainer", "RANK": "1", "LOCAL_RANK": "1"}, "trainer"),
         ({"WG_BACKEND": "ray", "RANK": "3", "NEURON_RT_VISIBLE_CORES": "7"}, "trainer"),
         ({"WG_BACKEND": "ray", "VERL_NEURON_PROCESS_ROLE": "controller"}, "trainer"),
         ({"VERL_NEURON_PROCESS_ROLE": "rollout"}, "rollout"),
         ({"WG_BACKEND": "ray", "VERL_NEURON_PROCESS_ROLE": "rollout"}, "rollout"),
     ],
 )
-def test_launcher_uses_shared_interpreter_for_every_role(tmp_path, monkeypatch, worker_environment, role):
-    path = tmp_path / "shared python"
-    path.write_text(f'#!/bin/sh\nexport SELECTED_PYTHON=shared\nexec "{sys.executable}" "$@"\n')
-    path.chmod(0o755)
-    monkeypatch.setenv("VERL_NEURON_PYTHON", str(path))
-    environment = os.environ.copy()
-    for key in ("WG_BACKEND", "VERL_NEURON_PROCESS_ROLE", "RANK", "NEURON_RT_VISIBLE_CORES"):
-        environment.pop(key, None)
-    environment.update(worker_environment)
-    launcher = Path(__file__).parents[3] / "verl_hardware_plugin/accelerators/neuron/worker_launcher.sh"
+def test_process_role_preserves_ray_and_torchrun_assignments(monkeypatch, worker_environment, role):
+    for key in ("WG_BACKEND", "VERL_NEURON_PROCESS_ROLE", "RANK", "LOCAL_RANK", "NEURON_RT_VISIBLE_CORES"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in worker_environment.items():
+        monkeypatch.setenv(key, value)
+    assert process_role() == role
+    for key in ("RANK", "LOCAL_RANK", "NEURON_RT_VISIBLE_CORES"):
+        assert os.environ.get(key) == worker_environment.get(key)
+
+
+@pytest.mark.parametrize("backend", ["ray", ""])
+def test_process_role_rejects_invalid_configuration(monkeypatch, backend):
+    monkeypatch.setenv("WG_BACKEND", backend)
+    monkeypatch.setenv("VERL_NEURON_PROCESS_ROLE", "invalid")
+    with pytest.raises(ValueError, match="Unknown Neuron process role"):
+        process_role()
+
+
+@pytest.mark.parametrize("inherited_libraries", [None, "/system/lib:/efa/lib"])
+def test_public_runtime_starts_python_with_native_library_environment(tmp_path, monkeypatch, inherited_libraries):
+    executable_dir = tmp_path / "shared environment" / "bin"
+    executable_dir.mkdir(parents=True)
+    executable = executable_dir / "python"
+    executable.symlink_to(sys.executable)
+    monkeypatch.setenv("VERL_NEURON_PYTHON", str(executable))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    if inherited_libraries:
+        monkeypatch.setenv("LD_LIBRARY_PATH", inherited_libraries)
+    runtime = public_runtime_env()
+    assert shlex.split(runtime["py_executable"]) == [str(executable)]
+    # Read the environment at Python startup, before importing torch or the plugin.
     code = (
-        "import json, os; print(json.dumps({k: os.environ.get(k) for k in "
-        "('SELECTED_PYTHON', 'VERL_NEURON_PROCESS_ROLE', 'RANK', 'NEURON_RT_VISIBLE_CORES')}))"
+        "import json, os, sys; print(json.dumps(dict(executable=sys.executable, environment={"
+        "k: os.environ.get(k) for k in ('PATH', 'LD_LIBRARY_PATH', 'TORCH_DEVICE_BACKEND_AUTOLOAD')})))"
     )
-    result = json.loads(subprocess.check_output(["bash", str(launcher), "-c", code], env=environment))
-    assert result["VERL_NEURON_PROCESS_ROLE"] == role
-    assert result["SELECTED_PYTHON"] == "shared"
-    for key in ("RANK", "NEURON_RT_VISIBLE_CORES"):
-        assert result[key] == worker_environment.get(key)
-    assert public_runtime_env()["env_vars"]["VERL_NEURON_PYTHON"] == str(path)
+    result = json.loads(
+        subprocess.check_output(
+            [*shlex.split(runtime["py_executable"]), "-c", code], env={**os.environ, **runtime["env_vars"]}
+        )
+    )
+    assert result["executable"] == str(executable)
+    assert result["environment"]["PATH"] == f"{executable_dir}:/usr/bin:/bin"
+    expected_libraries = str(executable_dir.parent / "lib")
+    if inherited_libraries:
+        expected_libraries += f":{inherited_libraries}"
+    assert result["environment"]["LD_LIBRARY_PATH"] == expected_libraries
+    assert result["environment"]["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "0"
 
 
 def test_public_runtime_without_an_explicit_environment(monkeypatch):
@@ -169,8 +199,12 @@ def test_ray_exchanges_batches_in_shared_environment():
 
             import torch
 
+            from verl_hardware_plugin.accelerators.neuron.runtime import process_role
+
+            assert os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "0"
+            assert os.environ["NEURON_RT_VISIBLE_CORES"] == ""
             batch["scores"] = batch["tokens"].sum(-1)
-            return batch, torch.__version__, sys.executable, os.environ["VERL_NEURON_PROCESS_ROLE"]
+            return batch, torch.__version__, sys.executable, process_role()
 
     ray.init(num_cpus=2, runtime_env=public_runtime_env(), include_dashboard=False)
     try:
@@ -178,6 +212,7 @@ def test_ray_exchanges_batches_in_shared_environment():
         for expected_role, environment in (
             ("trainer", {"WG_BACKEND": "ray"}),
             ("rollout", {"VERL_NEURON_PROCESS_ROLE": "rollout"}),
+            ("rollout", {"WG_BACKEND": "ray", "VERL_NEURON_PROCESS_ROLE": "rollout"}),
             ("controller", {}),
         ):
             worker = BatchReceiver.options(

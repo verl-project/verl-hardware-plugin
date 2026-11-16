@@ -86,7 +86,7 @@ source "$PUBLIC_ENV_ROOT/venv/bin/activate"
 
 export VERL_NEURON_PYTHON="$VIRTUAL_ENV/bin/python"
 export LD_LIBRARY_PATH="$VIRTUAL_ENV/lib:/opt/aws/neuron/lib:/opt/aws/neuron/cuda-stubs:/opt/amazon/efa/lib:/opt/amazon/efa/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-# Use controller settings for data preparation; the launcher sets each worker's role.
+# Use controller settings for data preparation; the plugin resolves each Ray worker's role.
 export VERL_PLATFORM=aws
 export VERL_NEURON_PROCESS_ROLE=controller
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
@@ -96,8 +96,8 @@ python "$PLUGIN_DIR/scripts/accelerators/neuron/check_neuron_environment.py" --h
 ```
 
 Resolve any check failures before training. `VERL_NEURON_PYTHON` selects the same
-interpreter for every worker. Caches use their defaults, with NKI binaries stored
-in `$PUBLIC_ENV_ROOT/nki-cache`.
+interpreter directly through Ray's runtime environment for every worker. Caches
+use their defaults, with NKI binaries stored in `$PUBLIC_ENV_ROOT/nki-cache`.
 
 ## 2. Run a minimal GRPO example
 

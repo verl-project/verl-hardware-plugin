@@ -76,7 +76,6 @@ verl_hardware_plugin/
 │   ├── supa/       # Biren SUPA
 │   ├── tpu/        # Google TPU
 │   ├── neuron/     # AWS Trainium: TorchTitan, vLLM-Neuron and NIXL
-│   ├── trainium/   # Inert compatibility placeholder
 │   └── xpu/        # Intel XPU
 ├── integrations/
 │   └── flagos/     # Software integration spanning accelerator backends
