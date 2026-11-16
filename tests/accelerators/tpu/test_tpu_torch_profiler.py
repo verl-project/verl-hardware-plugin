@@ -15,6 +15,9 @@ import verl.utils.profiler.config as profiler_config  # noqa: E402
 import verl.utils.profiler.torch_profile as tp  # noqa: E402
 from verl_hardware_plugin.accelerators.tpu.profilers import torch_profiler_tpu  # noqa: E402
 
+if not hasattr(profiler_config, "DEVICE_ACTIVITIES"):
+    pytest.skip("verl without per-device profiler activities (DEVICE_ACTIVITIES)", allow_module_level=True)
+
 
 class _FakeTpuProfilerConfig:
     def __init__(self, *, run_dir=None, worker_rank=None):

@@ -3,6 +3,7 @@
 
 """Register Google TPU components and lazy rollout hooks when imported."""
 
+import importlib.util
 import logging
 import os
 
@@ -24,12 +25,14 @@ try:
 except Exception as exc:
     logger.debug("TPU tpu-sync checkpoint engine registration failed: %s", exc)
 
-try:
-    from verl_hardware_plugin.accelerators.tpu.profilers import torch_profiler_tpu
+if importlib.util.find_spec("torch_tpu") is not None:
+    # Only on hosts with torch_tpu: elsewhere verl's torch profiler stays untouched (and unimported).
+    try:
+        from verl_hardware_plugin.accelerators.tpu.profilers import torch_profiler_tpu
 
-    torch_profiler_tpu.apply()
-except Exception as exc:
-    logger.debug("TPU torch-profiler (XProf) patch failed: %s", exc)
+        torch_profiler_tpu.apply()
+    except Exception as exc:
+        logger.debug("TPU torch-profiler (XProf) patch failed: %s", exc)
 
 
 def register_rollout() -> None:
