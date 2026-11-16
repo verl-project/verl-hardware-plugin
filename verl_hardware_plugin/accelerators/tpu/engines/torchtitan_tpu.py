@@ -1530,12 +1530,14 @@ class TorchTitanTPUEngine(BaseEngine):
         tpu_options = get_tpu_engine_options(self.engine_config)
         static_len = int(tpu_options.static_micro_batch_len or 0)
         static_response_len = int(tpu_options.static_max_response_len or 0)
-        if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len:
+        slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)
+        if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len or slot_len:
             align_micro_batch_shapes_across_ranks(
                 micro_batches,
                 bucket_size=get_tpu_seq_bucket_size(self.engine_config),
                 static_len=static_len,
                 static_response_len=static_response_len,
+                gdn_row_slot_len=slot_len,
             )
 
         if "kda" in getattr(self, "_tpu_kernels", ()) and not getattr(self, "_gdn_row_slot_len", 0):
