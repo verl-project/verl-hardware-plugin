@@ -64,6 +64,15 @@ per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 `context_parallel_strategy` (see `TPUEngineOptions` in `options.py`); an unknown key is an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
 deprecated and log a warning.
 
+With SimpleFSDP, `embed_head_accum=True` (off by default) accumulates the input embedding and LM head gradients of
+all micro-batches of a training step on each device and reduce-scatters them once per step, instead of all-gathering
+these weights and reduce-scattering their gradients in every micro-batch. Both modules run eagerly outside the
+compiled TransformerBlocks, so their collectives do not overlap with compute; this matters most for small models with
+a large vocabulary. The embedding and head gradients then differ from the default path only by summation order
+(rounding), every other gradient is unchanged, and tied embeddings are reduced once. The gathered weights and a
+full-size gradient buffer per parameter stay allocated during the micro-batch loop. Layouts it does not handle
+(pipeline parallelism, TP / EP / HSDP sharding of these weights, the `spmd_types` backend) are rejected at start-up.
+
 Qwen3 MoE models (HF `qwen3_moe`, e.g. Qwen3-30B-A3B) need no extra option. The engine turns off torchtitan's
 expert-bias load balancing, so the trainer picks the same experts as vLLM, and runs the routed experts with torchtitan's
 TPU token dispatcher and Pallas grouped matmul (required: torchtitan's default `torch._grouped_mm` path has a wrong

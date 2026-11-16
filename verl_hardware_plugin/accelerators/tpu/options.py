@@ -216,6 +216,13 @@ class TPUEngineOptions:
         frozen_param_regex: Parameters whose FQN matches this regex (``re.search``) are not trained: their
             gradients are dropped before the gradient norm and the optimizer step, e.g. ``moe.router.gate`` freezes
             the MoE router (default: unset, train every parameter).
+        embed_head_accum: With SimpleFSDP, accumulate the input embedding and LM head gradients of a training step's
+            micro-batches locally and reduce-scatter them once per step, instead of one all-gather and one
+            reduce-scatter per micro-batch (default: ``False``). These two modules run eagerly outside the compiled
+            TransformerBlocks, so their collectives do not overlap with compute. Their gradients then match the
+            default path to rounding (different summation order); the gathered weights and full-size gradient
+            buffers stay allocated during the micro-batch loop. Tied embeddings are supported. See
+            ``engines/embed_head_grad_accum.py``.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -249,6 +256,7 @@ class TPUEngineOptions:
     moe_native_weight_layout: Optional[bool] = None
     gdn_row_slot_len: Optional[int] = None
     frozen_param_regex: Optional[str] = None
+    embed_head_accum: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -283,6 +291,7 @@ _ENGINE_KINDS: dict[str, type] = {
     "moe_native_weight_layout": bool,
     "gdn_row_slot_len": int,
     "frozen_param_regex": str,
+    "embed_head_accum": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
