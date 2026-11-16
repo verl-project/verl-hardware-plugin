@@ -1213,12 +1213,19 @@ def test_receive_into_vllm_binds_every_vllm_parameter(
     fake_tpu_sync, worker_ext, caplog, trainer_ranks, tp, local_shards, tie_word_embeddings
 ):
     """The trainer exports in vLLM's layout (fused qkv / gate_up, transposed linears, one virtual tensor per vLLM
-    parameter); every rollout rank binds its vLLM parameters as the receive buffers, with no staging and no install."""
+    parameter); every rollout rank binds its vLLM parameters as the receive buffers, with no staging and no install.
+    With tie_word_embeddings the options are refused: nothing would fill vLLM's lm_head from the embedding."""
     weights = {"current": _trainer_weights(seed=0)}
     if local_shards:
         weights_for_rank = lambda rank: _LocalShardWeights(weights["current"], rank, trainer_ranks)  # noqa: E731
     else:
         weights_for_rank = lambda rank: iter(weights["current"].items())  # noqa: E731
+    if tie_word_embeddings:
+        with pytest.raises(ValueError, match="receive_into_vllm=True cannot be combined with tie_word_embeddings=True"):
+            _receive_into_vllm_setup(
+                worker_ext, weights_for_rank, trainer_ranks, tp, verify_parity=True, tie_word_embeddings=True
+            )
+        return
     manager, models, samplers = _receive_into_vllm_setup(
         worker_ext, weights_for_rank, trainer_ranks, tp, verify_parity=True, tie_word_embeddings=tie_word_embeddings
     )
@@ -1229,21 +1236,12 @@ def test_receive_into_vllm_binds_every_vllm_parameter(
         with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
             asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=step))
         for rank, model in enumerate(models):
-            expected = _expected_vllm_state(
-                weights["current"], rank, tp, lm_head_from_embed=tie_word_embeddings, flip_linears=True
-            )
-            if tie_word_embeddings:
-                # The fake model's lm_head is a separate tensor; the trainer sends none and vLLM would tie it.
-                expected.pop("lm_head.weight")
-                state = model.state_dict()
-                for name, tensor in expected.items():
-                    assert torch.equal(state[name], tensor), name
-            else:
-                _assert_state(model, expected)
+            expected = _expected_vllm_state(weights["current"], rank, tp, flip_linears=True)
+            _assert_state(model, expected)
         assert f"TPU-SYNC PARITY VERIFIED | Step {step}" in caplog.text
         assert "MISMATCH" not in caplog.text
 
-    sent = set(VLLM_PARAMS) - ({"lm_head.weight"} if tie_word_embeddings else set())
+    sent = set(VLLM_PARAMS)
     for sampler, model in zip(samplers, models, strict=True):
         assert sampler._tpu_sync_bound_names == sent
         bound = {t.data_ptr() for t in sampler._tpu_sync_ws.tensors}
@@ -1255,6 +1253,30 @@ def test_receive_into_vllm_binds_every_vllm_parameter(
     assert qkv.shape == [HIDDEN, tp * (Q_ROWS // tp + 2 * KV_ROWS // min(tp, KV_HEADS))]
     assert qkv.sharding_spec == (["", "fsdp"] if local_shards else ["", ""])
     assert trainer_vars["model.embed_tokens.weight"].sharding_spec == (["fsdp", ""] if local_shards else ["", ""])
+
+
+def test_receive_into_vllm_with_tie_word_embeddings_is_refused(fake_tpu_sync):
+    """receive_into_vllm together with tie_word_embeddings is refused where the options are parsed: by the trainer
+    ranks' engine, and by the driver before it starts a sync (nothing would fill vLLM's lm_head from the embedding).
+    Each option alone is accepted."""
+    refused = "receive_into_vllm=True cannot be combined with tie_word_embeddings=True"
+    with pytest.raises(ValueError, match=refused):
+        tpu_sync_engine.TPUSyncCheckpointEngine(receive_into_vllm=True, tie_word_embeddings=True)
+    with pytest.raises(ValueError, match=refused):  # command-line overrides may arrive as strings
+        tpu_sync_engine.TPUSyncCheckpointEngine(receive_into_vllm="true", tie_word_embeddings="1")
+    events: list = []
+    manager, _ = _make_manager([], None, [], events, receive_into_vllm=True, tie_word_embeddings=True)
+    with pytest.raises(ValueError, match=refused):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert events == []
+    assert not hasattr(manager, "_tpu_sync_controller")
+
+    engine = tpu_sync_engine.TPUSyncCheckpointEngine(receive_into_vllm=True, tie_word_embeddings=False)
+    assert (engine.receive_into_vllm, engine.tie_word_embeddings) == (True, False)
+    engine = tpu_sync_engine.TPUSyncCheckpointEngine(receive_into_vllm=True)
+    assert (engine.receive_into_vllm, engine.tie_word_embeddings) == (True, None)
+    engine = tpu_sync_engine.TPUSyncCheckpointEngine(tie_word_embeddings=True)
+    assert (engine.receive_into_vllm, engine.tie_word_embeddings) == (False, True)
 
 
 def test_receive_into_vllm_needs_fsdp_equal_to_tp_for_fused_parameters(fake_tpu_sync, worker_ext):

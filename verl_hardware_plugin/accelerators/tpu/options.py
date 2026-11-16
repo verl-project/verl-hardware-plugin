@@ -456,11 +456,20 @@ def get_tpu_sync_options(engine_kwargs: Optional[Mapping[str, Any]], backend: st
     ``VERL_TPU_SYNC_RELEASE_BUFFERS`` (deprecated) > ``engine_kwargs.<backend>`` > the default.
 
     Raises:
-        ValueError: on an unknown key or a value of the wrong type.
+        ValueError: on an unknown key, a value of the wrong type, or ``receive_into_vllm`` together with
+            ``tie_word_embeddings``.
     """
     target = f"checkpoint_engine.engine_kwargs.{backend}"
     values = _parse_section(engine_kwargs, _SYNC_KINDS, target, "tpu-sync")
     _apply_legacy_env(values, _SYNC_KINDS, _SYNC_LEGACY_ENV_VARS, target)
+    if values.get("receive_into_vllm") and values.get("tie_word_embeddings"):
+        raise ValueError(
+            f"{target}: receive_into_vllm=True cannot be combined with tie_word_embeddings=True. With "
+            "receive_into_vllm nothing fills vLLM's lm_head from the embedding: a separate lm_head would keep its "
+            "checkpoint weights, and a tensor that lm_head shares with the embedding would receive nothing either "
+            "(the rollout lists it as lm_head.weight, which the trainer does not send). Leave tie_word_embeddings "
+            "unset, so that the trainer sends lm_head, or set receive_into_vllm=False."
+        )
     return TPUSyncOptions(**{name: value for name, value in values.items() if value is not None})
 
 
