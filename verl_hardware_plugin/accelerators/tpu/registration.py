@@ -24,6 +24,13 @@ try:
 except Exception as exc:
     logger.debug("TPU tpu-sync checkpoint engine registration failed: %s", exc)
 
+try:
+    from verl_hardware_plugin.accelerators.tpu.profilers import torch_profiler_tpu
+
+    torch_profiler_tpu.apply()
+except Exception as exc:
+    logger.debug("TPU torch-profiler (XProf) patch failed: %s", exc)
+
 
 def register_rollout() -> None:
     """Keep upstream vLLM and SGLang loaders on non-TPU devices without importing them eagerly."""
