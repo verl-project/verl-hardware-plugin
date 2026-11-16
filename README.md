@@ -27,7 +27,7 @@ The platforms and engines in this repository are **reference implementations** �
 | Intel XPU | Data Center GPU Max / Arc | xccl (oneCCL) | ✅ Supported | [User Guide](docs/accelerators/xpu/README.md) |
 | Cambricon MLU | MLU | CNCL | ✅ Supported | [User Guide](docs/accelerators/mlu/README.md) |
 | MetaX | MetaX GPUs (CUDA-compatible) | NCCL API / MCCL | ✅ Supported | [User Guide](docs/accelerators/metax/README.md) |
-| Enflame GCU | GCU | ECCL / FlagCX | ✅ Example (requires vendor support) | [User Guide](docs/accelerators/enflame/README.md) |
+| Enflame GCU | GCU | ECCL / FlagCX | ✅ Supported | [User Guide](docs/accelerators/enflame/README.md) |
 | Huawei NPU | Ascend 910B | HCCL | Built-in (verl core) | [Ascend Tutorial](https://github.com/verl-project/verl/tree/main/docs/ascend_tutorial) |
 | Iluvatar | BI-V150 (CUDA-compatible) | IXCCL | ✅ Supported | [User Guide](docs/accelerators/iluvatar/README.md) |
 | Moore Threads | MUSA | MCCL | ✅ Supported | [User Guide](docs/accelerators/musa/README.md) |

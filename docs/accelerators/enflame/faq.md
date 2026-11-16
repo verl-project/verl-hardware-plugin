@@ -28,13 +28,16 @@ Set `USE_FLAGCX=1` only when FlagCX is installed and configured for your cluster
 
 ### Q: Do I need Migration?
 
-Migration is **recommended** for verl + vLLM on GCU. It applies runtime patches (device normalization, vLLM compat, checkpoint fixes) before verl initializes.
+Migration is **required** for GRPO training on GCU, not merely recommended. It
+applies runtime patches before verl initializes — device normalization, vLLM
+compat, checkpoint fixes — and it is now the only home of the adaptations that
+`verl_hardware_plugin` used to install at runtime: verl worker device pinning,
+the transformers packed-sequence fix and the embedding backward index dtype.
 
 ```bash
 export ENFLAME_ENABLE_AUTO_MIGRATION=1
 pip install migration
 ```
-
 Without Migration, some verl/vLLM code paths may fail on `torch_gcu`. If you hit import or device errors, install Migration first.
 
 ### Q: How do I validate my Enflame setup end-to-end?
@@ -63,7 +66,7 @@ Ray workers are separate processes. Shell exports are not propagated unless pass
 +ray_kwargs.ray_init.runtime_env.env_vars.VERL_PLATFORM='enflame'
 ```
 
-Always mirror `ENFLAME_ENABLE_AUTO_MIGRATION`, `VERL_PLATFORM`, `TOPS_VISIBLE_DEVICES`, and vLLM/GCU stability vars in `runtime_env`.
+Always mirror `ENFLAME_ENABLE_AUTO_MIGRATION`, `VERL_PLATFORM`, `TOPS_VISIBLE_DEVICES`, and vLLM/GCU stability vars in `runtime_env`. The example scripts mirror the variables they set, but they do **not** forward `USE_FLAGCX`/`FLAGCX_PATH`: add those yourself when you enable FlagCX. Workers read `USE_FLAGCX` from their own environment, so a missing value silently falls back to `eccl` even though the driver selected FlagCX.
 
 ---
 
@@ -119,7 +122,9 @@ export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export TORCH_ECCL_AVOID_RECORD_STREAMS=1
 ```
 
-And set `actor_rollout_ref.rollout.enforce_eager=True`.
+If the failure persists, rule out graph capture by adding
+`actor_rollout_ref.rollout.enforce_eager=True`; GCU supports both modes, so this
+is a diagnostic step rather than a requirement.
 
 ### `torch.compile` / dynamo errors during FSDP training
 
@@ -144,9 +149,11 @@ Or disable compile in actor config: `actor_rollout_ref.actor.fsdp_config.use_tor
 
 **Symptoms:** Errors mentioning `ipc_collect`, shared memory, or weight sync between actor and rollout.
 
-**Cause:** `torch_gcu` does not support Python multiprocessing SHM for weight transfer.
+**Cause:** `PlatformENFLAME.is_ipc_supported()` returns `True`, which declares that device-side IPC is available. verl derives `use_shm = not is_support_ipc() = False` and therefore skips the Python multiprocessing shared-memory fallback, which `torch_gcu` does not support. This does not mean "no IPC".
 
-**Fix:** PlatformENFLAME sets `is_ipc_supported=True` so verl uses the device-tensor path. Ensure you are on a recent `verl_hardware_plugin` version. If errors persist, check Migration patches are active (`ENFLAME_ENABLE_AUTO_MIGRATION=1`).
+**Fix:** The layout determines the path. Colocated actor/rollout goes through `vllm_rollout.py`'s `use_shm=False` branch: `BucketedWeightSender` synchronizes weights with device-side IPC handles (`reduce_tensor` + `rebuild_ipc`). Disaggregated/async rollout uses the ECCL checkpoint engine's on-device broadcast buffers instead. Ensure you are on a recent `verl_hardware_plugin` version; if errors persist, check which layout you are running and inspect the failing handle path.
+
+**Implementation note:** `rebuild_ipc` uses the CUDA `PrivateUse1` handle layout (`list_args[6] = device_id`), which torch_gcu provides. If weight sync still fails on the colocated path, switch to disaggregated rollout with the ECCL checkpoint engine, which does not use IPC handles.
 
 ### ECCL hang or timeout
 
@@ -158,6 +165,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 ```
 
 Verify all ranks see the same `TOPS_VISIBLE_DEVICES` via `runtime_env`. For multi-node, check network connectivity between nodes.
+
+The checkpoint engine's collective backend follows the platform: `eccl` by default, or `flagcx` when `USE_FLAGCX=1`. The FlagCX path requires the vendor Ray build to expose the corresponding `ray.util.collective` backend; if it does not, set `USE_FLAGCX=0` to use ECCL.
 
 ### Migration patches not applied
 
@@ -206,7 +215,7 @@ ray status
 
 ## Known Limitations
 
-- Python multiprocessing shared-memory weight transfer is not supported; verl uses device-tensor transfer instead.
+- Python multiprocessing shared-memory weight transfer is not supported. Colocated rollout uses device-side IPC handles (`reduce_tensor` + `rebuild_ipc`); disaggregated rollout uses the ECCL checkpoint engine. See [feature_support.md](./feature_support.md#weight-transfer).
 - `torch_gcu` patches `torch.cuda` APIs; platform auto-detection must probe `torch.gcu` before CUDA.
-- vLLM on GCU requires `enforce_eager=True` and the stability env vars listed above for reliable rollout.
+- vLLM on GCU supports eager mode and graph capture; the stability env vars listed above are required for reliable rollout.
 - Megatron backend requires Megatron-LM-FL installed and on `PYTHONPATH` for all Ray workers.

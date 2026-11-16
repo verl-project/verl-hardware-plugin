@@ -12,7 +12,8 @@ Key design decisions for Enflame GCU:
 - communication_backend: "flagcx" when USE_FLAGCX=1, otherwise "eccl"
 - ray_resource_name: "GPU" (Ray maps ENFLAME workers to the built-in GPU resource)
 - visible_devices_envvar: "TOPS_VISIBLE_DEVICES"
-- is_ipc_supported: True (verl uses device-tensor/reduce_tensor path; Python SHM is unsupported on torch_gcu)
+- is_ipc_supported: True (colocated weight transfer uses device-side IPC handles rather than
+  Python SHM, see is_ipc_supported() and docs/accelerators/enflame/faq.md)
 - ensure_initialized: loads torch_gcu and applies gcu runtime shims (ipc_collect, Stream)
 
 Prerequisites:
@@ -81,6 +82,22 @@ def _get_gcu_module() -> ModuleType:
     return gcu
 
 
+def gcu_available() -> bool:
+    """Whether a usable Enflame GCU is present in this process.
+
+    Importing ``torch_gcu`` is not enough: the same image may be installed on a
+    CUDA host, where the Enflame engines and checkpoint engine must not register.
+    """
+    if not _ensure_torch_gcu():
+        return False
+    try:
+        gcu = getattr(torch, "gcu", None)
+        is_available = getattr(gcu, "is_available", None)
+        return callable(is_available) and bool(is_available())
+    except (ImportError, RuntimeError, AttributeError):
+        return False
+
+
 def _gcu_vllm_runtime_env_vars() -> dict[str, str]:
     """Env vars required for stable vLLM rollout on torch_gcu (verl 0.7.1 e2e parity)."""
     return {
@@ -116,26 +133,14 @@ class PlatformENFLAME(PlatformBase):
         return _get_gcu_module()
 
     def is_available(self) -> bool:
-        if not _ensure_torch_gcu():
-            return False
-        try:
-            return torch.gcu.is_available()
-        except (ImportError, RuntimeError, AttributeError):
-            return False
+        return gcu_available()
 
     def is_platform_available(self, use_smi_check: bool = False) -> bool:
         """Determine if the current machine has Enflame GCU hardware.
 
         Must be probed before CUDA because torch_gcu may patch torch.cuda.
         """
-        if not _ensure_torch_gcu():
-            return False
-        try:
-            gcu = getattr(torch, "gcu", None)
-            is_available = getattr(gcu, "is_available", None)
-            return callable(is_available) and is_available()
-        except (ImportError, RuntimeError, AttributeError):
-            return False
+        return gcu_available()
 
     def current_device(self) -> int:
         return _get_gcu_module().current_device()
@@ -190,11 +195,19 @@ class PlatformENFLAME(PlatformBase):
         return ["RAY_EXPERIMENTAL_NOSET_TOPS_VISIBLE_DEVICES"]
 
     def is_ipc_supported(self) -> bool:
-        """Tell verl to avoid Python multiprocessing SHM for weight transfer.
+        """Declare that device-side IPC is available for weight transfer.
 
         verl sets ``use_shm = not is_support_ipc()`` in vLLM rollout. torch_gcu
-        does not support the SHM fallback; return True so verl uses on-device
-        buffers with ``reduce_tensor`` instead.
+        does not support the Python SHM fallback, so this returns True and verl
+        skips it. That does not mean "no IPC": colocated weight updates take the
+        ``use_shm=False`` path in ``vllm_rollout.py``, where
+        ``BucketedWeightSender`` uses device-side IPC handles
+        (``reduce_tensor`` + ``rebuild_ipc``), while disaggregated/async rollout
+        uses the ECCL checkpoint engine's on-device broadcast buffers.
+
+        Implementation note: ``rebuild_ipc`` uses the CUDA ``PrivateUse1``
+        handle layout (``list_args[6] = device_id``), which torch_gcu provides.
+        See ``docs/accelerators/enflame/faq.md``.
         """
         return True
 

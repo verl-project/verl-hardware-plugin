@@ -48,7 +48,7 @@ ENGINES = {
     "xpu": ("fsdp_xpu", "megatron_xpu"),
     "mlu": ("fsdp_mlu", "megatron_mlu", "cncl_checkpoint_engine", "cnixl_checkpoint_engine"),
     "metax": ("fsdp_metax", "megatron_metax"),
-    "enflame": ("fsdp_enflame", "megatron_enflame"),
+    "enflame": ("fsdp_enflame", "megatron_enflame", "eccl_checkpoint_engine"),
     "iluvatar": ("fsdp_iluvatar", "megatron_iluvatar"),
     "musa": ("fsdp_musa", "megatron_musa"),
     "tpu": ("torchtitan_tpu", "weight_sync.ray_checkpoint_engine", "weight_sync.tpu_sync_checkpoint_engine"),

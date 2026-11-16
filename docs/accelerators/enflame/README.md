@@ -11,6 +11,7 @@ docs/accelerators/enflame/
 ├── README.md              # This file
 ├── install_guidance.md    # Installation guide
 ├── quick_start.md         # Quick start (GRPO baseline)
+├── feature_support.md     # Supported features and limitations
 └── faq.md                 # FAQ and troubleshooting
 ```
 
@@ -18,6 +19,7 @@ docs/accelerators/enflame/
 
 - [Installation Guide](./install_guidance.md) — prerequisites, software stack, environment verification
 - [Quick Start](./quick_start.md) — run the acceptance baseline (`scripts/accelerators/enflame/baseline_grpo_gsm8k_enflame.sh`)
+- [Feature Support](./feature_support.md) — features supported on GCU and known limitations
 - [FAQ](./faq.md) — common errors, known limitations, diagnostic commands
 
 ## Software Stack
@@ -29,12 +31,12 @@ docs/accelerators/enflame/
 | ECCL | Homogeneous GCU communication (default) | Yes |
 | [verl](https://github.com/verl-project/verl) | RL training framework | Yes |
 | [verl-hardware-plugin](../../development.md) | Platform + FSDP/Megatron engines | Yes |
-| [Migration](https://github.com/enflame/Migration) | Runtime patches for verl/vLLM on GCU | Recommended |
+| [Migration](https://github.com/enflame/Migration) | Runtime patches for verl/vLLM on GCU, including worker device pinning and the transformers fixes | Yes |
 | TransformerEngine-FL | Training kernels (vendor or FlagOS path) | Yes (FSDP) |
 | vllm-plugin-FL + vLLM | Rollout inference backend | Yes (vLLM rollout) |
 | Megatron-LM-FL | Megatron training backend | Optional |
 
-> **Startup order:** set `ENFLAME_ENABLE_AUTO_MIGRATION=1` (if using Migration) **before** importing verl, so runtime patches apply first. Then load `verl_hardware_plugin` and set `VERL_PLATFORM=enflame`.
+> **Startup order:** set `ENFLAME_ENABLE_AUTO_MIGRATION=1` **before** importing verl, so Migration's runtime patches (worker device pinning, transformers packed-sequence and embedding fixes) apply first. Then load `verl_hardware_plugin` and set `VERL_PLATFORM=enflame`.
 
 ## Platform Summary
 
@@ -47,7 +49,9 @@ docs/accelerators/enflame/
 | Communication backend | `eccl` (default) or `flagcx` (when `USE_FLAGCX=1`) |
 | Device visibility env var | `TOPS_VISIBLE_DEVICES` |
 | Ray resource name | `GPU` (built-in; uses `num_gpus`, not custom resources) |
-| IPC support | Device-tensor path only (Python SHM unsupported on `torch_gcu`) |
+| Checkpoint engine | ECCL registered as `eccl` (`nccl` is a compatibility alias) for disaggregated/async rollout |
+| Profiler | Not provided by this plugin |
+| IPC support | Device-side IPC handles, not Python SHM (see [FAQ](./faq.md#weight-transfer--ipc--shm-errors)) |
 
 ## Acceptance Baseline (E2E Validation)
 
@@ -58,15 +62,19 @@ End-to-end validation uses the repo-standard GRPO baseline on GSM8K with Qwen3-0
 **Run on Enflame GCU:**
 
 ```bash
-# After install_guidance.md steps (data/model at /workspace/...)
+# After install_guidance.md steps; pass DATA_DIR/MODEL_DIR if your copies live elsewhere
 bash scripts/accelerators/enflame/baseline_grpo_gsm8k_enflame.sh
 ```
 
-This wraps [`scripts/baseline_grpo_gsm8k.sh`](../../../scripts/baseline_grpo_gsm8k.sh) with Enflame platform env vars and Ray `runtime_env` overrides. Adjust device count if needed:
+This wraps [`scripts/baseline_grpo_gsm8k.sh`](../../../scripts/baseline_grpo_gsm8k.sh) with Enflame platform env vars and Ray `runtime_env` overrides. `DATA_DIR`, `MODEL_DIR` and `NGPUS_PER_NODE` can be overridden:
 
 ```bash
 NGPUS_PER_NODE=4 TOPS_VISIBLE_DEVICES=0,1,2,3 bash scripts/accelerators/enflame/baseline_grpo_gsm8k_enflame.sh
 ```
+
+`TOPS_VISIBLE_DEVICES` is pinned inside the wrapper, in both the shell export and the Ray `runtime_env` entry; edit those lines in the script to run on a different device set.
+
+**Disaggregated / async layout:** [`example_grpo_gsm8k_enflame_async.sh`](../../../scripts/accelerators/enflame/example_grpo_gsm8k_enflame_async.sh) splits the visible GCUs between training and rollout and moves weights through the ECCL checkpoint engine (`checkpoint_engine.backend=eccl`). It is an example, not part of the acceptance baseline.
 
 **Acceptance criteria** (first 100 steps):
 
@@ -89,7 +97,7 @@ export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
 export USE_FLAGCX=0   # ECCL on homogeneous ENFLAME cluster
 ```
 
-Migration bootstrap (recommended):
+Migration bootstrap (required for training):
 
 ```bash
 export ENFLAME_ENABLE_AUTO_MIGRATION=1
@@ -104,6 +112,8 @@ Ray workers do **not** inherit shell exports. Pass critical variables through Hy
 +ray_kwargs.ray_init.runtime_env.env_vars.RAY_EXPERIMENTAL_NOSET_TOPS_VISIBLE_DEVICES='1'
 +ray_kwargs.ray_init.runtime_env.env_vars.TOPS_VISIBLE_DEVICES='0,1,2,3'
 ```
+
+The example scripts do not mirror `USE_FLAGCX`/`FLAGCX_PATH`; add them to `runtime_env` yourself when you enable FlagCX, otherwise workers fall back to `eccl`.
 
 ## Quick Verification
 
