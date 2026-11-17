@@ -129,9 +129,41 @@ def test_worker_groups_get_the_pins(monkeypatch, prefix, pinned):
     assert common.ROLE_ENV not in _worker_env(p, prefix)  # default off: nothing added
 
 
-def _run(code: str, env: dict) -> str:
+# verl.workers.engine_workers imports uvicorn and fastapi (through verl.checkpoint_engine), which verl does not require
+# and the CPU CI does not install. By default a child stubs them when missing, as the plugin's checkpoint-engine tests
+# do (nothing here uses them); the *_without_verl_server_deps children hide them instead and record every attempt to
+# import verl's worker class or the in-process package.
+_STUB_SERVER_DEPS = """
+import sys, types
+for _name in ("uvicorn", "fastapi"):
+    if _name not in sys.modules:
+        try:
+            __import__(_name)
+        except ImportError:
+            _stub = types.ModuleType(_name)
+            _stub.FastAPI = _stub.Server = _stub.Config = object
+            sys.modules[_name] = _stub
+"""
+_HIDE_SERVER_DEPS = """
+import importlib.abc, sys
+class _Watch(importlib.abc.MetaPathFinder):
+    tried = []
+    def find_spec(self, name, path=None, target=None):
+        if name.startswith(("verl.workers.engine_workers", "verl_hardware_plugin.accelerators.tpu.rollout.inproc")):
+            self.tried.append(name)
+        if name.partition(".")[0] in ("uvicorn", "fastapi"):
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return None
+WATCH = _Watch()
+sys.meta_path.insert(0, WATCH)
+"""
+
+
+def _run(code: str, env: dict, prelude: str = _STUB_SERVER_DEPS) -> str:
     base = {k: v for k, v in __import__("os").environ.items() if not k.startswith("VERL_TPU_")}
-    r = subprocess.run([sys.executable, "-B", "-c", code], env={**base, **env}, capture_output=True, text=True)
+    r = subprocess.run(
+        [sys.executable, "-B", "-c", prelude + code], env={**base, **env}, capture_output=True, text=True
+    )
     assert r.returncode == 0, r.stderr[-2000:]
     return r.stdout
 
@@ -176,6 +208,65 @@ print(json.dumps({"rollout": base._ROLLOUT_REGISTRY[("vllm", "async")],
     assert out["rollout"] == "verl_hardware_plugin.accelerators.tpu.rollout.inproc.rollout.TPUInProcRollout"
     assert out["methods"] == ["abort_all_requests", "generate", "inproc_server_info", "resume_generation"]
     assert out["wrapped"] == ["compute_log_prob", "init_model", "update_actor"]
+
+
+@pytest.mark.parametrize("value", [None, "0"])
+def test_default_off_is_inert_without_verl_server_deps(value):
+    """uvicorn and fastapi missing (verl's worker class cannot be imported, as on the CPU CI) and the switch off:
+    importing verl, which loads the plugin, never tries the in-process package or verl's worker class, the TPU
+    registration is imported, verl's ("vllm", "async") rollout is not the plugin's, and the environment is unchanged."""
+    code = """
+import json, os
+before = dict(os.environ)
+import verl  # loads the plugin (verl.plugins entry point)
+from verl.workers.rollout import base
+print(json.dumps({
+    "tried": WATCH.tried,
+    "registration": "verl_hardware_plugin.accelerators.tpu.registration" in sys.modules,
+    "plugin_rollout": str(base._ROLLOUT_REGISTRY.get(("vllm", "async"))).startswith("verl_hardware_plugin"),
+    "env_same": dict(os.environ) == before,
+}))
+"""
+    env = {} if value is None else {"VERL_TPU_ROLLOUT_INPROC": value}
+    out = __import__("json").loads(_run(code, env, _HIDE_SERVER_DEPS).strip().splitlines()[-1])
+    assert out == {"tried": [], "registration": True, "plugin_rollout": False, "env_same": True}
+
+
+def test_switch_on_without_verl_server_deps_fails_closed():
+    """The switch on and verl's worker class not importable: the in-process registration refuses with the import error
+    and registers nothing (verl's ("vllm", "async") rollout stays upstream's); the plugin's other registrations, the
+    TPU replica loader among them, are kept."""
+    code = """
+import json, logging
+records = []
+class _Rec(logging.Handler):
+    def emit(self, record):
+        records.append(record.getMessage())
+logging.getLogger("verl_hardware_plugin.accelerators.tpu.registration").addHandler(_Rec(logging.WARNING))
+import verl  # loads the plugin (verl.plugins entry point)
+from verl.workers.rollout import base
+from verl.workers.rollout.replica import RolloutReplicaRegistry
+regs = sorted(m for m in sys.modules if m.startswith("verl_hardware_plugin.") and m.endswith(".registration"))
+print(json.dumps({
+    "failed": [m for m in records if "REGISTRATION FAILED" in m],
+    "rollout": str(base._ROLLOUT_REGISTRY.get(("vllm", "async"))),
+    "replica_loader": getattr(RolloutReplicaRegistry._registry.get("vllm"), "__module__", None),
+    "registrations": regs,
+}))
+"""
+
+    def child(env: dict) -> dict:
+        return __import__("json").loads(_run(code, env, _HIDE_SERVER_DEPS).strip().splitlines()[-1])
+
+    off, on = child({}), child({"VERL_TPU_ROLLOUT_INPROC": "1"})
+    assert off["failed"] == [] and len(on["failed"]) == 1, on["failed"]
+    assert "the in-process rollout needs verl.workers.engine_workers, which failed to import" in on["failed"][0]
+    assert "No module named 'uvicorn'" in on["failed"][0] or "No module named 'fastapi'" in on["failed"][0]
+    assert on["rollout"] == off["rollout"] and not on["rollout"].startswith("verl_hardware_plugin")
+    assert on["replica_loader"] == off["replica_loader"] == "verl_hardware_plugin.accelerators.tpu.registration"
+    tpu = "verl_hardware_plugin.accelerators.tpu.registration"
+    assert set(on["registrations"]) < set(off["registrations"])
+    assert set(off["registrations"]) - set(on["registrations"]) == {tpu}
 
 
 def test_tp_above_one_refuses(monkeypatch):
