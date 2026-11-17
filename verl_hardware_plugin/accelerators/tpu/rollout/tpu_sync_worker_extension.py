@@ -423,8 +423,17 @@ class TPUSyncWorkerMixin:
         """
         vllm_model = self._get_vllm_model()
         worker: Any = getattr(self, "worker", self)
-        tp_size = int(worker.vllm_config.parallel_config.tensor_parallel_size)
+        vllm_config = getattr(worker, "vllm_config", None)
+        if vllm_model is None or vllm_config is None:
+            # Non-vLLM rollout workers (e.g. SGLang) do not expose vLLM's parameter metadata.
+            return {}
+        tp_size = int(vllm_config.parallel_config.tensor_parallel_size)
         model_sd = vllm_model.state_dict()
+        unsupported_reason = ""
+        if hasattr(type(vllm_model), "get_mamba_state_shape_from_config"):
+            unsupported_reason = f"{type(vllm_model).__name__} uses hybrid Mamba/linear-attention state"
+        elif getattr(vllm_model, "expert_params_mapping", None):
+            unsupported_reason = f"{type(vllm_model).__name__} declares MoE expert_params_mapping"
         modules = dict(vllm_model.named_modules())
         packed = dict(getattr(vllm_model, "packed_modules_mapping", None) or {})
         params: dict[str, dict] = {}
@@ -448,7 +457,10 @@ class TPUSyncWorkerMixin:
                 output_sizes = tuple(int(s) for s in getattr(module, "output_sizes", ()) or ())
                 kv_replicas = int(getattr(module, "num_kv_head_replicas", 1) or 1)
             params[key] = VllmParam(tuple(t.shape), str(t.dtype), flipped, sources, output_sizes, kv_replicas).to_dict()
-        return {"tp_size": tp_size, "params": params}
+        result: dict[str, Any] = {"tp_size": tp_size, "params": params}
+        if unsupported_reason:
+            result["unsupported_reason"] = unsupported_reason
+        return result
 
     def _init_receive_into_vllm(
         self,

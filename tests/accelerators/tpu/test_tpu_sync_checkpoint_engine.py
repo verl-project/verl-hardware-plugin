@@ -1028,14 +1028,20 @@ def test_update_tpu_sync_weights_end_to_end(fake_tpu_sync, worker_ext, caplog, t
     tp = trainer_ranks = 2
     weights = {"current": _trainer_weights(seed=0)}
     engines = [
-        _trainer_engine(rank, verify_parity=True, tie_word_embeddings=tie_word_embeddings)
+        _trainer_engine(rank, verify_parity=True, tie_word_embeddings=tie_word_embeddings, receive_into_vllm=False)
         for rank in range(trainer_ranks)
     ]
     models = [_FakeVllmModel(tp) for _ in range(tp)]
     samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
     events: list = []
     manager, server = _make_manager(
-        engines, lambda rank: iter(weights["current"].items()), samplers, events, verify_parity=True, parallelism=4
+        engines,
+        lambda rank: iter(weights["current"].items()),
+        samplers,
+        events,
+        verify_parity=True,
+        parallelism=4,
+        receive_into_vllm=False,
     )
 
     # Initial sync (step 0): nothing to abort and no parity check.
@@ -1116,12 +1122,13 @@ def test_update_tpu_sync_weights_installs_tp_shards_into_transposed_weights(fake
     models = [_FakeVllmModel(tp, flip_o_proj=True) for _ in range(tp)]
     samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
     manager, _ = _make_manager(
-        [_trainer_engine(rank) for rank in range(trainer_ranks)],
+        [_trainer_engine(rank, receive_into_vllm=False) for rank in range(trainer_ranks)],
         lambda rank: iter(weights.items()),
         samplers,
         [],
         backend=backend,
         parallelism=3,
+        receive_into_vllm=False,
     )
     asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
 
@@ -1147,7 +1154,7 @@ def test_update_tpu_sync_weights_from_local_shards(
     """
     weights = {"current": _trainer_weights(seed=0)}
     engines = [
-        _trainer_engine(rank, verify_parity=True, tie_word_embeddings=tie_word_embeddings)
+        _trainer_engine(rank, verify_parity=True, tie_word_embeddings=tie_word_embeddings, receive_into_vllm=False)
         for rank in range(trainer_ranks)
     ]
     models = [_FakeVllmModel(tp) for _ in range(tp)]
@@ -1158,6 +1165,7 @@ def test_update_tpu_sync_weights_from_local_shards(
         samplers,
         [],
         verify_parity=True,
+        receive_into_vllm=False,
     )
 
     for step in (1, 2):
@@ -1259,7 +1267,7 @@ def test_receive_into_vllm_binds_every_vllm_parameter(
 
 def test_receive_into_vllm_needs_fsdp_equal_to_tp_for_fused_parameters(fake_tpu_sync, worker_ext):
     """F != TP, or replicated KV heads with local shards, would need an exchange among trainer ranks for the fused
-    qkv / gate_up (not implemented): the export fails clearly."""
+    qkv / gate_up (not implemented): when receive_into_vllm is forced on, the export fails clearly."""
     weights = _trainer_weights()
     manager, _, _ = _receive_into_vllm_setup(worker_ext, lambda rank: _LocalShardWeights(weights, rank, 4), 4, 2)
     with pytest.raises(Exception, match="FSDP degree 4 != rollout TP 2"):
@@ -1267,6 +1275,92 @@ def test_receive_into_vllm_needs_fsdp_equal_to_tp_for_fused_parameters(fake_tpu_
     manager, _, _ = _receive_into_vllm_setup(worker_ext, lambda rank: _LocalShardWeights(weights, rank, 4), 4, 4)
     with pytest.raises(Exception, match="replicated KV heads"):
         asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+
+
+def test_receive_into_vllm_auto_enables_by_default_and_falls_back_when_unsupported(fake_tpu_sync, worker_ext, caplog):
+    """Default ``receive_into_vllm="auto"`` binds vLLM parameters directly when supported (dense, FSDP == TP) and
+    falls back cleanly to rollout staging buffers otherwise (FSDP != TP, replicated KV heads, MoE/hybrid models, or
+    non-vLLM rollout workers such as SGLang)."""
+    weights = _trainer_weights()
+
+    # 1. Default ("auto") on supported dense FSDP=2 == TP=2 (including 0-D vLLM state_dict buffers like _k_scale):
+    #    binds vLLM parameters directly with no staging copy.
+    models = [_FakeVllmModel(2, flip_linears=True) for _ in range(2)]
+    for m in models:
+        m.model.layers[0].self_attn.register_buffer("_k_scale", torch.tensor(1.0, dtype=torch.float32))
+    samplers = [_make_sampler(worker_ext, rank, 2, model) for rank, model in enumerate(models)]
+    engines = [_trainer_engine(rank, verify_parity=True) for rank in range(2)]
+    manager, _ = _make_manager(
+        engines, lambda rank: _LocalShardWeights(weights, rank, 2), samplers, [], verify_parity=True
+    )
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    for rank, model in enumerate(models):
+        expected = {
+            **_expected_vllm_state(weights, rank, 2, flip_linears=True),
+            LAYER + "self_attn._k_scale": torch.tensor(1.0),
+        }
+        _assert_state(model, expected)
+    for sampler, model in zip(samplers, models, strict=True):
+        assert sampler._tpu_sync_bound_names == set(VLLM_PARAMS)
+        assert {t.data_ptr() for t in sampler._tpu_sync_ws.tensors} == {
+            p.data_ptr() for n, p in model.state_dict().items() if n in VLLM_PARAMS
+        }
+
+    # 2. Default ("auto") when FSDP=4 != TP=2: logs fallback and completes via staging buffers.
+    fake_tpu_sync.registry_state = TpuSyncRendezvousState()
+    fake_tpu_sync.registry = _FakeActorHandle(fake_tpu_sync.registry_state)
+    models = [_FakeVllmModel(2, flip_o_proj=True) for _ in range(2)]
+    samplers = [_make_sampler(worker_ext, rank, 2, model) for rank, model in enumerate(models)]
+    engines = [_trainer_engine(rank, verify_parity=True) for rank in range(4)]
+    manager, _ = _make_manager(
+        engines, lambda rank: _LocalShardWeights(weights, rank, 4), samplers, [], verify_parity=True
+    )
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert "receive_into_vllm=auto falling back to rollout staging buffers" in caplog.text
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights, rank, 2, flip_o_proj=True))
+    assert all(not getattr(s, "_tpu_sync_bound_names", None) for s in samplers)
+
+    # 3. Default ("auto") on a model declaring MoE expert_params_mapping: falls back to staging buffers.
+    fake_tpu_sync.registry_state = TpuSyncRendezvousState()
+    fake_tpu_sync.registry = _FakeActorHandle(fake_tpu_sync.registry_state)
+    models = [_FakeVllmModel(2) for _ in range(2)]
+    for m in models:
+        m.expert_params_mapping = [("w13_weight", "gate_proj.weight", 0, "w1")]
+    samplers = [_make_sampler(worker_ext, rank, 2, model) for rank, model in enumerate(models)]
+    engines = [_trainer_engine(rank, verify_parity=True) for rank in range(2)]
+    manager, _ = _make_manager(
+        engines, lambda rank: _LocalShardWeights(weights, rank, 2), samplers, [], verify_parity=True
+    )
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert "expert_params_mapping" in caplog.text
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights, rank, 2))
+    assert all(not getattr(s, "_tpu_sync_bound_names", None) for s in samplers)
+
+    # 4. Default ("auto") on a non-vLLM rollout worker (no vllm_config, e.g. SGLang): falls back to staging buffers.
+    fake_tpu_sync.registry_state = TpuSyncRendezvousState()
+    fake_tpu_sync.registry = _FakeActorHandle(fake_tpu_sync.registry_state)
+    models = [_FakeVllmModel(2) for _ in range(2)]
+    samplers = [_make_sampler(worker_ext, rank, 2, model) for rank, model in enumerate(models)]
+    for s in samplers:
+        del s.vllm_config
+        s._get_tp_size = lambda: 2
+        s._get_model_config = lambda: SimpleNamespace(get_total_num_kv_heads=lambda: KV_HEADS)
+    engines = [_trainer_engine(rank, verify_parity=True) for rank in range(2)]
+    manager, _ = _make_manager(
+        engines, lambda rank: _LocalShardWeights(weights, rank, 2), samplers, [], verify_parity=True
+    )
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert "no vLLM parameter description" in caplog.text
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights, rank, 2))
 
 
 def test_receive_into_vllm_exact_parity_compares_with_what_vllm_loaded(fake_tpu_sync, worker_ext):
@@ -2001,11 +2095,12 @@ def test_update_tpu_sync_weights_gqa_replicated_kv_heads(fake_tpu_sync, worker_e
     models = [_FakeVllmModel(tp) for _ in range(tp)]
     samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
     manager, _ = _make_manager(
-        [_trainer_engine(rank, verify_parity=verify_parity) for rank in range(2)],
+        [_trainer_engine(rank, verify_parity=verify_parity, receive_into_vllm=False) for rank in range(2)],
         lambda rank: iter(weights.items()),
         samplers,
         [],
         verify_parity=verify_parity,
+        receive_into_vllm=False,
     )
     with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
         asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
