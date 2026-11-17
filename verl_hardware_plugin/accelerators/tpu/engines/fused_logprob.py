@@ -121,26 +121,29 @@ class _FusedLogprob(torch.autograd.Function):
         # grad_w column block is complete after one matmul, so it is written in the weight's dtype directly.
         # On torch_tpu, FP32 matmuls already default to single-pass BF16 MXU with FP32 accumulation; honor the
         # process-wide float32_matmul_precision rather than mutating it here.
-        x, labels, weight_t, lse = ctx.saved_tensors
-        num_tokens, vocab = x.shape[0], weight_t.shape[1]
-        x32 = x.float()
-        scale = grad.float().unsqueeze(-1)
-        lse_col = lse.unsqueeze(-1)
-        labels = labels.long()
-        grad_x = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
-        grad_w = torch.empty_like(weight_t)
-        chunk = backward_vocab_chunk(num_tokens, vocab)
-        for start in range(0, vocab, chunk):
-            cols = slice(start, min(start + chunk, vocab))
-            w32 = weight_t[:, cols].float()
-            g = -torch.exp(x32 @ w32 - lse_col)  # -softmax over this chunk's columns
-            in_chunk = (labels >= cols.start) & (labels < cols.stop)
-            local = (labels - cols.start).clamp_(0, cols.stop - cols.start - 1).unsqueeze(-1)
-            g.scatter_add_(-1, local, in_chunk.to(g.dtype).unsqueeze(-1))
-            g *= scale
-            grad_x.addmm_(g, w32.t())
-            grad_w[:, cols] = (x32.t() @ g).to(weight_t.dtype)
-        return grad_x.to(x.dtype), None, grad_w, None
+        # Autocast off: under bf16 autocast (graph mode traces the backward inside it) the FP32 matmuls below would
+        # run in bf16, and exp(logits - lse) on bf16 logits loses the softmax.
+        with torch.autocast(device_type=grad.device.type, enabled=False):
+            x, labels, weight_t, lse = ctx.saved_tensors
+            num_tokens, vocab = x.shape[0], weight_t.shape[1]
+            x32 = x.float()
+            scale = grad.float().unsqueeze(-1)
+            lse_col = lse.unsqueeze(-1)
+            labels = labels.long()
+            grad_x = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+            grad_w = torch.empty_like(weight_t)
+            chunk = backward_vocab_chunk(num_tokens, vocab)
+            for start in range(0, vocab, chunk):
+                cols = slice(start, min(start + chunk, vocab))
+                w32 = weight_t[:, cols].float()
+                g = -torch.exp(x32 @ w32 - lse_col)  # -softmax over this chunk's columns
+                in_chunk = (labels >= cols.start) & (labels < cols.stop)
+                local = (labels - cols.start).clamp_(0, cols.stop - cols.start - 1).unsqueeze(-1)
+                g.scatter_add_(-1, local, in_chunk.to(g.dtype).unsqueeze(-1))
+                g *= scale
+                grad_x.addmm_(g, w32.t())
+                grad_w[:, cols] = (x32.t() @ g).to(weight_t.dtype)
+            return grad_x.to(x.dtype), None, grad_w, None
 
 
 class _FusedLogprobFunctional(_FusedLogprob):
@@ -149,34 +152,41 @@ class _FusedLogprobFunctional(_FusedLogprob):
     TorchTitan's graph trainer traces the backward with ``make_fx`` without functionalization, so the in-place writes
     above (``scatter_add_``, ``*=``, ``grad_x.addmm_``, ``grad_w[:, cols] = ...``) would land in the graph as mutations
     of intermediates. Same math and vocab chunking; ``grad_x`` is summed and the ``grad_w`` column blocks are
-    concatenated instead. The trace unrolls the chunk loop.
+    concatenated instead. The trace unrolls the chunk loop: ``ceil(V / backward_vocab_chunk(T, V))`` copies of 3
+    matmuls plus elementwise ops (10 chunks for Qwen3, ``V=151936``, at ``T=8192``; 29 at ``T=24576``).
+
+    TODO(torchtitan): move this backward into TorchTitan as one custom op with a registered backward, next to the
+    fused CE kernel (a ``reduction="none"`` backward kernel), so the graph holds one node instead of the unrolled
+    chunks; then remove this class.
     """
 
     @staticmethod
     def backward(ctx: Any, grad):  # type: ignore[override]
         # Same math as _FusedLogprob.backward (one vocab chunk of FP32 logits at a time), without in-place ops.
-        x, labels, weight_t, lse = ctx.saved_tensors
-        num_tokens, vocab = x.shape[0], weight_t.shape[1]
-        x32 = x.float()
-        scale = grad.float().unsqueeze(-1)
-        lse_col = lse.unsqueeze(-1)
-        labels = labels.long()
-        grad_x = None
-        grad_w_chunks = []
-        chunk = backward_vocab_chunk(num_tokens, vocab)
-        for start in range(0, vocab, chunk):
-            cols = slice(start, min(start + chunk, vocab))
-            w32 = weight_t[:, cols].float()
-            g = -torch.exp(x32 @ w32 - lse_col)  # -softmax over this chunk's columns
-            in_chunk = (labels >= cols.start) & (labels < cols.stop)
-            local = (labels - cols.start).clamp(0, cols.stop - cols.start - 1).unsqueeze(-1)
-            g = g.scatter_add(-1, local, in_chunk.to(g.dtype).unsqueeze(-1))
-            g = g * scale
-            chunk_grad_x = g @ w32.t()
-            grad_x = chunk_grad_x if grad_x is None else grad_x + chunk_grad_x
-            grad_w_chunks.append((x32.t() @ g).to(weight_t.dtype))
-        assert grad_x is not None
-        return grad_x.to(x.dtype), None, torch.cat(grad_w_chunks, dim=1), None
+        # Autocast off as there: graph mode traces this backward inside the step's bf16 autocast block.
+        with torch.autocast(device_type=grad.device.type, enabled=False):
+            x, labels, weight_t, lse = ctx.saved_tensors
+            num_tokens, vocab = x.shape[0], weight_t.shape[1]
+            x32 = x.float()
+            scale = grad.float().unsqueeze(-1)
+            lse_col = lse.unsqueeze(-1)
+            labels = labels.long()
+            grad_x = None
+            grad_w_chunks = []
+            chunk = backward_vocab_chunk(num_tokens, vocab)
+            for start in range(0, vocab, chunk):
+                cols = slice(start, min(start + chunk, vocab))
+                w32 = weight_t[:, cols].float()
+                g = -torch.exp(x32 @ w32 - lse_col)  # -softmax over this chunk's columns
+                in_chunk = (labels >= cols.start) & (labels < cols.stop)
+                local = (labels - cols.start).clamp(0, cols.stop - cols.start - 1).unsqueeze(-1)
+                g = g.scatter_add(-1, local, in_chunk.to(g.dtype).unsqueeze(-1))
+                g = g * scale
+                chunk_grad_x = g @ w32.t()
+                grad_x = chunk_grad_x if grad_x is None else grad_x + chunk_grad_x
+                grad_w_chunks.append((x32.t() @ g).to(weight_t.dtype))
+            assert grad_x is not None
+            return grad_x.to(x.dtype), None, torch.cat(grad_w_chunks, dim=1), None
 
 
 def fused_linear_logprobs_tpu(

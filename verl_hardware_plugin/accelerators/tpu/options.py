@@ -58,6 +58,15 @@ def _warn_once(key: str, message: str) -> None:
         logger.warning(message)
 
 
+def _to_plain_dict(value: Any) -> Any:
+    """Recursively converts mappings and iterables into plain dicts and lists."""
+    if isinstance(value, Mapping):
+        return {str(k): _to_plain_dict(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_to_plain_dict(v) for v in value]
+    return value
+
+
 def _parse(name: str, kind: type, value: Any, source: str, label: str = "TPU") -> Any:
     """Converts ``value`` (a config value or an environment string) to ``kind``; ``None`` / ``""`` is unset."""
     if value is None:
@@ -67,6 +76,10 @@ def _parse(name: str, kind: type, value: Any, source: str, label: str = "TPU") -
         if value == "":
             return None
     try:
+        if kind is dict:
+            if isinstance(value, Mapping):
+                return _to_plain_dict(value)
+            raise ValueError(f"expected a mapping, got {type(value).__name__}")
         if kind is ParityMode:
             return ParityMode.parse(value)
         if kind is bool:
@@ -221,16 +234,9 @@ class TPUEngineOptions:
             ``TpuGraphTrainer`` traces forward + RL loss + backward of a micro-batch into one graph and compiles it
             whole, see ``engines/graph_trainer_mode.py``). ``graph_trainer`` needs ``use_simple_fsdp`` and
             ``static_micro_batch_len`` (one traced shape for every micro-batch) and trains actors only.
-        graph_trainer_memory_policy: ``graph_trainer`` activation memory policy (TorchTitan's
-            ``graph_trainer_memory_policy``, e.g. ``full``, ``default``, ``tpu_selective``; default: ``full`` with
-            ``activation_checkpoint=full``, ``default`` with ``selective``, ``none`` without).
-        graph_trainer_save_regions: ``graph_trainer`` with ``tpu_selective``: comma-separated regions to save
-            instead of recomputing (e.g. ``moe.routing,attention.inner_attention``, as TorchTitan's Qwen3-30B-A3B
-            SFT recipe).
-        graph_trainer_fsdp_schedule: ``graph_trainer`` FSDP all-gather schedule, ``none`` (default), ``prefetch`` or
-            ``interleave``; anything but ``none`` also turns on TorchTitan's remat schedule. ZeRO-3
-            (``reshard_after_forward=always``) needs ``prefetch`` / ``interleave`` for XLA not to keep every
-            all-gathered parameter through the backward.
+        graph_trainer: Settings passed straight to TorchTitan's ``TpuGraphTrainerCompileConfig(**cfg)``
+            (e.g. ``memory_policy``, ``save_regions``, ``fsdp_barrier_policy``, ``graph_split``).
+            Ignored when ``trainer_mode`` is not ``graph_trainer``.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -265,12 +271,10 @@ class TPUEngineOptions:
     gdn_row_slot_len: Optional[int] = None
     frozen_param_regex: Optional[str] = None
     trainer_mode: Optional[str] = None
-    graph_trainer_memory_policy: Optional[str] = None
-    graph_trainer_save_regions: Optional[str] = None
-    graph_trainer_fsdp_schedule: Optional[str] = None
+    graph_trainer: Optional[dict[str, Any]] = None
 
 
-_ENGINE_KINDS: dict[str, type] = {
+_ENGINE_KINDS: dict[str, Any] = {
     "use_splash_attention": bool,
     "use_simple_fsdp": bool,
     "use_fused_linear_cross_entropy": bool,
@@ -303,9 +307,7 @@ _ENGINE_KINDS: dict[str, type] = {
     "gdn_row_slot_len": int,
     "frozen_param_regex": str,
     "trainer_mode": str,
-    "graph_trainer_memory_policy": str,
-    "graph_trainer_save_regions": str,
-    "graph_trainer_fsdp_schedule": str,
+    "graph_trainer": dict,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
@@ -313,7 +315,6 @@ assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOption
 TRAINER_MODE_EAGER_BLOCKS = "eager_blocks"
 TRAINER_MODE_GRAPH_TRAINER = "graph_trainer"
 _TRAINER_MODES = (TRAINER_MODE_EAGER_BLOCKS, TRAINER_MODE_GRAPH_TRAINER)
-_GRAPH_TRAINER_FSDP_SCHEDULES = ("none", "prefetch", "interleave")
 
 # Deprecated channels, read for compatibility: option -> environment variable / top-level config field.
 _ENGINE_LEGACY_ENV_VARS = {
@@ -391,28 +392,17 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
 
 
 def _normalize_trainer_mode(values: dict[str, Any]) -> None:
-    """Checks ``trainer_mode`` and its ``graph_trainer_*`` sub-options (lower-cased in place)."""
+    """Checks ``trainer_mode`` (lower-cased in place)."""
     key = f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}"
-    if values.get("trainer_mode") is not None:
-        mode = values["trainer_mode"].strip().lower()
-        if mode not in _TRAINER_MODES:
-            raise ValueError(f"{key}.trainer_mode must be one of {_TRAINER_MODES}, got {values['trainer_mode']!r}")
-        values["trainer_mode"] = mode
-    graph_options = sorted(
-        name for name, value in values.items() if name.startswith("graph_trainer_") and value is not None
-    )
-    if graph_options and values.get("trainer_mode") != TRAINER_MODE_GRAPH_TRAINER:
-        raise ValueError(f"{key}.{graph_options} only apply with {key}.trainer_mode={TRAINER_MODE_GRAPH_TRAINER}")
-    if values.get("graph_trainer_fsdp_schedule") is not None:
-        schedule = values["graph_trainer_fsdp_schedule"].strip().lower()
-        if schedule not in _GRAPH_TRAINER_FSDP_SCHEDULES:
-            raise ValueError(
-                f"{key}.graph_trainer_fsdp_schedule must be one of {_GRAPH_TRAINER_FSDP_SCHEDULES}, "
-                f"got {values['graph_trainer_fsdp_schedule']!r}"
-            )
-        values["graph_trainer_fsdp_schedule"] = schedule
-    if values.get("graph_trainer_memory_policy") is not None:
-        values["graph_trainer_memory_policy"] = values["graph_trainer_memory_policy"].strip()
+    val = values.get("trainer_mode")
+    if val is None:
+        return
+    if not isinstance(val, str):
+        raise ValueError(f"{key}.trainer_mode must be a string, got {type(val).__name__}")
+    mode = val.strip().lower()
+    if mode not in _TRAINER_MODES:
+        raise ValueError(f"{key}.trainer_mode must be one of {_TRAINER_MODES}, got {val!r}")
+    values["trainer_mode"] = mode
 
 
 # ---------------------------------------------------------------------------------------------------------------

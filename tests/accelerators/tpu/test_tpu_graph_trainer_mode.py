@@ -12,6 +12,7 @@ the one-micro-batch engine step.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 from types import SimpleNamespace
@@ -59,28 +60,51 @@ def _actor_config(**overrides):
     return config
 
 
+def _dense_fused_logprobs(hidden_states, labels, weight_t, *, temperature=1.0, functional_backward=False, **_):
+    """CPU stand-in for the Tokamax ``fused_linear_logprobs_tpu`` (Pallas, TPU only): same math, dense logits."""
+    logits = hidden_states.reshape(-1, hidden_states.shape[-1]).float() @ weight_t.float() / temperature
+    return torch.log_softmax(logits, -1).gather(-1, labels.reshape(-1, 1).long()).squeeze(-1)
+
+
+def _patch_fused_logprobs():
+    return mock.patch.object(fused_logprob, "fused_linear_logprobs_tpu", _dense_fused_logprobs)
+
+
 def _options(**tpu):
     return get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": tpu}))
 
 
 def test_trainer_mode_options():
     assert _options().trainer_mode is None
+    assert _options().graph_trainer is None
     assert _options(trainer_mode="Graph_Trainer").trainer_mode == "graph_trainer"
     assert graph_trainer_mode.is_graph_trainer_mode(_options(trainer_mode="graph_trainer"))
     assert not graph_trainer_mode.is_graph_trainer_mode(_options(trainer_mode="eager_blocks"))
+
+    # When trainer_mode is not graph_trainer, graph_trainer config is ignored.
+    assert not graph_trainer_mode.is_graph_trainer_mode(_options(graph_trainer={"memory_policy": "full"}))
+    assert not graph_trainer_mode.is_graph_trainer_mode(
+        _options(trainer_mode="eager_blocks", graph_trainer={"memory_policy": "full"})
+    )
+
     opts = _options(
         trainer_mode="graph_trainer",
-        graph_trainer_memory_policy="tpu_selective",
-        graph_trainer_save_regions="moe.routing,attention.inner_attention",
-        graph_trainer_fsdp_schedule="Interleave",
+        graph_trainer={
+            "memory_policy": "tpu_selective",
+            "save_regions": "moe.routing,attention.inner_attention",
+            "fsdp_barrier_policy": "interleave",
+        },
     )
-    assert opts.graph_trainer_fsdp_schedule == "interleave"
+    assert opts.trainer_mode == "graph_trainer"
+    assert opts.graph_trainer == {
+        "memory_policy": "tpu_selective",
+        "save_regions": "moe.routing,attention.inner_attention",
+        "fsdp_barrier_policy": "interleave",
+    }
+    assert graph_trainer_mode.is_graph_trainer_mode(opts)
+
     with pytest.raises(ValueError, match="trainer_mode must be one of"):
         _options(trainer_mode="graph")
-    with pytest.raises(ValueError, match="only apply with"):
-        _options(graph_trainer_memory_policy="full")
-    with pytest.raises(ValueError, match="graph_trainer_fsdp_schedule must be one of"):
-        _options(trainer_mode="graph_trainer", graph_trainer_fsdp_schedule="eager")
 
 
 def test_validate_graph_trainer_engine():
@@ -91,12 +115,32 @@ def test_validate_graph_trainer_engine():
     bad = SimpleNamespace(forward_only=True, param_offload=True, expert_parallel_size=2, context_parallel_size=1)
     with pytest.raises(ValueError) as e:
         graph_trainer_mode.validate_graph_trainer_engine(
-            bad, _options(trainer_mode="graph_trainer"), use_simple_fsdp=False, tpu_kernels=frozenset({"kda"})
+            bad,
+            _options(trainer_mode="graph_trainer", use_fused_linear_cross_entropy=False, gdn_row_slot_len=4096),
+            use_simple_fsdp=False,
+            tpu_kernels=frozenset({"kda"}),
         )
     message = str(e.value)
-    for expected in ("forward_only", "use_simple_fsdp", "static_micro_batch_len", "expert_parallel_size=2", "KDA"):
+    for expected in (
+        "forward_only",
+        "use_simple_fsdp",
+        "static_micro_batch_len",
+        "use_fused_linear_cross_entropy",
+        "expert_parallel_size=2",
+        "KDA",
+        "gdn_row_slot_len=4096",
+    ):
         assert expected in message, (expected, message)
     assert "param_offload" in message
+
+    # gdn_row_slot_len alone: the traced step never restores the packed token order of the slot layout.
+    with pytest.raises(ValueError, match="gdn_row_slot_len=4096"):
+        graph_trainer_mode.validate_graph_trainer_engine(
+            good,
+            _options(trainer_mode="graph_trainer", static_micro_batch_len=8192, gdn_row_slot_len=4096),
+            use_simple_fsdp=True,
+            tpu_kernels=frozenset(),
+        )
 
 
 def test_memory_policy_defaults_follow_activation_checkpoint():
@@ -104,7 +148,7 @@ def test_memory_policy_defaults_follow_activation_checkpoint():
     assert graph_trainer_mode.resolve_memory_policy(options, "full") == "full"
     assert graph_trainer_mode.resolve_memory_policy(options, "selective") == "default"
     assert graph_trainer_mode.resolve_memory_policy(options, "none") == "none"
-    explicit = _options(trainer_mode="graph_trainer", graph_trainer_memory_policy="tpu_selective")
+    explicit = _options(trainer_mode="graph_trainer", graph_trainer={"memory_policy": "tpu_selective"})
     assert graph_trainer_mode.resolve_memory_policy(explicit, "full") == "tpu_selective"
 
 
@@ -165,12 +209,14 @@ def test_policy_loss_spec_reads_and_checks_the_actor_config():
 def test_graph_policy_loss_matches_verl_vanilla_ppo():
     """Traced loss x dp_size == verl's token-mean vanilla PPO loss, and so are its gradients."""
     torch.manual_seed(0)
-    num_tokens, vocab, dp_size, global_tokens = 64, 50, 4, 100.0
+    num_tokens, hidden, vocab, dp_size, global_tokens = 64, 16, 50, 4, 100.0
     config = _actor_config()
     spec = graph_trainer_mode.GraphPolicyLossSpec(0.2, 0.28, 3.0, temperature=0.9)
     loss_fn = graph_trainer_mode.GraphPolicyLoss(spec)
 
-    logits = torch.randn(num_tokens, vocab, requires_grad=True)
+    # Fused LM-head output (FusedLossLinearWrapper): (hidden_states, lm_head_weight_t), no logits.
+    hidden_states = torch.randn(num_tokens, hidden, requires_grad=True)
+    weight_t = torch.randn(hidden, vocab, requires_grad=True)
     target_ids = torch.randint(0, vocab, (num_tokens,))
     old_log_probs = torch.log_softmax(torch.randn(num_tokens, vocab), -1).gather(-1, target_ids[:, None]).squeeze(-1)
     advantages = torch.randn(num_tokens)
@@ -178,16 +224,18 @@ def test_graph_policy_loss_matches_verl_vanilla_ppo():
     # A masked-out bucket-padding token with an extreme log-prob must not leak into the loss.
     old_log_probs[-1] = -1e4
 
-    loss, (log_probs,) = loss_fn(
-        logits,
-        (target_ids, old_log_probs, advantages, loss_mask),
-        global_valid_tokens=torch.tensor(global_tokens),
-    )
+    with _patch_fused_logprobs():
+        loss, (log_probs,) = loss_fn(
+            (hidden_states, weight_t),
+            (target_ids, old_log_probs, advantages, loss_mask),
+            global_valid_tokens=torch.tensor(global_tokens),
+        )
     loss.backward()
-    graph_grad = logits.grad.clone()
+    graph_grads = (hidden_states.grad.clone(), weight_t.grad.clone())
     assert not log_probs.requires_grad
 
-    logits.grad = None
+    hidden_states.grad = weight_t.grad = None
+    logits = hidden_states @ weight_t
     log_prob = torch.log_softmax(logits / 0.9, -1).gather(-1, target_ids[:, None]).squeeze(-1)
     torch.testing.assert_close(log_probs, log_prob.detach())
     config.global_batch_info.update(dp_size=dp_size, batch_num_tokens=global_tokens)
@@ -202,9 +250,16 @@ def test_graph_policy_loss_matches_verl_vanilla_ppo():
     torch.testing.assert_close(loss * dp_size, expected)
     # The eager engine back-propagates verl's loss times 1/dp (SimpleFSDP sums gradients): same gradient.
     (expected / dp_size).backward()
-    torch.testing.assert_close(graph_grad, logits.grad)
+    torch.testing.assert_close(graph_grads, (hidden_states.grad, weight_t.grad))
+    # Graph mode has no dense-logits path: a plain logits tensor is rejected.
+    with pytest.raises(TypeError, match="fused LM head"):
+        loss_fn.log_probs(logits.detach(), target_ids)
     assert graph_trainer_mode.check_loss_consistency(loss.item(), expected.item(), dp_size)
-    assert not graph_trainer_mode.check_loss_consistency(loss.item(), 2 * expected.item(), dp_size)
+    with pytest.raises(RuntimeError, match="traced loss x dp_size"):
+        graph_trainer_mode.check_loss_consistency(loss.item(), 2 * expected.item(), dp_size)
+    assert not graph_trainer_mode.check_loss_consistency(
+        loss.item(), 2 * expected.item(), dp_size, raise_on_mismatch=False
+    )
 
 
 def _rl_micro_batch(prompt_lens, response_lens):
@@ -293,10 +348,14 @@ def test_packed_graph_loss_matches_verl_ppo_loss_on_the_same_log_probs():
 
 
 def _reference_forward_op(b_block, h_block, v_block):
+    """FP32 stand-in for the Pallas forward kernel ``(x, labels, weight_t) -> (-log p(label), lse)``."""
+
     def op(x, labels, weight_t):
-        logits = x.float() @ weight_t.float()
-        lse = torch.logsumexp(logits, -1)
-        return lse - logits.gather(-1, labels.long().unsqueeze(-1)).squeeze(-1), lse
+        # The Pallas kernel computes in FP32 whatever the autocast state; so does this reference.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            logits = x.float() @ weight_t.float()
+            lse = torch.logsumexp(logits, -1)
+            return lse - logits.gather(-1, labels.long().unsqueeze(-1)).squeeze(-1), lse
 
     return op
 
@@ -343,6 +402,46 @@ def test_functional_fused_logprob_backward_traces_without_mutations():
         n.target for n in gm.graph.nodes if n.op == "call_function" and str(n.target).split(".")[-2].endswith("_")
     ]
     assert not in_place, in_place
+
+
+@pytest.mark.parametrize("functional", [False, True])
+def test_fused_logprob_backward_stays_fp32_under_bf16_autocast(functional):
+    """Graph mode traces the backward inside the step's bf16 autocast: it must match the eager (no-autocast) one."""
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    def grads(x, weight_t, labels, *, autocast, trace):
+        def step(x, weight_t):
+            x, weight_t = x.detach().requires_grad_(), weight_t.detach().requires_grad_()
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=autocast):
+                logp = fused_logprob.fused_linear_logprobs_tpu(
+                    x, labels, weight_t, b_block_size=16, functional_backward=functional
+                )
+                return torch.autograd.grad(logp.sum(), (x, weight_t))
+
+        return make_fx(step)(x, weight_t)(x, weight_t) if trace else step(x, weight_t)
+
+    with (
+        mock.patch.object(fused_logprob, "_forward_op", _reference_forward_op),
+        mock.patch.object(fused_logprob, "backward_vocab_chunk", lambda num_tokens, vocab: 7),
+    ):
+        # Two identical vocab columns: log p(label) = log(1/2) whatever x is, so d logp / dx = 0. Under autocast the
+        # bf16 logits made it 1.57 (PR #134 review).
+        x = torch.tensor([[1.03125]], dtype=torch.bfloat16)
+        weight_t = torch.tensor([[33.5, 33.5]], dtype=torch.bfloat16)
+        labels = torch.tensor([0])
+        for trace in (False, True):
+            (grad_x, _) = grads(x, weight_t, labels, autocast=True, trace=trace)
+            assert abs(float(grad_x)) < 1e-3, (trace, float(grad_x))
+
+        torch.manual_seed(0)
+        x = torch.randn(10, 8).to(torch.bfloat16)
+        weight_t = (torch.randn(8, 30) * 3).to(torch.bfloat16)
+        labels = torch.randint(0, 30, (10,))
+        expected = grads(x, weight_t, labels, autocast=False, trace=False)
+        for trace in (False, True):
+            got = grads(x, weight_t, labels, autocast=True, trace=trace)
+            for g, e in zip(got, expected, strict=True):
+                torch.testing.assert_close(g, e, rtol=0, atol=0)
 
 
 def test_forward_op_overrides_singleton_pallas_fake_for_make_fx():
@@ -409,7 +508,12 @@ class _TinyLM(torch.nn.Module):
         self.head = torch.nn.Linear(dim, vocab, bias=False)
 
     def forward(self, tokens):
-        return self.head(torch.tanh(self.emb(tokens)))
+        # Fused LM-head output, as FusedLossLinearWrapper: (hidden_states, lm_head_weight_t), no logits.
+        return torch.tanh(self.emb(tokens)), self.head.weight.t()
+
+    def logits(self, tokens):
+        hidden_states, weight_t = self(tokens)
+        return hidden_states @ weight_t
 
 
 class _FakeGraphTrainer:
@@ -423,9 +527,10 @@ class _FakeGraphTrainer:
 
     def forward_backward_step(self, *, input_dict, global_valid_tokens):
         self.calls.append((tuple(input_dict["input"].shape), float(global_valid_tokens)))
-        loss, aux = self.loss_fn(
-            self.model(input_dict["input"]), input_dict["labels"], global_valid_tokens=global_valid_tokens
-        )
+        with _patch_fused_logprobs():
+            loss, aux = self.loss_fn(
+                self.model(input_dict["input"]), input_dict["labels"], global_valid_tokens=global_valid_tokens
+            )
         loss.backward()
         self.last_loss_aux = aux
         return loss.detach()
@@ -510,7 +615,7 @@ def test_graph_mode_step_matches_eager_ppo_loss_on_one_micro_batch():
     for p in model.parameters():
         p.grad = None
     ids = micro_batch["input_ids"].values()
-    logp = torch.log_softmax(model(ids), -1).gather(-1, torch.roll(ids, -1)[:, None]).squeeze(-1)
+    logp = torch.log_softmax(model.logits(ids), -1).gather(-1, torch.roll(ids, -1)[:, None]).squeeze(-1)
     output = {"log_probs": torch.nested.nested_tensor_from_jagged(logp, micro_batch["input_ids"].offsets())}
     loss, _ = ppo_loss(config, model_output=output, data=micro_batch.copy())
     loss.backward()
@@ -559,9 +664,11 @@ def test_build_graph_trainer_config():
 
     opts = _options(
         trainer_mode="graph_trainer",
-        graph_trainer_memory_policy="tpu_selective",
-        graph_trainer_save_regions="moe.routing, attention.inner_attention",
-        graph_trainer_fsdp_schedule="interleave",
+        graph_trainer={
+            "memory_policy": "tpu_selective",
+            "save_regions": "moe.routing, attention.inner_attention",
+            "fsdp_barrier_policy": "interleave",
+        },
     )
     new_modules = {
         "torchtitan": SimpleNamespace(),
@@ -593,6 +700,18 @@ def test_build_graph_trainer_config():
         # The fused LM head needs a loss config with soft_cap / output_multiplier (TorchTitan checks them).
         assert cfg.loss == PallasCrossEntropyLoss.Config()
 
+        # Simple string trainer_mode="graph_trainer" uses activation_checkpoint defaults
+        opts_str = _options(trainer_mode="graph_trainer")
+        cfg_str = graph_trainer_mode.build_graph_trainer_config({}, opts_str, activation_checkpoint="selective")
+        assert cfg_str.compile == TpuGraphTrainerCompileConfig(
+            enable=False,
+            mode="aot_fx_trace",
+            memory_policy="default",
+            save_regions=(),
+            enable_remat_barriers=False,
+            fsdp_barrier_policy="none",
+        )
+
     # TorchTitan 109bd618 keeps the loss in torchtitan/experiments/tpu/loss.py.
     legacy_modules = dict(new_modules)
     legacy_modules["torchtitan.experiments.tpu.components"] = None
@@ -610,7 +729,7 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
     def upstream_make_fwd_bwd_step(model, loss_fn, *, collect_moe_routing_metrics: bool = False):
         def fwd_bwd(inputs, labels, global_valid_tokens, extra_kwargs):
             pred = model(inputs, **extra_kwargs)
-            routing = [pred.detach().sum()] if collect_moe_routing_metrics else []
+            routing = [pred[0].detach().sum()] if collect_moe_routing_metrics else []
             res = loss_fn(pred, labels, global_valid_tokens=global_valid_tokens)
             loss = res[0] if isinstance(res, tuple) else res  # upstream drops res[1]!
             params = [p for _, p in model.named_parameters(remove_duplicate=False) if p.requires_grad]
@@ -629,6 +748,22 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
     trainer_mod = SimpleNamespace(make_fwd_bwd_step=upstream_make_fwd_bwd_step)
     tracer_mod = SimpleNamespace(run_traced=upstream_run_traced)
 
+    # TorchTitan's unflatten shim: a module-level row length set by a context manager.
+    shim_state = {"seq_len": None}
+
+    @contextlib.contextmanager
+    def set_unflatten_seq_len(seq_len):
+        old, shim_state["seq_len"] = shim_state["seq_len"], seq_len
+        try:
+            yield
+        finally:
+            shim_state["seq_len"] = old
+
+    shim_mod = SimpleNamespace(
+        set_unflatten_seq_len=set_unflatten_seq_len, get_unflatten_seq_len=lambda: shim_state["seq_len"]
+    )
+    max_context_length = 4  # smaller than the 12-token micro-batch, as max_seq_len < static_micro_batch_len
+
     class UpstreamTpuGraphTrainerStub:
         def __init__(self, cfg):
             self.model = cfg.model
@@ -641,14 +776,16 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
 
         def forward_backward_step(self, *, input_dict, global_valid_tokens):
             params = [p for _, p in self.model.named_parameters(remove_duplicate=False) if p.requires_grad]
-            return self._make_fx_forward_backward_step(
-                self.model,
-                input_dict["input"],
-                input_dict["labels"],
-                global_valid_tokens,
-                params,
-                {"positions": input_dict["positions"]},
-            )
+            # As upstream: the step runs with the shim row length set to training.max_context_length.
+            with set_unflatten_seq_len(max_context_length):
+                return self._make_fx_forward_backward_step(
+                    self.model,
+                    input_dict["input"],
+                    input_dict["labels"],
+                    global_valid_tokens,
+                    params,
+                    {"positions": input_dict["positions"]},
+                )
 
         def _make_fx_forward_backward_step(self, model, inputs, labels, global_valid_tokens, params, extra_kwargs):
             if self._traced_step is None:
@@ -685,9 +822,13 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
             super().__init__()
             self.emb = torch.nn.Embedding(32, 8)
             self.head = torch.nn.Linear(8, 32, bias=False)
+            self.seen_row_len: list[int | None] = []
 
         def forward(self, tokens, *, positions):
-            return self.head(torch.tanh(self.emb(tokens)) + 0.0 * positions.unsqueeze(-1).float())
+            # What a GatedDeltaNet would read to split the packed stream into rows.
+            self.seen_row_len.append(shim_mod.get_unflatten_seq_len())
+            # Fused LM-head output, as FusedLossLinearWrapper: (hidden_states, lm_head_weight_t), no logits.
+            return torch.tanh(self.emb(tokens)) + 0.0 * positions.unsqueeze(-1).float(), self.head.weight.t()
 
     torch.manual_seed(0)
     model = TinyPosLM()
@@ -701,12 +842,13 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
         "torchtitan.experiments.graph_trainer.trainer": trainer_mod,
         "torchtitan.experiments.graph_trainer.make_fx_tracer": tracer_mod,
         "torchtitan.experiments.tpu": SimpleNamespace(),
+        "torchtitan.experiments.tpu.unflatten_shim": shim_mod,
         "torchtitan.experiments.tpu.graph_trainer": SimpleNamespace(),
         "torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer": SimpleNamespace(
             TpuGraphTrainer=UpstreamTpuGraphTrainerStub
         ),
     }
-    with mock.patch.dict("sys.modules", modules):
+    with mock.patch.dict("sys.modules", modules), _patch_fused_logprobs():
         trainer = graph_trainer_mode.build_rl_graph_trainer(SimpleNamespace(model=model))
         spec = graph_trainer_mode.GraphPolicyLossSpec(0.2, 0.28, 3.0, temperature=1.0)
         trainer.loss_fn = graph_trainer_mode.GraphPolicyLoss(spec)
@@ -743,3 +885,11 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
 
         # Routing metrics list kept its exact length (1 tensor per step), without leaking aux_logp into it.
         assert [len(r) for r in trainer.routing_received] == [1, 1]
+        # The model ran once (the trace) with the shim cleared, as in the eager engine, so a GatedDeltaNet would see
+        # the packed micro-batch as one row, not max_context_length rows; the upstream value is restored afterwards.
+        assert model.seen_row_len == [None]
+        assert shim_mod.get_unflatten_seq_len() is None
+        with set_unflatten_seq_len(max_context_length):
+            with graph_trainer_mode._packed_stream_as_one_row():
+                assert shim_mod.get_unflatten_seq_len() is None
+            assert shim_mod.get_unflatten_seq_len() == max_context_length

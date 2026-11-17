@@ -95,9 +95,13 @@ def validate_graph_trainer_engine(
     # TODO: drop checks here as follow-ups land:
     # - forward_only (TODO-3): once TorchTitan's graph trainer can trace a forward-only log-prob step.
     # - static_micro_batch_len (TODO-2): once the traced step is cached per sequence shape (TorchTitan / plugin).
-    # - pipeline / context / tensor / expert parallel sizes: once the graph-trainer path supports and is validated
-    #   with them.
+    # - pipeline / context / tensor parallel sizes: once the graph-trainer path supports and is validated with them.
+    # - expert_parallel_size: take graph-mode EP from TorchTitan's TpuGraphTrainer (EP stack from
+    #   google-pytorch/torchtitan#181; Qwen3.5 first, Qwen3 through the same helper) instead of porting the plugin's
+    #   eager tpu_ragged_ep. FSDP-only is the Phase 1 scope (EP mainly saves memory on the larger MoE models).
     # - kda: once the plugin pins the Tokamax KDA document budget for the run instead of setting it per batch.
+    # - gdn_row_slot_len: once the traced step restores the packed token order (gdn_contig_src) before the LM head
+    #   and traces with the shim row length set to the slot length (see _packed_stream_as_one_row).
     # use_simple_fsdp and param_offload stay: the graph trainer shards with SimpleFSDP and holds the live parameters.
     errors = []
     if getattr(engine_config, "forward_only", False):
@@ -108,6 +112,11 @@ def validate_graph_trainer_engine(
         )
     if not options.static_micro_batch_len:
         errors.append(f"it needs engine_kwargs.tpu.static_micro_batch_len ({_TODO_2})")
+    if options.use_fused_linear_cross_entropy is False:
+        errors.append(
+            "it needs engine_kwargs.tpu.use_fused_linear_cross_entropy=True (the non-fused log-prob path "
+            "materializes [tokens, vocab] logits and exhausts TPU HBM)"
+        )
     for name in ("pipeline_parallel_size", "context_parallel_size", "tensor_parallel_size", "expert_parallel_size"):
         size = int(getattr(engine_config, name, 1) or 1)
         if size > 1:
@@ -116,14 +125,19 @@ def validate_graph_trainer_engine(
         errors.append("param_offload swaps parameter storages between steps; it is not supported yet")
     if "kda" in tpu_kernels:
         errors.append("the Tokamax KDA kernels change their document budget per batch; that would freeze in the graph")
+    if options.gdn_row_slot_len:
+        errors.append(
+            f"gdn_row_slot_len={options.gdn_row_slot_len} is not supported yet (the traced step does not restore the "
+            "packed token order of the one-sequence-per-row layout, so log-probs would pair with the wrong labels)"
+        )
     if errors:
         raise ValueError("engine_kwargs.tpu.trainer_mode=graph_trainer: " + "; ".join(errors))
 
 
 def resolve_memory_policy(options: TPUEngineOptions, activation_checkpoint: str) -> str:
-    """TorchTitan graph-trainer memory policy: the option, else the analogue of ``activation_checkpoint``."""
-    if options.graph_trainer_memory_policy:
-        return options.graph_trainer_memory_policy
+    """TorchTitan graph-trainer memory policy: ``options.graph_trainer``, else analogue of ``activation_checkpoint``."""
+    if options.graph_trainer and "memory_policy" in options.graph_trainer:
+        return options.graph_trainer["memory_policy"]
     return {"full": "full", "selective": "default"}.get(activation_checkpoint, "none")
 
 
@@ -147,6 +161,9 @@ def build_graph_trainer_config(
     trace and compile the whole step. Needs TorchTitan with ``TpuGraphTrainerCompileConfig`` (e.g. 109bd618, the
     verl TPU Dockerfile pin).
 
+    ``compile`` accepts settings straight from ``engine_kwargs.tpu.graph_trainer``
+    (passed through to ``TpuGraphTrainerCompileConfig(**cfg)``).
+
     ``loss`` is a default ``PallasCrossEntropyLoss.Config``: with the fused log-prob head, ``lm_head`` is a
     ``FusedLossLinearWrapper`` and TorchTitan's graph-trainer patches require a loss config whose ``soft_cap`` /
     ``output_multiplier`` match the head (``None`` / ``1.0`` for Qwen3). The plugin replaces ``trainer.loss_fn`` with
@@ -156,35 +173,49 @@ def build_graph_trainer_config(
     from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
     from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
 
-    memory_policy = resolve_memory_policy(options, activation_checkpoint)
-    save_regions = tuple(r.strip() for r in (options.graph_trainer_save_regions or "").split(",") if r.strip())
-    fsdp_schedule = options.graph_trainer_fsdp_schedule or "none"
-    # TorchTitan validates these combinations (save regions vs. memory policy, FSDP schedule vs. remat) in
-    # TpuGraphTrainer.__init__, before the model is built.
-    # As TorchTitan's Qwen3-30B-A3B SFT recipe: remat barriers with the selective policy; FSDP schedules require them.
-    enable_remat_barriers = memory_policy == "tpu_selective" or fsdp_schedule != "none"
+    user_cfg = dict(options.graph_trainer or {})
+
+    # Normalize save_regions if passed as string or list
+    if "save_regions" in user_cfg:
+        sr = user_cfg["save_regions"]
+        if isinstance(sr, str):
+            user_cfg["save_regions"] = tuple(r.strip() for r in sr.split(",") if r.strip())
+        elif isinstance(sr, list | set):
+            user_cfg["save_regions"] = tuple(sr)
+
+    # Normalize graph_split if passed as a dict
+    if "graph_split" in user_cfg and isinstance(user_cfg["graph_split"], dict):
+        try:
+            from torchtitan.experiments.tpu.graph_trainer.config import GraphSplitterConfig
+
+            user_cfg["graph_split"] = GraphSplitterConfig(**user_cfg["graph_split"])
+        except ImportError:
+            pass
+
+    memory_policy = user_cfg.pop("memory_policy", None) or resolve_memory_policy(options, activation_checkpoint)
+    fsdp_barrier_policy = user_cfg.pop("fsdp_barrier_policy", None) or "none"
+    enable_remat_barriers = user_cfg.pop(
+        "enable_remat_barriers",
+        memory_policy == "tpu_selective" or fsdp_barrier_policy != "none",
+    )
+
+    compile_kwargs = {
+        "enable": False,
+        "mode": TPU_COMPILE_MODE,
+        "memory_policy": memory_policy,
+        "enable_remat_barriers": enable_remat_barriers,
+        "fsdp_barrier_policy": fsdp_barrier_policy,
+    }
+    compile_kwargs.update(user_cfg)
 
     # bld_block_layout=False keeps packed [T, D] inputs for the plugin's Splash / varlen attention modules, as in
     # eager_blocks mode.
     tpu_config = TPUConfig(use_simple_fsdp=True, bld_block_layout=False)
-    compile_config = TpuGraphTrainerCompileConfig(
-        enable=False,
-        mode=TPU_COMPILE_MODE,
-        memory_policy=memory_policy,
-        save_regions=save_regions,
-        enable_remat_barriers=enable_remat_barriers,
-        fsdp_barrier_policy=fsdp_schedule,
-    )
+    compile_config = TpuGraphTrainerCompileConfig(**compile_kwargs)
 
     kwargs = dict(trainer_config_kwargs)
     kwargs.update(compile=compile_config, activation_checkpoint=None, tpu_config=tpu_config, loss=_pallas_loss_config())
-    logger.warning(
-        "TPU trainer_mode=graph_trainer: TpuGraphTrainer (aot_fx_trace), memory_policy=%s, save_regions=%s, "
-        "fsdp_schedule=%s",
-        memory_policy,
-        save_regions,
-        fsdp_schedule,
-    )
+    logger.warning("TPU trainer_mode=graph_trainer: TpuGraphTrainer (aot_fx_trace), compile_config=%s", compile_config)
     return TpuGraphTrainer.Config(**kwargs)
 
 
@@ -256,29 +287,35 @@ def _wrap_step_for_loss_aux(trainer: Any, num_aux: int):
     return _ctx()
 
 
-def _rl_graph_trainer_init(self: Any, cfg: Any) -> None:
-    super(type(self), self).__init__(cfg)
-    self.last_loss_aux = ()
+def _packed_stream_as_one_row() -> Any:
+    """Clears TorchTitan's unflatten-shim row length while the step runs, as the eager engine leaves it.
 
+    ``TpuGraphTrainer.forward_backward_step`` sets the row length to ``training.max_context_length`` (the engine's
+    ``max_seq_len``). Kernels that read it split the packed ``[T]`` micro-batch into ``max_seq_len`` rows: Qwen3.5's
+    GatedDeltaNet then restarts its convolution and recurrent state at every row start, in the middle of any sequence
+    that crosses one (``static_micro_batch_len`` is usually larger than ``max_seq_len``). With no row length the packed
+    micro-batch is one row and the state resets only at document boundaries, as in the eager engine. The value is read
+    while tracing, so the traced graph keeps it.
+    """
+    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 
-def _rl_graph_trainer_make_fx_step(self: Any, *args: Any, **kwargs: Any) -> torch.Tensor:
-    with _wrap_step_for_loss_aux(self, NUM_LOSS_AUX_OUTPUTS):
-        return super(type(self), self)._make_fx_forward_backward_step(*args, **kwargs)
+    return set_unflatten_seq_len(None)
 
 
 def build_rl_graph_trainer(config: Any) -> Any:
     """Builds a ``TpuGraphTrainer`` whose traced step also returns the detached per-token log-probs (aux output)."""
     from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 
-    cls = type(
-        "_RLTpuGraphTrainer",
-        (TpuGraphTrainer,),
-        {
-            "__init__": _rl_graph_trainer_init,
-            "_make_fx_forward_backward_step": _rl_graph_trainer_make_fx_step,
-        },
-    )
-    return cls(config)
+    class _RLTpuGraphTrainer(TpuGraphTrainer):
+        def __init__(self, cfg: Any) -> None:
+            super().__init__(cfg)
+            self.last_loss_aux = ()
+
+        def _make_fx_forward_backward_step(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+            with _packed_stream_as_one_row(), _wrap_step_for_loss_aux(self, NUM_LOSS_AUX_OUTPUTS):
+                return super()._make_fx_forward_backward_step(*args, **kwargs)
+
+    return _RLTpuGraphTrainer(config)
 
 
 def _plugin_preprocess_inputs(input_dict: dict[str, Any], **_: Any) -> tuple[Any, Any, dict[str, Any]]:
@@ -387,11 +424,11 @@ class GraphPolicyLossSpec:
 class GraphPolicyLoss:
     """Trace-safe verl vanilla dual-clip PPO loss, the ``loss_fn`` of ``TpuGraphTrainer`` (pure tensor ops).
 
-    ``pred`` is the model output: ``(hidden_states, lm_head_weight_t)`` with the fused LM-head override (log-probs from
-    the Tokamax kernel, no ``[tokens, vocab]`` logits), else the logits (``use_fused_linear_cross_entropy=False``:
-    plain log-softmax, the fallback if the fused op does not trace). ``labels`` is the tuple
-    ``(target_ids, old_log_probs, advantages, loss_mask)`` of packed ``[T]`` tensors (``pack_rl_loss_targets``).
-    Returns ``(loss, (log_probs.detach(),))``; the second element becomes the graph's auxiliary output.
+    ``pred`` is the model output with the fused LM-head override, ``(hidden_states, lm_head_weight_t)``: log-probs
+    come from the Tokamax kernel, with no ``[tokens, vocab]`` logits (graph mode always uses the fused path). ``labels``
+    is the tuple ``(target_ids, old_log_probs, advantages, loss_mask)`` of packed ``[T]`` tensors
+    (``pack_rl_loss_targets``). Returns ``(loss, (log_probs.detach(),))``; the second element becomes the graph's
+    auxiliary output.
 
     Same math as ``verl.trainer.ppo.core_algos.compute_policy_loss_vanilla`` with ``token-mean`` ``agg_loss``, without
     the ``dp_size`` factor (see the module docstring).
@@ -402,27 +439,27 @@ class GraphPolicyLoss:
         self.tpu_kernels = tpu_kernels
 
     def log_probs(self, pred: Any, target_ids: torch.Tensor) -> torch.Tensor:
-        temperature = self.spec.temperature
-        if isinstance(pred, tuple):
-            from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels
-            from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
-
-            hidden_states, lm_head_weight_t = pred
-            return fused_linear_logprobs_tpu(
-                hidden_states,
-                target_ids,
-                lm_head_weight_t,
-                temperature=temperature,
-                functional_backward=True,
-                **tpu_model_kernels.lce_block_sizes(
-                    self.tpu_kernels,
-                    hidden_size=int(lm_head_weight_t.shape[0]),
-                    vocab_size=int(lm_head_weight_t.shape[1]),
-                ),
+        if not (isinstance(pred, tuple) and len(pred) == 2):
+            raise TypeError(
+                "trainer_mode=graph_trainer needs the fused LM head output (hidden_states, lm_head_weight_t), got "
+                f"{type(pred).__name__}"
             )
-        logits = pred.reshape(-1, pred.shape[-1]).float() / temperature
-        log_softmax = torch.log_softmax(logits, dim=-1)
-        return torch.gather(log_softmax, -1, target_ids.reshape(-1, 1).long()).squeeze(-1)
+        from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels
+        from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
+
+        hidden_states, lm_head_weight_t = pred
+        return fused_linear_logprobs_tpu(
+            hidden_states,
+            target_ids,
+            lm_head_weight_t,
+            temperature=self.spec.temperature,
+            functional_backward=True,
+            **tpu_model_kernels.lce_block_sizes(
+                self.tpu_kernels,
+                hidden_size=int(lm_head_weight_t.shape[0]),
+                vocab_size=int(lm_head_weight_t.shape[1]),
+            ),
+        )
 
     def __call__(
         self, pred: Any, labels: tuple[torch.Tensor, ...], *, global_valid_tokens: torch.Tensor
@@ -494,19 +531,39 @@ def pack_rl_loss_targets(micro_batch: TensorDict, padded_len: int) -> tuple[torc
     return packed[0], packed[1], packed[2]
 
 
-def check_loss_consistency(graph_loss: float, verl_loss: float, dp_size: int, rtol: float = 1e-2) -> bool:
-    """Warns if the traced loss (no ``dp_size`` factor) and verl's eager ``ppo_loss`` on the same log-probs disagree.
+def check_loss_consistency(
+    graph_loss: float,
+    verl_loss: float,
+    dp_size: int,
+    rtol: float = 1e-2,
+    *,
+    raise_on_mismatch: bool = True,
+) -> bool:
+    """Checks whether the traced loss (no ``dp_size`` factor) and verl's eager ``ppo_loss`` on the same log-probs agree.
 
     They compute the same token-mean PPO loss, verl's times ``dp_size``; a mismatch means the graph's loss inputs or
     scaling are wrong, so the gradients are too.
+
+    Args:
+        graph_loss: Traced graph scalar loss.
+        verl_loss: Eager reference verl loss.
+        dp_size: Data parallel size.
+        rtol: Relative tolerance (default: 1%).
+        raise_on_mismatch: If True (default), raises ``RuntimeError`` on mismatch. If False, logs a warning and
+            returns False.
+
+    Raises:
+        RuntimeError: if ``raise_on_mismatch=True`` and the losses disagree beyond ``rtol``.
     """
     expected = graph_loss * dp_size
     tolerance = rtol * max(abs(verl_loss), abs(expected)) + 1e-6
     ok = math.isfinite(expected) and math.isfinite(verl_loss) and abs(expected - verl_loss) <= tolerance
     if not ok:
-        logger.warning(
-            "graph_trainer: traced loss x dp_size = %.6g but verl's ppo_loss on the same log-probs = %.6g",
-            expected,
-            verl_loss,
+        message = (
+            f"graph_trainer: traced loss x dp_size = {expected:.6g} but verl's ppo_loss on the same "
+            f"log-probs = {verl_loss:.6g} (diff {abs(expected - verl_loss):.6g} > tolerance {tolerance:.6g})"
         )
+        if raise_on_mismatch:
+            raise RuntimeError(message)
+        logger.warning(message)
     return ok

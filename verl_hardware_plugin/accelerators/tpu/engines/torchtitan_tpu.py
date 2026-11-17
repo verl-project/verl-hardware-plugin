@@ -1030,9 +1030,12 @@ class TorchTitanTPUEngine(BaseEngine):
         # MoE models require the fused LM-head log-prob: their per-chip token budgets only fit without the
         # [tokens, vocab] logits, so the engine raises rather than falling back to them.
         self._fused_logprob_required = setup is not None and setup.requires_fused_logprob
-        self._use_fused_linear_cross_entropy = resolve_tpu_use_fused_linear_cross_entropy(
-            engine_config, required=self._fused_logprob_required
-        )
+        if self._graph_trainer_mode:
+            self._use_fused_linear_cross_entropy = True
+        else:
+            self._use_fused_linear_cross_entropy = resolve_tpu_use_fused_linear_cross_entropy(
+                engine_config, required=self._fused_logprob_required
+            )
         model_spec = model_module.model_registry(
             torchtitan_flavor,
             attn_backend=torchtitan_model_attn_backend(torchtitan_name, self.engine_config.attn_type),
@@ -1761,7 +1764,10 @@ class TorchTitanTPUEngine(BaseEngine):
                     delattr(value, TPU_PADDED_VALUES_ATTR)
         verl_loss = loss.detach().item()
         graph_trainer_mode.check_loss_consistency(
-            graph_loss.detach().float().item(), verl_loss, self.get_data_parallel_size()
+            graph_loss.detach().float().item(),
+            verl_loss,
+            self.get_data_parallel_size(),
+            raise_on_mismatch=os.getenv("VERL_TPU_LOSS_CONSISTENCY_RAISE", "1") != "0",
         )
         return {"model_output": detach_tree(model_output), "loss": verl_loss, "metrics": metrics}
 
@@ -2531,11 +2537,14 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
             require_tokamax()
         except (ImportError, RuntimeError) as e:
-            if self._fused_logprob_required:
-                raise RuntimeError(
-                    "This model requires the fused LM-head log-prob (engine_kwargs.tpu.use_fused_linear_cross_entropy)"
-                    f", but it is unavailable: {e!r}. Set use_fused_linear_cross_entropy=False to run without it."
-                ) from e
+            if self._fused_logprob_required or self._graph_trainer_mode:
+                msg = (
+                    "trainer_mode=graph_trainer requires the fused LM-head log-prob"
+                    if self._graph_trainer_mode
+                    else "This model requires the fused LM-head log-prob "
+                    "(engine_kwargs.tpu.use_fused_linear_cross_entropy)"
+                )
+                raise RuntimeError(f"{msg}, but it is unavailable: {e!r}.") from e
             logger.warning("Disabling use_fused_linear_cross_entropy: %r", e)
             self._use_fused_linear_cross_entropy = False
             return

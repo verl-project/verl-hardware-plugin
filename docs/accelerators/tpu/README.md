@@ -85,7 +85,8 @@ docs/accelerators/tpu/
 ├── README.md                         # This file
 ├── install_guidance.md               # Installation and environment setup
 ├── quick_start.md                    # Selecting and verifying the platform
-├── rollout.md                        # Running the vLLM rollout on TPU; TorchTitan engine options (engine_kwargs.tpu)
+├── engine.md                         # TorchTitan TPU training engine options (engine_kwargs.tpu) and GraphTrainer
+├── rollout.md                        # Running the vLLM and SGLang rollouts on TPU
 ├── weight_sync.md                    # Choosing and configuring the weight sync (ray-plasma-store / tpu-sync)
 └── timeline.md                       # Recording (`VERL_TPU_TIMELINE=1`) and viewing the unified Timeline + HBM report
 ```
@@ -94,7 +95,8 @@ docs/accelerators/tpu/
 
 - [Installation Guide](./install_guidance.md) — prerequisites and environment setup
 - [Quick Start](./quick_start.md) — select the TPU platform and verify it resolves
-- [vLLM Rollout](./rollout.md) — run GRPO with the vLLM rollout on TPU, and set the TorchTitan engine's TPU options (`engine_kwargs.tpu`)
+- [Training Engine](./engine.md) — configure TorchTitan engine options on TPU (`engine_kwargs.tpu`), MoE kernels, and GraphTrainer whole-step compilation
+- [vLLM & SGLang Rollout](./rollout.md) — run GRPO with vLLM / SGLang rollout on TPU
 - [Weight Sync](./weight_sync.md) — send the trainer's weights to the rollout peer to peer with `tpu-sync`
 - [RL Timeline & HBM Profiler](./timeline.md) — see what the trainer and rollout chips do and their 1 Hz HBM usage in every step (`VERL_TPU_TIMELINE=1`)
 - [GRPO example](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) — end-to-end GRPO recipes in verl (`Dockerfile`, KubeRay `RayCluster`, Qwen3-0.6B / Qwen3-4B scripts)
@@ -109,7 +111,7 @@ replacement. verl's `TorchtitanEngineConfig` has no `engine_kwargs` field yet; t
 
 | Component | Where the options go | Read by | Options |
 |-----------|----------------------|---------|---------|
-| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`, `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `trainer_mode`, `graph_trainer_*`, `context_parallel_strategy`, `qwen3_pallas_experts`, `moe_paired_gemm`; see [vLLM Rollout](./rollout.md) |
+| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`, `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `trainer_mode`, `graph_trainer`, `context_parallel_strategy`, `qwen3_pallas_experts`, `moe_paired_gemm`; see [Training Engine](./engine.md) |
 | Rollout (vLLM on TPU) | `actor_rollout_ref.rollout.engine_kwargs.vllm.*` | verl core, passed to vLLM as is | vLLM engine arguments. The TPU replica forces `enable_sleep_mode=False` and keeps upstream's `distributed_executor_backend=mp`; there are no TPU-only rollout options. |
 | Weight sync | `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.*` | verl core passes them to the checkpoint engine's constructor; `options.py`: `TPUSyncOptions` | `tpu-sync`: `parallelism`, `verify_parity`, `release_buffers_after_sync`, `tie_word_embeddings`, `return_after_d2h`; `ray-plasma-store`: none. See [Weight Sync](./weight_sync.md#configuration) |
 
