@@ -3667,7 +3667,7 @@ STATIC_8K_LIKE = {"static_micro_batch_len": 256, "static_max_response_len": 64} 
 
 
 def test_static_micro_batch_seqs_pads_only_ppo_loss_rows_and_keeps_verls_partition(static_seqs_engine):
-    """The option tags every micro-batch of verl's ppo_loss and changes neither the partition, the loss nor the grads."""
+    """The option tags every micro-batch of verl's ppo_loss; the partition, the loss and the grads stay the same."""
     from verl.workers.utils.losses import ppo_loss
 
     results = {}
@@ -3696,7 +3696,8 @@ def test_static_micro_batch_seqs_pads_only_ppo_loss_rows_and_keeps_verls_partiti
 
     engine, _, calls = static_seqs_engine({**STATIC_8K_LIKE, "static_micro_batch_seqs": 16})
     engine.forward_backward_batch(
-        _static_seqs_mini_batch(48, seed=3), functools.partial(other_loss, config=_ppo_loss_function().keywords["config"])
+        _static_seqs_mini_batch(48, seed=3),
+        functools.partial(other_loss, config=_ppo_loss_function().keywords["config"]),
     )
     assert {c.num_seqs_key for c in calls} == {None} and {c.rows for c in calls} == {(c.seqs, 64) for c in calls}
 

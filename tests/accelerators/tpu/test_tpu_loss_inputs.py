@@ -360,11 +360,11 @@ def test_static_micro_batch_seqs_rows_with_rollout_correction():
     reference = _run_rows(_bypass_config())
     padded = _run_rows(_bypass_config(), num_rows=12, width=32)
     assert any(key.startswith("rollout_corr/") for key in padded[2])
-    _assert_same_loss(reference, padded, metric_keys=[key for key in reference[2] if not key.startswith("rollout_corr/")])
+    _assert_same_loss(
+        reference, padded, metric_keys=[key for key in reference[2] if not key.startswith("rollout_corr/")]
+    )
     differing = {
-        key
-        for key in reference[2]
-        if not math.isclose(reference[2][key], padded[2][key], rel_tol=1e-5, abs_tol=1e-6)
+        key for key in reference[2] if not math.isclose(reference[2][key], padded[2][key], rel_tol=1e-5, abs_tol=1e-6)
     }
     assert all(key.startswith("rollout_corr/") for key in differing), sorted(differing)
 
