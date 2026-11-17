@@ -69,7 +69,7 @@ from verl.workers.engine.utils import (
     postprocess_batch_func,
     prepare_micro_batches,
 )
-from verl_hardware_plugin.accelerators.tpu.engines import tpu_fixed_shapes, tpu_model_kernels, tpu_ragged_ep
+from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels, tpu_ragged_ep
 from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
@@ -942,8 +942,6 @@ class TorchTitanTPUEngine(BaseEngine):
 
         tpu_options = get_tpu_engine_options(self.engine_config)
         self._tpu_options = tpu_options
-        # Fixed-shape micro-batches (engines/tpu_fixed_shapes.py); None (verl's partition) unless fixed_shape_rows.
-        self._fixed_shapes = tpu_fixed_shapes.FixedShapeConfig.from_engine_config(self.engine_config)
 
         # Get ModelSpec from model registry
         model_module = importlib.import_module(get_torchtitan_model_module_name(torchtitan_name))
@@ -1488,43 +1486,33 @@ class TorchTitanTPUEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens)
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
-        fixed_shapes = tpu_fixed_shapes.active_config(getattr(self, "_fixed_shapes", None), data, self.parallel_dims)
-        if fixed_shapes is not None:
-            # The same layout on every rank, so no cross-rank shape alignment. The document budget is constant, and
-            # set before the pre-warm compiles the rows.
-            self._set_packed_document_budget(fixed_shapes.max_seqs + 1)
-            if not forward_only and loss_function is not None:
-                self._prewarm_fixed_shapes(data, loss_function, fixed_shapes)
-            micro_batches, indices = tpu_fixed_shapes.build_micro_batches(data, fixed_shapes)
-        else:
-            micro_batches, indices = prepare_micro_batches(
-                data=data,
-                dp_group=dp_group,
-                same_micro_num_in_dp=True,
+        micro_batches, indices = prepare_micro_batches(
+            data=data,
+            dp_group=dp_group,
+            same_micro_num_in_dp=True,
+        )
+        tpu_options = get_tpu_engine_options(self.engine_config)
+        static_len = int(tpu_options.static_micro_batch_len or 0)
+        static_response_len = int(tpu_options.static_max_response_len or 0)
+        if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len:
+            align_micro_batch_shapes_across_ranks(
+                micro_batches,
+                bucket_size=get_tpu_seq_bucket_size(self.engine_config),
+                static_len=static_len,
+                static_response_len=static_response_len,
             )
-            tpu_options = get_tpu_engine_options(self.engine_config)
-            static_len = int(tpu_options.static_micro_batch_len or 0)
-            static_response_len = int(tpu_options.static_max_response_len or 0)
-            if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len:
-                align_micro_batch_shapes_across_ranks(
-                    micro_batches,
-                    bucket_size=get_tpu_seq_bucket_size(self.engine_config),
-                    static_len=static_len,
-                    static_response_len=static_response_len,
-                )
-            if "kda" in getattr(self, "_tpu_kernels", ()) and not getattr(self, "_gdn_row_slot_len", 0):
-                # Largest micro-batch plus the bucket-padding tail, bucketed so that use_dynamic_bsz's varying sequence
-                # counts do not recompile the kernels (see packed_document_budget); only computed when the kernels
-                # need it.
-                self._set_packed_document_budget(
-                    tpu_model_kernels.packed_document_budget(max(int(mb.batch_size[0]) for mb in micro_batches))
-                )
+
+        if "kda" in getattr(self, "_tpu_kernels", ()) and not getattr(self, "_gdn_row_slot_len", 0):
+            # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
+            # micro-batch is one packed document, plus the bucket-padding tail; bucketed so that use_dynamic_bsz's
+            # varying sequence counts do not recompile the kernels (see packed_document_budget).
+            budget = tpu_model_kernels.packed_document_budget(max(int(mb.batch_size[0]) for mb in micro_batches))
+            updated = tpu_model_kernels.set_packed_document_budget(self.module, budget)
+            if updated:
+                logger.info("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)
 
         output_lst = []
         ctx = torch.no_grad() if forward_only else nullcontext()
-        span_args: dict[str, Any] = {}
-        if fixed_shapes is not None:
-            span_args["rows"] = tpu_fixed_shapes.row_lengths(micro_batches)
         timeline_ctx = (
             timeline.span(
                 "fwd_bwd",
@@ -1532,7 +1520,6 @@ class TorchTitanTPUEngine(BaseEngine):
                 lane=timeline.trainer_lane(),
                 micro_batches=len(micro_batches),
                 tokens=batch_num_tokens,
-                **span_args,
             )
             if not forward_only
             else nullcontext()
@@ -1547,53 +1534,22 @@ class TorchTitanTPUEngine(BaseEngine):
         with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), row_ctx:
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
-                    output = self._forward_backward_micro_batch(micro_batch, loss_function, forward_only)
+                    loss, output = self.forward_step(
+                        micro_batch, loss_function=loss_function, forward_only=forward_only
+                    )
+                    if not forward_only:
+                        with spmd_no_typecheck_context():
+                            if self._simple_fsdp_loss_scale is not None:
+                                loss = loss * self._simple_fsdp_loss_scale
+                            tpu_synchronize(loss, wait=False)
+                            loss.backward()
+                            del loss
+                            tpu_synchronize(wait=True)
+                    else:
+                        del loss
                 output_lst.append(output)
 
-        output = postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
-        if fixed_shapes is not None:
-            tpu_fixed_shapes.sum_losses_on_host(output)
-        return output
-
-    def _forward_backward_micro_batch(
-        self, micro_batch: TensorDict, loss_function: Callable, forward_only: bool
-    ) -> dict[str, Any]:
-        """Forward (and backward unless ``forward_only``) of one micro-batch; returns its ``forward_step`` output."""
-        loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
-        if not forward_only:
-            with spmd_no_typecheck_context():
-                if self._simple_fsdp_loss_scale is not None:
-                    loss = loss * self._simple_fsdp_loss_scale
-                tpu_synchronize(loss, wait=False)
-                loss.backward()
-                del loss
-                tpu_synchronize(wait=True)
-        else:
-            del loss
-        return output
-
-    def _set_packed_document_budget(self, budget: int) -> None:
-        """Sets the packed-document budget of Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74), if any.
-
-        Every sequence of a micro-batch is one packed document, plus the bucket-padding tail.
-        """
-        if "kda" not in getattr(self, "_tpu_kernels", ()):
-            return
-        updated = tpu_model_kernels.set_packed_document_budget(self.module, budget)
-        if updated:
-            logger.info("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)
-
-    def _prewarm_fixed_shapes(
-        self, data: TensorDict, loss_function: Callable, fixed_shapes: tpu_fixed_shapes.FixedShapeConfig
-    ) -> None:
-        """Compiles and times every fixed-shape row length once (``tpu_fixed_shapes.prewarm``)."""
-
-        def run_micro_batch(micro_batch: TensorDict) -> None:
-            with self.trainer.train_context():
-                self._forward_backward_micro_batch(micro_batch, loss_function, forward_only=False)
-
-        with tpu_eager_mode_context(self._tpu_eager_mode):
-            tpu_fixed_shapes.prewarm(data, fixed_shapes, run_micro_batch, self.optimizer_zero_grad)
+        return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def model_forward_step(
         self,

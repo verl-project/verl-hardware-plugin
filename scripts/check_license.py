@@ -32,7 +32,6 @@ license_headers = [
     "Copyright (c) 2026 BAAI. All rights reserved.",
     "Copyright (c) 2026 Google LLC. All rights reserved.",
     "Copyright 2026 Advanced Micro Devices, Inc.",
-    "Copyright (c) Meta Platforms, Inc. and affiliates.",
 ]
 
 

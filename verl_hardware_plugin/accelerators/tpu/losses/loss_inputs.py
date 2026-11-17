@@ -20,8 +20,11 @@ from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData
 
 from verl.utils import tensordict_utils as tu
-from verl_hardware_plugin.accelerators.tpu.engines.tpu_fixed_shapes import TPU_PADDED_NUM_SEQS_KEY
-from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import TPU_PADDED_VALUES_ATTR, unwrap_metadata
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+    TPU_PADDED_NUM_SEQS_KEY,
+    TPU_PADDED_VALUES_ATTR,
+    unwrap_metadata,
+)
 
 
 class _TPUPaddedJaggedProxy:
@@ -96,7 +99,7 @@ def _scalar_metadata_tensordict(td: TensorDict, num_rows: int) -> TensorDict:
 
 
 def _loss_num_rows(micro_batch: TensorDict, response_mask: torch.Tensor) -> int:
-    """Rows of the PPO loss inputs: ``tpu_padded_num_seqs`` for fixed-shape micro-batches, else the batch size."""
+    """Rows of the PPO loss inputs: ``tpu_padded_num_seqs`` when the micro-batch carries it, else the batch size."""
     batch_size = int(micro_batch.batch_size[0])
     num_rows = int(unwrap_metadata(tu.get_non_tensor_data(micro_batch, TPU_PADDED_NUM_SEQS_KEY, 0)) or 0)
     if num_rows in (0, batch_size):
@@ -157,9 +160,9 @@ def prepare_tpu_loss_inputs(model_output: dict[str, Any], micro_batch: TensorDic
     the outputs to the exact token count instead would make every micro-batch with new lengths compile new XLA
     programs (forward loss and the fused LM-head backward) for the whole run.
 
-    Fixed-shape micro-batches (``engines/tpu_fixed_shapes.py``) carry ``tpu_padded_num_seqs``: their PPO loss inputs
-    get that many rows, so their shapes do not depend on the micro-batch size either. The extra rows are empty
-    sequences (zero response mask, log-probs and advantages), which leave the loss and its gradients unchanged.
+    A micro-batch that carries ``tpu_padded_num_seqs`` gets that many rows in its PPO loss inputs, so their shapes do
+    not depend on the micro-batch size either. The extra rows are empty sequences (zero response mask, log-probs and
+    advantages), which leave the loss and its gradients unchanged.
     """
     log_prob = model_output.get("log_probs")
     tpu_padded_log_prob = getattr(log_prob, TPU_PADDED_VALUES_ATTR, None)

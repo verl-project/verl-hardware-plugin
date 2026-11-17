@@ -91,27 +91,6 @@ Performance options for long packed micro-batches (the Qwen3-30B-A3B recipe sets
 | `mixed_precision_reduce: bfloat16` | bf16 FSDP gradient reduce-scatter instead of fp32 (half the traffic; a performance A/B option) |
 | `gdn_row_slot_len: <max_model_len>` | Qwen3.5: every sequence of a packed micro-batch starts at a multiple of this length, so the GatedDeltaNet runs one sequence per row (torchtitan's `set_unflatten_seq_len`) instead of resetting at packed documents through Tokamax `segment_ids`. Needs `use_dynamic_bsz=False`, a fixed `ppo_micro_batch_size_per_gpu`, `static_micro_batch_len` = that size x `gdn_row_slot_len`, and the fused log-prob |
 
-With `use_dynamic_bsz=True`, every update gets a new number of micro-batches and of sequences per micro-batch, and each
-new packed length or sequence count compiles new XLA programs. Fixed-shape micro-batches (opt-in,
-`engines/tpu_fixed_shapes.py`) remove these recompiles: every rank packs each mini-batch into the same layout of
-packed-row lengths taken from a small fixed set, and the PPO loss inputs always have `fixed_shape_max_seqs` rows of
-`fixed_shape_response_len` tokens (the extra rows are empty sequences, so the loss and its gradients are unchanged). On
-the first training call, every row length is compiled and timed once, and the layouts are then chosen by measured cost:
-
-```bash
-+actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.seq_bucket_size=2048
-+actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.fixed_shape_rows=8192:14336:16384
-+actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.fixed_shape_max_seqs=64
-+actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.fixed_shape_response_len=4096
-```
-
-Set `fixed_shape_response_len` to `data.max_response_length`. The row lengths must be multiples of `seq_bucket_size`,
-and the largest must hold the longest sequence. Fixed-shape micro-batches need packed inputs (`use_remove_padding=True`)
-and no context or pipeline parallelism; otherwise the engine keeps verl's partition and logs a warning. Where they
-apply, they replace `static_micro_batch_len` and `static_max_response_len`, which then only pad the micro-batches
-that fall back to verl's partition.
-`fixed_shape_prewarm=False` skips the compile-and-time pass and ranks layouts by their padded token count instead.
-
 The rollout settings that matter on TPU (the recipes already set them):
 
 | Setting | Value on TPU |
