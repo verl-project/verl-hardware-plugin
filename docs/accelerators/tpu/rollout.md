@@ -93,7 +93,7 @@ Performance options for long packed micro-batches (the Qwen3-30B-A3B recipe sets
 |---|---|
 | `splash_max_block_size: 1024` | Largest Splash attention block (torchtitan's default 512). Splash's grid grows as `(tokens / block)^2`; 1024 cut `update_actor` by 17% at 24k tokens per chip on v5p |
 | `static_micro_batch_len: <tokens>` | Pads every packed micro-batch to at least this length (e.g. the `use_dynamic_bsz` token budget), so the trainer compiles one shape instead of recompiling when the packed length reaches a new bucket (`static_max_response_len` does the same for the response length) |
-| `static_micro_batch_seqs: <sequences>` | Pads the PPO loss inputs of every micro-batch to at least this many rows, so the number of sequences that `use_dynamic_bsz` puts in a micro-batch no longer changes the shapes of the loss and its metrics. The extra rows are empty sequences (zero response mask), so the loss and its gradients do not change. With Tokamax's GatedDeltaNet kernels it is also the floor of their document budget. See [Static micro-batches](#static-micro-batches) |
+| `static_micro_batch_seqs: <sequences>` | Pads the PPO loss inputs of every micro-batch to at least this many rows, so the number of sequences that `use_dynamic_bsz` puts in a micro-batch no longer changes the shapes of the loss and its metrics. The extra rows are empty sequences (zero response mask), so the loss and its gradients do not change; with the `geo_mean` loss mode, which averages over every row, the loss inputs keep their exact rows. With Tokamax's GatedDeltaNet kernels it is also the floor of their document budget. See [Static micro-batches](#static-micro-batches) |
 | `moe_paired_grouped_mm: true` | Qwen3 MoE: torchtitan's paired W1/W3 Pallas grouped matmul (shares the routed-token loads) |
 | `moe_native_weight_layout: true` | Qwen3 MoE: kernel-native `(E, K, N)` expert weights; `state_dict()` / `load_state_dict()` keep the canonical layout and names, so the HF load and the tpu-sync expert export are unchanged |
 | `mixed_precision_reduce: bfloat16` | bf16 FSDP gradient reduce-scatter instead of fp32 (half the traffic; a performance A/B option) |
@@ -132,10 +132,14 @@ sizes keeps its own size and compiles once for it; the engine logs every new seq
 `static_micro_batch_seqs`. With `use_dynamic_bsz=False` every micro-batch already has `ppo_micro_batch_size_per_gpu`
 sequences, so `static_micro_batch_seqs` is not needed there.
 
-Only verl's `ppo_loss` gets padding rows; other losses keep the exact rows. The loss, its gradients and the masked
-metrics do not change. Per-sequence diagnostics that average over every loss row also count the padding rows: the
-sequence-level rollout-correction statistics of bypass mode (`rollout_corr/rollout_is_seq_*`), and with verl 0.9.1
-also its off-policy perplexity and chi-square metrics (`rollout_corr/*ppl*`, `rollout_corr/chi2_seq`).
+Only verl's `ppo_loss` gets padding rows, and only with a policy loss mode whose loss ignores empty rows
+(`ROW_PADDING_LOSS_MODES` in `losses/loss_inputs.py`): every mode of verl except `geo_mean`, which averages its
+per-sequence losses over every row. With `geo_mean`, and with any other loss, the loss inputs keep their exact rows
+(the engine logs this once). The loss, its gradients and the masked metrics do not change. Per-sequence diagnostics
+that average over every loss row also count the padding rows: in bypass mode, the sequence-level IS statistics
+(`rollout_corr/rollout_is_seq_*`) and, with rejection sampling, the fraction of sequences with rejected tokens
+(`rollout_corr/rollout_rs_seq_masked_fraction`); with verl 0.9.1 also the off-policy perplexity and chi-square metrics
+(`rollout_corr/*ppl*`, `rollout_corr/chi2_seq`).
 
 ## Verify
 

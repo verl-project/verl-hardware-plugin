@@ -206,7 +206,8 @@ class TPUEngineOptions:
             unset, off). The extra rows are empty sequences (all-zero response mask, log-probs and advantages), so the
             loss, its gradients and the token-mean normalization do not change. With Tokamax's GatedDeltaNet kernels
             it is also the floor of their packed-document budget. A micro-batch with more sequences keeps its own
-            row count. Only verl's ``ppo_loss`` gets padded rows; other losses keep the exact rows.
+            row count. Only verl's ``ppo_loss`` gets padded rows, and only with a policy loss mode that ignores
+            empty rows (``ROW_PADDING_LOSS_MODES``: not ``geo_mean``); other losses keep the exact rows.
         splash_max_block_size: Largest Splash attention block size, a power of two >= 128 (default: ``512``,
             torchtitan's). Long packed micro-batches run faster with ``1024``.
         mixed_precision_reduce: dtype of the FSDP gradient reduce-scatter, ``float32`` (default, torchtitan's) or

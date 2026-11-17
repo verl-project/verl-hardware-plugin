@@ -26,6 +26,14 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     unwrap_metadata,
 )
 
+# Policy loss modes of verl (``actor.policy_loss.loss_mode``) that reduce over the response mask only (``agg_loss``,
+# masked means): empty loss rows change neither their loss, its gradients nor its metrics. ``geo_mean`` averages its
+# per-sequence losses over every row (``torch.mean``), so empty rows would scale its loss; it keeps the exact rows,
+# like any mode not listed here.
+ROW_PADDING_LOSS_MODES = frozenset(
+    {"bypass_mode", "cispo", "clip_cov", "dppo_kl", "dppo_tv", "dro", "gpg", "gspo", "kl_cov", "sapo", "vanilla"}
+)
+
 
 class _TPUPaddedJaggedProxy:
     """Lightweight proxy exposing a 1D bucket-padded TPU tensor via ``.values()``."""
@@ -156,9 +164,10 @@ def prepare_tpu_loss_inputs(model_output: dict[str, Any], micro_batch: TensorDic
     programs (forward loss and the fused LM-head backward) for the whole run.
 
     With ``engine_kwargs.tpu.static_micro_batch_seqs``, the engine gives every micro-batch of verl's ``ppo_loss``
-    ``tpu_padded_num_seqs``: its PPO loss inputs get at least that many rows, so their shapes do not depend on the
-    number of sequences in the micro-batch either. The extra rows are empty sequences (zero response mask, log-probs
-    and advantages), which leave the loss, its gradients and the token-mean normalization unchanged.
+    ``tpu_padded_num_seqs`` (for a policy loss mode in ``ROW_PADDING_LOSS_MODES``): its PPO loss inputs get at least
+    that many rows, so their shapes do not depend on the number of sequences in the micro-batch either. The extra
+    rows are empty sequences (zero response mask, log-probs and advantages), which leave the loss, its gradients and
+    the token-mean normalization unchanged.
     """
     log_prob = model_output.get("log_probs")
     tpu_padded_log_prob = getattr(log_prob, TPU_PADDED_VALUES_ATTR, None)

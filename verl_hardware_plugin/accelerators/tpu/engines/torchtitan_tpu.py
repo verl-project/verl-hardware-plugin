@@ -113,7 +113,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     unwrap_metadata,
 )
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
-from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import prepare_tpu_loss_inputs
+from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import ROW_PADDING_LOSS_MODES, prepare_tpu_loss_inputs
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 
@@ -1544,13 +1544,14 @@ class TorchTitanTPUEngine(BaseEngine):
 
         uses_document_budget = "kda" in getattr(self, "_tpu_kernels", ()) and not slot_len
         if static_seqs:
-            # Only verl's ppo_loss gets padded loss rows: the padded loss inputs hold its fields only (loss_inputs.py).
-            pads_loss_rows = isinstance(loss_function, partial) and loss_function.func is ppo_loss
+            pads_loss_rows = self._pads_loss_rows(loss_function)
             if pads_loss_rows:
                 for micro_batch in micro_batches:
                     tu.assign_non_tensor_data(micro_batch, TPU_PADDED_NUM_SEQS_KEY, static_seqs)
             if pads_loss_rows or uses_document_budget:
-                self._warn_above_static_micro_batch_seqs(micro_batches, static_seqs)
+                self._warn_above_static_micro_batch_seqs(
+                    micro_batches, static_seqs, pads_loss_rows, uses_document_budget
+                )
 
         if uses_document_budget:
             # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
@@ -1603,18 +1604,50 @@ class TorchTitanTPUEngine(BaseEngine):
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
-    def _warn_above_static_micro_batch_seqs(self, micro_batches: list[TensorDict], static_seqs: int) -> None:
-        """Logs each new sequence count above ``static_micro_batch_seqs`` once: such micro-batches get new shapes."""
+    def _pads_loss_rows(self, loss_function: Optional[Callable]) -> bool:
+        """Whether ``static_micro_batch_seqs`` pads the loss rows of ``loss_function``.
+
+        Only verl's ``ppo_loss`` gets padding rows (the padded loss inputs hold its fields only), and only with a
+        policy loss mode in ``ROW_PADDING_LOSS_MODES``. Any other mode, e.g. ``geo_mean``, which averages over
+        every row, keeps the exact rows, with one warning per mode.
+        """
+        if not (isinstance(loss_function, partial) and loss_function.func is ppo_loss):
+            return False
+        config = loss_function.keywords.get("config")
+        if config is None and loss_function.args:
+            config = loss_function.args[0]
+        loss_mode = config.policy_loss.get("loss_mode", "vanilla") if config is not None else None
+        if loss_mode in ROW_PADDING_LOSS_MODES:
+            return True
+        warned = self.__dict__.setdefault("_static_micro_batch_seqs_warned_modes", set())
+        if loss_mode not in warned:
+            warned.add(loss_mode)
+            logger.warning(
+                "static_micro_batch_seqs: policy loss mode %r is not one whose loss ignores empty rows (geo_mean "
+                "averages over every row), so its PPO loss inputs keep their exact rows.",
+                loss_mode,
+            )
+        return False
+
+    def _warn_above_static_micro_batch_seqs(
+        self, micro_batches: list[TensorDict], static_seqs: int, pads_loss_rows: bool, uses_document_budget: bool
+    ) -> None:
+        """Logs each new sequence count above ``static_micro_batch_seqs`` once, and which shapes follow it."""
         warned = self.__dict__.setdefault("_static_micro_batch_seqs_warned", set())
         counts = sorted({int(mb.batch_size[0]) for mb in micro_batches if int(mb.batch_size[0]) > static_seqs} - warned)
         if counts:
             warned.update(counts)
+            effects = []
+            if pads_loss_rows:
+                effects.append("their PPO loss inputs keep their own row count")
+            if uses_document_budget:
+                effects.append("the Tokamax GatedDeltaNet document budget grows with them")
             logger.warning(
-                "static_micro_batch_seqs=%d is below the %s sequences of some micro-batches: they keep their own PPO "
-                "loss rows (and Tokamax GatedDeltaNet document budget), so each new count compiles new programs. "
-                "Raise static_micro_batch_seqs to cover them.",
+                "static_micro_batch_seqs=%d is below the %s sequences of some micro-batches: %s, so shapes can "
+                "change again and compile new programs. Raise static_micro_batch_seqs to cover them.",
                 static_seqs,
                 counts,
+                " and ".join(effects),
             )
 
     def model_forward_step(

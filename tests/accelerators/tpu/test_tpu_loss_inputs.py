@@ -13,6 +13,7 @@ from torch.utils._pytree import tree_flatten
 from torch.utils.weak import WeakTensorKeyDictionary
 
 from verl.trainer.config.algorithm import RolloutCorrectionConfig
+from verl.trainer.ppo.core_algos import POLICY_LOSS_REGISTRY
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.workers.config import ActorConfig
@@ -23,7 +24,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     bucket_length,
 )
-from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import prepare_tpu_loss_inputs
+from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import ROW_PADDING_LOSS_MODES, prepare_tpu_loss_inputs
 
 
 def test_prepare_tpu_loss_inputs_matches_unmodified_sft_loss():
@@ -293,13 +294,14 @@ def _rows_config(loss_agg_mode="token-mean", **kwargs):
     )
 
 
-def _bypass_config():
-    """Rollout correction in bypass mode with token-level IS weights, as common for TPU rollouts."""
+def _bypass_config(rollout_is="token", rollout_is_batch_normalize=False, rollout_rs=None, rs_threshold=None):
+    """Rollout correction in bypass mode, by default with token-level IS weights, as common for TPU rollouts."""
     correction = RolloutCorrectionConfig(
-        rollout_is="token",
+        rollout_is=rollout_is,
         rollout_is_threshold=3.0,
-        rollout_is_batch_normalize=False,
-        rollout_rs=None,
+        rollout_is_batch_normalize=rollout_is_batch_normalize,
+        rollout_rs=rollout_rs,
+        rollout_rs_threshold=rs_threshold,
         bypass_mode=True,
         loss_type="ppo_clip",
     )
@@ -316,6 +318,28 @@ def _bypass_config():
         clip_ratio_c=1.0e9,
         policy_loss=PolicyLossConfig(loss_mode="bypass_mode", rollout_correction=correction),
     )
+
+
+def _loss_mode_config(loss_mode):
+    """An actor config for verl's policy loss ``loss_mode``, with the settings that some modes require."""
+    if loss_mode == "bypass_mode":
+        return _bypass_config()
+    extra = {"dro_beta": 0.1} if loss_mode == "dro" else {}
+    return _rows_config(clip_ratio_c=3.0, policy_loss=PolicyLossConfig(loss_mode=loss_mode, **extra))
+
+
+# Metrics that average over every loss row, so the padding rows count too (docs/accelerators/tpu/rollout.md):
+# the sequence-level IS statistics and the rejection-sampling fraction of bypass mode, and verl 0.9.1's
+# perplexity and chi-square metrics.
+PADDING_SENSITIVE_METRICS = (
+    "rollout_corr/rollout_is_seq_",
+    "rollout_corr/rollout_rs_seq_masked_fraction",
+    "rollout_corr/chi2_seq",
+)
+
+
+def _padding_sensitive(key):
+    return key.startswith(PADDING_SENSITIVE_METRICS) or (key.startswith("rollout_corr/") and "ppl" in key)
 
 
 def _assert_same_loss(a, b, metric_keys=None):
@@ -350,23 +374,49 @@ def test_static_micro_batch_seqs_rows_give_the_same_loss_gradients_and_metrics(l
     _assert_same_loss(_run_rows(config, exact=True, dp_size=dp_size), padded)
 
 
-def test_static_micro_batch_seqs_rows_with_rollout_correction():
-    """Bypass-mode rollout correction: the same loss and gradients; only rollout-correction diagnostics may differ.
+@pytest.mark.parametrize(
+    "correction",
+    [
+        {},
+        {"rollout_is": "sequence", "rollout_is_batch_normalize": True},
+        {"rollout_is": None, "rollout_rs": "token_k1", "rs_threshold": "0.9_1.1"},
+        {"rollout_rs": "seq_max_k2", "rs_threshold": 0.05},
+    ],
+    ids=["token-is", "sequence-is", "token-rs", "token-is-sequence-rs"],
+)
+def test_static_micro_batch_seqs_rows_with_rollout_correction(correction):
+    """Bypass-mode rollout correction: the same loss and gradients; only the listed diagnostics may differ.
 
     Per-sequence rollout-correction statistics that average over every loss row also count the padding rows: the
-    sequence-level IS statistics, and in verl 0.9.1 also the off-policy perplexity and chi-square metrics. The loss,
-    the gradients and every other metric are unchanged.
+    sequence-level IS statistics, the fraction of sequences with rejected tokens, and in verl 0.9.1 also the
+    off-policy perplexity and chi-square metrics (``PADDING_SENSITIVE_METRICS``). The loss, the gradients and every
+    other metric are unchanged.
     """
-    reference = _run_rows(_bypass_config())
-    padded = _run_rows(_bypass_config(), num_rows=12, width=32)
+    reference = _run_rows(_bypass_config(**correction))
+    padded = _run_rows(_bypass_config(**correction), num_rows=12, width=32)
     assert any(key.startswith("rollout_corr/") for key in padded[2])
-    _assert_same_loss(
-        reference, padded, metric_keys=[key for key in reference[2] if not key.startswith("rollout_corr/")]
-    )
-    differing = {
-        key for key in reference[2] if not math.isclose(reference[2][key], padded[2][key], rel_tol=1e-5, abs_tol=1e-6)
-    }
-    assert all(key.startswith("rollout_corr/") for key in differing), sorted(differing)
+    _assert_same_loss(reference, padded, metric_keys=[key for key in reference[2] if not _padding_sensitive(key)])
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("loss_mode", sorted(POLICY_LOSS_REGISTRY))
+def test_static_micro_batch_seqs_rows_for_every_policy_loss_mode(loss_mode, dp_size):
+    """Padding rows leave every mode in ``ROW_PADDING_LOSS_MODES`` unchanged, but would change geo_mean's loss.
+
+    geo_mean averages its per-sequence losses over every row, so padding rows scale its loss and gradients; the
+    engine keeps its exact rows (test_tpu_engine.py). verl modes not in the list are skipped: the engine does not
+    pad them either.
+    """
+    if loss_mode not in ROW_PADDING_LOSS_MODES and loss_mode != "geo_mean":
+        pytest.skip(f"{loss_mode} is not in ROW_PADDING_LOSS_MODES: the engine keeps its exact rows")
+    torch.manual_seed(0)  # clip_cov picks a random subset of its tokens
+    reference = _run_rows(_loss_mode_config(loss_mode), dp_size=dp_size)
+    torch.manual_seed(0)
+    padded = _run_rows(_loss_mode_config(loss_mode), num_rows=12, width=32, dp_size=dp_size)
+    if loss_mode == "geo_mean":
+        assert not math.isclose(reference[0].item(), padded[0].item(), rel_tol=1e-3)
+        return
+    _assert_same_loss(reference, padded, metric_keys=[key for key in reference[2] if not _padding_sensitive(key)])
 
 
 def test_static_micro_batch_seqs_shapes_do_not_depend_on_the_sequence_count():
@@ -438,7 +488,8 @@ def test_static_micro_batch_seqs_device_ops_do_not_depend_on_the_sequence_count(
 
     This covers the forward loss, its metrics and the backward. An op whose output size depends on tensor values
     (verl versions whose ppo_loss counts ``actor/old_logprobs_mismatch_count`` with a boolean mask have one) cannot be
-    made static by row padding; such ops must stay off the autograd graph, and are compared separately.
+    made static by row padding. The test compares such ops by name only, and every other device op, of the forward
+    and of the backward, by name and shapes.
     """
     config = _rows_config()
     a = _trace_loss_and_backward(config, [(5, 7), (9, 11), (4, 3)], num_rows=8, seed=1)

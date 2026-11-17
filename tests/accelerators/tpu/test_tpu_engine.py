@@ -3613,11 +3613,13 @@ def _static_seqs_mini_batch(n, seed, max_prompt=20, max_response=40):
     return data
 
 
-def _ppo_loss_function():
+def _ppo_loss_function(**actor_kwargs):
     from verl.workers.config import ActorConfig
     from verl.workers.utils.losses import ppo_loss
 
-    config = ActorConfig(strategy="fsdp", rollout_n=8, ppo_micro_batch_size_per_gpu=4, loss_agg_mode="token-mean")
+    config = ActorConfig(
+        strategy="fsdp", rollout_n=8, ppo_micro_batch_size_per_gpu=4, loss_agg_mode="token-mean", **actor_kwargs
+    )
     return functools.partial(ppo_loss, config=config)
 
 
@@ -3754,6 +3756,7 @@ def test_static_micro_batch_seqs_warns_once_per_new_count_above_it(static_seqs_e
         second = warnings_in(caplog.records)
     above = sorted({c.seqs for c in calls if c.seqs > 2})
     assert above and len(first) == 1 and str(above) in first[0]
+    assert "PPO loss inputs keep their own row count" in first[0] and "GatedDeltaNet" not in first[0]
     assert second == first  # the same counts again: no new warning
     # Rows above N keep their own count; the others are padded to N.
     assert {c.rows for c in calls} == {(max(c.seqs, 2), 64) for c in calls}
@@ -3764,3 +3767,75 @@ def test_static_micro_batch_seqs_warns_once_per_new_count_above_it(static_seqs_e
     with caplog.at_level(logging.WARNING, logger=torchtitan_tpu.logger.name), torch.no_grad():
         engine.forward_backward_batch(_static_seqs_mini_batch(48, seed=3), None, forward_only=True)
     assert warnings_in(caplog.records) == []
+
+    # A forward-only call with Tokamax kernels: only the document budget follows the counts above N.
+    engine, _, _ = static_seqs_engine({**STATIC_8K_LIKE, "static_micro_batch_seqs": 2})
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=torchtitan_tpu.logger.name), torch.no_grad():
+        engine.forward_backward_batch(_static_seqs_mini_batch(48, seed=3), None, forward_only=True)
+    messages = warnings_in(caplog.records)
+    assert len(messages) == 1 and "GatedDeltaNet document budget" in messages[0]
+    assert "PPO loss inputs" not in messages[0]
+
+
+def test_static_micro_batch_seqs_keeps_the_exact_rows_of_geo_mean(static_seqs_engine, caplog):
+    """geo_mean averages over every row: its loss inputs keep their exact rows, with one warning per engine."""
+    import logging
+
+    from verl.workers.config.actor import PolicyLossConfig
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+
+    results = {}
+    for seqs in (None, 16):
+        engine, toy, calls = static_seqs_engine({**STATIC_8K_LIKE, "static_micro_batch_seqs": seqs})
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=torchtitan_tpu.logger.name):
+            for _ in range(2):  # the second call warns no more
+                loss_function = _ppo_loss_function(policy_loss=PolicyLossConfig(loss_mode="geo_mean"))
+                output = engine.forward_backward_batch(_static_seqs_mini_batch(48, seed=3), loss_function)
+        warnings = [r.getMessage() for r in caplog.records if "'geo_mean'" in r.getMessage()]
+        results[seqs] = (output["loss"], toy.theta.grad.clone(), calls, warnings)
+
+    loss_v, theta_v, _, warnings_v = results[None]
+    loss_s, theta_s, calls_s, warnings_s = results[16]
+    assert {c.num_seqs_key for c in calls_s} == {None}
+    assert {c.rows for c in calls_s} == {(c.seqs, 64) for c in calls_s}  # the exact rows
+    assert loss_s == pytest.approx(loss_v, rel=1e-12, abs=1e-12)
+    torch.testing.assert_close(theta_s, theta_v, rtol=1e-12, atol=1e-14)
+    assert warnings_v == [] and len(warnings_s) == 1 and "exact rows" in warnings_s[0]
+
+
+def test_static_micro_batch_seqs_keeps_the_engines_own_ppo_metrics(static_seqs_engine, monkeypatch):
+    """forward_step's own token-mean PPO metrics are the same with padding rows (the toy policy as the model)."""
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import TPU_PADDED_VALUES_ATTR
+
+    monkeypatch.setattr(torchtitan_tpu, "get_device_name", lambda: "cpu")
+    names = ("actor/ppo_kl_token_mean", "actor/ppo_k3_token_mean", "actor/logprob_gap_abs_token_mean")
+    results = {}
+    for seqs in (None, 16):
+        engine, toy, _ = static_seqs_engine({**STATIC_8K_LIKE, "static_micro_batch_seqs": seqs})
+        del engine.forward_step  # the engine's own forward_step, around the toy policy
+
+        def model_outputs(logits, output_args, micro_batch, toy=toy):
+            input_ids = micro_batch["input_ids"]
+            _, positions, labels, orig = pad_packed_inputs_for_tpu(
+                input_ids, micro_batch["position_ids"], micro_batch, "cpu", 32
+            )
+            padded = -torch.nn.functional.softplus(toy.theta[labels] + toy.w * positions.to(torch.float64) / 64)
+            log_probs = torch.nested.nested_tensor_from_jagged(padded.detach()[:orig].clone(), input_ids.offsets())
+            setattr(log_probs, TPU_PADDED_VALUES_ATTR, padded)
+            return {"log_probs": log_probs}
+
+        engine.prepare_model_inputs = lambda micro_batch: (None, {}, {}, {})
+        engine.model_forward_step = lambda **kwargs: None
+        engine.prepare_model_outputs = model_outputs
+        output = engine.forward_backward_batch(_static_seqs_mini_batch(48, seed=3), _ppo_loss_function())
+        values = {name: getattr(output["metrics"][name], "values", output["metrics"][name]) for name in names}
+        results[seqs] = (values, toy.theta.grad.clone())
+
+    (metrics_v, theta_v), (metrics_s, theta_s) = results[None], results[16]
+    assert len(metrics_v[names[0]]) > 2 and any(value > 0 for value in metrics_v[names[2]])
+    for name in names:
+        assert metrics_s[name] == pytest.approx(metrics_v[name], rel=1e-6, abs=1e-9), name
+    torch.testing.assert_close(theta_s, theta_v, rtol=1e-12, atol=1e-14)
