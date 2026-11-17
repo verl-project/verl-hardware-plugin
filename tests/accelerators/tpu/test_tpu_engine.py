@@ -719,6 +719,45 @@ def test_get_tpu_env_vars_resolves_single_host_subhost_rollout_worker_group(tp, 
                 )
 
 
+def test_get_tpu_env_vars_rejects_a_rollout_replica_split_across_hosts():
+    # verl places rollout workers with Ray's best-effort PACK, which can split a placement group over hosts. A TP=4
+    # replica split 2 + 2 fails with that, not with a mesh error for 4 devices on 2 hosts.
+    platform = PlatformTPU()
+    nodes = [
+        {
+            "NodeID": f"node-ro-{h}",
+            "NodeManagerAddress": f"10.0.0.1{h}",
+            "Alive": True,
+            "Resources": {"TPU": 8.0},
+            "Labels": {"ray.io/tpu-pod-type": "v7x-16"},
+        }
+        for h in (0, 1)
+    ]
+    tables = {
+        "split": {
+            "state": "CREATED",
+            "bundles_to_node_id": {0: "node-ro-0", 1: "node-ro-0", 2: "node-ro-1", 3: "node-ro-1"},
+        },
+        "host-0": {"state": "CREATED", "bundles_to_node_id": {i: "node-ro-0" for i in range(8)}},
+        "host-1": {"state": "CREATED", "bundles_to_node_id": {i: "node-ro-1" for i in range(8)}},
+    }
+
+    def env(name_prefix, pg_ids, world_size, local_world_size):
+        pgs = [SimpleNamespace(id=pg_id) for pg_id in pg_ids]
+        return platform.get_tpu_env_vars(0, world_size, 0, local_world_size, name_prefix=name_prefix, pgs=pgs)
+
+    with (
+        mock.patch.dict(os.environ, _env_without_webhook(), clear=True),
+        mock.patch("ray.is_initialized", return_value=True),
+        mock.patch("ray.nodes", return_value=nodes),
+        mock.patch("ray._private.state.state.placement_group_table", side_effect=tables.__getitem__),
+    ):
+        with pytest.raises(RuntimeError, match=r"'rollout_standalone_0' on 2 hosts \(10\.0\.0\.10, 10\.0\.0\.11\)"):
+            env("rollout_standalone_0", ["split"], world_size=4, local_world_size=4)
+        # A replica over two hosts has one placement group per host, each on its own host.
+        assert env("rollout_standalone_1", ["host-0", "host-1"], 16, 8)["TORCH_TPU_TOPOLOGY"] == "2,2,2,2"
+
+
 def _clear_forwarded_tpu_env(monkeypatch):
     """Unset the variables the platform forwards, so the test shell's own exports do not leak in."""
     for name in list(os.environ):

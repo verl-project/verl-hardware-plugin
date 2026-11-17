@@ -827,6 +827,9 @@ class PlatformTPU(PlatformBase):
         (``CLOUD_TPU_TASK_ID``, ``TPU_VISIBLE_DEVICES`` / ``TPU_VISIBLE_CHIPS``, ``TPU_PROCESS_ADDRESSES``,
         ``TPU_PROCESS_PORT``, and the host, process and chip bounds) and overwrites any value set before, on TPU 7x
         as on v6e.
+
+        Raises:
+            RuntimeError: if Ray placed one placement group of a rollout replica on more than one host.
         """
         node_ip_map = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes() if node.get("Alive", False)}
         bundle_ips = []
@@ -836,6 +839,18 @@ class PlatformTPU(PlatformBase):
             if specs.get("state") != "CREATED":
                 continue
             bundles_map = specs.get("bundles_to_node_id", {})
+            pg_hosts = sorted({node_ip_map.get(node_id, node_id) for node_id in bundles_map.values()})
+            if len(pg_hosts) > 1 and (name_prefix or "").startswith(ROLLOUT_REPLICA_POOL_PREFIX):
+                # verl creates one placement group per host of a rollout replica (a single-host replica has one), with
+                # Ray's best-effort PACK (bin_pack=False), which can split it over hosts. Say so here, rather than fail
+                # later on a mesh for devices of several hosts.
+                raise RuntimeError(
+                    f"Ray placed the {len(bundles_map)} bundles of one placement group of rollout worker group "
+                    f"{name_prefix!r} on {len(pg_hosts)} hosts ({', '.join(pg_hosts)}), but a rollout replica's "
+                    "placement group must hold the devices of one host: a replica on one host is a single-host mesh. "
+                    "verl places rollout workers with Ray's best-effort PACK strategy (bin_pack=False), which can "
+                    "split a placement group over partly used hosts."
+                )
             for b_idx in sorted(bundles_map.keys()):
                 node_id = bundles_map[b_idx]
                 if node_id in node_ip_map:

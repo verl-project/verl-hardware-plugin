@@ -20,10 +20,14 @@ The same logic previously lived behind ``get_resource_name() == "TPU"`` branches
 ``vllm_async_server.py`` and ``replica.py``.
 """
 
+import asyncio
+import inspect
 import logging
 
 import ray
 
+from verl.single_controller.ray import RayResourcePool, ResourcePoolManager
+from verl.utils.device import get_device_name
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import ray_tpu_accelerator_name, single_host_tpu_topology
 from verl_hardware_plugin.accelerators.tpu.profilers.tpu_vllm_timeline import vLLMServerTimelineMixin
@@ -68,6 +72,36 @@ class TPUvLLMReplica(vLLMReplica):
         super().__init__(*args, **kwargs)
         self.server_class = ray.remote(TPUvLLMHttpServer)
 
+    async def init_standalone(self, resource_pool: RayResourcePool | None = None):
+        # verl builds a standalone replica's workers with bin_pack=False: Ray's best-effort PACK, which fills the
+        # best-scored host and puts the remaining bundles on others, so it can split a replica over partly used hosts.
+        # A replica on one host hands verl its pool with a STRICT_PACK placement group instead. A verl whose
+        # init_standalone takes no pool (before verl-project/verl#7993) keeps PACK, and a split replica fails in
+        # PlatformTPU.get_tpu_env_vars or TPUvLLMReplica.launch_servers.
+        if (
+            resource_pool is None
+            and self.nnodes == 1
+            and "resource_pool" in inspect.signature(super().init_standalone).parameters
+        ):
+            resource_pool = self._single_host_pool()
+        if resource_pool is None:
+            await super().init_standalone()
+        else:
+            await super().init_standalone(resource_pool=resource_pool)
+
+    def _single_host_pool(self) -> RayResourcePool:
+        """verl's standalone pool of this replica (same name and spec), with its placement group created now by
+        STRICT_PACK: on one host, or pending until a host has room. verl's worker group reuses that placement group."""
+        kind = "_reward" if self.is_reward_model else "_teacher" if self.is_teacher_model else ""
+        name = f"rollout_pool{kind}_{self.replica_rank}{self.name_suffix}"
+        manager = ResourcePoolManager(
+            resource_pool_spec={name: [self.gpus_per_replica_node]}, mapping=None, max_colocate_count=2
+        )
+        manager.create_resource_pool()
+        pool = manager.resource_pool_dict[name]
+        pool.get_placement_groups(strategy="STRICT_PACK", device_name=get_device_name())
+        return pool
+
     def _get_server_env_vars(self, node_ids: list[str]) -> dict[str, str]:
         env_vars = {
             **super()._get_server_env_vars(node_ids),
@@ -106,4 +140,23 @@ class TPUvLLMReplica(vLLMReplica):
                 "then creates one rollout replica per tensor_model_parallel_size chips, "
                 "which is equivalent to engine-internal data parallelism."
             )
+        if self.nnodes == 1 and getattr(self, "workers", None):
+            # Upstream launch_servers queries every worker's node id, then slices
+            # worker_node_ids[::gpus_per_replica_node] (only worker 0 when nnodes == 1). Check every worker here so a
+            # replica split across hosts by Ray's PACK strategy fails before any server starts: its engine runs on
+            # worker 0's host and opens that host's devices.
+            node_ids = await asyncio.gather(
+                *[
+                    worker.__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
+                    for worker in self.workers
+                ]
+            )
+            hosts = sorted(set(node_ids))
+            if len(hosts) > 1:
+                raise RuntimeError(
+                    f"Rollout replica {self.replica_rank} must run on one host, but Ray placed its {len(node_ids)} "
+                    f"workers on {len(hosts)} hosts ({', '.join(hosts)}): its engine would open devices of other "
+                    "replicas. verl places rollout workers with Ray's best-effort PACK strategy (bin_pack=False), "
+                    "which can split a replica over partly used hosts."
+                )
         await super().launch_servers()

@@ -51,16 +51,32 @@ class _FakeReplica:
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
+        self.replica_rank = args[0] if args else 0
+        self.is_reward_model = kwargs.get("is_reward_model", False)
+        self.is_teacher_model = kwargs.get("is_teacher_model", False)
+        self.name_suffix = kwargs.get("name_suffix", "")
+        self.workers = []
         self.server_class = None
         self.launched = False
 
     def _get_server_name_prefix(self):
         return "vllm_"
 
+    async def init_standalone(self, resource_pool=None):
+        self.standalone_pool = resource_pool
+
     def _get_server_env_vars(self, node_ids):
         return {"FROM_UPSTREAM": "1"}
 
     async def launch_servers(self):
+        if self.workers:
+            worker_node_ids = await asyncio.gather(
+                *[
+                    worker.__ray_call__.remote(lambda w: ray.get_runtime_context().get_node_id())
+                    for worker in self.workers
+                ]
+            )
+            self.server_env_vars = self._get_server_env_vars(worker_node_ids[:: self.gpus_per_replica_node])
         self.launched = True
 
 
@@ -78,12 +94,6 @@ def tpu_vllm():
         module = importlib.import_module("verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm")
         yield module
         sys.modules.pop("verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm", None)
-
-
-def _done(value):
-    future = asyncio.get_event_loop().create_future()
-    future.set_result(value)
-    return future
 
 
 # ---------------------------------------------------------------------------
@@ -166,16 +176,107 @@ def test_replica_uses_tpu_server(tpu_vllm):
     assert replica.args == (0, "config", "model_config")
 
 
+class _FakePool:
+    def __init__(self, name, process_on_nodes):
+        self.name = name
+        self.process_on_nodes = process_on_nodes
+        self.created = []
+
+    def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
+        self.created.append((strategy, device_name))
+        return ["pg"]
+
+
+class _FakePoolManager:
+    def __init__(self, resource_pool_spec, mapping, max_colocate_count):
+        self.resource_pool_dict = {name: _FakePool(name, nodes) for name, nodes in resource_pool_spec.items()}
+
+    def create_resource_pool(self):
+        pass
+
+
+def _standalone_replica(tpu_vllm, nnodes, **attrs):
+    replica = tpu_vllm.TPUvLLMReplica(3, "config", "model_config")
+    replica.__dict__.update(replica_rank=3, nnodes=nnodes, gpus_per_replica_node=4, name_suffix="")
+    replica.__dict__.update({"is_reward_model": False, "is_teacher_model": False, **attrs})
+    return replica
+
+
+@pytest.mark.parametrize(
+    "kind, pool_name",
+    [
+        ({}, "rollout_pool_3"),
+        ({"is_reward_model": True}, "rollout_pool_reward_3"),
+        ({"is_teacher_model": True, "name_suffix": "_org_teacher"}, "rollout_pool_teacher_3_org_teacher"),
+    ],
+)
+def test_single_host_replica_gets_a_strict_pack_placement_group(tpu_vllm, kind, pool_name):
+    # verl builds a standalone replica's workers with bin_pack=False (Ray's best-effort PACK), which can split a
+    # replica over hosts. A replica on one host hands verl its pool, under verl's name, with the placement group
+    # already created by STRICT_PACK; verl's worker group reuses it.
+    replica = _standalone_replica(tpu_vllm, nnodes=1, **kind)
+    with (
+        mock.patch.object(tpu_vllm, "ResourcePoolManager", _FakePoolManager),
+        mock.patch.object(tpu_vllm, "get_device_name", return_value="tpu"),
+    ):
+        asyncio.run(replica.init_standalone())
+    pool = replica.standalone_pool
+    assert (pool.name, pool.process_on_nodes, pool.created) == (pool_name, [4], [("STRICT_PACK", "tpu")])
+
+
+def test_other_replicas_keep_verl_init_standalone(tpu_vllm):
+    with mock.patch.object(tpu_vllm, "ResourcePoolManager") as manager:
+        # A replica over several hosts: verl creates its pool.
+        replica = _standalone_replica(tpu_vllm, nnodes=2)
+        asyncio.run(replica.init_standalone())
+        assert replica.standalone_pool is None
+        # A pool the caller passes is used as it is.
+        replica = _standalone_replica(tpu_vllm, nnodes=1)
+        asyncio.run(replica.init_standalone(resource_pool="caller's pool"))
+        assert replica.standalone_pool == "caller's pool"
+        # A verl whose init_standalone takes no pool creates its own.
+        calls = []
+
+        async def init_standalone_without_pool(self):
+            calls.append(self)
+
+        with mock.patch.object(_FakeReplica, "init_standalone", init_standalone_without_pool):
+            asyncio.run(replica.init_standalone())
+        assert calls == [replica]
+    manager.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # TPUvLLMReplica._get_server_env_vars / launch_servers
 # ---------------------------------------------------------------------------
+
+
+class _FakeRemoteMethod:
+    def __init__(self, result):
+        self._result = result
+
+    def remote(self, *args, **kwargs):
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(self._result(*args, **kwargs) if callable(self._result) else self._result)
+        return future
+
+
+class _FakeWorker:
+    def __init__(self, node_id):
+        self._node_id = node_id
+        self.__ray_call__ = _FakeRemoteMethod(self._call)
+
+    def _call(self, fn):
+        with mock.patch("ray.get_runtime_context", return_value=SimpleNamespace(get_node_id=lambda: self._node_id)):
+            return fn(self)
+
 
 NODE_A = "a" * 56
 NODE_B = "b" * 56
 
 
-def _make_tpu_replica(tpu_vllm, *, data_parallel_size=1, nnodes=2, chips_per_host=4):
-    replica = tpu_vllm.TPUvLLMReplica(0, "config", "model_config")
+def _make_tpu_replica(tpu_vllm, *, replica_rank=0, data_parallel_size=1, nnodes=2, chips_per_host=4):
+    replica = tpu_vllm.TPUvLLMReplica(replica_rank, "config", "model_config")
     replica.config = SimpleNamespace(
         data_parallel_size=data_parallel_size,
         tensor_model_parallel_size=chips_per_host * nnodes,
@@ -200,6 +301,17 @@ def test_replica_launch_servers_delegates_to_upstream_and_rejects_data_parallel(
 
     with pytest.raises(NotImplementedError, match="data_parallel_size"):
         asyncio.run(_make_tpu_replica(tpu_vllm, data_parallel_size=2).launch_servers())
+
+
+@pytest.mark.parametrize("chips", [4, 8])
+def test_replica_launch_servers_rejects_a_single_host_replica_split_across_hosts(tpu_vllm, chips):
+    # Ray's best-effort PACK put half of a single-host replica's workers on another host. Upstream launch_servers
+    # inspects only worker 0's host when nnodes == 1, so TPUvLLMReplica checks every worker before starting a server.
+    replica = _make_tpu_replica(tpu_vllm, replica_rank=3, nnodes=1, chips_per_host=chips)
+    replica.workers = [_FakeWorker(node) for node in (NODE_A, NODE_B) for _ in range(chips // 2)]
+    with pytest.raises(RuntimeError, match=f"replica 3 must run on one host, but Ray placed its {chips} workers on 2"):
+        asyncio.run(replica.launch_servers())
+    assert replica.launched is False
 
 
 @pytest.mark.parametrize(
