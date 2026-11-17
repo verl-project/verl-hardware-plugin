@@ -589,7 +589,7 @@ def _replica_class():
     return TPUInProcReplica
 
 
-_REPLICA_CLS = None
+_REPLICA_CLS: Optional[type] = None
 
 
 def __getattr__(name: str):  # the replica class imports verl's server module: built on first use
