@@ -57,11 +57,38 @@ actor_rollout_ref:
 |---|---|---|
 | `num_chains` | 8 | Max stripes; the trainer world size caps it. |
 | `num_slots` | 2 | Buckets in flight per stripe and hop (>= 2); costs `num_slots * bucket size` of device memory per worker. |
+| `export` | `full` | `full`: stripes come from the trainer's full-tensor export (`get_per_tensor_param`). `shard`: see [Sharded export](#sharded-export). |
 | `intra_node` | `xgmi` | `xgmi` copies inside a rollout node over XGMI; `rdma` keeps it on the NIC. |
 | `qp_per_transfer`, `num_nics_per_transfer`, `enable_chunking` | 4, 1, True | MoRI RDMA settings. Chunking off halves the bandwidth of one transfer. |
 | `host` | Ray node IP | Address for MoRI and the control socket. |
 | `node_id` | Ray node id | Node identity used to group rollout workers. |
 | `timeout_s` | 600 | Max wait for any single transfer or control message. |
+
+## Sharded export
+
+With `export: shard`, stripe r carries trainer rank r's own shards from the training engine's
+`get_per_tensor_param_shard()` (bf16), so the trainer does not all-gather. Rollout workers put full tensors together
+from the pieces of all stripes and split packed MoE experts into per-expert names, as the full export does; server
+adapters see the same `(name, full tensor)` stream.
+
+- Needs verl's `consumes_training_engine` hook: the trainer worker then hands its training engine to `send_weights`
+  instead of a generator of full tensors. With a verl that lacks it, `export: shard` is refused.
+- Only verl's FSDP training engines, whose shards are HF-named. VeOmni (fused expert stacks), Megatron (MCore-named
+  TP slices) and TorchTitan are refused.
+- Shards must be one flat range of the full tensor (FSDP2 `Shard(0)`); replicated tensors are sent once.
+  `num_chains` must be >= the trainer world size.
+- Also refused: LoRA, QAT and specs that need a to-HF conversion; use `export: full`. A refusal fails the sync on
+  every worker.
+- Rollout workers hold at most `num_slots * bucket size` plus the largest tensor of partly assembled tensors: a stripe
+  starts a new tensor only if it fits that budget or is the next incomplete tensor in export order. A sync fails if
+  any tensor is still incomplete when every stripe has ended.
+
+```yaml
+        mori:
+          num_chains: 8   # >= trainer world size
+          num_slots: 4
+          export: shard
+```
 
 ## Failures are fail-stop
 
@@ -73,13 +100,13 @@ MoRI engine, region and transfer statuses alive for the rest of the process and 
 the rollout and trainer workers to continue.
 
 - A worker refuses `prepare`, `init_process_group` and a new sync while its previous sync is still running.
-  `CheckpointEngineManager` waits with `ray.get`, which returns on the first error, so a retry could otherwise reach
-  a worker that is still unwinding.
+  `CheckpointEngineManager` raises on the first worker error without waiting for the others (`ray.get`, or
+  `asyncio.gather` since verl#8542), so a retry could otherwise reach a worker that is still unwinding.
 - A receiver's sync starts when `receive_weights` is called, not at its first iteration; closing the stream before
   the first tensor fails the sync too.
 - A server adapter that raises while consuming the stream does not close it: verl's
   `CheckpointEngineWorker.update_weights` passes the error on and leaves the stream to garbage collection. The driver
-  sees the error at once (`ray.get` returns on the first error). The engine sees it only when an unfinished stream is
+  sees the error at once (the manager raises on the first worker error). The engine sees it only when an unfinished stream is
   finalized, and not at all if the adapter failed before its first tensor; until then that receiver stays busy and
   refuses new syncs, and its peers stop when `timeout_s` expires.
 
@@ -101,12 +128,16 @@ rollout side, median of 9 syncs after the first:
 |---|---|
 | `nccl`, 2048 MB bucket | 1.323 |
 | `mori`, 2048 MB bucket, 4 slots | **0.662** |
+| `mori`, `export: shard`, 2048 MB bucket, 4 slots | **0.451** |
 | trainer export alone (iterating `get_per_tensor_param()`, sending nothing) | 0.60 |
+| trainer shard export alone (iterating `get_per_tensor_param_shard()`, sending nothing) | 0.30 |
 
-The first two syncs of both backends matched the HF checkpoint tensor by tensor on all 8 rollout workers. Earlier
-runs (16 runs, 5 node pairs) gave medians of 1.28-1.46 s for `nccl` and 0.65-0.83 s for `mori`, 1.6-2.2x faster
-within each run. End to end (GRPO on GSM8K with a vLLM rollout, 2 nodes, Qwen2.5-7B-Instruct, 20 steps), test
-accuracy went from 0.785 to 0.892 with `mori` and to 0.901 with `nccl`.
+The first two syncs of every configuration matched the HF checkpoint tensor by tensor on all 8 rollout workers. The
+sharded export ships bf16 (61 GB for this model, what the rollout loads); the full export ships the trainer's fp32
+parameters (122 GB). Earlier runs (16 runs, 5 node pairs) gave medians of 1.28-1.46 s for `nccl` and 0.65-0.83 s
+for `mori`, 1.6-2.2x faster within each run. End to end (GRPO on GSM8K with a vLLM rollout, 2 nodes,
+Qwen2.5-7B-Instruct, 20 steps), test accuracy went from 0.785 to 0.892 with `mori`, to 0.909 with `export: shard` and
+to 0.901 with `nccl`.
 
 ## Tests
 
@@ -115,7 +146,9 @@ ZMQ: a write reads its source and lands on a background thread after a random de
 and same-node XGMI writes do not; as in MoRI 1.2.4, a write can report FAILED while its copy still runs, and a
 deregistered peer's endpoint is kept until the engine is destroyed. The tests cover many topologies and stripe and
 slot counts with tensors of every dtype (fp8 and e8m0 included) arriving bit-exact, the traffic pattern, every
-failure path above, membership changes, and foreign messages on the control socket.
+failure path above, membership changes, and foreign messages on the control socket. For `export: shard`, a fake
+trainer cuts each tensor along dim 0 (uneven, empty and 0-dim shards, replicated tensors, packed MoE experts) and
+the tests check the memory bound and every refusal.
 
 ## MoRI 1.2.4 workarounds
 

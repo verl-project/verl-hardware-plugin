@@ -26,6 +26,7 @@ BACKEND_MODULES = (
     "verl_hardware_plugin.accelerators.iluvatar",
     "verl_hardware_plugin.accelerators.musa",
     "verl_hardware_plugin.accelerators.tpu",
+    "verl_hardware_plugin.accelerators.neuron",
     "verl_hardware_plugin.accelerators.supa",
     "verl_hardware_plugin.accelerators.rocm",
 )

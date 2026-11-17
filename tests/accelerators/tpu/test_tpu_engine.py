@@ -3501,3 +3501,24 @@ def test_row_slot_permutation():
     for cu_seqlens, padded_len in (([0, 9], 32), ([0, 1, 2, 3, 4, 5], 32), ([0, 5], 30)):
         with pytest.raises(ValueError, match="gdn_row_slot_len"):
             row_slot_permutation(torch.tensor(cu_seqlens), padded_len, slot_len=8)
+
+
+def test_align_micro_batch_shapes_gdn_row_slot_len_multi_seq():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+
+    seq_lens = [22000, 18000, 25000, 19000]  # 84000 real tokens across 4 sequences (> static_len=32768)
+    ids = torch.nested.as_nested_tensor([torch.arange(n, dtype=torch.int64) for n in seq_lens], layout=torch.jagged)
+    pos = torch.nested.as_nested_tensor([torch.arange(n, dtype=torch.int64) for n in seq_lens], layout=torch.jagged)
+    mb4 = TensorDict({"input_ids": ids, "position_ids": pos}, batch_size=[4])
+
+    tpu_utils.align_micro_batch_shapes_across_ranks([mb4], bucket_size=2048, static_len=32768, gdn_row_slot_len=32768)
+    assert tu.get_non_tensor_data(mb4, "tpu_padded_seq_len", None) == 4 * 32768
+    ids_pad, pos_pad, _, orig_len = pad_packed_inputs_for_tpu(
+        ids, pos, mb4, torch.device("cpu"), bucket_size=2048, vocab_size=248320
+    )
+    assert orig_len == sum(seq_lens)
+    assert ids_pad.shape == (4 * 32768,)
+    slot_src, contig_src = tpu_utils.row_slot_permutation(ids.offsets(), ids_pad.shape[-1], 32768)
+    slotted = ids_pad[slot_src]
+    restored = slotted[contig_src]
+    assert torch.equal(restored[:orig_len], ids.values())
