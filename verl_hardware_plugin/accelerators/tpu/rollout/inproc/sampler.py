@@ -118,7 +118,7 @@ def batch_guard(rb: Any, batch: Any, global_steps: int, partition_id: str, batch
     return problems, info
 
 
-_FAST_POLL_CLS = None
+_FAST_POLL_CLS: Optional[type] = None
 
 
 def _fast_poll_class():
