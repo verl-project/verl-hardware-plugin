@@ -70,6 +70,20 @@ def _wrap_worker_method(orig_fn: Callable, kind: str) -> Callable:
     return wrapper
 
 
+def _worker_class() -> Any:
+    """verl's ``ActorRolloutRefWorker``, imported only on the switch-on path. verl.workers.engine_workers imports
+    uvicorn and fastapi (through verl.checkpoint_engine), which verl does not require: a failed import refuses with
+    its own error and what to do, instead of a bare ModuleNotFoundError from inside verl."""
+    try:
+        from verl.workers.engine_workers import ActorRolloutRefWorker
+    except ImportError as exc:
+        raise RuntimeError(
+            f"{INPROC_ENV}=1: the in-process rollout needs verl.workers.engine_workers, which failed to import "
+            f"({type(exc).__name__}: {exc}); install the missing package or unset {INPROC_ENV}"
+        ) from exc
+    return ActorRolloutRefWorker
+
+
 def install_worker_methods() -> list[str]:
     """The trainer worker serves the replica's requests: adds async ``generate`` / ``abort_all_requests`` /
     ``resume_generation`` / ``inproc_server_info`` to ``ActorRolloutRefWorker`` as DIRECT_ROLLOUT_METHOD methods
@@ -77,11 +91,12 @@ def install_worker_methods() -> list[str]:
     ``update_actor`` / ``compute_log_prob`` (refused when one is absent or a coroutine). Idempotent. Returns the
     wrapped methods."""
     from verl.single_controller.base.decorator import MAGIC_ATTR, Dispatch, Execute
-    from verl.workers.engine_workers import ActorRolloutRefWorker as W
     from verl_hardware_plugin.accelerators.tpu.rollout.inproc.compat import (
         WRAPPED_WORKER_METHODS,
         worker_methods_problem,
     )
+
+    W = _worker_class()
 
     attrs = {"dispatch_mode": Dispatch.DIRECT_ROLLOUT_METHOD, "execute_mode": Execute.ALL, "blocking": True}
 
@@ -166,8 +181,9 @@ def register_rollout_class() -> None:
 
 def register() -> None:
     """Called by the plugin's TPU registration with ``VERL_TPU_ROLLOUT_INPROC=1``, in every process that imports verl.
-    Fails closed."""
+    Fails closed: when verl's worker class cannot be imported it refuses before registering anything."""
     check_switches()
+    _worker_class()
     register_rollout_class()
     wrapped = install_worker_methods()
     log(
