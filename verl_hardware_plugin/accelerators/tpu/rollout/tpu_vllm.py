@@ -20,13 +20,10 @@ The same logic previously lived behind ``get_resource_name() == "TPU"`` branches
 ``vllm_async_server.py`` and ``replica.py``.
 """
 
-import asyncio
 import logging
 
 import ray
 
-from verl.plugin.platform import get_platform
-from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import ray_tpu_accelerator_name, single_host_tpu_topology
 from verl_hardware_plugin.accelerators.tpu.profilers.tpu_vllm_timeline import vLLMServerTimelineMixin
@@ -39,98 +36,6 @@ logger = logging.getLogger(__name__)
 TPU_SYNC_WORKER_EXTENSION_CLS = (
     "verl_hardware_plugin.accelerators.tpu.rollout.tpu_sync_worker_extension.vLLMTPUSyncWorkerExtension"
 )
-
-
-async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
-    """Launch one vLLM rollout server actor per host of a TPU replica."""
-    if replica.config.data_parallel_size > 1:
-        raise NotImplementedError(
-            "actor_rollout_ref.rollout.data_parallel_size="
-            f"{replica.config.data_parallel_size} is not supported on TPU. The TPU "
-            "distributed runtime requires each compiled program to span the whole "
-            "TPU mesh, but a single DP group only spans "
-            f"tensor_model_parallel_size={replica.config.tensor_model_parallel_size} "
-            "chips. Set actor_rollout_ref.rollout.data_parallel_size=1 instead: verl "
-            "then creates one rollout replica per tensor_model_parallel_size chips, "
-            "which is equivalent to engine-internal data parallelism."
-        )
-
-    # As upstream, but the servers get no devices: verl's rollout workers hold no TPU (a chip belongs to one
-    # process), so there are no accelerator ids to hand over. vLLM's own workers open the host's chips.
-    chips_per_host = replica.gpus_per_replica_node
-    node_ids = await asyncio.gather(
-        *[
-            worker.__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
-            for worker in replica.workers[::chips_per_host]
-        ]
-    )
-    env_vars = {
-        **{var: "1" for var in get_platform().ray_noset_envvars()},
-        **get_platform().rollout_env_vars(),
-        # vllm-torchtpu's default; set so that a job-level value cannot switch the replica to the Ray backend.
-        "TPU_MULTIHOST_BACKEND": "mp",
-    }
-    if replica.nnodes == 1:
-        # A replica on one host (e.g. one of several replicas on a multi-host rollout slice) is its own mesh; it
-        # must not inherit the slice's TORCH_TPU_TOPOLOGY. Multi-host replicas get theirs from vllm-torchtpu's
-        # rendezvous. The TPU type comes from the replica's host, not from this process's environment, which
-        # may be a CPU Ray head without TPU_ACCELERATOR_TYPE. Sizes without a known mesh (e.g. TP=2 / TP=4 on TPU
-        # 7x) keep the inherited environment, as before.
-        pod_type = ray_tpu_accelerator_name(node_ids=list(node_ids))
-        topology = single_host_tpu_topology(chips_per_host, pod_type=pod_type)
-        if topology:
-            env_vars["TORCH_TPU_TOPOLOGY"] = topology
-        else:
-            logger.warning(
-                "No single-host TPU mesh of %d chips (TPU type %r); the rollout replica keeps the inherited "
-                "TORCH_TPU_TOPOLOGY",
-                chips_per_host,
-                pod_type,
-            )
-    prefix = replica._get_server_name_prefix()
-    for node_rank, node_id in enumerate(node_ids):
-        if replica.is_reward_model:
-            name = f"{prefix}server_reward_{replica.replica_rank}_{node_rank}{replica.name_suffix}"
-        elif replica.is_teacher_model:
-            name = f"{prefix}server_teacher_{replica.replica_rank}_{node_rank}{replica.name_suffix}"
-        else:
-            name = f"{prefix}server_{replica.replica_rank}_{node_rank}{replica.name_suffix}"
-        server = replica.server_class.options(
-            scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                node_id=node_id,
-                soft=False,
-            ),
-            runtime_env={"env_vars": env_vars},
-            name=name,
-            max_concurrency=replica.config.ray_actor_max_concurrency,
-        ).remote(
-            config=replica.config,
-            model_config=replica.model_config,
-            rollout_mode=replica.rollout_mode,
-            workers=replica.workers[node_rank * chips_per_host : (node_rank + 1) * chips_per_host],
-            replica_rank=replica.replica_rank,
-            node_rank=node_rank,
-            gpus_per_node=chips_per_host,
-            nnodes=replica.nnodes,
-            cuda_visible_devices="",
-        )
-        replica.servers.append(server)
-
-    master_address, master_port, dp_rpc_port = await replica.servers[0].get_master_address.remote()
-    await asyncio.gather(
-        *[
-            server.launch_server.remote(master_address=master_address, master_port=master_port, dp_rpc_port=dp_rpc_port)
-            for server in replica.servers
-        ]
-    )
-
-    server_address, server_port = await replica.servers[0].get_server_address.remote()
-    replica._server_handle = replica.servers[0]
-    replica._server_address = (
-        f"[{server_address}]:{server_port}"
-        if is_valid_ipv6_address(server_address)
-        else f"{server_address}:{server_port}"
-    )
 
 
 class TPUvLLMHttpServer(vLLMServerTimelineMixin, vLLMHttpServer):
@@ -163,8 +68,42 @@ class TPUvLLMReplica(vLLMReplica):
         super().__init__(*args, **kwargs)
         self.server_class = ray.remote(TPUvLLMHttpServer)
 
+    def _get_server_env_vars(self, node_ids: list[str]) -> dict[str, str]:
+        env_vars = {
+            **super()._get_server_env_vars(node_ids),
+            # vllm-torchtpu's default; set so that a job-level value cannot switch the replica to the Ray backend.
+            "TPU_MULTIHOST_BACKEND": "mp",
+        }
+        if self.nnodes == 1:
+            # A replica on one host (e.g. one of several replicas on a multi-host rollout slice) is its own mesh; it
+            # must not inherit the slice's TORCH_TPU_TOPOLOGY. Multi-host replicas get theirs from vllm-torchtpu's
+            # rendezvous. The TPU type comes from the replica's host, not from this process's environment, which
+            # may be a CPU Ray head without TPU_ACCELERATOR_TYPE. Sizes without a known mesh (e.g. TP=2 / TP=4 on TPU
+            # 7x) keep the inherited environment, as before.
+            chips_per_host = self.gpus_per_replica_node
+            pod_type = ray_tpu_accelerator_name(node_ids=list(node_ids))
+            topology = single_host_tpu_topology(chips_per_host, pod_type=pod_type)
+            if topology:
+                env_vars["TORCH_TPU_TOPOLOGY"] = topology
+            else:
+                logger.warning(
+                    "No single-host TPU mesh of %d chips (TPU type %r); the rollout replica keeps the inherited "
+                    "TORCH_TPU_TOPOLOGY",
+                    chips_per_host,
+                    pod_type,
+                )
+        return env_vars
+
     async def launch_servers(self):
-        assert len(self.workers) == self.world_size, (
-            f"worker number {len(self.workers)} not equal to world size {self.world_size}"
-        )
-        await launch_tpu_vllm_servers(self)
+        if self.config.data_parallel_size > 1:
+            raise NotImplementedError(
+                "actor_rollout_ref.rollout.data_parallel_size="
+                f"{self.config.data_parallel_size} is not supported on TPU. The TPU "
+                "distributed runtime requires each compiled program to span the whole "
+                "TPU mesh, but a single DP group only spans "
+                f"tensor_model_parallel_size={self.config.tensor_model_parallel_size} "
+                "chips. Set actor_rollout_ref.rollout.data_parallel_size=1 instead: verl "
+                "then creates one rollout replica per tensor_model_parallel_size chips, "
+                "which is equivalent to engine-internal data parallelism."
+            )
+        await super().launch_servers()
