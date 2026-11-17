@@ -31,7 +31,7 @@ The platforms and engines in this repository are **reference implementations** �
 | Huawei NPU | Ascend 910B | HCCL | Built-in (verl core) | [Ascend Tutorial](https://github.com/verl-project/verl/tree/main/docs/ascend_tutorial) |
 | Iluvatar | BI-V150 (CUDA-compatible) | IXCCL | ✅ Supported | [User Guide](docs/accelerators/iluvatar/README.md) |
 | Moore Threads | MUSA | MCCL | ✅ Supported | [User Guide](docs/accelerators/musa/README.md) |
-| Google TPU | v6e | tpu_dist | ✅ Supported | [User Guide](docs/accelerators/tpu/README.md), [GRPO example](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) |
+| Google TPU | v6e, v7x | tpu_dist | ✅ Supported | [User Guide](docs/accelerators/tpu/README.md), [GRPO example](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) |
 | AWS Trainium | Trainium2 | Neuron collectives / NIXL | Experimental | [User Guide](docs/accelerators/neuron/README.md) |
 | Biren | SUPA (CUDA-compatible) | BCCL | ✅ Example (requires vendor support) | [User Guide](docs/accelerators/supa/README.md) |
 | AMD ROCm | MI300X / MI355X | RCCL; MoRI-IO weight sync | Platform built-in (verl core); Primus Megatron / MaxText engines and `mori` checkpoint engine here | [User Guide](docs/accelerators/rocm/README.md) |
