@@ -294,7 +294,9 @@ def _rows_config(loss_agg_mode="token-mean", **kwargs):
     )
 
 
-def _bypass_config(rollout_is="token", rollout_is_batch_normalize=False, rollout_rs=None, rs_threshold=None):
+def _bypass_config(
+    rollout_is="token", rollout_is_batch_normalize=False, rollout_rs=None, rs_threshold=None, loss_type="ppo_clip"
+):
     """Rollout correction in bypass mode, by default with token-level IS weights, as common for TPU rollouts."""
     correction = RolloutCorrectionConfig(
         rollout_is=rollout_is,
@@ -303,7 +305,7 @@ def _bypass_config(rollout_is="token", rollout_is_batch_normalize=False, rollout
         rollout_rs=rollout_rs,
         rollout_rs_threshold=rs_threshold,
         bypass_mode=True,
-        loss_type="ppo_clip",
+        loss_type=loss_type,
     )
     return ActorConfig(
         strategy="fsdp",
@@ -381,8 +383,9 @@ def test_static_micro_batch_seqs_rows_give_the_same_loss_gradients_and_metrics(l
         {"rollout_is": "sequence", "rollout_is_batch_normalize": True},
         {"rollout_is": None, "rollout_rs": "token_k1", "rs_threshold": "0.9_1.1"},
         {"rollout_rs": "seq_max_k2", "rs_threshold": 0.05},
+        {"rollout_is": "sequence", "rollout_is_batch_normalize": True, "loss_type": "reinforce"},
     ],
-    ids=["token-is", "sequence-is", "token-rs", "token-is-sequence-rs"],
+    ids=["token-is", "sequence-is", "token-rs", "token-is-sequence-rs", "sequence-is-reinforce"],
 )
 def test_static_micro_batch_seqs_rows_with_rollout_correction(correction):
     """Bypass-mode rollout correction: the same loss and gradients; only the listed diagnostics may differ.
@@ -390,7 +393,7 @@ def test_static_micro_batch_seqs_rows_with_rollout_correction(correction):
     Per-sequence rollout-correction statistics that average over every loss row also count the padding rows: the
     sequence-level IS statistics, the fraction of sequences with rejected tokens, and in verl 0.9.1 also the
     off-policy perplexity and chi-square metrics (``PADDING_SENSITIVE_METRICS``). The loss, the gradients and every
-    other metric are unchanged.
+    other metric are unchanged, also with ``loss_type="reinforce"``, where the IS weights scale the loss itself.
     """
     reference = _run_rows(_bypass_config(**correction))
     padded = _run_rows(_bypass_config(**correction), num_rows=12, width=32)
