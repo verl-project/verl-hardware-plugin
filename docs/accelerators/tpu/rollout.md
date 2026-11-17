@@ -58,7 +58,8 @@ TPU options of the TorchTitan engine go in its config, under `engine_kwargs.tpu`
 per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 `+actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.use_simple_fsdp=False`. Supported keys:
 `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`,
-`tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`,
+`tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `static_max_response_len`,
+`static_micro_batch_seqs`, `splash_max_block_size`,
 `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `model_kernels`, `ep_capacity_factor`,
 `qwen3_pallas_experts`, `moe_paired_gemm` and
 `context_parallel_strategy` (see `TPUEngineOptions` in `options.py`); an unknown key is an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
@@ -92,6 +93,7 @@ Performance options for long packed micro-batches (the Qwen3-30B-A3B recipe sets
 |---|---|
 | `splash_max_block_size: 1024` | Largest Splash attention block (torchtitan's default 512). Splash's grid grows as `(tokens / block)^2`; 1024 cut `update_actor` by 17% at 24k tokens per chip on v5p |
 | `static_micro_batch_len: <tokens>` | Pads every packed micro-batch to at least this length (e.g. the `use_dynamic_bsz` token budget), so the trainer compiles one shape instead of recompiling when the packed length reaches a new bucket (`static_max_response_len` does the same for the response length) |
+| `static_micro_batch_seqs: <sequences>` | Pads the PPO loss inputs of every micro-batch to at least this many rows, so the number of sequences that `use_dynamic_bsz` puts in a micro-batch no longer changes the shapes of the loss and its metrics. The extra rows are empty sequences (zero response mask), so the loss and its gradients do not change. With Tokamax's GatedDeltaNet kernels it is also the floor of their document budget. See [Static micro-batches](#static-micro-batches) |
 | `moe_paired_grouped_mm: true` | Qwen3 MoE: torchtitan's paired W1/W3 Pallas grouped matmul (shares the routed-token loads) |
 | `moe_native_weight_layout: true` | Qwen3 MoE: kernel-native `(E, K, N)` expert weights; `state_dict()` / `load_state_dict()` keep the canonical layout and names, so the HF load and the tpu-sync expert export are unchanged |
 | `mixed_precision_reduce: bfloat16` | bf16 FSDP gradient reduce-scatter instead of fp32 (half the traffic; a performance A/B option) |
@@ -106,6 +108,34 @@ The rollout settings that matter on TPU (the recipes already set them):
 | `actor_rollout_ref.rollout.data_parallel_size` | `1` (the default); larger values are rejected |
 | `actor_rollout_ref.rollout.checkpoint_engine.backend` | `ray-plasma-store`, or `tpu-sync` (see [Weight Sync](./weight_sync.md)) |
 | `actor_rollout_ref.hybrid_engine` | `False` |
+
+### Static micro-batches
+
+With `use_dynamic_bsz=True`, the three `static_*` options give every micro-batch one packed length, one response width
+and one row count of the PPO loss inputs, so the shapes of the trainer's forward, loss and backward programs no longer
+depend on how many tokens or sequences a micro-batch holds:
+
+```bash
+actor_rollout_ref.actor.use_dynamic_bsz=True
+actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192
++actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.static_micro_batch_len=8192
++actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.static_max_response_len=4096
++actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.static_micro_batch_seqs=64
+```
+
+Set `static_micro_batch_len` to the token budget, `static_max_response_len` to `data.max_response_length`, and
+`static_micro_batch_seqs` to the most sequences a micro-batch holds; it never needs to exceed `ppo_mini_batch_size` x
+`rollout.n` / data-parallel size, the sequences of one rank's mini-batch. The padding rows add work that grows with
+`static_micro_batch_seqs` (verl slices the loss inputs one row at a time on the host), so a value close to the largest
+count your run reaches costs less than a much larger one. A micro-batch longer, wider or with more sequences than these
+sizes keeps its own size and compiles once for it; the engine logs every new sequence count above
+`static_micro_batch_seqs`. With `use_dynamic_bsz=False` every micro-batch already has `ppo_micro_batch_size_per_gpu`
+sequences, so `static_micro_batch_seqs` is not needed there.
+
+Only verl's `ppo_loss` gets padding rows; other losses keep the exact rows. The loss, its gradients and the masked
+metrics do not change. Per-sequence diagnostics that average over every loss row also count the padding rows: the
+sequence-level rollout-correction statistics of bypass mode (`rollout_corr/rollout_is_seq_*`), and with verl 0.9.1
+also its off-policy perplexity and chi-square metrics (`rollout_corr/*ppl*`, `rollout_corr/chi2_seq`).
 
 ## Verify
 

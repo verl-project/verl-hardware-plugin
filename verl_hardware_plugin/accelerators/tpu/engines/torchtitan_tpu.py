@@ -78,6 +78,7 @@ from verl.workers.utils.padding import no_padding_2_padding
 from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels, tpu_ragged_ep
 from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+    TPU_PADDED_NUM_SEQS_KEY,
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
     align_micro_batch_shapes_across_ranks,
@@ -1530,6 +1531,7 @@ class TorchTitanTPUEngine(BaseEngine):
         tpu_options = get_tpu_engine_options(self.engine_config)
         static_len = int(tpu_options.static_micro_batch_len or 0)
         static_response_len = int(tpu_options.static_max_response_len or 0)
+        static_seqs = int(tpu_options.static_micro_batch_seqs or 0)
         slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)
         if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len or slot_len:
             align_micro_batch_shapes_across_ranks(
@@ -1540,11 +1542,23 @@ class TorchTitanTPUEngine(BaseEngine):
                 gdn_row_slot_len=slot_len,
             )
 
-        if "kda" in getattr(self, "_tpu_kernels", ()) and not getattr(self, "_gdn_row_slot_len", 0):
+        uses_document_budget = "kda" in getattr(self, "_tpu_kernels", ()) and not slot_len
+        if static_seqs:
+            # Only verl's ppo_loss gets padded loss rows: the padded loss inputs hold its fields only (loss_inputs.py).
+            pads_loss_rows = isinstance(loss_function, partial) and loss_function.func is ppo_loss
+            if pads_loss_rows:
+                for micro_batch in micro_batches:
+                    tu.assign_non_tensor_data(micro_batch, TPU_PADDED_NUM_SEQS_KEY, static_seqs)
+            if pads_loss_rows or uses_document_budget:
+                self._warn_above_static_micro_batch_seqs(micro_batches, static_seqs)
+
+        if uses_document_budget:
             # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
             # micro-batch is one packed document, plus the bucket-padding tail; bucketed so that use_dynamic_bsz's
-            # varying sequence counts do not recompile the kernels (see packed_document_budget).
-            budget = tpu_model_kernels.packed_document_budget(max(int(mb.batch_size[0]) for mb in micro_batches))
+            # varying sequence counts do not recompile the kernels (see packed_document_budget), and sized for at
+            # least static_micro_batch_seqs sequences, so it stays constant while no micro-batch has more.
+            num_seqs = max(int(mb.batch_size[0]) for mb in micro_batches)
+            budget = tpu_model_kernels.packed_document_budget(max(num_seqs, static_seqs))
             updated = tpu_model_kernels.set_packed_document_budget(self.module, budget)
             if updated:
                 logger.info("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)
@@ -1588,6 +1602,20 @@ class TorchTitanTPUEngine(BaseEngine):
                 output_lst.append(output)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+
+    def _warn_above_static_micro_batch_seqs(self, micro_batches: list[TensorDict], static_seqs: int) -> None:
+        """Logs each new sequence count above ``static_micro_batch_seqs`` once: such micro-batches get new shapes."""
+        warned = self.__dict__.setdefault("_static_micro_batch_seqs_warned", set())
+        counts = sorted({int(mb.batch_size[0]) for mb in micro_batches if int(mb.batch_size[0]) > static_seqs} - warned)
+        if counts:
+            warned.update(counts)
+            logger.warning(
+                "static_micro_batch_seqs=%d is below the %s sequences of some micro-batches: they keep their own PPO "
+                "loss rows (and Tokamax GatedDeltaNet document budget), so each new count compiles new programs. "
+                "Raise static_micro_batch_seqs to cover them.",
+                static_seqs,
+                counts,
+            )
 
     def model_forward_step(
         self,

@@ -98,19 +98,14 @@ def _scalar_metadata_tensordict(td: TensorDict, num_rows: int) -> TensorDict:
     return out
 
 
-def _loss_num_rows(micro_batch: TensorDict, response_mask: torch.Tensor) -> int:
-    """Rows of the PPO loss inputs: ``tpu_padded_num_seqs`` when the micro-batch carries it, else the batch size."""
+def _loss_num_rows(micro_batch: TensorDict) -> int:
+    """Rows of the PPO loss inputs: the batch size, padded to at least ``tpu_padded_num_seqs`` when it is set.
+
+    A micro-batch with more sequences than ``tpu_padded_num_seqs`` keeps its own row count.
+    """
     batch_size = int(micro_batch.batch_size[0])
     num_rows = int(unwrap_metadata(tu.get_non_tensor_data(micro_batch, TPU_PADDED_NUM_SEQS_KEY, 0)) or 0)
-    if num_rows in (0, batch_size):
-        return batch_size
-    if num_rows < batch_size:
-        raise ValueError(f"{TPU_PADDED_NUM_SEQS_KEY}={num_rows} is smaller than the micro-batch ({batch_size})")
-    # Padding rows are the rows without valid tokens: keep the exact layout for a real sequence without any, so that
-    # nothing that skips such rows (e.g. per-sequence metrics) can confuse it with padding.
-    if not bool((response_mask.sum(dim=-1) > 0).all()):
-        return batch_size
-    return num_rows
+    return max(batch_size, num_rows)
 
 
 def _response_gather_index(
@@ -160,9 +155,10 @@ def prepare_tpu_loss_inputs(model_output: dict[str, Any], micro_batch: TensorDic
     the outputs to the exact token count instead would make every micro-batch with new lengths compile new XLA
     programs (forward loss and the fused LM-head backward) for the whole run.
 
-    A micro-batch that carries ``tpu_padded_num_seqs`` gets that many rows in its PPO loss inputs, so their shapes do
-    not depend on the micro-batch size either. The extra rows are empty sequences (zero response mask, log-probs and
-    advantages), which leave the loss and its gradients unchanged.
+    With ``engine_kwargs.tpu.static_micro_batch_seqs``, the engine gives every micro-batch of verl's ``ppo_loss``
+    ``tpu_padded_num_seqs``: its PPO loss inputs get at least that many rows, so their shapes do not depend on the
+    number of sequences in the micro-batch either. The extra rows are empty sequences (zero response mask, log-probs
+    and advantages), which leave the loss, its gradients and the token-mean normalization unchanged.
     """
     log_prob = model_output.get("log_probs")
     tpu_padded_log_prob = getattr(log_prob, TPU_PADDED_VALUES_ATTR, None)
@@ -202,7 +198,7 @@ def prepare_tpu_loss_inputs(model_output: dict[str, Any], micro_batch: TensorDic
             )
         )
         batch_size = int(micro_batch.batch_size[0])
-        num_rows = _loss_num_rows(micro_batch, padded_fields["response_mask"]) if static_layout else batch_size
+        num_rows = _loss_num_rows(micro_batch) if static_layout else batch_size
         if num_rows > batch_size:
             loss_data = _scalar_metadata_tensordict(micro_batch, num_rows)
         else:
