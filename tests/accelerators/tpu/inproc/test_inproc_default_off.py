@@ -357,6 +357,21 @@ def _fingerprint(env0: dict) -> dict:
     return out
 
 
+def _stub_server_deps() -> None:
+    """verl.workers.engine_workers, which the fingerprint reads, imports uvicorn and fastapi (through
+    verl.checkpoint_engine); verl does not require them and the CPU CI does not install them. Stub them when missing,
+    in every scenario alike, as the plugin's checkpoint-engine tests do (nothing here uses them). The switch-off path
+    with them missing is tested in test_inproc_switches.py (``*_without_verl_server_deps``)."""
+    for name in ("uvicorn", "fastapi"):
+        if name not in sys.modules:
+            try:
+                __import__(name)
+            except ImportError:
+                stub = types.ModuleType(name)
+                stub.FastAPI = stub.Server = stub.Config = object  # type: ignore[attr-defined]
+                sys.modules[name] = stub
+
+
 def _child_main(spec: dict) -> dict:
     found = importlib.util.find_spec(PLUGIN_PKG)  # located, not imported
     env_watch = _EnvWriteWatch(os.path.dirname(found.origin) if found is not None and found.origin else None)
@@ -364,6 +379,7 @@ def _child_main(spec: dict) -> dict:
     env_watch_ok = env_watch.selftest()
     watch = _ImportWatch(block=bool(spec.get("block")), block_plugin=bool(spec.get("no_plugin")))
     sys.meta_path.insert(0, watch)
+    _stub_server_deps()
     env0 = dict(os.environ)
     import torch  # noqa: F401
 
