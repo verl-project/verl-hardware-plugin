@@ -1907,6 +1907,74 @@ def _fake_qwen3_moe_model_spec(modules, *, n_layers=2, top_k=8, tpu_experts=True
     return SimpleNamespace(model=SimpleNamespace(traverse=traverse), nodes=nodes)
 
 
+def _fake_qwen3_5_model_configs(modules):
+    """``(moe, dense)`` torchtitan model config stand-ins, e.g. Qwen3.5-35B-A3B and Qwen3.5-0.8B."""
+    ffns = [SimpleNamespace(hidden_dim=3584) for _ in range(2)]  # dense layers: no ``MoE.Config``
+
+    def traverse(cls):
+        return [(f"layers.{i}.feed_forward", ffn, None, None) for i, ffn in enumerate(ffns) if isinstance(ffn, cls)]
+
+    return _fake_qwen3_moe_model_spec(modules).model, SimpleNamespace(traverse=traverse)
+
+
+def test_model_kernels_auto_leaves_moe_out_of_dense_qwen3_5(monkeypatch):
+    """A dense flavor has no MoE layers for the TPU MoE converters: ``auto`` must not enable ``moe`` there."""
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels as kernels_mod
+
+    resolve = kernels_mod.resolve_tpu_model_kernels
+    modules = _fake_torchtitan_moe_modules()
+    moe_config, dense_config = _fake_qwen3_5_model_configs(modules)
+    # torchtitan with google-pytorch/torchtitan#73 (``moe``, ``lce``), Tokamax without the KDA op.
+    monkeypatch.setattr(kernels_mod, "_available_kernels", lambda name: frozenset({"moe", "lce"}))
+    with mock.patch.dict(sys.modules, modules):
+        assert kernels_mod.has_moe_layers(moe_config)
+        assert not kernels_mod.has_moe_layers(dense_config)
+        assert resolve("qwen3_5", model_config=dense_config) == {"lce"}
+        assert resolve("qwen3_5", "auto", model_config=dense_config) == {"lce"}
+        assert resolve("qwen3_5", "auto", model_config=moe_config) == {"moe", "lce"}
+
+        # ``all`` is every kernel of this flavor, so no ``moe`` either.
+        monkeypatch.setattr(kernels_mod, "_available_kernels", lambda name: frozenset({"moe", "kda", "lce"}))
+        assert resolve("qwen3_5", "all", model_config=dense_config) == {"kda", "lce"}
+        assert resolve("qwen3_5", "all", model_config=moe_config) == {"moe", "kda", "lce"}
+
+    # Only a request that would select ``moe`` looks at the model config (or imports torchtitan's MoE), so models
+    # without MoE kernels, ``none`` and lists without ``moe`` never do.
+    def traverse(cls):
+        raise AssertionError("traversed")
+
+    untouched = SimpleNamespace(traverse=traverse)
+    assert resolve("qwen3", "auto", model_config=untouched) == frozenset()
+    for requested in ("none", "lce", "kda, lce"):
+        assert resolve("qwen3_5", requested, model_config=untouched) == resolve("qwen3_5", requested)
+    # Nor does ``auto`` on a torchtitan without the MoE kernels.
+    monkeypatch.setattr(kernels_mod, "_available_kernels", lambda name: frozenset({"kda"}))
+    assert resolve("qwen3_5", "auto", model_config=untouched) == {"kda"}
+
+
+def test_model_kernels_explicit_lists_unchanged_and_explicit_moe_on_dense_fails(monkeypatch):
+    """The model config changes only ``auto`` and ``all`` of dense flavors; an explicit ``moe`` there is an error."""
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels as kernels_mod
+
+    resolve = kernels_mod.resolve_tpu_model_kernels
+    modules = _fake_torchtitan_moe_modules()
+    moe_config, dense_config = _fake_qwen3_5_model_configs(modules)
+    monkeypatch.setattr(kernels_mod, "_available_kernels", lambda name: frozenset({"moe", "kda", "lce"}))
+    with mock.patch.dict(sys.modules, modules):
+        # A MoE flavor resolves every request as without the model config.
+        for requested in (None, "auto", "all", "none", "moe", "lce", "moe, lce", "MOE,kda"):
+            assert resolve("qwen3_5", requested, model_config=moe_config) == resolve("qwen3_5", requested)
+        # So does a dense flavor, for lists without ``moe``.
+        for requested in ("none", "lce", "kda, lce"):
+            assert resolve("qwen3_5", requested, model_config=dense_config) == resolve("qwen3_5", requested)
+        # An explicit ``moe`` on a dense flavor fails here, instead of in torchtitan's _use_tpu_moe_kernels.
+        for requested in ("moe", "lce,moe"):
+            with pytest.raises(ValueError, match=r"\['moe'\] needs MoE layers, but this qwen3_5 flavor has none"):
+                resolve("qwen3_5", requested, model_config=dense_config)
+        with pytest.raises(ValueError, match="not supported"):
+            resolve("qwen3_5", "bogus,moe", model_config=dense_config)
+
+
 def test_only_qwen3_moe_gets_the_qwen3_moe_setup():
     from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels as kernels_mod
 

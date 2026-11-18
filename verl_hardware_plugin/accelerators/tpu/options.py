@@ -150,7 +150,8 @@ class TPUEngineOptions:
         seq_bucket_size: Packed sequence length bucket in tokens (default: ``pad_to_length_bucket`` when
             ``pad_to_length`` is set, else 256).
         model_kernels: Optional torchtitan TPU kernels of the model (``engines.tpu_model_kernels``): ``auto``
-            (default: what the installed torchtitan provides), ``none``, ``all``, or a comma-separated subset.
+            (default: what the installed torchtitan provides, without ``moe`` for a dense flavor), ``none``,
+            ``all``, or a comma-separated subset.
         ep_capacity_factor: Per-destination-rank token capacity multiplier of the TPU EP token dispatcher when
             ``expert_parallel_size > 1`` (default: ``4.0``). torchtitan's pretraining default (``1.25``) drops
             skewed RL / math tokens across 32-64 EP ranks while vLLM rollout is dropless.
