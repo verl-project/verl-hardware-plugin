@@ -79,12 +79,6 @@ except ImportError:
     TOTAL_CORE_NUM = 0
 
 
-# triton-mlu >= 3.4.0+mlu2.2.0 raised per-tile NRAM usage: tiles that used to
-# fit 512 KB parts (notably (128, 1024, 256)) stopped compiling there, which is
-# why those configs were pruned from the 512 KB lists. Older triton
-# (e.g. 3.4.0+mlu2.1.3) still fits — and is fastest with — those tiles, so the
-# autotune selectors below branch on this threshold instead of hard-dropping
-# the big tiles for every stack.
 _NRAM_REGRESSION_TRITON_MIN = (3, 4, 0, 2, 2, 0)
 
 
@@ -123,11 +117,6 @@ def _triton_version_tuple() -> tuple[int, ...] | None:
     return tuple(numbers + mlu)
 
 
-# Low-version compatibility: True on triton stacks older than the NRAM
-# regression above (e.g. 3.4.0+mlu2.1.3), where the big tiles still fit
-# 512 KB NRAM. ``None`` (unreadable metadata) stays conservative. Temporary
-# shim — delete the flag and its branches once the old triton stacks are
-# retired.
 _TRITON_VERSION_TUPLE = _triton_version_tuple()
 _TRITON_LOW_VERSION_COMPAT = (
     HAVE_TRITON and _TRITON_VERSION_TUPLE is not None and _TRITON_VERSION_TUPLE < _NRAM_REGRESSION_TRITON_MIN
@@ -158,11 +147,6 @@ elif SUPPORT_CUDA_TMA:
     def alloc_fn(size: int, alignment: int, stream: typing.Optional[int]):
         return torch.empty(size, device=get_device_name(), dtype=torch.int8)
 
-    # https://github.com/triton-lang/triton/commit/43625fc968b693ab51884ca95adbcf3e43483fd0
-    # Triton 3.5.0 stores allocators in ContextVar; values do not propagate to new
-    # threads by default. Some execution paths in verl use thread pools (e.g.,
-    # concurrent.futures), so we set a ContextVar *default* to avoid falling
-    # back to NullAllocator in worker threads.
     try:
         import contextvars
 
@@ -269,12 +253,6 @@ def _tile_config(
     num_warps: int,
     group_size_m: typing.Optional[int] = None,
 ) -> "triton.Config":
-    """Shorthand for the repeated BLOCK_SIZE_* ``triton.Config`` pattern.
-
-    ``num_stages``/``num_warps`` are required (no defaults): they are the two
-    levers that decide NRAM occupancy on MLU, so every call site states them
-    explicitly to keep the tuning auditable.
-    """
     kwargs = {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k}
     if group_size_m is not None:
         kwargs["GROUP_SIZE_M"] = group_size_m
@@ -657,13 +635,6 @@ def efficient_entropy_triton_kernel_epilogue_tp(
 
 
 def epilogue_tp_update_config():
-    """MLU-friendly autotune configs (shared by the optimized mHC kernels).
-
-    The MLU triton backend silently resets num_warps>4 -> 4 and num_warps==2 -> 1,
-    so the effective warp set is {1, 4}; we only emit those. Larger BLOCK_SIZE_C
-    amortizes the small H_pre / H_post / H_res reloads across the c-tiles of an
-    m row and improves memory coalescing.
-    """
     warps = [1]
     stages = [2]
 
