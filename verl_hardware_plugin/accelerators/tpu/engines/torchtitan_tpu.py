@@ -75,7 +75,12 @@ from verl.workers.engine.utils import (
 )
 from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import no_padding_2_padding
-from verl_hardware_plugin.accelerators.tpu.engines import graph_trainer_mode, tpu_model_kernels, tpu_ragged_ep
+from verl_hardware_plugin.accelerators.tpu.engines import (
+    block_grouping,
+    graph_trainer_mode,
+    tpu_model_kernels,
+    tpu_ragged_ep,
+)
 from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
@@ -1258,6 +1263,12 @@ class TorchTitanTPUEngine(BaseEngine):
             self.trainer = Trainer(self.config)
         if engine_config.use_torch_compile:
             tpu_model_kernels.patch_torchtitan_tpu_dynamo_caches()
+            # VERL_TPU_BLOCKS_PER_COMPILE=k: one XLA program per k blocks, so the scheduler can prefetch the next
+            # block's SimpleFSDP all-gathers under the current block's compute (engines/block_grouping.py).
+            k = block_grouping.blocks_per_compile()
+            if k > 1 and not self._graph_trainer_mode:
+                for model_part in self.trainer.model_parts:
+                    block_grouping.group_compiled_blocks(model_part, k)
         self.parallel_dims = self.trainer.parallel_dims
         self._dp_group = self._build_dp_gloo_group()
         # Like torchtitan's init_distributed (which verl bypasses): no autograd multithreading, so backward-thread
