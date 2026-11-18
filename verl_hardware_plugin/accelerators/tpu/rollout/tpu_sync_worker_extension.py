@@ -227,7 +227,9 @@ class TPUSyncWorkerMixin:
             logger.warning("tpu-sync Sampler: could not locate rollout model to bind parameters.")
             return False
 
-        bind_ip = get_ip(controller_address).strip("[]")
+        # The IP that reaches the controller serves the control RPCs; the weights go over the data NICs that
+        # tpu-sync finds itself (see ``tpu_sync_engine.data_plane_address``).
+        control_ip = get_ip(controller_address).strip("[]")
         rank_val = getattr(self, "rank", 0)
         # The listener port is assigned by the OS, as on the trainer side, and registered with the controller
         # below; fixed ``base + rank`` ports collided when two replicas shared a host.
@@ -250,7 +252,14 @@ class TPUSyncWorkerMixin:
 
         if receive_into_vllm:
             return self._init_receive_into_vllm(
-                vllm_model, controller_addr, global_shapes_map, tp_size, parallelism, job_name, bind_ip, listener_port
+                vllm_model,
+                controller_addr,
+                global_shapes_map,
+                tp_size,
+                parallelism,
+                job_name,
+                control_ip,
+                listener_port,
             )
 
         # Models with a direct-install layout (``direct_install``: e.g. Qwen3.5, Qwen3 MoE) install each rank's slices
@@ -376,7 +385,6 @@ class TPUSyncWorkerMixin:
             local_port=0,
             parallelism=parallelism,
             listener_port=listener_port,
-            bind_ip=bind_ip,
         )
 
         # Whether a tensor can skip the CPU (de)tiling pass is decided by tpu-sync's planner per transfer, from the
@@ -390,10 +398,11 @@ class TPUSyncWorkerMixin:
         try:
             ctrl_client = tpu_sync_api.controller_client(controller_addr)
             unit_id = tpu_sync_api.unit_id(job_name, str(rank_val))
+            data_address = tpu_sync_engine.data_plane_address(self._tpu_sync_ws, control_ip, rank_val)
             ctrl_client.register_work_unit(
                 unit_id,
-                [f"{bind_ip}:{self._tpu_sync_ws.local_port}"],
-                f"{bind_ip}:{self._tpu_sync_ws.listener_port}",
+                [data_address],
+                f"{control_ip}:{self._tpu_sync_ws.listener_port}",
                 mesh_shape=[1, tp_size],
                 variables=variable_protos,
                 mesh_axes=["fsdp", "tp"],
@@ -405,7 +414,7 @@ class TPUSyncWorkerMixin:
             f"tpu-sync Sampler Rank {rank_val} bound {len(valid_params)} dynamic staging tensors and registered "
             f"directly with the tpu-sync controller ({controller_addr}) as {job_name}/{rank_val}: "
             f"mesh_shape=[1, {tp_size}], "
-            f"data_port={self._tpu_sync_ws.local_port}, listener_port={self._tpu_sync_ws.listener_port}"
+            f"data_address={data_address}, listener_port={self._tpu_sync_ws.listener_port}"
         )
 
         return True
@@ -470,7 +479,7 @@ class TPUSyncWorkerMixin:
         tp_size: int,
         parallelism: int,
         job_name: str,
-        bind_ip: str,
+        control_ip: str,
         listener_port: int,
     ) -> bool:
         """``init_tpu_sync_on_worker`` for ``receive_into_vllm``: bind vLLM's parameters as the receive buffers.
@@ -548,13 +557,12 @@ class TPUSyncWorkerMixin:
             local_port=0,
             parallelism=parallelism,
             listener_port=listener_port,
-            bind_ip=bind_ip,
         )
         ctrl_client = tpu_sync_api.controller_client(controller_addr)
         ctrl_client.register_work_unit(
             tpu_sync_api.unit_id(job_name, str(rank_val)),
-            [f"{bind_ip}:{self._tpu_sync_ws.local_port}"],
-            f"{bind_ip}:{self._tpu_sync_ws.listener_port}",
+            [tpu_sync_engine.data_plane_address(self._tpu_sync_ws, control_ip, rank_val)],
+            f"{control_ip}:{self._tpu_sync_ws.listener_port}",
             mesh_shape=[1, tp_size],
             variables=variable_protos,
             mesh_axes=["fsdp", "tp"],

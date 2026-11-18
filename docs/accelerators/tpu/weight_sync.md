@@ -74,6 +74,11 @@ for this backend):
   - from all trainer and rollout hosts to the tpu-sync controller, which runs in the driver process;
   - from the trainer hosts to the rollout hosts. Every trainer and rollout worker listens on a port the
     OS assigns and registers it with the controller, so no fixed port range needs to be open.
+- The weights travel over the hosts' data NICs. tpu-sync treats every NIC with jumbo frames (MTU above 1500)
+  as a data NIC, listens on all of them, and each worker registers one of them with the controller, the
+  workers of a host taking the NICs in turn. A host without such a NIC uses its default IP, as do the control
+  messages. On Cloud TPU v6e hosts with two extra 200 Gbps NICs (`ct6e-standard-4t`), this sends the weights
+  over both instead of the default NIC.
 
 ## Configuration
 
@@ -88,6 +93,7 @@ actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 | Option (`engine_kwargs.tpu-sync.*`) | Default | Description |
 |-------------------------------------|---------|-------------|
 | `parallelism` | `8` | Parallel transfer streams per worker. |
+| `group_size` | `16` | Number of consecutive tensors the tpu-sync controller plans and schedules as one stage of the transfer (`1` makes every tensor its own stage). |
 | `verify_parity` | `off` | Weight-sync check: `off`, `norm`, `exact` or `all` (`True` means `norm`). See [Parity checks](#parity-checks). A failed check stops the run. Meant for bring-up and after changing sharding or upgrading tpu-sync. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The deprecated environment variable `VERL_TPU_SYNC_RELEASE_BUFFERS` still overrides the option on the trainer workers and logs a deprecation warning. |
 | `return_after_d2h` | `True` | Return to the trainer as soon as its ranks have copied their weights to host memory and freed the device buffers, and finish the sync (transfer, pause, install, resume) in the background while training goes on. The next sync waits for it first and raises its error, if any. Applies from the second sync on (tpu-sync keeps the weights bound across the first transfer to a rollout topology) and needs a `tpu-sync-torch` whose `WeightSynchronizer.d2h()` returns a future; otherwise the sync runs to the end as before. See [Returning after the D2H](#returning-after-the-d2h). |

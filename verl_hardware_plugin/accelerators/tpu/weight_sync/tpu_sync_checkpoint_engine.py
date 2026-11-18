@@ -87,9 +87,14 @@ def create_torch_weight_synchronizer(
     local_port: int = 0,
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM,
     listener_port: int = 0,
-    bind_ip: str = "127.0.0.1",
+    bind_ip: Optional[str] = None,
 ) -> Any:
-    """Creates a tpu_sync ``WeightSynchronizer`` over ``device_tensors``."""
+    """Creates a tpu_sync ``WeightSynchronizer`` over ``device_tensors``.
+
+    Leave ``bind_ip`` unset: tpu-sync then serves on every data NIC of the host (the NICs with jumbo frames, e.g.
+    the extra high-bandwidth NICs of a TPU VM) and reports them in ``get_local_endpoints()``. Passing an IP pins
+    the transfer to that one NIC, typically the host's default NIC, which is slower.
+    """
     from tpu_sync.api.torch.weight_synchronizer import WeightSynchronizer
 
     return WeightSynchronizer(
@@ -101,6 +106,37 @@ def create_torch_weight_synchronizer(
         unsafe_skip_buffer_lock=True,
         auto_h2d=False,
     )
+
+
+_UNROUTABLE_HOSTS = ("", "0.0.0.0", "::", "127.0.0.1", "::1", "localhost")
+
+
+def data_plane_address(ws: Any, fallback_ip: str, index: int) -> str:
+    """The ``host:port`` that peers should send this process's weights to (the address registered as its shard).
+
+    tpu-sync reports one endpoint per data NIC it listens on (``WeightSynchronizer.get_local_endpoints()``). Each
+    process registers a single endpoint, so the processes of one host take the NICs in turn by ``index`` (e.g. its
+    rank): with two data NICs, half of the host's processes receive and send on each. Without a usable endpoint
+    (an older tpu-sync, or a host with no data NIC) this is ``fallback_ip:local_port``.
+    """
+    endpoints: list[str] = []
+    get_local_endpoints = getattr(ws, "get_local_endpoints", None)
+    if callable(get_local_endpoints):
+        try:
+            reported = get_local_endpoints() or []
+        except Exception as e:
+            logger.warning(f"tpu-sync: get_local_endpoints() failed, registering {fallback_ip}: {e}")
+            reported = []
+        for endpoint in reported:
+            address = str(endpoint.get("endpoint", "")) if hasattr(endpoint, "get") else ""
+            host, _, port = address.rpartition(":")
+            if host.strip("[]") in _UNROUTABLE_HOSTS or not port.isdigit():
+                continue
+            if address not in endpoints:
+                endpoints.append(address)
+    if not endpoints:
+        return f"{fallback_ip}:{ws.local_port}"
+    return endpoints[index % len(endpoints)]
 
 
 def _d2h_returns_future() -> bool:
@@ -233,6 +269,8 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
     Engine kwargs (``actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.tpu-sync``):
 
     * ``parallelism`` (default 8): parallel transfer streams per worker.
+    * ``group_size`` (default 16, read by the driver): consecutive tensors the controller plans and schedules as
+      one stage of the transfer.
     * ``verify_parity`` (default ``off``): ``norm`` posts weight norms after every sync so the driver can check
       that the rollout received the trainer's weights; ``exact`` has the rollout workers compare the step-0 sync
       bit for bit with the checkpoint vLLM loaded (trainer ranks do nothing for it); ``all`` runs both. A failed
@@ -516,13 +554,13 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         self._close_synchronizer()
 
         logger.info(f"Trainer Rank {self.rank}: binding {len(valid_weights)} tensors to WeightSynchronizer")
-        bind_ip = ray.util.get_node_ip_address().strip("[]")
+        # The node IP only serves the control RPCs; the weights go over the data NICs tpu-sync finds itself.
+        node_ip = ray.util.get_node_ip_address().strip("[]")
         self._trainer_tpu_sync_ws = create_torch_weight_synchronizer(
             [[t] for _, t in valid_weights],
             local_port=0,
             listener_port=0,
             parallelism=self.parallelism,
-            bind_ip=bind_ip,
         )
 
         def full_shape(name: str, p: torch.Tensor) -> list[int]:
@@ -599,10 +637,11 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         try:
             ctrl_client = tpu_sync_api.controller_client(self._controller_addr)
             unit_id = tpu_sync_api.unit_id("trainer", str(self.rank))
+            data_address = data_plane_address(self._trainer_tpu_sync_ws, node_ip, self.rank)
             ctrl_client.register_work_unit(
                 unit_id,
-                [f"{bind_ip}:{self._trainer_tpu_sync_ws.local_port}"],
-                f"{bind_ip}:{self._trainer_tpu_sync_ws.listener_port}",
+                [data_address],
+                f"{node_ip}:{self._trainer_tpu_sync_ws.listener_port}",
                 mesh_shape=[max_shards, 1],
                 variables=variable_protos,
                 mesh_axes=["fsdp", "tp"],
@@ -616,7 +655,7 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         logger.info(
             f"Trainer Rank {self.rank} bound {len(valid_weights)} dynamic tensors and registered "
             f"directly with the tpu-sync controller ({self._controller_addr}): "
-            f"data_port={self._trainer_tpu_sync_ws.local_port}, "
+            f"data_address={data_address}, "
             f"listener_port={self._trainer_tpu_sync_ws.listener_port}"
         )
 
@@ -1012,6 +1051,7 @@ async def _finish_tpu_sync(
         is_sender=True,
         expected_block_count=0,
         parallelism=parallelism,
+        group_size=options.group_size,
         req_id=f"verl_step_{global_steps or 0}",
         **transfer_kwargs,
     )
