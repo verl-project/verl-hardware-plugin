@@ -136,10 +136,18 @@ Only verl's `ppo_loss` gets padding rows, and only with a policy loss mode whose
 (`ROW_PADDING_LOSS_MODES` in `losses/loss_inputs.py`): every mode of verl except `geo_mean`, which averages its
 per-sequence losses over every row. With `geo_mean`, and with any other loss, the loss inputs keep their exact rows
 (the engine logs this once). The loss, its gradients and the masked metrics do not change. Per-sequence diagnostics
-that average over every loss row also count the padding rows: in bypass mode, the sequence-level IS statistics
-(`rollout_corr/rollout_is_seq_*`) and, with rejection sampling, the fraction of sequences with rejected tokens
-(`rollout_corr/rollout_rs_seq_masked_fraction`); with verl 0.9.1 also the off-policy perplexity and chi-square metrics
-(`rollout_corr/*ppl*`, `rollout_corr/chi2_seq`).
+that reduce over every loss row also count the padding rows, which are empty sequences. These bypass-mode metrics can
+change:
+
+- the sequence-level IS statistics, `rollout_corr/rollout_is_seq_*`;
+- with `rollout_is=sequence`, the largest and smallest sequence IS ratio and the fractions of sequences above
+  `rollout_is_threshold` and below its lower bound (by default 1 / `rollout_is_threshold`):
+  `rollout_corr/rollout_is_max`, `rollout_corr/rollout_is_min`, `rollout_corr/rollout_is_ratio_fraction_high` and
+  `rollout_corr/rollout_is_ratio_fraction_low`. A padding row has the sequence ratio 1, so the ratios 2 and 4, for
+  example, get a minimum of 1, and both fractions count the padding rows in their denominator;
+- with rejection sampling, the fraction of sequences with rejected tokens
+  (`rollout_corr/rollout_rs_seq_masked_fraction`);
+- with verl 0.9.1, the off-policy perplexity and chi-square metrics (`rollout_corr/*ppl*`, `rollout_corr/chi2_seq`).
 
 ## Verify
 

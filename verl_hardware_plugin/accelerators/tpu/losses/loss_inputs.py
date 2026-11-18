@@ -27,9 +27,10 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
 )
 
 # Policy loss modes of verl (``actor.policy_loss.loss_mode``) that reduce over the response mask only (``agg_loss``,
-# masked means): empty loss rows change neither their loss, its gradients nor its metrics. ``geo_mean`` averages its
-# per-sequence losses over every row (``torch.mean``), so empty rows would scale its loss; it keeps the exact rows,
-# like any mode not listed here.
+# masked means): empty loss rows change neither their loss, its gradients nor its masked metrics. Bypass mode's
+# per-sequence diagnostics that reduce over every row also count the empty rows, so they can change (listed in
+# docs/accelerators/tpu/rollout.md). ``geo_mean`` averages its per-sequence losses over every row (``torch.mean``), so
+# empty rows would scale its loss; it keeps the exact rows, like any mode not listed here.
 ROW_PADDING_LOSS_MODES = frozenset(
     {"bypass_mode", "cispo", "clip_cov", "dppo_kl", "dppo_tv", "dro", "gpg", "gspo", "kl_cov", "sapo", "vanilla"}
 )

@@ -189,12 +189,14 @@ def test_prepare_tpu_loss_inputs_ppo_falls_back_to_trimmed_outputs():
 LENGTHS = [(5, 7), (3, 2), (6, 9), (4, 1), (7, 13)]  # (prompt, response) tokens of the packed sequences
 
 
-def _rows_case(lengths, padded_len, seed=0, dp_size=2, zero_mask_row=None):
+def _rows_case(lengths, padded_len, seed=0, dp_size=2, zero_mask_row=None, seq_ratios=None):
     """A packed PPO micro-batch and its bucket-padded device leaves (log-probs, entropy).
 
     The response log-probs stay within 0.4 of the old ones, so the PPO ratios vary around 1 and some are clipped.
-    With ``dp_size > 1`` the micro-batch carries global token / sequence counts, as verl sets them under data
-    parallelism; with ``dp_size == 1`` the loss normalizes by the micro-batch's own counts.
+    ``seq_ratios`` shifts the token log-ratios of sequence ``i`` so that they sum to ``log(seq_ratios[i])``, which
+    makes ``seq_ratios[i]`` its IS ratio with ``rollout_is="sequence"`` in bypass mode. With ``dp_size > 1`` the
+    micro-batch carries global token / sequence counts, as verl sets them under data parallelism; with
+    ``dp_size == 1`` the loss normalizes by the micro-batch's own counts.
     """
     gen = torch.Generator().manual_seed(seed)
 
@@ -225,8 +227,11 @@ def _rows_case(lengths, padded_len, seed=0, dp_size=2, zero_mask_row=None):
 
     log_probs = -0.5 - torch.rand(padded_len, generator=gen)
     offset = 0
-    for (p, r), old in zip(lengths, old_log_probs, strict=True):
-        log_probs[offset + p - 1 : offset + p - 1 + r] = old + 0.8 * (torch.rand(r, generator=gen) - 0.5)
+    for i, ((p, r), old) in enumerate(zip(lengths, old_log_probs, strict=True)):
+        log_ratio = 0.8 * (torch.rand(r, generator=gen) - 0.5)
+        if seq_ratios is not None:
+            log_ratio += math.log(seq_ratios[i]) / r - log_ratio.mean()
+        log_probs[offset + p - 1 : offset + p - 1 + r] = old + log_ratio
         offset += p + r
     leaves = {"log_probs": log_probs, "entropy": torch.rand(padded_len, generator=gen)}
     for leaf in leaves.values():
@@ -330,17 +335,31 @@ def _loss_mode_config(loss_mode):
     return _rows_config(clip_ratio_c=3.0, policy_loss=PolicyLossConfig(loss_mode=loss_mode, **extra))
 
 
-# Metrics that average over every loss row, so the padding rows count too (docs/accelerators/tpu/rollout.md):
-# the sequence-level IS statistics and the rejection-sampling fraction of bypass mode, and verl 0.9.1's
-# perplexity and chi-square metrics.
+# Metrics that reduce over every loss row, so the padding rows count too (docs/accelerators/tpu/rollout.md): the
+# sequence-level IS statistics and the rejection-sampling fraction of bypass mode, and verl 0.9.1's perplexity and
+# chi-square metrics.
 PADDING_SENSITIVE_METRICS = (
     "rollout_corr/rollout_is_seq_",
     "rollout_corr/rollout_rs_seq_masked_fraction",
     "rollout_corr/chi2_seq",
 )
+# With rollout_is="sequence", verl's compute_is_metrics also reduces over every loss row. With s_i the sum of
+# log_prob - old_log_prob over the response tokens of row i (its sequence log-ratio), it logs rollout_is_max =
+# exp(max s_i) (capped at exp(20)), rollout_is_min = exp(min s_i), and the fractions of rows with
+# s_i > log(rollout_is_threshold) (rollout_is_ratio_fraction_high) and s_i < log(rollout_is_threshold_lower)
+# (rollout_is_ratio_fraction_low; 1 / rollout_is_threshold by default). A padding row has s_i = 0, the ratio 1.
+SEQUENCE_IS_PADDING_SENSITIVE_METRICS = (
+    "rollout_corr/rollout_is_max",
+    "rollout_corr/rollout_is_min",
+    "rollout_corr/rollout_is_ratio_fraction_high",
+    "rollout_corr/rollout_is_ratio_fraction_low",
+)
 
 
-def _padding_sensitive(key):
+def _padding_sensitive(key, rollout_is=None):
+    """Whether the padding rows can change metric ``key``; ``rollout_is`` is the IS level of bypass mode."""
+    if rollout_is == "sequence" and key in SEQUENCE_IS_PADDING_SENSITIVE_METRICS:
+        return True
     return key.startswith(PADDING_SENSITIVE_METRICS) or (key.startswith("rollout_corr/") and "ppl" in key)
 
 
@@ -390,15 +409,52 @@ def test_static_micro_batch_seqs_rows_give_the_same_loss_gradients_and_metrics(l
 def test_static_micro_batch_seqs_rows_with_rollout_correction(correction):
     """Bypass-mode rollout correction: the same loss and gradients; only the listed diagnostics may differ.
 
-    Per-sequence rollout-correction statistics that average over every loss row also count the padding rows: the
-    sequence-level IS statistics, the fraction of sequences with rejected tokens, and in verl 0.9.1 also the
-    off-policy perplexity and chi-square metrics (``PADDING_SENSITIVE_METRICS``). The loss, the gradients and every
-    other metric are unchanged, also with ``loss_type="reinforce"``, where the IS weights scale the loss itself.
+    Per-sequence rollout-correction statistics that reduce over every loss row also count the padding rows: the
+    sequence-level IS statistics, with ``rollout_is="sequence"`` also the largest and smallest sequence IS ratio and
+    the fractions of sequences outside the IS thresholds (exact cases in the next test), the fraction of sequences
+    with rejected tokens, and in verl 0.9.1 also the off-policy perplexity and chi-square metrics. The loss, the
+    gradients and the other metrics are unchanged, also with ``loss_type="reinforce"``, where the IS weights scale
+    the loss itself.
     """
     reference = _run_rows(_bypass_config(**correction))
     padded = _run_rows(_bypass_config(**correction), num_rows=12, width=32)
     assert any(key.startswith("rollout_corr/") for key in padded[2])
-    _assert_same_loss(reference, padded, metric_keys=[key for key in reference[2] if not _padding_sensitive(key)])
+    rollout_is = correction.get("rollout_is", "token")
+    metric_keys = [key for key in reference[2] if not _padding_sensitive(key, rollout_is)]
+    _assert_same_loss(reference, padded, metric_keys=metric_keys)
+
+
+@pytest.mark.parametrize("loss_type", ["ppo_clip", "reinforce"])
+@pytest.mark.parametrize(
+    "seq_ratios, two_rows, four_rows",
+    [
+        ([4.0, 0.1], (4.0, 0.1, 0.5, 0.5), (4.0, 0.1, 0.25, 0.25)),  # one ratio above 3, one below 1/3
+        ([2.0, 4.0], (4.0, 2.0, 0.5, 0.0), (4.0, 1.0, 0.25, 0.0)),  # all above 1: the minimum becomes 1
+        ([0.1, 0.2], (0.2, 0.1, 0.0, 1.0), (1.0, 0.1, 0.0, 0.5)),  # all below 1: the maximum becomes 1
+    ],
+    ids=["out-of-bounds", "above-1", "below-1"],
+)
+def test_static_micro_batch_seqs_rows_change_the_sequence_is_max_min_and_fractions(
+    seq_ratios, two_rows, four_rows, loss_type
+):
+    """With rollout_is="sequence", padding rows (ratio 1) change these diagnostics, but not the loss or gradients.
+
+    Two sequences with the sequence IS ratios ``seq_ratios``, without and with padding to 4 rows. ``two_rows`` and
+    ``four_rows`` are (rollout_is_max, rollout_is_min, rollout_is_ratio_fraction_high, rollout_is_ratio_fraction_low)
+    for rollout_is_threshold=3 and the default rollout_is_threshold_lower=1/3.
+    """
+    config = _bypass_config(rollout_is="sequence", loss_type=loss_type)
+    lengths = [(5, 7), (6, 9)]
+    exact = _run_rows(config, lengths, 32, exact=True, seq_ratios=seq_ratios)  # verl on the exact rows, as on GPU
+    reference = _run_rows(config, lengths, 32, seq_ratios=seq_ratios)
+    padded = _run_rows(config, lengths, 32, num_rows=4, seq_ratios=seq_ratios)
+    assert padded[4]["response_mask"].shape == (4, 16)
+    for run, expected in ((exact, two_rows), (reference, two_rows), (padded, four_rows)):
+        values = tuple(run[2][key] for key in SEQUENCE_IS_PADDING_SENSITIVE_METRICS)
+        assert values == pytest.approx(expected, rel=1e-5, abs=1e-6)
+    _assert_same_loss(exact, reference)
+    metric_keys = [key for key in reference[2] if not _padding_sensitive(key, "sequence")]
+    _assert_same_loss(reference, padded, metric_keys=metric_keys)
 
 
 @pytest.mark.parametrize("dp_size", [1, 2])
