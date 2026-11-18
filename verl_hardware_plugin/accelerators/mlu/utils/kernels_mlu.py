@@ -79,7 +79,7 @@ except ImportError:
     TOTAL_CORE_NUM = 0
 
 
-_NRAM_REGRESSION_TRITON_MIN = (3, 4, 0, 2, 2, 0)
+_REGRESSION_TRITON_MIN = (3, 4, 0, 2, 2, 0)
 
 
 def _triton_version_tuple() -> tuple[int, ...] | None:
@@ -106,7 +106,7 @@ def _triton_version_tuple() -> tuple[int, ...] | None:
 
 _TRITON_VERSION_TUPLE = _triton_version_tuple()
 _TRITON_LOW_VERSION_COMPAT = (
-    HAVE_TRITON and _TRITON_VERSION_TUPLE is not None and _TRITON_VERSION_TUPLE < _NRAM_REGRESSION_TRITON_MIN
+    HAVE_TRITON and _TRITON_VERSION_TUPLE is not None and _TRITON_VERSION_TUPLE < _REGRESSION_TRITON_MIN
 )
 
 if not HAVE_TRITON:
@@ -134,6 +134,11 @@ elif SUPPORT_CUDA_TMA:
     def alloc_fn(size: int, alignment: int, stream: typing.Optional[int]):
         return torch.empty(size, device=get_device_name(), dtype=torch.int8)
 
+    # https://github.com/triton-lang/triton/commit/43625fc968b693ab51884ca95adbcf3e43483fd0
+    # Triton 3.5.0 stores allocators in ContextVar; values do not propagate to new
+    # threads by default. Some execution paths in verl use thread pools (e.g.,
+    # concurrent.futures), so we set a ContextVar *default* to avoid falling
+    # back to NullAllocator in worker threads.
     try:
         import contextvars
 
@@ -240,17 +245,16 @@ def _tile_config(
     num_warps: int,
     group_size_m: typing.Optional[int] = None,
 ) -> "triton.Config":
+    """Shorthand for the repeated BLOCK_SIZE_* ``triton.Config`` pattern.
+
+    ``num_stages``/``num_warps`` are required (no defaults): they are the two
+    levers that decide NRAM occupancy on MLU, so every call site states them
+    explicitly to keep the tuning auditable.
+    """
     kwargs = {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k}
     if group_size_m is not None:
         kwargs["GROUP_SIZE_M"] = group_size_m
     return triton.Config(kwargs, num_stages=num_stages, num_warps=num_warps)
-
-
-_LARGE_NRAM_BYTES = 1024 * 1024
-
-
-def _has_large_nram() -> bool:
-    return _devprob.get("max_nram_size", 0) >= _LARGE_NRAM_BYTES
 
 
 def _entropy_forward_configs():
@@ -261,23 +265,17 @@ def _entropy_forward_configs():
             _tile_config(128, 1024, 256, num_stages=3, num_warps=4),
             _tile_config(256, 256, 128, num_stages=3, num_warps=1),
         ]
-    if _has_large_nram():
-        return [
-            _tile_config(256, 256, 128, num_stages=3, num_warps=1),
-            # fastest fp32 tile that fits 1 MB
-            _tile_config(64, 256, 128, num_stages=3, num_warps=1),
-        ]
     if _TRITON_LOW_VERSION_COMPAT:
         return [
             _tile_config(128, 1024, 256, num_stages=3, num_warps=4),
             _tile_config(256, 128, 128, num_stages=3, num_warps=1),
             _tile_config(64, 256, 256, num_stages=3, num_warps=1),
         ]
-    # triton >= 3.4.0+mlu2.2.0 raised per-tile NRAM usage: the big tiles no
-    # longer fit 512 KB parts, keep the compact list only.
     return [
         _tile_config(128, 128, 512, num_stages=3, num_warps=4),
         _tile_config(64, 256, 256, num_stages=3, num_warps=1),
+        _tile_config(256, 256, 128, num_stages=3, num_warps=1),
+        _tile_config(64, 256, 128, num_stages=3, num_warps=1),
     ]
 
 
@@ -616,6 +614,13 @@ def efficient_entropy_triton_kernel_epilogue_tp(
 
 
 def epilogue_tp_update_config():
+    """MLU-friendly autotune configs (shared by the optimized mHC kernels).
+
+    The MLU triton backend silently resets num_warps>4 -> 4 and num_warps==2 -> 1,
+    so the effective warp set is {1, 4}; we only emit those. Larger BLOCK_SIZE_C
+    amortizes the small H_pre / H_post / H_res reloads across the c-tiles of an
+    m row and improves memory coalescing.
+    """
     warps = [1]
     stages = [2]
 
@@ -897,13 +902,10 @@ def _entropy_backward_mainloop_mn_configs():
             _tile_config(128, 64, 512, num_stages=3, num_warps=4, group_size_m=16),
             _tile_config(128, 128, 256, num_stages=1, num_warps=1, group_size_m=16),
         ]
-    if _has_large_nram():
-        return [
-            _tile_config(128, 128, 256, num_stages=2, num_warps=4, group_size_m=16),
-            _tile_config(128, 128, 256, num_stages=1, num_warps=1, group_size_m=16),
-        ]
     return [
         _tile_config(128, 64, 256, num_stages=1, num_warps=1, group_size_m=16),
+        _tile_config(128, 128, 256, num_stages=2, num_warps=4, group_size_m=16),
+        _tile_config(128, 128, 256, num_stages=1, num_warps=1, group_size_m=16),
     ]
 
 
@@ -1119,20 +1121,11 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
 
 
 def _entropy_backward_d_hidden_configs():
-    if not _has_large_nram():
-        return [
-            # best on every training shape scanned
-            _tile_config(256, 64, 512, num_stages=2, num_warps=4, group_size_m=8),
-            # small / odd shapes
-            _tile_config(128, 128, 256, num_stages=3, num_warps=4, group_size_m=8),
-        ]
     return [
-        # large tokens / hidden: overall fastest
         _tile_config(128, 64, 512, num_stages=1, num_warps=1, group_size_m=8),
-        # hidden_size=8192-class shapes
         _tile_config(128, 64, 256, num_stages=3, num_warps=1, group_size_m=8),
-        # small / odd shapes
         _tile_config(128, 128, 256, num_stages=3, num_warps=4, group_size_m=8),
+        _tile_config(256, 64, 512, num_stages=2, num_warps=4, group_size_m=8),
     ]
 
 
@@ -1290,15 +1283,9 @@ def efficient_entropy_backward_kernel_d_hidden(
 
 
 def _entropy_backward_d_weight_configs():
-    if not _has_large_nram():
-        return [
-            # best or within ~1% on every training shape scanned
-            _tile_config(128, 128, 512, num_stages=3, num_warps=4, group_size_m=8),
-        ]
     return [
-        # best on hidden_size>=4096 shapes
+        _tile_config(128, 128, 512, num_stages=3, num_warps=4, group_size_m=8),
         _tile_config(256, 64, 512, num_stages=3, num_warps=4, group_size_m=8),
-        # best on hidden_size=2048-class shapes
         _tile_config(128, 64, 256, num_stages=3, num_warps=1, group_size_m=8),
     ]
 
@@ -1341,6 +1328,20 @@ def efficient_entropy_backward_kernel_d_weight(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
+    """backward d_weight.
+
+    Each program owns TWO adjacent vocab tiles (effective vocab width
+    ``2*BLOCK_SIZE_N``) and shares one ``hidden`` GEMM stream across them, which
+    amortises the per-tile hidden re-streaming — the kernel's dominant cost.
+    Two logits accumulators and two weight streams live in NRAM concurrently, so
+    BLOCK_SIZE_N is the per-tile width (64) and the (vocab/2BN x hidden/BK) tile
+    space is self-distributed across TOTAL_CORE_NUM cores (one program per core,
+    striding over tiles) — same convention as
+    ``efficient_entropy_backward_kernel_general_d_logits``. Launching one program
+    per tile instead would exceed the MLU per-dimension grid limit (65535): the
+    backend scales grid_0 by num_warps when checking the limit, so even ~64k
+    tiles become ~256k tasks at num_warps=4.
+    """
     pid = tl.program_id(axis=0)
     num_jobs = tl.num_programs(axis=0)
     num_pid_n = tl.cdiv(vocab_size, 2 * BLOCK_SIZE_N)
@@ -1455,19 +1456,21 @@ def efficient_entropy_backward_kernel_d_weight(
 
 
 def _entropy_backward_d_logits_configs():
+    """NRAM-aware autotune list shared by both d_logits kernels:
+    ``efficient_entropy_backward_kernel_general_d_logits``
+    (``BackwardEnum._Total_Separate``) and
+    ``efficient_entropy_backward_kernel_general_d_logits_split_N``
+    (``BackwardEnum._Split_Dlogits_N``) — same tile space, one list.
+    """
     if not _devprob:
         return [
             _tile_config(256, 128, 512, num_stages=3, num_warps=8, group_size_m=16),
             _tile_config(256, 64, 256, num_stages=3, num_warps=1, group_size_m=16),
         ]
-    if _has_large_nram():
-        return [
-            _tile_config(256, 64, 256, num_stages=3, num_warps=1, group_size_m=16),
-            _tile_config(128, 64, 128, num_stages=3, num_warps=1, group_size_m=16),
-        ]
     return [
         _tile_config(128, 64, 256, num_stages=3, num_warps=1, group_size_m=16),
         _tile_config(128, 64, 128, num_stages=3, num_warps=1, group_size_m=16),
+        _tile_config(256, 64, 256, num_stages=3, num_warps=1, group_size_m=16),
     ]
 
 
