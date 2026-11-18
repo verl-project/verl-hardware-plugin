@@ -83,19 +83,6 @@ _NRAM_REGRESSION_TRITON_MIN = (3, 4, 0, 2, 2, 0)
 
 
 def _triton_version_tuple() -> tuple[int, ...] | None:
-    """``(major, minor, patch, mlu_major, mlu_minor, mlu_patch)`` or ``None``.
-
-    Reads the installed distribution version: triton-mlu builds report only
-    the base version through ``triton.__version__`` (e.g. ``3.4.0``) while
-    the full version with the ``+mluX.Y.Z`` local segment lives in the
-    package metadata. Community triton without an ``+mluX.Y.Z`` suffix maps
-    the mlu part to ``(0, 0, 0)`` so any mlu-tagged cutoff sorts above it.
-
-    Returns ``None`` when the metadata is unreadable (triton installed
-    without package metadata, or a bare ``__version__`` without the mlu
-    suffix): callers must then take the conservative path, because a bare
-    base version cannot prove the big tiles fit 512 KB NRAM.
-    """
     try:
         raw = importlib.metadata.version("triton")
     except importlib.metadata.PackageNotFoundError:
@@ -263,12 +250,6 @@ _LARGE_NRAM_BYTES = 1024 * 1024
 
 
 def _has_large_nram() -> bool:
-    """True on >= 1 MB-NRAM MLU parts.
-
-    False on 512 KB parts and when no MLU triton backend is present (the
-    community-triton import path); selectors that distinguish the no-backend
-    case check ``not _devprob`` before consulting this.
-    """
     return _devprob.get("max_nram_size", 0) >= _LARGE_NRAM_BYTES
 
 
@@ -1360,20 +1341,6 @@ def efficient_entropy_backward_kernel_d_weight(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
-    """backward d_weight.
-
-    Each program owns TWO adjacent vocab tiles (effective vocab width
-    ``2*BLOCK_SIZE_N``) and shares one ``hidden`` GEMM stream across them, which
-    amortises the per-tile hidden re-streaming — the kernel's dominant cost.
-    Two logits accumulators and two weight streams live in NRAM concurrently, so
-    BLOCK_SIZE_N is the per-tile width (64) and the (vocab/2BN x hidden/BK) tile
-    space is self-distributed across TOTAL_CORE_NUM cores (one program per core,
-    striding over tiles) — same convention as
-    ``efficient_entropy_backward_kernel_general_d_logits``. Launching one program
-    per tile instead would exceed the MLU per-dimension grid limit (65535): the
-    backend scales grid_0 by num_warps when checking the limit, so even ~64k
-    tiles become ~256k tasks at num_warps=4.
-    """
     pid = tl.program_id(axis=0)
     num_jobs = tl.num_programs(axis=0)
     num_pid_n = tl.cdiv(vocab_size, 2 * BLOCK_SIZE_N)
@@ -1488,12 +1455,6 @@ def efficient_entropy_backward_kernel_d_weight(
 
 
 def _entropy_backward_d_logits_configs():
-    """NRAM-aware autotune list shared by both d_logits kernels:
-    ``efficient_entropy_backward_kernel_general_d_logits``
-    (``BackwardEnum._Total_Separate``) and
-    ``efficient_entropy_backward_kernel_general_d_logits_split_N``
-    (``BackwardEnum._Split_Dlogits_N``) — same tile space, one list.
-    """
     if not _devprob:
         return [
             _tile_config(256, 128, 512, num_stages=3, num_warps=8, group_size_m=16),
