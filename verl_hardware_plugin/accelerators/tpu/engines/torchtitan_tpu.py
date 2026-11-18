@@ -37,6 +37,7 @@ import math
 import os
 import re
 import shutil
+from collections import deque
 from collections.abc import Collection, Iterable, Mapping
 from contextlib import nullcontext
 from functools import partial
@@ -119,6 +120,89 @@ from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# verl's deferred host scalars (``verl.utils.metric.deferred``) are not in every verl release this plugin supports;
+# without them, training passes read their host scalars where they are computed, as before. Imported through importlib:
+# an optional module, not one of the verl APIs the plugin requires (``scripts/check_verl_api.py``).
+try:
+    _deferred: Any = importlib.import_module("verl.utils.metric.deferred")
+except ImportError:
+    _deferred = None
+
+# Host syncs of training micro-batches (verl.utils.metric.deferred):
+#   "cut"  the metric / loss .item() and bool() reads and the log-prob host copy are read once after the micro-batch
+#          loop; at each former sync point the deferred tensor is materialized without waiting (tpu_synchronize(t,
+#          wait=False)), so the deferred-graph cut points, and with them the compiled programs, stay exactly as before
+#   "fuse" the same without the cuts (the loss glue and its metrics become one deferred graph per micro-batch)
+#   "off"  read each value where it is computed (eager), as with a verl that does not have the module
+_HOST_SCALARS_MODE = "cut"
+# Micro-batches end without a device drain, except the last one; at most this many finished-dispatch micro-batches may
+# still be running on the device while the host dispatches the next one (bounds the activations in HBM).
+_MICRO_BATCH_RUNAHEAD = 1
+
+
+def _host_scalar_scope():
+    """The deferral scope of one training forward/backward pass (see ``_HOST_SCALARS_MODE``)."""
+    if _HOST_SCALARS_MODE not in ("cut", "fuse", "off"):
+        raise ValueError(f"unknown _HOST_SCALARS_MODE {_HOST_SCALARS_MODE!r}")
+    if _HOST_SCALARS_MODE == "off" or _deferred is None:
+        return nullcontext(None)
+    if _HOST_SCALARS_MODE == "cut":
+        return _deferred.defer_host_scalars(materialize=functools.partial(tpu_synchronize, wait=False))
+    return _deferred.defer_host_scalars()
+
+
+def _host_scalar(t: torch.Tensor) -> Any:
+    """``t.item()``; in a training pass's host-scalar scope, a placeholder read after the micro-batch loop."""
+    return t.item() if _deferred is None else _deferred.host_scalar(t)
+
+
+def _host_copy(t: torch.Tensor) -> torch.Tensor:
+    """``t.cpu()``; in a training pass's host-scalar scope, a host tensor filled after the micro-batch loop."""
+    return t.cpu() if _deferred is None else _deferred.host_copy(t)
+
+
+def _record_device_event() -> Any:
+    """A completion marker for everything enqueued on this process's device so far (``torch.Event.record`` cuts and
+    dispatches the active ``DEFER_AND_FUSE`` stream; ``.synchronize()`` waits for it). Only TPU events are used: on
+    other devices (e.g. the CPU tests: the CPU backend does not support events) this raises, and the fence drains
+    after every micro-batch."""
+    device = torch.device(get_device_name())
+    if device.type != "tpu":
+        raise RuntimeError(f"micro-batch fence events need a TPU device, not {device.type}")
+    event = torch.Event(device=device)
+    event.record()
+    return event
+
+
+class _MicroBatchFence:
+    """Bounds how far the host runs ahead of the device when micro-batches end without a drain.
+
+    After micro-batch k is flushed (``tpu_synchronize(wait=False)``) the host records a device event and waits for the
+    event of micro-batch ``k - depth``: the host prepares and dispatches micro-batch k + 1 while the device runs k,
+    and at most ``depth + 1`` micro-batches hold activations. If no event can be recorded, every later micro-batch is
+    drained instead (``tpu_synchronize(wait=True)``, the behaviour without the fence).
+    """
+
+    _disabled = False
+
+    def __init__(self, depth: int):
+        self.depth = int(depth)
+        self.events: deque = deque()
+
+    def after_flush(self) -> None:
+        if not _MicroBatchFence._disabled:
+            try:
+                self.events.append(_record_device_event())
+            except Exception as e:
+                _MicroBatchFence._disabled = True
+                logger.warning("micro-batch fence: no device event (%r); draining after every micro-batch instead", e)
+        if _MicroBatchFence._disabled:
+            self.events.clear()
+            tpu_synchronize(wait=True)
+            return
+        while len(self.events) > self.depth:
+            self.events.popleft().synchronize()
+
 
 def _to_jagged(padded: torch.Tensor, cu_seqlens: torch.Tensor, orig_seq_len: Optional[int]) -> torch.Tensor:
     """Jagged view of a per-token output; for bucket-padded outputs a CPU view that carries the padded device tensor.
@@ -127,7 +211,10 @@ def _to_jagged(padded: torch.Tensor, cu_seqlens: torch.Tensor, orig_seq_len: Opt
     """
     if orig_seq_len is None:
         return torch.nested.nested_tensor_from_jagged(padded, cu_seqlens)
-    jagged = torch.nested.nested_tensor_from_jagged(padded.detach().cpu()[:orig_seq_len], cu_seqlens.detach().cpu())
+    # padded.detach().cpu(); in a training pass's host-scalar scope, filled after the micro-batch loop (nothing reads it
+    # earlier: the loss reads the padded device tensor)
+    values = _host_copy(padded.detach())[:orig_seq_len]
+    jagged = torch.nested.nested_tensor_from_jagged(values, cu_seqlens.detach().cpu())
     setattr(jagged, TPU_PADDED_VALUES_ATTR, padded)
     return jagged
 
@@ -1569,23 +1656,36 @@ class TorchTitanTPUEngine(BaseEngine):
             row_ctx = set_unflatten_seq_len(self._gdn_row_slot_len)
         else:
             row_ctx = nullcontext()
-        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), row_ctx:
+        # Training: host scalars read once after the loop; no drain between micro-batches (bounded run-ahead).
+        scalar_scope = _host_scalar_scope() if not forward_only else nullcontext(None)
+        fence = _MicroBatchFence(_MICRO_BATCH_RUNAHEAD)  # used by training passes only
+        last = len(micro_batches) - 1
+        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), row_ctx, scalar_scope as scope:
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                     loss, output = self.forward_step(
                         micro_batch, loss_function=loss_function, forward_only=forward_only
                     )
                     if not forward_only:
+                        # Every micro-batch but the last ends with a non-blocking device-wide materialization instead
+                        # of a drain (the same deferred-graph cut, without the host wait).
+                        drain = micro_batch_idx == last
                         with spmd_no_typecheck_context():
                             if self._simple_fsdp_loss_scale is not None:
                                 loss = loss * self._simple_fsdp_loss_scale
                             tpu_synchronize(loss, wait=False)
                             loss.backward()
                             del loss
-                            tpu_synchronize(wait=True)
+                            tpu_synchronize(wait=drain)
+                        if not drain:
+                            fence.after_flush()
                     else:
                         del loss
                 output_lst.append(output)
+            if scope is not None:
+                # The deferred values come from verl's loss and metric ops, which carry no spmd_types annotations.
+                with spmd_no_typecheck_context():
+                    scope.resolve(output_lst)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
@@ -2572,7 +2672,8 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
                 output = {
                     "model_output": detach_tree(model_output),
-                    "loss": loss.detach().item(),
+                    # loss.detach().item(); in a training pass's host-scalar scope, read after the micro-batch loop
+                    "loss": _host_scalar(loss.detach()),
                     "metrics": metrics,
                 }
 
