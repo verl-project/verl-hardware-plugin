@@ -75,7 +75,12 @@ from verl.workers.engine.utils import (
 )
 from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import no_padding_2_padding
-from verl_hardware_plugin.accelerators.tpu.engines import graph_trainer_mode, tpu_model_kernels, tpu_ragged_ep
+from verl_hardware_plugin.accelerators.tpu.engines import (
+    activation_offload,
+    graph_trainer_mode,
+    tpu_model_kernels,
+    tpu_ragged_ep,
+)
 from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
@@ -1651,12 +1656,21 @@ class TorchTitanTPUEngine(BaseEngine):
             row_ctx = set_unflatten_seq_len(self._gdn_row_slot_len)
         else:
             row_ctx = nullcontext()
+        # VERL_TPU_ACTIVATION_OFFLOAD=1: saved-for-backward activations go to pinned host memory between a micro-batch's
+        # forward and backward (engines/activation_offload.py).
+        offload = None
+        if not forward_only and activation_offload.activation_offload_enabled():
+            offload = getattr(self, "_activation_offload", None)
+            if offload is None:
+                offload = activation_offload.HostActivationOffload(p for m in self.module for p in m.parameters())
+                self._activation_offload = offload
         with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), row_ctx:
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
-                    loss, output = self.forward_step(
-                        micro_batch, loss_function=loss_function, forward_only=forward_only
-                    )
+                    with offload.hooks() if offload is not None else nullcontext():
+                        loss, output = self.forward_step(
+                            micro_batch, loss_function=loss_function, forward_only=forward_only
+                        )
                     if not forward_only:
                         with spmd_no_typecheck_context():
                             if self._simple_fsdp_loss_scale is not None:
@@ -1665,6 +1679,8 @@ class TorchTitanTPUEngine(BaseEngine):
                             loss.backward()
                             del loss
                             tpu_synchronize(wait=True)
+                            if offload is not None:
+                                offload.end_micro_batch()
                     else:
                         del loss
                 output_lst.append(output)
