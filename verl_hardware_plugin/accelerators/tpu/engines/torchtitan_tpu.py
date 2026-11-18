@@ -75,7 +75,12 @@ from verl.workers.engine.utils import (
 )
 from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import no_padding_2_padding
-from verl_hardware_plugin.accelerators.tpu.engines import graph_trainer_mode, tpu_model_kernels, tpu_ragged_ep
+from verl_hardware_plugin.accelerators.tpu.engines import (
+    graph_trainer_mode,
+    host_sync,
+    tpu_model_kernels,
+    tpu_ragged_ep,
+)
 from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
@@ -1651,7 +1656,16 @@ class TorchTitanTPUEngine(BaseEngine):
             row_ctx = set_unflatten_seq_len(self._gdn_row_slot_len)
         else:
             row_ctx = nullcontext()
-        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), row_ctx:
+        # VERL_TPU_DEFER_METRIC_SYNC=1: keep each micro-batch's loss and scalar metrics on the device and read them
+        # back once after the loop (engines/host_sync.py), instead of a blocking .item() between forward and backward.
+        defer_scalars = host_sync.defer_metric_sync_enabled()
+        mb_sync_wait = host_sync.micro_batch_sync_wait()
+        with (
+            timeline_ctx,
+            tpu_eager_mode_context(self._tpu_eager_mode),
+            row_ctx,
+            host_sync.defer_metric_items(defer_scalars),
+        ):
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                     loss, output = self.forward_step(
@@ -1664,10 +1678,12 @@ class TorchTitanTPUEngine(BaseEngine):
                             tpu_synchronize(loss, wait=False)
                             loss.backward()
                             del loss
-                            tpu_synchronize(wait=True)
+                            tpu_synchronize(wait=mb_sync_wait)
                     else:
                         del loss
                 output_lst.append(output)
+        if defer_scalars:
+            host_sync.materialize_host_scalars(output_lst)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
@@ -2741,7 +2757,8 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
                 output = {
                     "model_output": detach_tree(model_output),
-                    "loss": loss.detach().item(),
+                    # A 0-d device tensor under VERL_TPU_DEFER_METRIC_SYNC=1, read back after the micro-batch loop.
+                    "loss": loss.detach() if host_sync.defer_metric_sync_enabled() else loss.detach().item(),
                     "metrics": metrics,
                 }
 
