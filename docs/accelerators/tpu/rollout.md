@@ -97,6 +97,17 @@ Performance options for long packed micro-batches (the Qwen3-30B-A3B recipe sets
 | `mixed_precision_reduce: bfloat16` | bf16 FSDP gradient reduce-scatter instead of fp32 (half the traffic; a performance A/B option) |
 | `gdn_row_slot_len: <max_model_len>` | Qwen3.5: every sequence of a packed micro-batch starts at a multiple of this length, so the GatedDeltaNet runs one sequence per row (torchtitan's `set_unflatten_seq_len`) instead of resetting at packed documents through Tokamax `segment_ids`. Needs `use_dynamic_bsz=False`, a fixed `ppo_micro_batch_size_per_gpu`, `static_micro_batch_len` = that size x `gdn_row_slot_len`, and the fused log-prob |
 
+With `activation_checkpoint=selective`, three options tune the save set of torchtitan's `TPUSelectiveAC`, the
+engine's selective-AC policy (all off by default; see `engines/tpu_selective_ac.py`): `selective_ac_recompute_bmm`
+recomputes `aten.bmm` outputs in backward instead of saving them (Qwen3.5's XLA GatedDeltaNet chunk recurrence runs
+three per 64-token chunk), `selective_ac_save_pallas_attention` also saves the Pallas splash-attention forward so
+that backward does not re-run it, and `selective_ac_save_kda_residuals` also saves the output and residuals of the
+Tokamax KDA forward so that backward does not replay the forward kernel. The values do not change. Each option needs
+a torchtitan whose `TPUSelectiveAC` has the flag (`recompute_bmm` and `save_pallas_attention`:
+google-pytorch/torchtitan#168; `save_kda_residuals`: google-pytorch/torchtitan#170); otherwise the engine raises at
+start-up instead of ignoring the option. `ac_save_splash_and_routing` replaces `TPUSelectiveAC` with a save set of
+its own (only the splash forward and the MoE router's `aten.topk`), so it cannot be combined with these options.
+
 The rollout settings that matter on TPU (the recipes already set them):
 
 | Setting | Value on TPU |

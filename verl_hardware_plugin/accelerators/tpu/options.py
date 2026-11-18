@@ -216,6 +216,21 @@ class TPUEngineOptions:
         frozen_param_regex: Parameters whose FQN matches this regex (``re.search``) are not trained: their
             gradients are dropped before the gradient norm and the optimizer step, e.g. ``moe.router.gate`` freezes
             the MoE router (default: unset, train every parameter).
+        selective_ac_recompute_bmm: With ``activation_checkpoint=selective``, recompute batched-matmul
+            (``aten.bmm``) outputs in backward instead of saving them (default: ``False``). Saving them hands one
+            tensor per bmm from each compiled block's forward program to its backward program; Qwen3.5's XLA
+            GatedDeltaNet chunk recurrence runs three bmm per 64-token chunk. Like the two options below, this sets a
+            flag of torchtitan's ``TPUSelectiveAC`` (``recompute_bmm``; see ``engines/tpu_selective_ac.py``): the
+            engine raises if the installed torchtitan does not have it, and these options cannot be combined with
+            ``ac_save_splash_and_routing``. The values do not change (the same ops run on the same inputs).
+        selective_ac_save_pallas_attention: With ``activation_checkpoint=selective``, also save the Pallas
+            splash-attention forward's output and logsumexp, so backward does not re-run the forward kernel
+            (``save_pallas_attention``; default: ``False``). Costs one bf16 ``[1, H, T, D]`` and one f32
+            ``[1, H, T]`` tensor per attention layer.
+        selective_ac_save_kda_residuals: With ``activation_checkpoint=selective`` and the Tokamax KDA kernels
+            (``model_kernels``), also save each GatedDeltaNet layer's KDA forward output and backward residuals, so
+            backward does not replay the forward kernel (``save_kda_residuals``; default: ``False``). Costs those
+            residuals for every GatedDeltaNet layer.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -249,6 +264,9 @@ class TPUEngineOptions:
     moe_native_weight_layout: Optional[bool] = None
     gdn_row_slot_len: Optional[int] = None
     frozen_param_regex: Optional[str] = None
+    selective_ac_recompute_bmm: Optional[bool] = None
+    selective_ac_save_pallas_attention: Optional[bool] = None
+    selective_ac_save_kda_residuals: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -283,8 +301,18 @@ _ENGINE_KINDS: dict[str, type] = {
     "moe_native_weight_layout": bool,
     "gdn_row_slot_len": int,
     "frozen_param_regex": str,
+    "selective_ac_recompute_bmm": bool,
+    "selective_ac_save_pallas_attention": bool,
+    "selective_ac_save_kda_residuals": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
+
+# Options that turn on a flag of torchtitan's TPUSelectiveAC (``engines/tpu_selective_ac.py``): option -> flag.
+SELECTIVE_AC_FLAG_OPTIONS: dict[str, str] = {
+    "selective_ac_recompute_bmm": "recompute_bmm",
+    "selective_ac_save_pallas_attention": "save_pallas_attention",
+    "selective_ac_save_kda_residuals": "save_kda_residuals",
+}
 
 # Deprecated channels, read for compatibility: option -> environment variable / top-level config field.
 _ENGINE_LEGACY_ENV_VARS = {
@@ -356,6 +384,11 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
     if values.get("ep_token_chunks") is not None and values["ep_token_chunks"] < 1:
         raise ValueError(
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ep_token_chunks must be >= 1, got {values['ep_token_chunks']!r}"
+        )
+    if values.get("ac_save_splash_and_routing") and any(values.get(name) for name in SELECTIVE_AC_FLAG_OPTIONS):
+        raise ValueError(
+            f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ac_save_splash_and_routing replaces torchtitan's TPUSelectiveAC "
+            "with its own save set; it cannot be combined with the selective_ac_* options, which tune TPUSelectiveAC"
         )
     return TPUEngineOptions(**values)
 

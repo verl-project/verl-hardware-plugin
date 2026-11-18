@@ -33,6 +33,7 @@ verl_hardware_plugin/accelerators/tpu/
 │   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SimpleFSDP, SPMD)
 │   ├── tpu_utils.py                  # Attention, SimpleFSDP, compile and sequence-bucketing helpers; option resolvers
 │   ├── fused_logprob.py              # Fused LM-head log-prob: Tokamax forward kernel + chunked PyTorch backward
+│   ├── tpu_selective_ac.py           # Flags of torchtitan's TPUSelectiveAC (engine_kwargs.tpu.selective_ac_*)
 │   └── weight_export.py              # Exports the engine's weights as local FSDP shards or full tensors
 ├── losses/                           # verl core: verl/workers/utils/losses.py
 │   └── loss_inputs.py                # Static-shape inputs for verl's unmodified sft_loss / ppo_loss
@@ -66,6 +67,7 @@ tests/accelerators/tpu/
 ├── test_tpu_engine.py                # platform_tpu.py and engines/ (torchtitan_tpu, tpu_utils, weight_export)
 ├── test_tpu_options.py               # options.py (engine_kwargs.tpu, engine_kwargs.tpu-sync, deprecated env vars)
 ├── test_tpu_loss_inputs.py           # losses/loss_inputs.py
+├── test_tpu_selective_ac.py          # engines/tpu_selective_ac.py (engine_kwargs.tpu.selective_ac_*)
 ├── test_tpu_vllm_rollout.py          # rollout/tpu_vllm.py
 ├── test_tpu_vllm_patches.py          # rollout/tpu_vllm_patches.py
 ├── test_direct_install.py            # rollout/direct_install.py
