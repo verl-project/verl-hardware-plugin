@@ -29,7 +29,7 @@ MLU 上已支持并测试完成 Qwen 系列模型，包括dense模型、MoE模�
 
 vLLM 已预安装在 cambricon_release docker image 中，用户无需额外操作可以直接使用。
 
-注意，当使用cambricon_release docker image进行RL训练时，请确认处在`pytorch_infer`的环境中。
+注意，当使用cambricon_release docker image进行RL训练时，请确认处在`pytorch_vllm`的环境中。
 
 #### vLLM主要参数特性支持
 
@@ -121,6 +121,7 @@ MLU 支持 Megatron 和 Megatron-Bridge，且已经预安装在 cambricon_releas
 这里列出部分MLU支持的高级特性，供开发者参考
 | 特性 | 说明 |
 | -------- | --- |
+| Checkpoint Engine | Checkpoint Engine 用于异步训练时训练后端和推理后端间的权重同步，具体见[Checkpoint Engine](https://github.com/verl-project/verl/tree/main/verl/checkpoint_engine)。MLU 目前支持`cncl_checkpoint_engine`和`cnixl_checkpoint_engine`。通过在脚本中配置参数使能: <br>`actor_rollout_ref.rollout.checkpoint_engine.backend=cncl/cnixl` |
 | SFT 训练 | 使用verl框架进行sft训练，运行脚本参考[SFT example](https://github.com/verl-project/verl/tree/main/examples/sft/gsm8k) |
 | on policy distillation 训练 | OPD 在学生策略采样得到的状态上，将教师模型的知识蒸馏到学生模型。对比监督微调 (SFT) 或者标准知识蒸馏 (KD)，OPD 对齐训练阶段与推理阶段的状态，从而缓解暴露偏差。<br>运行及其详细说明见 [OPD example](https://github.com/verl-project/verl/tree/main/examples/on_policy_distillation_trainer)。|
 | Router Replay | Router Replay 是 verl 框架中面向混合专家（MoE）模型的高级路由回放功能。它通过记录并重放路由决策来实现确定性训练，保证训练计算多次之间模型行为保持一致。 |

@@ -4,7 +4,7 @@ This guide walks you through running a GRPO training job with verl on the Cambri
 
 ## Environment Setup
 **1.**
-Please use Cambricon release docker images to run verl and make sure you are in pytorch_infer env.
+Please use Cambricon release docker images to run verl and make sure you are in pytorch_vllm env.
 
 **2.**
 Start ray cluster:
