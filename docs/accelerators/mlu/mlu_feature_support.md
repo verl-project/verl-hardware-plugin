@@ -109,6 +109,29 @@ MLU 支持 Megatron 和 Megatron-Bridge，且已经预安装在 cambricon_releas
 
 更多参数配置参考 [verl megatron config](https://github.com/verl-project/verl/blob/main/verl/trainer/config/engine/megatron.yaml)
 
+### 3.2.1 Megatron Muon 优化器
+
+MLU 支持在训练后端为 Megatron 的场景下启用 Muon 优化器：对 2D 权重矩阵应用 Muon，其余参数（embedding、norm、bias、router、lm_head 等）仍使用 AdamW。
+依赖: python >= 3.12 | 安装 emerging-optimizers
+启用方式及推荐参数如下：
+
+| verl 参数 | 简介 |
+| --- | --- |
+| `actor_rollout_ref.actor.optim.optimizer=muon` | 选择 Muon 优化器（矩阵参数走 Muon，其余参数退回 AdamW） |
+| `actor_rollout_ref.actor.optim.use_layer_wise_distributed_optimizer=True` | 走 Megatron LayerWise 分布式优化器路径，Muon 逐层 buffer 分布式存储，将显存压到 AdamW 以下（30B 规模推荐） |
+| `actor_rollout_ref.actor.optim.muon_momentum=0.95` | Muon 内部 SGD 的动量系数 |
+| `actor_rollout_ref.actor.optim.muon_nesterov=False` | 是否在 Muon 内部 SGD 使用 Nesterov 动量 |
+| `actor_rollout_ref.actor.optim.muon_split_qkv=True` | 对 fused QKV 按 head 独立切分后再做 Muon 正交化 |
+| `actor_rollout_ref.actor.optim.muon_scale_mode=spectral` | Muon 更新的缩放模式 |
+| `actor_rollout_ref.actor.optim.muon_coefficient_type=quintic` | Newton-Schulz 迭代的系数类型 |
+| `actor_rollout_ref.actor.optim.muon_num_ns_steps=5` | Newton-Schulz 正交化的迭代步数 |
+| `actor_rollout_ref.actor.optim.muon_tp_mode=blockwise` | 张量并行下 Newton-Schulz 计算的分片模式 |
+| `actor_rollout_ref.actor.optim.muon_match_adamw_update_rms=True` | 由 betas[0] 派生 muon_extra_scale_factor，使 Muon 更新 RMS 匹配 AdamW |
+
+> 注意：启用 Muon 后学习率不可直接沿用 AdamW 的 `lr`。Megatron 默认 `muon_extra_scale_factor=1.0`，会使 Muon 的有效步长约为 AdamW 的 4.4 倍，易导致训练不稳定；建议始终开启 `muon_match_adamw_update_rms=True` 自动派生缩放，而非手填常数。
+
+更多参数配置参考 [verl megatron muon optimizer config](https://github.com/verl-project/verl/blob/main/examples/muon/README.md)
+
 ## 4. 融合算子
 | 算子 | 使用方式 | 说明 |
 | ------- | --- | --- |
