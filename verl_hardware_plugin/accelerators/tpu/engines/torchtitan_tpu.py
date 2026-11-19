@@ -120,6 +120,12 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+@functools.lru_cache(maxsize=32)
+def _headtail_restore_indices_cpu(seq_len: int, cp_size: int) -> torch.Tensor:
+    """CPU-cached restore permutation for ``_HeadTailLoadBalancer`` (avoids 64k ``argsort`` on TPU)."""
+    return _HeadTailLoadBalancer(seq_len, cp_size, "cpu")._generate_indices(restore=True)[0].to(torch.int64)
+
+
 def _to_jagged(padded: torch.Tensor, cu_seqlens: torch.Tensor, orig_seq_len: Optional[int]) -> torch.Tensor:
     """Jagged view of a per-token output; for bucket-padded outputs a CPU view that carries the padded device tensor.
 
@@ -1428,14 +1434,23 @@ class TorchTitanTPUEngine(BaseEngine):
     def _gather_context_parallel(self, tensor: torch.Tensor, seq_len: int) -> torch.Tensor:
         """All-gather a per-token tensor sharded along dim 0 by CP and restore the original token order."""
         load_balancer_type = self.trainer.config.parallelism.context_parallel_load_balancer
-        load_balancer = None
-        if load_balancer_type == "headtail":
-            load_balancer = _HeadTailLoadBalancer(seq_len, self.parallel_dims.cp, tensor.device)
-        elif load_balancer_type is not None:
+        if load_balancer_type not in (None, "headtail"):
             raise NotImplementedError(f"context_parallel_load_balancer={load_balancer_type!r} is not supported")
         gathered = ContextParallelGather.apply(tensor, self.get_context_parallel_group())
-        if load_balancer is not None:
-            gathered = gathered[load_balancer._generate_indices(restore=True)[0]]
+        if load_balancer_type == "headtail":
+            cache = getattr(self, "_cp_restore_idx_cache", None)
+            if cache is None:
+                cache = {}
+                self._cp_restore_idx_cache = cache
+            key = (int(seq_len), int(self.parallel_dims.cp), gathered.device)
+            restore_idx = cache.get(key)
+            if restore_idx is None:
+                restore_idx = _headtail_restore_indices_cpu(int(seq_len), int(self.parallel_dims.cp)).to(
+                    device=gathered.device
+                )
+                tpu_synchronize(restore_idx, wait=False)
+                cache[key] = restore_idx
+            gathered = gathered.index_select(0, restore_idx)
         return gathered
 
     def _build_dp_gloo_group(self):

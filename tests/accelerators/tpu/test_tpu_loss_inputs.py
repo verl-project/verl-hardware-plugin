@@ -272,3 +272,74 @@ def test_core_under_test_emits_the_expected_loss_metrics():
     _, metrics = ppo_loss(_ppo_config(), loss_model_output, loss_data)
     missing = [m for m in expected if m not in metrics]
     assert not missing, f"the verl core under test does not emit {missing}"
+
+
+@pytest.mark.parametrize("loss_agg_mode", ["token-mean", "seq-mean-token-mean"])
+def test_prepare_tpu_loss_inputs_ppo_bucketed_rows_match_unbucketed(loss_agg_mode):
+    """Rows padded up to ``tpu_padded_num_seqs`` (all-masked) leave the loss, grads and metrics unchanged."""
+    lengths, response_masks = _MASK_CASES[1]
+    config = ActorConfig(
+        strategy="fsdp",
+        rollout_n=8,
+        ppo_micro_batch_size_per_gpu=4,
+        loss_agg_mode=loss_agg_mode,
+        use_kl_loss=True,
+        kl_loss_coef=0.001,
+        entropy_coeff=0.01,
+    )
+
+    def run(padded_num_seqs):
+        model_output, leaves, _ = _ppo_model_output(lengths, padded_len=48, with_entropy=True)
+        micro_batch = _ppo_micro_batch(lengths, max_response_len=16, response_masks=response_masks)
+        if padded_num_seqs:
+            tu.assign_non_tensor_data(micro_batch, "tpu_padded_num_seqs", padded_num_seqs)
+        loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
+        loss, metrics = ppo_loss(config, loss_model_output, loss_data)
+        loss.backward()
+        return loss, {k: v.grad for k, v in leaves.items()}, metrics, loss_data
+
+    ref_loss, ref_grads, ref_metrics, ref_data = run(0)
+    loss, grads, metrics, data = run(4)
+    assert ref_data["response_mask"].shape == torch.Size([3, 16])
+    assert data["response_mask"].shape == torch.Size([4, 16])
+    assert data["prompts"].offsets().tolist() == [0, 1, 2, 3, 4]
+    torch.testing.assert_close(loss, ref_loss, rtol=0, atol=1e-6)
+    for key, grad in ref_grads.items():
+        torch.testing.assert_close(grads[key], grad, rtol=0, atol=1e-7)
+    assert set(metrics) == set(ref_metrics)
+    for key, ref_metric in ref_metrics.items():
+        assert _metric_value(metrics[key]) == pytest.approx(_metric_value(ref_metric), rel=1e-6, abs=1e-7), key
+
+
+def test_prepare_tpu_loss_inputs_ppo_bucketed_rows_share_shapes_across_batch_sizes():
+    """2- and 3-row micro-batches in the same row bucket give the loss identical shapes (no XLA recompiles)."""
+
+    def loss_inputs(lengths):
+        model_output, _, _ = _ppo_model_output(lengths, padded_len=48, with_entropy=True)
+        micro_batch = _ppo_micro_batch(lengths, max_response_len=16)
+        tu.assign_non_tensor_data(micro_batch, "tpu_padded_num_seqs", 4)
+        return prepare_tpu_loss_inputs(model_output, micro_batch)
+
+    out_a, data_a = loss_inputs([(5, 7), (9, 11)])
+    out_b, data_b = loss_inputs([(3, 2), (6, 9), (4, 1)])
+    for key in ("log_probs", "entropy"):
+        assert out_a[key].values().shape == out_b[key].values().shape == torch.Size([4 * (16 + 1)])
+    for key in ("prompts", "responses"):
+        assert data_a[key].offsets().tolist() == data_b[key].offsets().tolist()
+    for key in ("response_mask", "old_log_probs", "advantages", "ref_log_prob"):
+        assert data_a[key].shape == data_b[key].shape == torch.Size([4, 16])
+    # Scalar host metadata survives on the row-padded loss data.
+    assert tu.get_non_tensor_data(data_a, "dp_size", None) == 2
+    assert tu.get_non_tensor_data(data_a, "global_batch_size", None) == 8
+
+
+def test_prepare_tpu_loss_inputs_ppo_keeps_rows_when_a_row_has_no_valid_tokens():
+    """A real row without valid response tokens disables row bucketing (keeps the per-row path exact)."""
+    lengths = [(3, 2), (6, 9), (4, 1)]
+    model_output, _, _ = _ppo_model_output(lengths, padded_len=48, with_entropy=False)
+    micro_batch = _ppo_micro_batch(
+        lengths, max_response_len=16, response_masks=[[1, 0], [1, 1, 0, 1, 0, 1, 1, 0, 1], [0]]
+    )
+    tu.assign_non_tensor_data(micro_batch, "tpu_padded_num_seqs", 4)
+    _, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
+    assert loss_data["response_mask"].shape == torch.Size([3, 16])
