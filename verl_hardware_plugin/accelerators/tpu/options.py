@@ -58,6 +58,15 @@ def _warn_once(key: str, message: str) -> None:
         logger.warning(message)
 
 
+def _to_plain_dict(value: Any) -> Any:
+    """Recursively converts mappings and iterables into plain dicts and lists."""
+    if isinstance(value, Mapping):
+        return {str(k): _to_plain_dict(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_to_plain_dict(v) for v in value]
+    return value
+
+
 def _parse(name: str, kind: type, value: Any, source: str, label: str = "TPU") -> Any:
     """Converts ``value`` (a config value or an environment string) to ``kind``; ``None`` / ``""`` is unset."""
     if value is None:
@@ -67,8 +76,12 @@ def _parse(name: str, kind: type, value: Any, source: str, label: str = "TPU") -
         if value == "":
             return None
     try:
-        if kind is ParityMode:
-            return ParityMode.parse(value)
+        if kind is dict:
+            if isinstance(value, Mapping):
+                return _to_plain_dict(value)
+            raise ValueError(f"expected a mapping, got {type(value).__name__}")
+        if hasattr(kind, "parse"):
+            return kind.parse(value)
         if kind is bool:
             if isinstance(value, bool):
                 return value
@@ -216,6 +229,14 @@ class TPUEngineOptions:
         frozen_param_regex: Parameters whose FQN matches this regex (``re.search``) are not trained: their
             gradients are dropped before the gradient norm and the optimizer step, e.g. ``moe.router.gate`` freezes
             the MoE router (default: unset, train every parameter).
+        trainer_mode: How the actor's training step runs: ``eager_blocks`` (default: TorchTitan ``Trainer``,
+            per-TransformerBlock ``torch.compile`` and eager loss / backward) or ``graph_trainer`` (TorchTitan's
+            ``TpuGraphTrainer`` traces forward + RL loss + backward of a micro-batch into one graph and compiles it
+            whole, see ``engines/graph_trainer_mode.py``). ``graph_trainer`` needs ``use_simple_fsdp`` and
+            ``static_micro_batch_len`` (one traced shape for every micro-batch) and trains actors only.
+        graph_trainer: Settings passed straight to TorchTitan's ``TpuGraphTrainerCompileConfig(**cfg)``
+            (e.g. ``memory_policy``, ``save_regions``, ``fsdp_barrier_policy``, ``graph_split``).
+            Ignored when ``trainer_mode`` is not ``graph_trainer``.
         embed_head_accum: With SimpleFSDP, accumulate the input embedding and LM head gradients of a training step's
             micro-batches locally and reduce-scatter them once per step, instead of one all-gather and one
             reduce-scatter per micro-batch (default: ``False``). These two modules run eagerly outside the compiled
@@ -256,10 +277,12 @@ class TPUEngineOptions:
     moe_native_weight_layout: Optional[bool] = None
     gdn_row_slot_len: Optional[int] = None
     frozen_param_regex: Optional[str] = None
+    trainer_mode: Optional[str] = None
+    graph_trainer: Optional[dict[str, Any]] = None
     embed_head_accum: Optional[bool] = None
 
 
-_ENGINE_KINDS: dict[str, type] = {
+_ENGINE_KINDS: dict[str, Any] = {
     "use_splash_attention": bool,
     "use_simple_fsdp": bool,
     "use_fused_linear_cross_entropy": bool,
@@ -291,9 +314,16 @@ _ENGINE_KINDS: dict[str, type] = {
     "moe_native_weight_layout": bool,
     "gdn_row_slot_len": int,
     "frozen_param_regex": str,
+    "trainer_mode": str,
+    "graph_trainer": dict,
     "embed_head_accum": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
+
+# engine_kwargs.tpu.trainer_mode values.
+TRAINER_MODE_EAGER_BLOCKS = "eager_blocks"
+TRAINER_MODE_GRAPH_TRAINER = "graph_trainer"
+_TRAINER_MODES = (TRAINER_MODE_EAGER_BLOCKS, TRAINER_MODE_GRAPH_TRAINER)
 
 # Deprecated channels, read for compatibility: option -> environment variable / top-level config field.
 _ENGINE_LEGACY_ENV_VARS = {
@@ -366,7 +396,22 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
         raise ValueError(
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ep_token_chunks must be >= 1, got {values['ep_token_chunks']!r}"
         )
+    _normalize_trainer_mode(values)
     return TPUEngineOptions(**values)
+
+
+def _normalize_trainer_mode(values: dict[str, Any]) -> None:
+    """Checks ``trainer_mode`` (lower-cased in place)."""
+    key = f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}"
+    val = values.get("trainer_mode")
+    if val is None:
+        return
+    if not isinstance(val, str):
+        raise ValueError(f"{key}.trainer_mode must be a string, got {type(val).__name__}")
+    mode = val.strip().lower()
+    if mode not in _TRAINER_MODES:
+        raise ValueError(f"{key}.trainer_mode must be one of {_TRAINER_MODES}, got {val!r}")
+    values["trainer_mode"] = mode
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -400,6 +445,32 @@ class ParityMode:
         return mode
 
 
+class ReceiveIntoVllmMode:
+    """Values of ``engine_kwargs.tpu-sync.receive_into_vllm`` (see ``weight_sync/vllm_layout.py``).
+
+    * ``auto`` (default): receive straight into vLLM's parameters when the rollout is vLLM and the trainer's
+      weights can be exported in vLLM's layout without cross-rank exchange; fall back to rollout staging buffers
+      otherwise (e.g. SGLang, MoE / hybrid linear-attention models, ``FSDP != TP``, or replicated GQA KV heads).
+    * ``on``: require direct receive into vLLM's parameters; raise when unsupported.
+    * ``off``: always use rollout staging buffers.
+
+    A bool is accepted for compatibility: ``True`` means ``on``, ``False`` means ``off``.
+    """
+
+    MODES = ("auto", "on", "off")
+    _ALIASES = {"false": "off", "0": "off", "no": "off", "none": "off", "true": "on", "1": "on", "yes": "on"}
+
+    @classmethod
+    def parse(cls, value: Any) -> str:
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        mode = str(value).strip().lower()
+        mode = cls._ALIASES.get(mode, mode)
+        if mode not in cls.MODES:
+            raise ValueError(value)
+        return mode
+
+
 @dataclasses.dataclass(frozen=True)
 class TPUSyncOptions:
     """Options of the ``tpu-sync`` checkpoint engine.
@@ -420,10 +491,12 @@ class TPUSyncOptions:
             ``WeightSynchronizer.d2h()`` returns a future (verl#8626); with an older ``tpu-sync-torch`` the sync runs
             to the end as before. Relies on ``CheckpointEngineManager.wait_for_weight_update`` (verl#8530) before
             validation and at the end of training.
-        receive_into_vllm: The rollout receives every tensor straight into vLLM's parameters, with no HBM staging
-            copy. The trainer exports its weights in vLLM's layout (fused, transposed, one virtual tensor per vLLM
-            parameter), so each rollout rank's TP slice is its vLLM weight. Dense models with FSDP degree equal to
-            the rollout TP degree only, for now (see ``weight_sync/vllm_layout.py``).
+        receive_into_vllm: One of ``ReceiveIntoVllmMode.MODES`` (``auto`` by default). When active, the rollout
+            receives every tensor straight into vLLM's parameters with no HBM staging copy: the trainer exports its
+            weights in vLLM's layout (fused, transposed, one virtual tensor per vLLM parameter), so each rollout rank's
+            TP slice is its vLLM weight. ``auto`` enables it for dense vLLM models whose trainer layout needs no
+            cross-rank exchange (e.g. ``FSDP == TP``) and falls back to staging otherwise; ``on`` (``True``) requires
+            it and ``off`` (``False``) disables it.
     """
 
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM
@@ -431,7 +504,7 @@ class TPUSyncOptions:
     release_buffers_after_sync: bool = True
     tie_word_embeddings: Optional[bool] = None
     return_after_d2h: bool = True
-    receive_into_vllm: bool = False
+    receive_into_vllm: str = "auto"
 
     @property
     def verify_norms(self) -> bool:
@@ -449,7 +522,7 @@ _SYNC_KINDS: dict[str, type] = {
     "verify_parity": ParityMode,
     "release_buffers_after_sync": bool,
     "tie_word_embeddings": bool,
-    "receive_into_vllm": bool,
+    "receive_into_vllm": ReceiveIntoVllmMode,
     "return_after_d2h": bool,
 }
 assert set(_SYNC_KINDS) == {f.name for f in dataclasses.fields(TPUSyncOptions)}

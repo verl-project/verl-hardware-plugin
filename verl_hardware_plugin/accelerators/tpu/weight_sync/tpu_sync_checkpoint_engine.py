@@ -58,7 +58,11 @@ from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_rendezvous impor
     create_tpu_sync_rendezvous,
     get_tpu_sync_rendezvous,
 )
-from verl_hardware_plugin.accelerators.tpu.weight_sync.vllm_layout import VllmParam, build_vllm_layout_export
+from verl_hardware_plugin.accelerators.tpu.weight_sync.vllm_layout import (
+    VllmLayoutError,
+    VllmParam,
+    build_vllm_layout_export,
+)
 from verl_hardware_plugin.accelerators.tpu.weight_sync.weight_sync_backends import (
     TPU_SYNC_BACKEND,
     apply_checkpoint_engine_manager_hooks,
@@ -75,6 +79,7 @@ TPU_SYNC_DEVICE = "tpu"
 # (set_stage_d2h) and unbound them, so the transfer must not read them from the device (skip_d2h).
 STAGED_D2H_METRIC = "tpu-sync/trainer_staged_d2h"
 TRAINER_D2H_METRIC = "timing_s/tpu-sync/trainer_d2h"
+RECEIVE_INTO_VLLM_METRIC = "tpu-sync/trainer_receive_into_vllm"
 
 
 def create_torch_weight_synchronizer(
@@ -256,7 +261,10 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         # between syncs; opt out with engine_kwargs.tpu-sync.release_buffers_after_sync=False.
         self.release_buffers_after_sync = options.release_buffers_after_sync
         # Export in vLLM's layout so the rollout receives straight into its parameters (weight_sync/vllm_layout.py).
+        # One of ReceiveIntoVllmMode.MODES ("auto", "on", "off"); _effective_receive_into_vllm caches the resolved
+        # choice after the first sync so an "auto" fallback does not retry on every step.
         self.receive_into_vllm = options.receive_into_vllm
+        self._effective_receive_into_vllm: Optional[bool] = False if self.receive_into_vllm == "off" else None
         self._vllm_params: Optional[dict[str, VllmParam]] = None
         self._vllm_tp_size: Optional[int] = None
         if torch.distributed.is_initialized():
@@ -366,8 +374,10 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         valid_weights = validate_and_sanitize_tensors(sorted_weights, device=torch.device(TPU_SYNC_DEVICE))
         self._shard_info = {name: shard_info[name] for name, _ in valid_weights if name in shard_info}
         self._shard_dims = {}
-        if self.receive_into_vllm:
-            valid_weights = await self._export_in_vllm_layout(valid_weights)
+        if self._effective_receive_into_vllm is not False:
+            exported_vllm = await self._maybe_export_in_vllm_layout(valid_weights)
+            if exported_vllm is not None:
+                valid_weights = exported_vllm
 
         tpu_synchronize(strict=True)
         t_gathered = time.time()
@@ -437,34 +447,62 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
                     "d2h", t_d2h_start, t_d2h, group=timeline.TRAINER_WORKERS, lane=timeline_lane, step=step_key
                 )
 
+        if self._effective_receive_into_vllm:
+            metrics[RECEIVE_INTO_VLLM_METRIC] = 1.0
         if self.verify_parity:
             post_trainer_stats(self.registry, step_key, self.rank, self.is_master, valid_weights, self._shard_info)
-        if metrics:
+        if STAGED_D2H_METRIC in metrics:
             # The transfer reads the host staging buffers from here on: give the device buffers back now, so
             # training can go on while it runs.
             self._trainer_tpu_sync_ws.unbind_weights()
             self._bound_tensors = None
         return metrics
 
-    async def _export_in_vllm_layout(
+    async def _maybe_export_in_vllm_layout(
         self, valid_weights: list[tuple[str, torch.Tensor]]
-    ) -> list[tuple[str, torch.Tensor]]:
-        """Re-packs ``valid_weights`` (HF names) into vLLM's parameter layout (``receive_into_vllm``).
+    ) -> Optional[list[tuple[str, torch.Tensor]]]:
+        """Re-packs ``valid_weights`` (HF names) into vLLM's parameter layout when ``receive_into_vllm`` is active.
 
         The rollout's parameter description is read from the rendezvous once (the driver publishes it before the
-        first sync). Updates ``_shard_info`` / ``_shard_dims`` to the exported tensors.
+        first sync). In ``auto`` mode, missing metadata (e.g. SGLang or standalone trainer tests) or an unsupported
+        layout (``VllmLayoutError``) disables ``receive_into_vllm`` and falls back to rollout staging buffers; in
+        ``on`` mode (``receive_into_vllm=True``), either raises.
         """
+        auto = self.receive_into_vllm == "auto"
         if self._vllm_params is None:
             published = await self.registry.get_vllm_params.remote()
             if not published:
+                if auto:
+                    self._effective_receive_into_vllm = False
+                    return None
                 raise RuntimeError(
                     f"Trainer Rank {self.rank}: receive_into_vllm is on but the rollout's vLLM parameter description "
                     "is not in the rendezvous (the driver publishes it with describe_vllm_params before the first sync)"
                 )
+            unsupported = published.get("unsupported_reason", "")
+            if unsupported:
+                if auto:
+                    logger.info(
+                        f"Trainer Rank {self.rank}: receive_into_vllm=auto falling back to rollout staging buffers "
+                        f"({unsupported})"
+                    )
+                    self._effective_receive_into_vllm = False
+                    return None
+                raise VllmLayoutError(unsupported)
             self._vllm_tp_size = int(published["tp_size"])
             self._vllm_params = {name: VllmParam.from_dict(d) for name, d in published["params"].items()}
         assert self._vllm_tp_size is not None
-        export = build_vllm_layout_export(valid_weights, self._shard_info, self._vllm_params, self._vllm_tp_size)
+        try:
+            export = build_vllm_layout_export(valid_weights, self._shard_info, self._vllm_params, self._vllm_tp_size)
+        except VllmLayoutError as err:
+            if auto:
+                logger.info(
+                    f"Trainer Rank {self.rank}: receive_into_vllm=auto falling back to rollout staging buffers ({err})"
+                )
+                self._effective_receive_into_vllm = False
+                return None
+            raise
+        self._effective_receive_into_vllm = True
         self._shard_info = {name: (n, i) for name, (n, i, _) in export.shards.items()}
         self._shard_dims = {name: dim for name, (_, _, dim) in export.shards.items()}
         logger.info(
@@ -808,20 +846,27 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
             await asyncio.to_thread(ray.get, refs)
         manager._tpu_sync_stage_d2h = stage_d2h
 
-    # 0. With receive_into_vllm, the trainer exports in vLLM's layout, so it needs the rollout's parameter
-    #    description (shapes, dtypes, which weights vllm-torchtpu transposed) before its first export. Every rank
-    #    of every replica holds the same shapes, so one worker's description serves all.
-    if options.receive_into_vllm and not getattr(manager, "_tpu_sync_vllm_params_published", False):
+    # 0. With receive_into_vllm ("auto" or "on"), the trainer exports in vLLM's layout when supported, so it needs
+    #    the rollout's parameter description (shapes, dtypes, which weights vllm-torchtpu transposed) before its
+    #    first export. Every rank of every replica holds the same shapes, so one worker's description serves all.
+    if options.receive_into_vllm != "off" and not getattr(manager, "_tpu_sync_vllm_params_checked", False):
         described = await manager.replicas[0].server_handle.collective_rpc.remote(method="describe_vllm_params")
         description = next((d for d in (described or []) if isinstance(d, dict) and "params" in d), None)
+        manager._tpu_sync_vllm_params_checked = True
         if description is None:
-            raise RuntimeError("receive_into_vllm: the rollout workers returned no vLLM parameter description")
-        await manager._tpu_sync_rendezvous.set_vllm_params.remote(description)
-        manager._tpu_sync_vllm_params_published = True
-        logger.info(
-            f"tpu-sync: published {len(description['params'])} vLLM parameters (TP={description['tp_size']}) for "
-            "the trainer's export in vLLM's layout"
-        )
+            if options.receive_into_vllm == "on":
+                raise RuntimeError("receive_into_vllm: the rollout workers returned no vLLM parameter description")
+            logger.info(
+                "tpu-sync: receive_into_vllm=auto falling back to rollout staging buffers "
+                "(rollout returned no vLLM parameter description)"
+            )
+        else:
+            await manager._tpu_sync_rendezvous.set_vllm_params.remote(description)
+            manager._tpu_sync_vllm_params_published = True
+            logger.info(
+                f"tpu-sync: published {len(description['params'])} vLLM parameters (TP={description['tp_size']}) for "
+                "the trainer's export in vLLM's layout"
+            )
 
     # 1. Every trainer rank binds its tensors to its synchronizer, registers them with the controller and records
     #    the global shapes (and, with stage_d2h, copies them to host memory and unbinds them). ray.get blocks until
@@ -832,6 +877,13 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
     t_init_trainer = time.perf_counter() - t_init_trainer_start
 
     trainer_metrics = [r for r in (trainer_results or []) if isinstance(r, dict)]
+    vllm_layout_ranks = sum(1 for r in trainer_metrics if r.get(RECEIVE_INTO_VLLM_METRIC))
+    if vllm_layout_ranks and vllm_layout_ranks != manager.actor_wg.world_size:
+        raise RuntimeError(
+            f"Only {vllm_layout_ranks} of {manager.actor_wg.world_size} trainer ranks exported in vLLM's layout; "
+            "all ranks must export the same layout"
+        )
+    receive_into_vllm = vllm_layout_ranks > 0 if trainer_metrics else (options.receive_into_vllm == "on")
     staged_ranks = sum(1 for r in trainer_metrics if r.get(STAGED_D2H_METRIC))
     if staged_ranks and staged_ranks != manager.actor_wg.world_size:
         raise RuntimeError(
@@ -849,6 +901,7 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
         src_units,
         dst_units,
         staged=staged,
+        receive_into_vllm=receive_into_vllm,
         t_sync_wall=t_sync_wall,
         t_total_start=t_total_start,
         t_init_trainer=t_init_trainer,
@@ -895,6 +948,7 @@ async def _finish_tpu_sync(
     dst_units: list,
     *,
     staged: bool,
+    receive_into_vllm: bool,
     t_sync_wall: float,
     t_total_start: float,
     t_init_trainer: float,
@@ -929,7 +983,7 @@ async def _finish_tpu_sync(
                     "global_shapes": global_shapes,
                     "parallelism": parallelism,
                     "job_name": _sampler_job_name(replica, replica_idx),
-                    "receive_into_vllm": options.receive_into_vllm,
+                    "receive_into_vllm": receive_into_vllm,
                 },
             )
             for replica_idx, replica in enumerate(manager.replicas)
