@@ -967,12 +967,13 @@ class TorchTitanTPUEngine(BaseEngine):
         from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer, ParamGroupConfig
         from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
         from torchtitan.distributed.activation_checkpoint import FullAC
-
-        try:
-            from torchtitan.experiments.tpu.activation_checkpoint import TPUSelectiveAC
-        except ImportError:
-            from torchtitan.distributed.activation_checkpoint import SelectiveAC as TPUSelectiveAC
         from torchtitan.trainer import Trainer
+
+        from verl_hardware_plugin.accelerators.tpu.engines import tpu_selective_ac
+
+        # torchtitan's TPUSelectiveAC from wherever the installed torchtitan defines it (components/ in current
+        # torchtitan); core SelectiveAC for a torchtitan without it.
+        TPUSelectiveAC = tpu_selective_ac.tpu_selective_ac_class()
 
         super().__init__()
 
@@ -1207,6 +1208,9 @@ class TorchTitanTPUEngine(BaseEngine):
                 "full": FullAC.Config,
                 "none": lambda: None,
             }[ac_mode]()
+            # engine_kwargs.tpu.selective_ac_*: flags of TPUSelectiveAC's save set (engines/tpu_selective_ac.py).
+            # With none of them set the config stays as built.
+            activation_checkpoint = tpu_selective_ac.selective_ac_config(activation_checkpoint, ac_mode, tpu_options)
 
         # Construct Torchtitan's Trainer.Config
         trainer_config_kwargs: dict[str, Any] = dict(

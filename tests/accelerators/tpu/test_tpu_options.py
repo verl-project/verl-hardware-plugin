@@ -283,3 +283,20 @@ def test_ac_save_splash_and_routing_option():
         SimpleNamespace(engine_kwargs={"tpu": {"ac_save_splash_and_routing": False}})
     )
     assert opts_off.ac_save_splash_and_routing is False
+
+
+def test_selective_ac_options_are_off_by_default_and_exclude_ac_save_splash_and_routing():
+    options = tpu_options.SELECTIVE_AC_FLAG_OPTIONS
+    assert all(getattr(get_tpu_engine_options(_cfg()), name) is None for name in options)
+    for name in options:
+        for raw, expected in ((True, True), ("true", True), ("false", False), (0, False)):
+            assert getattr(get_tpu_engine_options(_cfg({name: raw})), name) is expected
+        with pytest.raises(ValueError, match=f"Invalid TPU engine option {name}"):
+            get_tpu_engine_options(_cfg({name: "sometimes"}))
+        with pytest.raises(ValueError, match="ac_save_splash_and_routing replaces torchtitan's TPUSelectiveAC"):
+            get_tpu_engine_options(_cfg({"ac_save_splash_and_routing": True, name: True}))
+        # Either one with the other one explicitly off is fine.
+        splash_only = get_tpu_engine_options(_cfg({"ac_save_splash_and_routing": True, name: False}))
+        assert splash_only.ac_save_splash_and_routing is True
+        flag_only = get_tpu_engine_options(_cfg({"ac_save_splash_and_routing": False, name: True}))
+        assert getattr(flag_only, name) is True
