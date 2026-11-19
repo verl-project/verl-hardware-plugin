@@ -131,6 +131,7 @@ TPU_V7X_TOPOLOGY_MAP = {
     32: "2,2,4,2",
     64: "2,4,4,2",
     128: "4,4,4,2",
+    256: "4,4,8,2",
 }
 # The mesh of a rollout engine on part of one TPU 7x host, one process per TensorCore: TP=2 is one chip
 # (``1,1,1,2``), TP=4 two chips (``1,2,1,2``). Validated on ``2x2x1`` hosts running four TP=2 or two TP=4

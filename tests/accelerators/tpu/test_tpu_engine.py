@@ -439,6 +439,8 @@ def test_resolve_tpu_v7x_topology_prefers_the_webhook_slice_shape():
     bigger = {"TPU_HOST_BOUNDS": "4,4,2", "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,2"}
     assert resolve_tpu_v7x_topology(512, 32, bigger) == "8,8,4,2"
     assert resolve_tpu_v7x_topology(64, 8, {**webhook, "TORCH_TPU_TOPOLOGY": "4,4,2,2"}) == "4,4,2,2"
+    # 256 TensorCores (a 4x4x8 v7x slice, 32 hosts) used as part of a larger slice: the table's shape.
+    assert resolve_tpu_v7x_topology(256, 32, bigger) == "4,4,8,2"
     with pytest.raises(ValueError, match="TPU 7x mesh"):
         resolve_tpu_v7x_topology(24, 3, webhook)
     assert tpu_v7x_process_env("2,2,1,2", rank=13, local_rank=5) == {
@@ -1528,6 +1530,58 @@ def test_enable_context_parallel_follows_torchtitan_cp_recipe(strategy, expected
         ("validate", "spmd_types", expected_lb),
         "patches",
     ]
+
+
+def test_enable_context_parallel_adds_gated_delta_net_cp_transform_when_available():
+    """With a torchtitan that ships GatedDeltaNetContextParallelTransform, it runs after ContextParallelTransform."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    applied = []
+
+    class _ContextParallelTransform:
+        def __init__(self, inner_attention):
+            self.inner_attention = inner_attention
+
+    class _GatedDeltaNetContextParallelTransform:
+        def __init__(self, load_balancer):
+            self.load_balancer = load_balancer
+
+    fake_transform = SimpleNamespace(
+        ContextParallelTransform=_ContextParallelTransform,
+        transform_model_config_=lambda model, transforms: applied.extend(transforms) or model,
+    )
+    fake_cp_attention = SimpleNamespace(
+        install_tpu_cp_patches=lambda: None,
+        tpu_cp_inner_attention=lambda base, strat: base,
+        tpu_cp_load_balancer=lambda strat: "headtail" if strat == "all_gather" else None,
+        validate_tpu_context_parallel=lambda model, parallelism: None,
+    )
+    fake_cp_gated_delta = SimpleNamespace(GatedDeltaNetContextParallelTransform=_GatedDeltaNetContextParallelTransform)
+    engine = SimpleNamespace(
+        engine_config=SimpleNamespace(engine_kwargs={"tpu": {"context_parallel_strategy": "all_gather"}}),
+        _use_splash_attention=True,
+    )
+    parallelism = SimpleNamespace(
+        context_parallel_degree=2, spmd_backend="partial_dtensor", context_parallel_load_balancer=None
+    )
+    model = SimpleNamespace(first_full_attention_backend=SimpleNamespace(_owner=object))
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "torchtitan": SimpleNamespace(),
+            "torchtitan.config": SimpleNamespace(transform=fake_transform),
+            "torchtitan.config.transform": fake_transform,
+            "torchtitan.experiments": SimpleNamespace(),
+            "torchtitan.experiments.tpu": SimpleNamespace(cp_attention=fake_cp_attention),
+            "torchtitan.experiments.tpu.cp_attention": fake_cp_attention,
+            "torchtitan.experiments.tpu.qwen3_5": SimpleNamespace(cp_gated_delta=fake_cp_gated_delta),
+            "torchtitan.experiments.tpu.qwen3_5.cp_gated_delta": fake_cp_gated_delta,
+        },
+    ):
+        TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
+
+    assert [type(t) for t in applied] == [_ContextParallelTransform, _GatedDeltaNetContextParallelTransform]
+    assert applied[1].load_balancer == "headtail"
 
 
 def test_enable_context_parallel_all_gather_requires_splash():

@@ -1414,10 +1414,20 @@ class TorchTitanTPUEngine(BaseEngine):
                 "context_parallel_strategy='ulysses'."
             )
         parallelism.spmd_backend = "spmd_types"
-        parallelism.context_parallel_load_balancer = tpu_cp_load_balancer(strategy)
+        load_balancer = tpu_cp_load_balancer(strategy)
+        parallelism.context_parallel_load_balancer = load_balancer
         inner_attention = model.first_full_attention_backend
         cp_inner_attention = tpu_cp_inner_attention(inner_attention._owner, strategy)
-        transform_model_config_(model, [ContextParallelTransform(inner_attention=cp_inner_attention)])
+        transforms = [ContextParallelTransform(inner_attention=cp_inner_attention)]
+        try:
+            # Hybrid Qwen3.5: run the GatedDeltaNet layers head-parallel over the CP token layout, as
+            # torchtitan's qwen3_5/config_registry.py::_qwen35_cp does (google-pytorch/torchtitan#201).
+            from torchtitan.experiments.tpu.qwen3_5.cp_gated_delta import GatedDeltaNetContextParallelTransform
+        except ImportError:
+            GatedDeltaNetContextParallelTransform = None
+        if GatedDeltaNetContextParallelTransform is not None:  # no-op for models without TpuInnerGatedDeltaNet
+            transforms.append(GatedDeltaNetContextParallelTransform(load_balancer=load_balancer))
+        transform_model_config_(model, transforms)
         validate_tpu_context_parallel(model, parallelism)
         # Runtime FSDP workaround for torch without spmd_types FSDP (see install_tpu_cp_patches).
         install_tpu_cp_patches()
