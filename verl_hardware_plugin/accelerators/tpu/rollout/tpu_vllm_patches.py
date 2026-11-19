@@ -16,7 +16,8 @@ patch to span several hosts. Each remaining patch fills a gap in vLLM (v0.29.0 -
   in vLLM's worker processes, which do not import the plugin.
 * ``vllm_torchtpu.worker.tpu_worker._configure_tpu_process_env``, only in an engine that shares its TPU 7x host
   with other engines (``tpu_vllm.subhost_engine_env``): per-worker MegaScale ports and libtpu log dir, and the
-  GKE webhook's container-level TPU variables dropped. Upstream fix: a per-engine port base in vllm-torchtpu.
+  GKE webhook's container-level TPU variables and ``TORCH_TPU_DEVICES_PER_HOST`` dropped. Upstream fix: a
+  per-engine port base in vllm-torchtpu.
 """
 
 import importlib
@@ -259,8 +260,10 @@ def patch_vllm_for_tpu() -> None:
 
 # Set by tpu_vllm.subhost_engine_env on an engine that shares its host: the first port of the engine's MegaScale block.
 SUBHOST_MEGASCALE_PORT_ENV = "VERL_TPU_SUBHOST_MEGASCALE_PORT"
-# Container-level variables of the GKE TPU webhook that describe the whole pod. Every engine in the container would
-# inherit them, and the second engine of a host then collides with the first on the pod's MegaScale ports.
+# Variables that describe the whole pod or host, which every engine in the container would inherit: the GKE TPU
+# webhook's container-level variables (the second engine of a host then collides with the first on the pod's MegaScale
+# ports), and torch_tpu's TORCH_TPU_DEVICES_PER_HOST (e.g. exported for the trainer): torch_tpu sizes its node-local
+# store by it and checks local ranks against it, which does not fit an engine on part of a host.
 _POD_TPU_ENV_VARS = (
     "MEGASCALE_NUM_SLICES",
     "MEGASCALE_SLICE_ID",
@@ -269,6 +272,7 @@ _POD_TPU_ENV_VARS = (
     "TPU_PROCESS_ADDRESSES",
     "TPU_PROCESS_PORT",
     "TPU_RUNTIME_METRICS_PORTS",
+    "TORCH_TPU_DEVICES_PER_HOST",
 )
 
 
@@ -289,8 +293,8 @@ def patch_tpu_worker_subhost_env() -> None:
     These depend on the worker's rank, so the server actor's environment cannot carry them. vllm-torchtpu's
     ``TPUWorker.init_device`` calls ``_configure_tpu_process_env(rank, local_rank, ...)`` once per worker, with the
     local rank already offset to the engine's devices, just before torch_tpu starts: the smallest hook that sees the
-    rank. The webhook's pod-wide variables are dropped here too, as an actor's ``env_vars`` can set a variable but
-    not unset it.
+    rank. The pod- and host-wide variables (``_POD_TPU_ENV_VARS``) are dropped here too, as an actor's ``env_vars``
+    can set a variable but not unset it.
     """
     try:
         import vllm_torchtpu.worker.tpu_worker as tpu_worker

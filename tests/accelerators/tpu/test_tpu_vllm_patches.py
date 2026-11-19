@@ -99,3 +99,14 @@ def test_subhost_worker_hook_sets_per_worker_ports_and_drops_pod_env():
         assert os.environ["TPU_LOG_DIR"] == "/tmp/tpu_logs/rank_5"
         assert not set(tpu_vllm_patches._POD_TPU_ENV_VARS) & set(os.environ)
     makedirs.assert_called_once_with("/tmp/tpu_logs/rank_5", exist_ok=True)
+
+
+def test_subhost_worker_hook_drops_torch_tpu_devices_per_host():
+    """A worker of an engine on part of a host must not keep a host-wide TORCH_TPU_DEVICES_PER_HOST (here the 8 of a
+    whole TPU 7x host, e.g. exported for the trainer): torch_tpu sizes its node-local store by it."""
+    worker_mod, modules = _fake_tpu_worker_module(lambda rank, local_rank, world_size, local_world_size: None)
+    env = {"TORCH_TPU_DEVICES_PER_HOST": "8", tpu_vllm_patches.SUBHOST_MEGASCALE_PORT_ENV: "21080"}
+    with mock.patch.dict(os.environ, env), mock.patch.object(os, "makedirs"):
+        _patch_in_fake_worker_process(modules)
+        worker_mod._configure_tpu_process_env(1, 5, 4, 8)  # worker 1 of the second TP=4 engine of the host
+        assert "TORCH_TPU_DEVICES_PER_HOST" not in os.environ
