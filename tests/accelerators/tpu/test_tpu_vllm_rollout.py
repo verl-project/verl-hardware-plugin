@@ -647,3 +647,47 @@ def test_multiprocessing_patch_wraps_keyword_and_positional_targets(isolated_pat
         assert isinstance(process._target, isolated_patches.PickleableProcessWrapper)
         assert process._target.target is len
     assert multiprocessing.Process()._target is None
+
+
+def test_write_fp8_moe_weights_quantize_into_live_params(monkeypatch):
+    """FP8 MoE direct install: received bf16 experts are requantized on the rollout into w13/w2 + scales in place."""
+    import sys
+    import types
+
+    import torch
+
+    from verl_hardware_plugin.accelerators.tpu.rollout import moe_weights
+
+    calls = []
+
+    def fake_fmt(w, *, name, quant_dtype, block_size, activation):
+        calls.append((name, tuple(w.shape), w.dtype, activation))
+        return w.transpose(1, 2).to(quant_dtype).contiguous(), torch.ones(w.shape[0], 1, 1, w.shape[1])
+
+    mod = types.ModuleType("vllm_torchtpu.layers.adapter.quantization.fp8")
+    mod._get_moe_quant_config = lambda prefix: ("float8_e4m3fn", torch.float8_e4m3fn, None)
+    mod._quantize_and_format_single_moe_weight = fake_fmt
+    for parent in (
+        "vllm_torchtpu",
+        "vllm_torchtpu.layers",
+        "vllm_torchtpu.layers.adapter",
+        "vllm_torchtpu.layers.adapter.quantization",
+    ):
+        monkeypatch.setitem(sys.modules, parent, sys.modules.get(parent) or types.ModuleType(parent))
+    monkeypatch.setitem(sys.modules, "vllm_torchtpu.layers.adapter.quantization.fp8", mod)
+
+    e, i, h = 4, 8, 16
+    gate, up, down = torch.randn(e, i, h), torch.randn(e, i, h), torch.randn(e, h, i)
+    w13 = torch.zeros(e, h, 2 * i, dtype=torch.float8_e4m3fn)
+    s13 = torch.zeros(e, 1, 1, 2 * i)
+    w2 = torch.zeros(e, i, h, dtype=torch.float8_e4m3fn)
+    s2 = torch.zeros(e, 1, 1, h)
+    moe_weights.write_w13_fp8(w13, s13, gate, up)
+    moe_weights.write_w2_fp8(w2, s2, down)
+    assert calls == [("w13", (e, 2 * i, h), torch.float32, "silu"), ("w2", (e, h, i), torch.float32, "silu")]
+    expected = torch.cat([gate, up], 1).transpose(1, 2).to(torch.float8_e4m3fn).float()
+    torch.testing.assert_close(w13.float(), expected)
+    assert bool((s13 == 1).all()) and bool((s2 == 1).all())
+    assert moe_weights.MOE_LAYOUTS["VllmFp8MoEMethodTPU"] == moe_weights.MOE_LAYOUT_TPU_FP8
+    with pytest.raises(RuntimeError, match="requantizer gives"):
+        moe_weights.write_w2_fp8(torch.zeros(e, i + 1, h, dtype=torch.float8_e4m3fn), s2, down)

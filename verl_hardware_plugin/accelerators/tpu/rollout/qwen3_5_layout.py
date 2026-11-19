@@ -51,13 +51,16 @@ import torch
 from verl_hardware_plugin.accelerators.tpu.rollout.direct_install import DirectInstallLayout
 from verl_hardware_plugin.accelerators.tpu.rollout.moe_weights import (
     MOE_LAYOUT_TPU_EP,
+    MOE_LAYOUT_TPU_FP8,
     MOE_LAYOUTS,
     ParityCheckFn,
     expert_param,
     moe_attr,
     moe_parallel_mode,
     write_w2,
+    write_w2_fp8,
     write_w13,
+    write_w13_fp8,
 )
 
 # HF model types of the Qwen3.5 text models this module installs.
@@ -522,6 +525,17 @@ def install(
             expert_param(model_sd, find_model_key, prefix, leaf, plan.expert_keys)
             for leaf in ("w13_weight", "w2_weight")
         )
+        if plan.moe_layout == MOE_LAYOUT_TPU_FP8:
+            # Quantize on the rollout TPU into the live FP8 weights and scales (bit parity with the trainer's bf16
+            # weights is not defined here, so ``check`` does not apply).
+            w13_scale_key, w2_scale_key = (
+                expert_param(model_sd, find_model_key, prefix, leaf, plan.expert_keys)
+                for leaf in ("w13_weight_scale_inv", "w2_weight_scale_inv")
+            )
+            write_w13_fp8(model_sd[w13_key], model_sd[w13_scale_key], gate, up)
+            write_w2_fp8(model_sd[w2_key], model_sd[w2_scale_key], down)
+            consumed.update({name, f"{prefix}.up_proj", f"{prefix}.down_proj"})
+            continue
         check_padding = not plan.padding_checked
         write_w13(model_sd[w13_key], gate, up, plan.moe_layout, check_padding, check=check, name=w13_key)
         write_w2(model_sd[w2_key], down, plan.moe_layout, check_padding, check=check, name=w2_key)

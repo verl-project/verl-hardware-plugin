@@ -50,6 +50,7 @@ import torch
 
 from verl_hardware_plugin.accelerators.tpu.rollout.direct_install import DirectInstallLayout
 from verl_hardware_plugin.accelerators.tpu.rollout.moe_weights import (
+    MOE_LAYOUT_TPU_FP8,
     MOE_LAYOUTS,
     ParityCheckFn,
     expert_param,
@@ -225,7 +226,7 @@ def plan_direct_install(
     layouts, modes = set(), set()
     for name, m in moe_modules:
         method = type(m.quant_method).__name__
-        if method not in MOE_LAYOUTS:
+        if method not in MOE_LAYOUTS or MOE_LAYOUTS[method] == MOE_LAYOUT_TPU_FP8:
             return None, f"unsupported vLLM MoE method {method} (quantized?)"
         layouts.add(MOE_LAYOUTS[method])
         expert_parallel, why = _moe_parallel_mode(m, dims, tp_size, worker_rank)

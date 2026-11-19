@@ -20,7 +20,14 @@ import torch
 MOE_LAYOUT_TPU = "tpu_transposed_padded"
 MOE_LAYOUT_VLLM = "vllm"
 MOE_LAYOUT_TPU_EP = "tpu_expert_parallel"  # vllm-torchtpu zero-copy EP layout (see qwen3_5_layout.EP_EXPERT_TENSORS)
-MOE_LAYOUTS = {"VllmUnquantizedFusedMoEMethod": MOE_LAYOUT_TPU, "UnquantizedFusedMoEMethod": MOE_LAYOUT_VLLM}
+# vllm-torchtpu's FP8 MoE (``QUANTIZE_ON_LOAD_PREFIXES=experts`` or an FP8 checkpoint): the same transposed, padded
+# layout as ``MOE_LAYOUT_TPU`` but FP8 weights plus per-output-channel ``w*_weight_scale_inv`` (``write_w13_fp8``).
+MOE_LAYOUT_TPU_FP8 = "tpu_transposed_padded_fp8"
+MOE_LAYOUTS = {
+    "VllmUnquantizedFusedMoEMethod": MOE_LAYOUT_TPU,
+    "UnquantizedFusedMoEMethod": MOE_LAYOUT_VLLM,
+    "VllmFp8MoEMethodTPU": MOE_LAYOUT_TPU_FP8,
+}
 _MOE_PAD_MULTIPLE = 128  # vllm-torchtpu's VllmUnquantizedFusedMoEMethod.process_weights_after_loading
 # ``ExactParityCheck.check(name, target, received)``: called on a target region before it is overwritten.
 ParityCheckFn = Callable[[str, torch.Tensor, torch.Tensor], None]
@@ -205,3 +212,43 @@ def write_w2(
     if check is not None:
         check(name, w2[:, :inter, :], down.transpose(1, 2))
     w2[:, :inter, :].copy_(down.transpose(1, 2))
+
+
+def _fp8_quantize_and_format(w: torch.Tensor, name: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """vllm-torchtpu's own requantizer (``VllmFp8MoEMethodTPU.process_weights_after_loading``): pads, quantizes per
+    output channel (or the ``MOE_REQUANTIZE_*`` format), transposes and formats the scale for the GMM kernel."""
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+        _get_moe_quant_config,
+        _quantize_and_format_single_moe_weight,
+    )
+
+    _, quant_dtype, block_size = _get_moe_quant_config("[tpu-sync direct install]: quantizing received MoE weights")
+    return _quantize_and_format_single_moe_weight(
+        w.to(torch.float32), name=name, quant_dtype=quant_dtype, block_size=block_size, activation="silu"
+    )
+
+
+def _copy_checked(target: torch.Tensor, src: torch.Tensor, what: str) -> None:
+    target = _local(target)
+    if tuple(target.shape) != tuple(src.shape) or target.dtype != src.dtype:
+        raise RuntimeError(
+            f"{_ERROR_PREFIX}: {what} is {tuple(target.shape)} {target.dtype}, the requantizer gives "
+            f"{tuple(src.shape)} {src.dtype}"
+        )
+    target.copy_(src)
+
+
+def write_w13_fp8(param: torch.Tensor, scale_param: torch.Tensor, gate: torch.Tensor, up: torch.Tensor) -> None:
+    """Quantizes rank-local ``gate`` / ``up`` [E, I_r, H] to vllm-torchtpu's FP8 MoE layout on the rollout TPU and
+    writes ``w13_weight`` [E, H, 2A] and ``w13_weight_scale_inv`` in place (no checkpoint loaders, no TP all-gather).
+    """
+    w13, scale = _fp8_quantize_and_format(torch.cat([gate, up], dim=1), "w13")
+    _copy_checked(param, w13, "w13_weight")
+    _copy_checked(scale_param, scale, "w13_weight_scale_inv")
+
+
+def write_w2_fp8(param: torch.Tensor, scale_param: torch.Tensor, down: torch.Tensor) -> None:
+    """``write_w13_fp8`` for ``down`` [E, H, I_r] -> ``w2_weight`` [E, A, H] and ``w2_weight_scale_inv``."""
+    w2, scale = _fp8_quantize_and_format(down, "w2")
+    _copy_checked(param, w2, "w2_weight")
+    _copy_checked(scale_param, scale, "w2_weight_scale_inv")
