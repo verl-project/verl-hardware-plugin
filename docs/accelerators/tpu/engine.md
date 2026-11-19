@@ -58,8 +58,8 @@ Performance options for long packed micro-batches (the Qwen3-30B-A3B recipe sets
 ### Static micro-batches
 
 With `use_dynamic_bsz=True`, the three `static_*` options give every micro-batch one packed length, one response width
-and one row count of the PPO loss inputs, so the shapes of the trainer's forward, loss and backward programs no longer
-depend on how many tokens or sequences a micro-batch holds:
+and one row count of the PPO loss inputs, so the input shapes of the trainer's forward, loss and backward programs no
+longer depend on how many tokens or sequences a micro-batch holds:
 
 ```bash
 actor_rollout_ref.actor.use_dynamic_bsz=True
@@ -77,6 +77,11 @@ count your run reaches costs less than a much larger one. A micro-batch longer, 
 sizes keeps its own size and compiles once for it; the engine logs every new sequence count above
 `static_micro_batch_seqs`. With `use_dynamic_bsz=False` every micro-batch already has `ppo_micro_batch_size_per_gpu`
 sequences, so `static_micro_batch_seqs` is not needed there.
+
+The options fix the shapes that go in. They cannot fix an op whose output size follows the data, and verl's loss has
+a few: in bypass mode with rejection sampling, the rejection-sampling metrics index the sequences that have valid
+tokens with a boolean mask, and the `kl_cov` and `clip_cov` policy loss modes select tokens with `nonzero`. With these
+settings, some shapes inside the loss still follow the data of each micro-batch, with or without padding rows.
 
 Only verl's `ppo_loss` gets padding rows, and only with a policy loss mode whose loss ignores empty rows
 (`ROW_PADDING_LOSS_MODES` in `losses/loss_inputs.py`): every mode of verl except `geo_mean`, which averages its
