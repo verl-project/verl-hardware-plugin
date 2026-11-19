@@ -270,6 +270,8 @@ def _entropy_forward_configs():
             _tile_config(128, 1024, 256, num_stages=3, num_warps=4),
             _tile_config(256, 128, 128, num_stages=3, num_warps=1),
             _tile_config(64, 256, 256, num_stages=3, num_warps=1),
+            _tile_config(256, 256, 128, num_stages=3, num_warps=1),
+            _tile_config(64, 256, 128, num_stages=3, num_warps=1),
         ]
     return [
         _tile_config(128, 128, 512, num_stages=3, num_warps=4),
