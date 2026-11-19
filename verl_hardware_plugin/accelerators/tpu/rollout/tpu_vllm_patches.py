@@ -14,6 +14,9 @@ patch to span several hosts. Each remaining patch fills a gap in vLLM (v0.29.0 -
   to FP32 attention statistics and CUDA RMSNorm rounding without changing BF16 model weights.
 * ``multiprocessing.process.BaseProcess.__init__``: install these patches in the EngineCore process and
   in vLLM's worker processes, which do not import the plugin.
+* ``vllm_torchtpu.worker.tpu_worker._configure_tpu_process_env``, only in an engine that shares its TPU 7x host
+  with other engines (``tpu_vllm.subhost_engine_env``): per-worker MegaScale ports and libtpu log dir, and the
+  GKE webhook's container-level TPU variables dropped. Upstream fix: a per-engine port base in vllm-torchtpu.
 """
 
 import importlib
@@ -248,8 +251,67 @@ def patch_vllm_for_tpu() -> None:
         return
 
     _apply_tpu_precision_patches()
+    if os.environ.get(SUBHOST_MEGASCALE_PORT_ENV):
+        patch_tpu_worker_subhost_env()
     _PATCHES_APPLIED = True
     logger.info("Successfully applied all TPU patches to vLLM and vllm-torchtpu.")
+
+
+# Set by tpu_vllm.subhost_engine_env on an engine that shares its host: the first port of the engine's MegaScale block.
+SUBHOST_MEGASCALE_PORT_ENV = "VERL_TPU_SUBHOST_MEGASCALE_PORT"
+# Container-level variables of the GKE TPU webhook that describe the whole pod. Every engine in the container would
+# inherit them, and the second engine of a host then collides with the first on the pod's MegaScale ports.
+_POD_TPU_ENV_VARS = (
+    "MEGASCALE_NUM_SLICES",
+    "MEGASCALE_SLICE_ID",
+    "TPU_WORKER_HOSTNAMES",
+    "TPU_WORKER_ID",
+    "TPU_PROCESS_ADDRESSES",
+    "TPU_PROCESS_PORT",
+    "TPU_RUNTIME_METRICS_PORTS",
+)
+
+
+def subhost_worker_env(rank: int, local_rank: int, megascale_port: int) -> dict[str, str]:
+    """The per-worker variables of an engine that shares its host; ``local_rank`` includes the engine's offset."""
+    return {
+        "TPU_VISIBLE_DEVICES": str(local_rank),
+        "TPU_VISIBLE_CHIPS": str(local_rank),
+        "MEGASCALE_PORT": str(megascale_port + 2 * rank),
+        "MEGASCALE_DEBUG_PORT": str(megascale_port + 2 * rank + 1),
+        "TPU_LOG_DIR": f"/tmp/tpu_logs/rank_{local_rank}",
+    }
+
+
+def patch_tpu_worker_subhost_env() -> None:
+    """Give each worker of an engine that shares its host its own MegaScale ports and libtpu log dir.
+
+    These depend on the worker's rank, so the server actor's environment cannot carry them. vllm-torchtpu's
+    ``TPUWorker.init_device`` calls ``_configure_tpu_process_env(rank, local_rank, ...)`` once per worker, with the
+    local rank already offset to the engine's devices, just before torch_tpu starts: the smallest hook that sees the
+    rank. The webhook's pod-wide variables are dropped here too, as an actor's ``env_vars`` can set a variable but
+    not unset it.
+    """
+    try:
+        import vllm_torchtpu.worker.tpu_worker as tpu_worker
+    except ImportError:
+        return
+    original = tpu_worker._configure_tpu_process_env
+    if getattr(original, "_verl_subhost_env", False):
+        return
+    megascale_port = int(os.environ[SUBHOST_MEGASCALE_PORT_ENV])
+
+    def _configure_tpu_process_env(rank: int, local_rank: int, world_size: int, local_world_size: int) -> None:
+        original(rank, local_rank, world_size, local_world_size)
+        for name in _POD_TPU_ENV_VARS:
+            os.environ.pop(name, None)
+        env = subhost_worker_env(int(rank), int(local_rank), megascale_port)
+        os.makedirs(env["TPU_LOG_DIR"], exist_ok=True)
+        os.environ.update(env)
+
+    _configure_tpu_process_env._verl_subhost_env = True  # type: ignore[attr-defined]
+    tpu_worker._configure_tpu_process_env = _configure_tpu_process_env
+    logger.info("Applied the TPU patch for engines that share a host (MegaScale ports from %d).", megascale_port)
 
 
 class PickleableProcessWrapper:
