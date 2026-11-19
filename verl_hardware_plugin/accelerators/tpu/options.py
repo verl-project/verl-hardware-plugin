@@ -58,6 +58,15 @@ def _warn_once(key: str, message: str) -> None:
         logger.warning(message)
 
 
+def _to_plain_dict(value: Any) -> Any:
+    """Recursively converts mappings and iterables into plain dicts and lists."""
+    if isinstance(value, Mapping):
+        return {str(k): _to_plain_dict(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_to_plain_dict(v) for v in value]
+    return value
+
+
 def _parse(name: str, kind: type, value: Any, source: str, label: str = "TPU") -> Any:
     """Converts ``value`` (a config value or an environment string) to ``kind``; ``None`` / ``""`` is unset."""
     if value is None:
@@ -67,6 +76,10 @@ def _parse(name: str, kind: type, value: Any, source: str, label: str = "TPU") -
         if value == "":
             return None
     try:
+        if kind is dict:
+            if isinstance(value, Mapping):
+                return _to_plain_dict(value)
+            raise ValueError(f"expected a mapping, got {type(value).__name__}")
         if hasattr(kind, "parse"):
             return kind.parse(value)
         if kind is bool:
@@ -216,6 +229,14 @@ class TPUEngineOptions:
         frozen_param_regex: Parameters whose FQN matches this regex (``re.search``) are not trained: their
             gradients are dropped before the gradient norm and the optimizer step, e.g. ``moe.router.gate`` freezes
             the MoE router (default: unset, train every parameter).
+        trainer_mode: How the actor's training step runs: ``eager_blocks`` (default: TorchTitan ``Trainer``,
+            per-TransformerBlock ``torch.compile`` and eager loss / backward) or ``graph_trainer`` (TorchTitan's
+            ``TpuGraphTrainer`` traces forward + RL loss + backward of a micro-batch into one graph and compiles it
+            whole, see ``engines/graph_trainer_mode.py``). ``graph_trainer`` needs ``use_simple_fsdp`` and
+            ``static_micro_batch_len`` (one traced shape for every micro-batch) and trains actors only.
+        graph_trainer: Settings passed straight to TorchTitan's ``TpuGraphTrainerCompileConfig(**cfg)``
+            (e.g. ``memory_policy``, ``save_regions``, ``fsdp_barrier_policy``, ``graph_split``).
+            Ignored when ``trainer_mode`` is not ``graph_trainer``.
         selective_ac_recompute_bmm: With ``activation_checkpoint=selective``, recompute batched-matmul
             (``aten.bmm``) outputs in backward instead of saving them (default: ``False``). Saving them hands one
             tensor per bmm from each compiled block's forward program to its backward program; Qwen3.5's XLA
@@ -264,12 +285,14 @@ class TPUEngineOptions:
     moe_native_weight_layout: Optional[bool] = None
     gdn_row_slot_len: Optional[int] = None
     frozen_param_regex: Optional[str] = None
+    trainer_mode: Optional[str] = None
+    graph_trainer: Optional[dict[str, Any]] = None
     selective_ac_recompute_bmm: Optional[bool] = None
     selective_ac_save_pallas_attention: Optional[bool] = None
     selective_ac_save_kda_residuals: Optional[bool] = None
 
 
-_ENGINE_KINDS: dict[str, type] = {
+_ENGINE_KINDS: dict[str, Any] = {
     "use_splash_attention": bool,
     "use_simple_fsdp": bool,
     "use_fused_linear_cross_entropy": bool,
@@ -301,11 +324,18 @@ _ENGINE_KINDS: dict[str, type] = {
     "moe_native_weight_layout": bool,
     "gdn_row_slot_len": int,
     "frozen_param_regex": str,
+    "trainer_mode": str,
+    "graph_trainer": dict,
     "selective_ac_recompute_bmm": bool,
     "selective_ac_save_pallas_attention": bool,
     "selective_ac_save_kda_residuals": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
+
+# engine_kwargs.tpu.trainer_mode values.
+TRAINER_MODE_EAGER_BLOCKS = "eager_blocks"
+TRAINER_MODE_GRAPH_TRAINER = "graph_trainer"
+_TRAINER_MODES = (TRAINER_MODE_EAGER_BLOCKS, TRAINER_MODE_GRAPH_TRAINER)
 
 # Options that turn on a flag of torchtitan's TPUSelectiveAC (``engines/tpu_selective_ac.py``): option -> flag.
 SELECTIVE_AC_FLAG_OPTIONS: dict[str, str] = {
@@ -390,7 +420,22 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ac_save_splash_and_routing replaces torchtitan's TPUSelectiveAC "
             "with its own save set; it cannot be combined with the selective_ac_* options, which tune TPUSelectiveAC"
         )
+    _normalize_trainer_mode(values)
     return TPUEngineOptions(**values)
+
+
+def _normalize_trainer_mode(values: dict[str, Any]) -> None:
+    """Checks ``trainer_mode`` (lower-cased in place)."""
+    key = f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}"
+    val = values.get("trainer_mode")
+    if val is None:
+        return
+    if not isinstance(val, str):
+        raise ValueError(f"{key}.trainer_mode must be a string, got {type(val).__name__}")
+    mode = val.strip().lower()
+    if mode not in _TRAINER_MODES:
+        raise ValueError(f"{key}.trainer_mode must be one of {_TRAINER_MODES}, got {val!r}")
+    values["trainer_mode"] = mode
 
 
 # ---------------------------------------------------------------------------------------------------------------

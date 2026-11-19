@@ -13,6 +13,7 @@ from ``PlatformBase``: every device query, Ray resource option and environment v
 defined here rather than inherited from another vendor's platform.
 """
 
+import importlib
 import logging
 import math
 import os
@@ -339,6 +340,19 @@ def resolve_tpu_topology_bounds(
     return topology, host_bounds, chips_per_host_bounds, chips_per_host
 
 
+def tpu_profiler_config_cls() -> Optional[type]:
+    """torch_tpu's ``TpuProfilerConfig`` (importing it also registers its PrivateUse1 Kineto backend), or None."""
+    for mod_name in ("torch_tpu._internal.profiler", "torch.tpu.profiler"):
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:  # noqa: BLE001 - absent off TPU
+            continue
+        config_cls = getattr(mod, "TpuProfilerConfig", None)
+        if config_cls is not None:
+            return config_cls
+    return None
+
+
 class DummyTpuDeviceModule:
     """Fallback device module for CPU-only nodes and driver processes.
 
@@ -658,6 +672,20 @@ class PlatformTPU(PlatformBase):
 
     def profiler_stop(self) -> None:
         pass
+
+    # verl's torch profiler (global_profiler.tool=torch), via PlatformBase's profiler hooks: torch_tpu
+    # records TPU activity as PrivateUse1 and writes <save_path>/plugins/profile/<ts>/<host>_<rank>.xplane.pb
+    # for XProf when given its TpuProfilerConfig. Without torch_tpu, only CPU events are recorded.
+    def torch_profiler_activity(self) -> Optional[Any]:
+        if tpu_profiler_config_cls() is None:
+            return None
+        return torch.profiler.ProfilerActivity.PrivateUse1
+
+    def torch_profiler_kwargs(self, save_path: str, rank: int) -> dict[str, Any]:
+        config_cls = tpu_profiler_config_cls()
+        if config_cls is None:
+            return {}
+        return {"experimental_config": config_cls(run_dir=save_path, worker_rank=str(rank))}
 
     def ray_noset_envvars(self) -> list[str]:
         return []

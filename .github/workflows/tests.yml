@@ -31,3 +31,33 @@ jobs:
 
       - name: Run CPU test suite
         run: pytest -q tests
+
+  tpu-loss-core-sha:
+    # The CPU suite above installs verl from PyPI (compat/verl-release.json is v0.9.1), which predates
+    # actor/old_logprobs_mismatch_count. This job runs the TPU loss static-shape checks against a pinned verl core
+    # commit that has the metric, and TPU_LOSS_EXPECT_METRICS fails the job if that core does not emit it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # verl-project/verl#8663 (count old_logprobs mismatches with a masked sum); move to its merge commit.
+      VERL_CORE_SHA: a524d30f6c1277cdd2f9bbfea4b1a344e5fb0ad9
+      TPU_LOSS_EXPECT_METRICS: actor/old_logprobs_mismatch_count
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install CPU test dependencies and the pinned verl core
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev]"
+          pip install --no-deps --force-reinstall "verl @ git+https://github.com/verl-project/verl@${VERL_CORE_SHA}"
+
+      - name: Run the TPU loss tests against the pinned core
+        run: pytest -q tests/accelerators/tpu/test_tpu_loss_inputs.py
