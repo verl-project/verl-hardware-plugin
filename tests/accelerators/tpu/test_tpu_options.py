@@ -283,3 +283,11 @@ def test_ac_save_splash_and_routing_option():
         SimpleNamespace(engine_kwargs={"tpu": {"ac_save_splash_and_routing": False}})
     )
     assert opts_off.ac_save_splash_and_routing is False
+
+
+def test_embed_head_accum_option_is_off_by_default():
+    assert get_tpu_engine_options(_cfg()).embed_head_accum is None
+    for raw, expected in ((True, True), ("on", True), ("true", True), (False, False), ("off", False)):
+        assert get_tpu_engine_options(_cfg({"embed_head_accum": raw})).embed_head_accum is expected
+    with pytest.raises(ValueError, match="Invalid TPU engine option embed_head_accum"):
+        get_tpu_engine_options(_cfg({"embed_head_accum": "sometimes"}))

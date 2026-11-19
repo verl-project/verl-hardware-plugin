@@ -237,6 +237,13 @@ class TPUEngineOptions:
         graph_trainer: Settings passed straight to TorchTitan's ``TpuGraphTrainerCompileConfig(**cfg)``
             (e.g. ``memory_policy``, ``save_regions``, ``fsdp_barrier_policy``, ``graph_split``).
             Ignored when ``trainer_mode`` is not ``graph_trainer``.
+        embed_head_accum: With SimpleFSDP, accumulate the input embedding and LM head gradients of a training step's
+            micro-batches locally and reduce-scatter them once per step, instead of one all-gather and one
+            reduce-scatter per micro-batch (default: ``False``). These two modules run eagerly outside the compiled
+            TransformerBlocks, so their collectives do not overlap with compute. Their gradients then match the
+            default path to rounding (different summation order); the gathered weights and full-size gradient
+            buffers stay allocated during the micro-batch loop. Tied embeddings are supported. See
+            ``engines/embed_head_grad_accum.py``.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -272,6 +279,7 @@ class TPUEngineOptions:
     frozen_param_regex: Optional[str] = None
     trainer_mode: Optional[str] = None
     graph_trainer: Optional[dict[str, Any]] = None
+    embed_head_accum: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, Any] = {
@@ -308,6 +316,7 @@ _ENGINE_KINDS: dict[str, Any] = {
     "frozen_param_regex": str,
     "trainer_mode": str,
     "graph_trainer": dict,
+    "embed_head_accum": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
