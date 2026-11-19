@@ -75,6 +75,8 @@ EPHEMERAL_PORTS = (32768, 60999)
 SUBHOST_OWNER_ENV = "VERL_TPU_SUBHOST_OWNER"
 SUBHOST_CLAIM_FILE = "/tmp/verl_tpu_subhost_rollout.lock"
 _CONTROLLER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+# Attempts to take over a claim that names another controller (see claim_host_for_subhost_engines).
+_CLAIM_ATTEMPTS = 3
 
 # {node id: {engine: slot}} and {node id: devices per engine} of the engines that share a host. Every replica of a
 # job is launched from this process (asyncio.gather), so the table sees all the engines of a host. A slot, once
@@ -177,26 +179,32 @@ def claim_host_for_subhost_engines(owner: str, path: str = SUBHOST_CLAIM_FILE) -
 
     Engines of one controller share the claim: each holds a shared ``flock`` on ``path`` for the life of its process,
     and the file names the owner. An engine of another controller fails here rather than open the same devices and
-    ports. A claim whose engines are all gone (the kernel drops their locks) is taken over.
+    ports. A claim whose engines are all gone (the kernel drops their locks) is taken over: only then does the
+    exclusive ``flock`` that writes the owner succeed. As the last engine of a claim may exit between a failed
+    exclusive attempt and the read of the file, which then still names its controller, a claim that names another
+    controller is tried a few times before the engine gives up.
     """
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            fcntl.flock(fd, fcntl.LOCK_SH)  # live engines hold the claim (this also waits out a takeover)
-        else:
-            os.ftruncate(fd, 0)
-            os.pwrite(fd, owner.encode(), 0)
-            fcntl.flock(fd, fcntl.LOCK_SH)
-        holder = os.pread(fd, 4096, 0).decode()
-        if holder != owner:
-            raise RuntimeError(
-                f"This host already runs TP=2 / TP=4 rollout engines of another controller ({holder}); this engine "
-                f"belongs to {owner}. Engines that share a host must all come from one verl job's rollout, which "
-                "assigns their devices and ports: give each job its own rollout hosts."
-            )
-        return fd
+        for _ in range(_CLAIM_ATTEMPTS):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass  # live engines hold the claim
+            else:
+                data = owner.encode()
+                os.pwrite(fd, data, 0)  # write before truncating, so the file always names a controller
+                os.ftruncate(fd, len(data))
+            fcntl.flock(fd, fcntl.LOCK_SH)  # keeps our claim, or waits out another engine's takeover
+            holder = os.pread(fd, 4096, 0).decode()
+            if holder == owner:
+                return fd
+            fcntl.flock(fd, fcntl.LOCK_UN)  # another controller's engines hold the claim, or did until just now
+        raise RuntimeError(
+            f"This host already runs TP=2 / TP=4 rollout engines of another controller ({holder}); this engine "
+            f"belongs to {owner}. Engines that share a host must all come from one verl job's rollout, which "
+            "assigns their devices and ports: give each job its own rollout hosts."
+        )
     except BaseException:
         os.close(fd)
         raise
@@ -243,10 +251,14 @@ class TPUvLLMHttpServer(vLLMServerTimelineMixin, vLLMHttpServer):
         # anything else. The patches carry themselves into the EngineCore and vLLM's workers.
         patch_vllm_for_tpu()
         owner = os.environ.get(SUBHOST_OWNER_ENV)
-        if owner:
-            # Held until this actor exits; the engine's processes are its children.
-            self._subhost_host_claim = claim_host_for_subhost_engines(owner, SUBHOST_CLAIM_FILE)
-        super().__init__(*args, **kwargs)
+        # Held until this actor exits; the engine's processes are its children.
+        self._subhost_host_claim = claim_host_for_subhost_engines(owner, SUBHOST_CLAIM_FILE) if owner else None
+        try:
+            super().__init__(*args, **kwargs)
+        except BaseException:
+            if self._subhost_host_claim is not None:
+                os.close(self._subhost_host_claim)  # an engine that fails to start gives the host back
+            raise
 
     def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:
         super()._preprocess_engine_kwargs(engine_kwargs)

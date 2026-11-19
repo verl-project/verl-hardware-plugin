@@ -9,6 +9,7 @@ upstream verl (which hooks are overridden and what they return) and the launch a
 """
 
 import asyncio
+import fcntl
 import importlib
 import importlib.util
 import multiprocessing.process
@@ -534,6 +535,42 @@ def test_host_claim_is_shared_by_one_controller_and_refused_to_another(tpu_vllm,
     for fd in fds:  # controller a's engines exit: the kernel drops their locks
         os.close(fd)
     os.close(claim("controller-b", path))  # a stale claim is taken over
+
+
+def test_host_claim_is_taken_over_when_the_last_engine_exits_during_the_claim(tpu_vllm, tmp_path, monkeypatch):
+    # Controller a's last engine exits just after controller b's LOCK_EX attempt failed and before b reads the file,
+    # which still names a. No engine holds the host any more, so b must take it over rather than refuse it.
+    path = str(tmp_path / "claim.lock")
+    claim = tpu_vllm.claim_host_for_subhost_engines
+    engines_of_a = [claim("controller-a-with-a-longer-id", path)]
+
+    def flock(fd, operation):
+        try:
+            fcntl.flock(fd, operation)
+        except BlockingIOError:
+            while engines_of_a:  # a's last engine exits here: the kernel drops its lock
+                os.close(engines_of_a.pop())
+            raise
+
+    lock_flags = {name: getattr(fcntl, name) for name in ("LOCK_EX", "LOCK_NB", "LOCK_SH", "LOCK_UN")}
+    monkeypatch.setattr(tpu_vllm, "fcntl", SimpleNamespace(flock=flock, **lock_flags))
+    fd = claim("controller-b", path)
+    assert not engines_of_a  # the race happened
+    with open(path) as f:
+        assert f.read() == "controller-b"  # no tail of the longer old owner
+    with pytest.raises(RuntimeError, match="another controller \\(controller-b\\)"):
+        claim("controller-c", path)  # b's engines hold the host now
+    os.close(fd)
+
+
+def test_server_that_fails_to_start_gives_the_host_back(tpu_vllm, tmp_path, monkeypatch):
+    path = str(tmp_path / "claim.lock")
+    monkeypatch.setattr(tpu_vllm, "SUBHOST_CLAIM_FILE", path)
+    monkeypatch.setenv(tpu_vllm.SUBHOST_OWNER_ENV, "controller-a")
+    with mock.patch.object(_FakeHttpServer, "__init__", side_effect=RuntimeError("engine failed")):
+        with pytest.raises(RuntimeError, match="engine failed"):
+            tpu_vllm.TPUvLLMHttpServer()
+    os.close(tpu_vllm.claim_host_for_subhost_engines("controller-b", path))  # a's claim went with its server
 
 
 def test_two_controllers_on_one_host_fail_fast_instead_of_sharing_a_slot(tpu_vllm, tmp_path, monkeypatch):
