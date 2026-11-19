@@ -1904,6 +1904,48 @@ def test_enable_context_parallel_all_gather_requires_splash():
                 assert parallelism.spmd_backend == "spmd_types"
 
 
+def test_headtail_restore_indices_cpu_matches_load_balancer_and_is_cached():
+    from torch.distributed.tensor.experimental._context_parallel._load_balancer import _HeadTailLoadBalancer
+
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import _headtail_restore_indices_cpu
+
+    for seq_len, cp in ((16, 2), (64, 4)):
+        expected = _HeadTailLoadBalancer(seq_len, cp, "cpu")._generate_indices(restore=True)[0]
+        restore = _headtail_restore_indices_cpu(seq_len, cp)
+        assert restore.dtype == torch.int64 and restore.device.type == "cpu"
+        assert torch.equal(restore, expected.to(torch.int64))
+        assert _headtail_restore_indices_cpu(seq_len, cp) is restore
+        # Restoring the head-tail shard order gives back the original token order.
+        shard_order = _HeadTailLoadBalancer(seq_len, cp, "cpu")._generate_indices(restore=False)[0]
+        tokens = torch.arange(seq_len)
+        assert torch.equal(tokens[shard_order].index_select(0, restore), tokens)
+
+
+def test_gather_context_parallel_headtail_uses_cached_restore_indices():
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    seq_len, cp = 16, 2
+    engine = SimpleNamespace(
+        trainer=SimpleNamespace(
+            config=SimpleNamespace(parallelism=SimpleNamespace(context_parallel_load_balancer="headtail"))
+        ),
+        parallel_dims=SimpleNamespace(cp=cp),
+        get_context_parallel_group=lambda: None,
+    )
+    shard_order = torchtitan_tpu._HeadTailLoadBalancer(seq_len, cp, "cpu")._generate_indices(restore=False)[0]
+    gathered = torch.arange(seq_len)[shard_order].float()
+    with (
+        mock.patch.object(torchtitan_tpu.ContextParallelGather, "apply", side_effect=lambda t, g: t),
+        mock.patch.object(torchtitan_tpu, "tpu_synchronize") as sync,
+    ):
+        out1 = TorchTitanTPUEngine._gather_context_parallel(engine, gathered, seq_len)
+        out2 = TorchTitanTPUEngine._gather_context_parallel(engine, gathered, seq_len)
+    assert torch.equal(out1, torch.arange(seq_len).float()) and torch.equal(out2, out1)
+    assert sync.call_count == 1  # the device copy of the indices is made once per (seq_len, cp, device)
+    assert len(engine._cp_restore_idx_cache) == 1
+
+
 def test_cp_attention_owner_dispatches_to_inner_attention_cp_shard():
     from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
 
