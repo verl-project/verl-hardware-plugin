@@ -237,6 +237,15 @@ class TPUEngineOptions:
             instead of one per length bucket it meets (default: unset, off).
         static_max_response_len: Pad every micro-batch's response-length bucket to at least this many tokens (e.g.
             ``max_response_length``), so response-shaped tensors also keep one shape (default: unset, off).
+        loss_row_bucketing: Pad the PPO loss inputs of every micro-batch with fully masked rows up to a common row
+            count (``tpu_padded_num_seqs``: the most sequences in any micro-batch of the mini-batch on any rank,
+            rounded up to a power of two), so the loss programs do not recompile whenever ``use_dynamic_bsz`` changes
+            the number of sequences per micro-batch (default: ``True``). Applied only with verl's ``ppo_loss`` and a
+            policy loss that ignores fully masked rows (``losses.loss_inputs.loss_rows_can_be_padded``); ``geo_mean``,
+            ``bypass_mode`` and custom ``register_policy_loss`` losses keep the exact row count. ``False`` turns it off.
+        static_micro_batch_num_seqs: With ``loss_row_bucketing``, pad the PPO loss inputs to at least this many rows
+            (e.g. the largest number of sequences a micro-batch can hold), so the loss keeps one row shape
+            (default: unset, the power-of-two bucket only).
         splash_max_block_size: Largest Splash attention block size, a power of two >= 128 (default: ``512``,
             torchtitan's). Long packed micro-batches run faster with ``1024``.
         mixed_precision_reduce: dtype of the FSDP gradient reduce-scatter, ``float32`` (default, torchtitan's) or
@@ -290,6 +299,8 @@ class TPUEngineOptions:
     ac_save_splash_and_routing: Optional[bool] = None
     static_micro_batch_len: Optional[int] = None
     static_max_response_len: Optional[int] = None
+    loss_row_bucketing: Optional[bool] = None
+    static_micro_batch_num_seqs: Optional[int] = None
     splash_max_block_size: Optional[int] = None
     mixed_precision_reduce: Optional[str] = None
     moe_paired_grouped_mm: Optional[bool] = None
@@ -298,6 +309,15 @@ class TPUEngineOptions:
     frozen_param_regex: Optional[str] = None
     trainer_mode: Optional[str] = None
     graph_trainer: Optional[dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        if self.static_micro_batch_num_seqs is not None and (
+            isinstance(self.static_micro_batch_num_seqs, bool) or self.static_micro_batch_num_seqs < 1
+        ):
+            raise ValueError(
+                f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.static_micro_batch_num_seqs must be >= 1, "
+                f"got {self.static_micro_batch_num_seqs!r}"
+            )
 
 
 _ENGINE_KINDS: dict[str, Any] = {
@@ -329,6 +349,8 @@ _ENGINE_KINDS: dict[str, Any] = {
     "ac_save_splash_and_routing": bool,
     "static_micro_batch_len": int,
     "static_max_response_len": int,
+    "loss_row_bucketing": bool,
+    "static_micro_batch_num_seqs": int,
     "splash_max_block_size": int,
     "mixed_precision_reduce": str,
     "moe_paired_grouped_mm": bool,
@@ -446,6 +468,11 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
     if values.get("ep_token_chunks") is not None and values["ep_token_chunks"] < 1:
         raise ValueError(
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ep_token_chunks must be >= 1, got {values['ep_token_chunks']!r}"
+        )
+    if values.get("static_micro_batch_num_seqs") is not None and values["static_micro_batch_num_seqs"] < 1:
+        raise ValueError(
+            f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.static_micro_batch_num_seqs must be >= 1, "
+            f"got {values['static_micro_batch_num_seqs']!r}"
         )
     _normalize_trainer_mode(values)
     return TPUEngineOptions(**values)
