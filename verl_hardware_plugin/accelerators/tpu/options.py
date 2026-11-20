@@ -284,6 +284,15 @@ class TPUEngineOptions:
     trainer_mode: Optional[str] = None
     graph_trainer: Optional[dict[str, Any]] = None
 
+    def __post_init__(self) -> None:
+        if self.static_micro_batch_num_seqs is not None and (
+            isinstance(self.static_micro_batch_num_seqs, bool) or self.static_micro_batch_num_seqs < 1
+        ):
+            raise ValueError(
+                f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.static_micro_batch_num_seqs must be >= 1, "
+                f"got {self.static_micro_batch_num_seqs!r}"
+            )
+
 
 _ENGINE_KINDS: dict[str, Any] = {
     "use_splash_attention": bool,
@@ -399,6 +408,11 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
     if values.get("ep_token_chunks") is not None and values["ep_token_chunks"] < 1:
         raise ValueError(
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ep_token_chunks must be >= 1, got {values['ep_token_chunks']!r}"
+        )
+    if values.get("static_micro_batch_num_seqs") is not None and values["static_micro_batch_num_seqs"] < 1:
+        raise ValueError(
+            f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.static_micro_batch_num_seqs must be >= 1, "
+            f"got {values['static_micro_batch_num_seqs']!r}"
         )
     _normalize_trainer_mode(values)
     return TPUEngineOptions(**values)

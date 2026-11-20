@@ -1615,6 +1615,29 @@ def test_gather_context_parallel_headtail_restores_order_with_one_index_tensor_p
     assert set(engine._cp_restore_idx_cache) == {(16, cp, torch.device("cpu")), (32, cp, torch.device("cpu"))}
 
 
+def test_cp_restore_indices_uses_non_blocking_transfer():
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    engine = object.__new__(TorchTitanTPUEngine)
+    engine.parallel_dims = SimpleNamespace(cp=2)
+    engine._cp_restore_idx_cache = {}
+
+    to_calls = []
+    orig_to = torch.Tensor.to
+
+    def spy_to(self, *args, **kwargs):
+        if "device" in kwargs:
+            to_calls.append((kwargs["device"], kwargs.get("non_blocking", False)))
+        return orig_to(self, *args, **kwargs)
+
+    dev = torch.device("cpu")
+    with mock.patch.object(torch.Tensor, "to", spy_to):
+        idx = engine._cp_restore_indices(16, dev)
+        idx_again = engine._cp_restore_indices(16, dev)
+    assert idx_again is idx
+    assert to_calls == [(dev, True)]
+
+
 def test_bucket_num_sequences_and_packed_document_budget():
     from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels
 

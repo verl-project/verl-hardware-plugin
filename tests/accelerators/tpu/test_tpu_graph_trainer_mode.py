@@ -667,6 +667,36 @@ def test_graph_mode_step_uses_the_mini_batch_device_token_count():
     assert losses[1] == pytest.approx(losses[0], rel=1e-6)
 
 
+def test_graph_mode_step_handles_zero_batch_num_tokens():
+    """``batch_num_tokens == 0`` (all response tokens masked out globally) gives finite ``0.0`` loss/grads and passes
+    ``check_loss_consistency`` both via ``device_loss_scalars`` and via the CPU fallback."""
+    from verl_hardware_plugin.accelerators.tpu.losses import loss_inputs
+
+    padded_len = 48
+    micro_batch = _engine_micro_batch([3, 5, 2], [4, 6, 5], 1)
+    micro_batch["response_mask"] = torch.zeros_like(micro_batch["response_mask"])
+    tu.assign_non_tensor(micro_batch, batch_num_tokens=0.0)
+    loss_fn = functools.partial(ppo_loss, config=_actor_config(policy_loss=_ActorConfig(loss_mode="vanilla")))
+
+    with mock.patch.object(loss_inputs, "accelerator_is_tpu", return_value=True):
+        tpu_scalars = loss_inputs.device_loss_scalars(micro_batch, torch.device("cpu"))
+    assert float(tpu_scalars["batch_num_tokens"]) == 1.0
+
+    for scalars in (None, {}, tpu_scalars):
+        torch.manual_seed(0)
+        model = _TinyLM()
+        engine = _graph_engine(model, padded_len)
+        out = engine._graph_trainer_forward_backward(micro_batch.copy(), [micro_batch], None, loss_fn, 0.0, scalars)
+        assert out["loss"] == [0.0]
+        assert engine.trainer.calls == [((padded_len,), 1.0)]
+        for p in model.parameters():
+            assert p.grad is not None and torch.isfinite(p.grad).all() and float(p.grad.abs().max()) == 0.0
+        for name in ("actor/ppo_kl_token_mean", "actor/ppo_k3_token_mean", "actor/logprob_gap_abs_token_mean"):
+            metric = out["metrics"][name]
+            val = metric.aggregate() if hasattr(metric, "aggregate") else float(metric)
+            assert val == 0.0
+
+
 def test_build_graph_trainer_config():
     @dataclasses.dataclass
     class NewTPUConfig:

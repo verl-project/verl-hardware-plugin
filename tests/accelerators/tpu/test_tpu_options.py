@@ -110,6 +110,31 @@ def test_resolvers_read_engine_kwargs():
     assert get_tpu_seq_bucket_size(_cfg(pad_to_length=True, pad_to_length_bucket=512)) == 512
 
 
+def test_loss_row_bucketing_and_static_micro_batch_num_seqs_options():
+    assert get_tpu_engine_options(_cfg()).loss_row_bucketing is None
+    assert get_tpu_engine_options(_cfg()).static_micro_batch_num_seqs is None
+
+    opts = get_tpu_engine_options(_cfg({"loss_row_bucketing": "false", "static_micro_batch_num_seqs": "8"}))
+    assert opts.loss_row_bucketing is False
+    assert opts.static_micro_batch_num_seqs == 8
+
+    opts_on = get_tpu_engine_options(_cfg({"loss_row_bucketing": True, "static_micro_batch_num_seqs": 1}))
+    assert opts_on.loss_row_bucketing is True
+    assert opts_on.static_micro_batch_num_seqs == 1
+
+    for bad_bool in ("maybe", 2):
+        with pytest.raises(ValueError, match="loss_row_bucketing"):
+            get_tpu_engine_options(_cfg({"loss_row_bucketing": bad_bool}))
+
+    for bad_seqs in (0, -1, -8, "0", "-3", True, False):
+        with pytest.raises(ValueError, match="static_micro_batch_num_seqs"):
+            get_tpu_engine_options(_cfg({"static_micro_batch_num_seqs": bad_seqs}))
+
+    for bad_direct in (0, -1, True, False):
+        with pytest.raises(ValueError, match="static_micro_batch_num_seqs"):
+            TPUEngineOptions(static_micro_batch_num_seqs=bad_direct)  # type: ignore[arg-type]
+
+
 def test_legacy_field_and_env_still_work_with_a_warning(monkeypatch, caplog):
     legacy = _cfg(use_torch_compile=True, use_splash_attention=None, use_simple_fsdp=False, tpu_eager_mode=None)
     with caplog.at_level(logging.WARNING, logger=tpu_options.__name__):

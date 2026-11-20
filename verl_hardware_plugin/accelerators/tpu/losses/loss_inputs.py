@@ -26,10 +26,30 @@ from tensordict.tensorclass import NonTensorData, NonTensorStack
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.losses import ppo_loss
 from verl_hardware_plugin.accelerators.tpu.device_api import accelerator_is_tpu
-from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import TPU_PADDED_VALUES_ATTR, unwrap_metadata
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+    TPU_PADDED_VALUES_ATTR,
+    can_pad_nested_tensor_rows,
+    can_pad_tensordict_rows,
+    first_unpaddable_tensordict_entry,
+    unwrap_metadata,
+)
+
+__all__ = [
+    "DEVICE_LOSS_SCALAR_KEYS",
+    "ROW_PADDING_INVARIANT_POLICY_LOSSES",
+    "ROW_PADDING_VARIANT_POLICY_LOSSES",
+    "can_pad_tensordict_rows",
+    "device_loss_scalars",
+    "loss_rows_can_be_padded",
+    "pad_tensordict_rows",
+    "ppo_loss_config",
+    "prepare_tpu_loss_inputs",
+]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_WARNED_UNPADDABLE: set[tuple[str, str]] = set()
 
 # verl policy losses (``actor.policy_loss.loss_mode``) whose loss, gradients and metrics ignore fully masked rows: they
 # reduce over rows only through ``agg_loss`` (which drops rows without valid tokens) and masked means, so rows padded
@@ -80,8 +100,14 @@ class _TPULossDataProxy:
         self._base = base
         self._overrides = overrides
 
-    def __getitem__(self, key: str) -> Any:
-        if key in self._overrides:
+    def __len__(self) -> int:
+        return len(self._base)
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, str) and key in self._overrides:
             return self._overrides[key]
         return self._base[key]
 
@@ -90,11 +116,23 @@ class _TPULossDataProxy:
             return self._overrides[key]
         return self._base.get(key, default)
 
-    def __contains__(self, key: str) -> bool:
-        return key in self._overrides or key in self._base
+    def __contains__(self, key: Any) -> bool:
+        return (isinstance(key, str) and key in self._overrides) or key in self._base
 
-    def keys(self):
-        return self._base.keys()
+    def keys(self, *args: Any, **kwargs: Any):
+        base_keys = self._base.keys(*args, **kwargs)
+        extra = [key for key in self._overrides if key not in self._base]
+        if not extra:
+            return base_keys
+        return dict.fromkeys([*base_keys, *extra]).keys()
+
+    def select(self, *keys: Any, **kwargs: Any) -> _TPULossDataProxy:
+        if kwargs.get("inplace"):
+            raise ValueError("_TPULossDataProxy is read-only; select(inplace=True) is not supported")
+        base_keys = [key for key in keys if key in self._base or key not in self._overrides]
+        selected_base = self._base.select(*base_keys, **kwargs)
+        selected_overrides = {key: self._overrides[key] for key in keys if key in self._overrides}
+        return _TPULossDataProxy(selected_base, selected_overrides)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base, name)
@@ -125,13 +163,21 @@ def _pad_rows(value: Any, extra: int) -> Any:
     if isinstance(value, NonTensorStack):
         return [*value.tolist(), *([None] * extra)]
     if isinstance(value, TensorDict):
+        if len(value.batch_size) == 0:
+            raise TypeError("cannot pad the rows of a 0-D TensorDict")
         return pad_tensordict_rows(value, int(value.batch_size[0]) + extra)
     if isinstance(value, torch.Tensor) and value.is_nested:
-        if value.layout != torch.jagged or value._lengths is not None or value._ragged_idx != 1:
+        if not can_pad_nested_tensor_rows(value):
             raise TypeError("cannot pad the rows of a strided or non-contiguous nested tensor")
         offsets = value.offsets()
-        return torch.nested.nested_tensor_from_jagged(value.values(), torch.cat([offsets, offsets[-1:].expand(extra)]))
+        return torch.nested.nested_tensor_from_jagged(
+            value.values(),
+            torch.cat([offsets, offsets[-1:].expand(extra)]),
+            jagged_dim=value._ragged_idx,
+        )
     if isinstance(value, torch.Tensor):
+        if value.ndim < 1:
+            raise TypeError("cannot pad the rows of a 0-D tensor")
         return torch.cat([value, value.new_zeros((extra, *value.shape[1:]))])
     raise TypeError(f"cannot pad the rows of a {type(value).__name__}")
 
@@ -139,9 +185,10 @@ def _pad_rows(value: Any, extra: int) -> Any:
 def pad_tensordict_rows(td: TensorDict, num_rows: int) -> TensorDict:
     """Shallow copy of ``td`` (no device) with every per-row entry padded to ``num_rows`` rows.
 
-    Dense tensors get zero rows, jagged nested tensors empty rows, per-row non-tensor stacks ``None`` rows, and nested
-    TensorDicts are padded recursively; scalar host metadata (``NonTensorData``) is kept as is. Every key of ``td``
-    survives, so a loss can read any field of the micro-batch whether or not its rows were padded.
+    Dense tensors get zero rows, jagged nested tensors empty rows (including 3-D mRoPE ``position_ids`` with
+    ``jagged_dim=2``), per-row non-tensor stacks ``None`` rows, and nested TensorDicts are padded recursively; scalar
+    host metadata (``NonTensorData``) is kept as is. Every key of ``td`` survives, so a loss can read any field of the
+    micro-batch whether or not its rows were padded.
 
     Raises:
         TypeError: for an entry whose rows it cannot pad.
@@ -161,11 +208,21 @@ def pad_tensordict_rows(td: TensorDict, num_rows: int) -> TensorDict:
     return out
 
 
+def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+    """Read ``key`` from a mapping, dataclass/object, or ``None`` without raising ``AttributeError``."""
+    if cfg is None:
+        return default
+    if isinstance(cfg, Mapping):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
 def ppo_loss_config(loss_function: Any) -> Any:
     """The actor config of a ``partial(verl ppo_loss, config=...)`` loss function, else ``None``."""
     if not isinstance(loss_function, partial) or loss_function.func is not ppo_loss:
         return None
-    config = loss_function.keywords.get("config")
+    keywords = loss_function.keywords or {}
+    config = keywords.get("config")
     if config is None and loss_function.args:
         config = loss_function.args[0]
     return config
@@ -179,9 +236,10 @@ def loss_rows_can_be_padded(loss_function: Any) -> bool:
     loss) keeps the exact number of rows.
     """
     config = ppo_loss_config(loss_function)
-    if config is None or config.loss_agg_mode not in _ROW_PADDING_INVARIANT_AGG_MODES:
+    if config is None or _cfg_get(config, "loss_agg_mode") not in _ROW_PADDING_INVARIANT_AGG_MODES:
         return False
-    return config.policy_loss.get("loss_mode", "vanilla") in ROW_PADDING_INVARIANT_POLICY_LOSSES
+    policy_loss = _cfg_get(config, "policy_loss")
+    return _cfg_get(policy_loss, "loss_mode", "vanilla") in ROW_PADDING_INVARIANT_POLICY_LOSSES
 
 
 def device_loss_scalars(data: TensorDict, device: Any) -> dict[str, torch.Tensor]:
@@ -189,10 +247,15 @@ def device_loss_scalars(data: TensorDict, device: Any) -> dict[str, torch.Tensor
     not on TPU.
 
     The engine calls this once per mini-batch, before the micro-batch loop and outside the deferred eager-mode region
-    (so the copy is a materialized device buffer and needs no stream cut), and passes the result to
-    :func:`prepare_tpu_loss_inputs` (which overrides the loss data's entries with it, for the PPO, SFT and critic
-    losses) and to the ``graph_trainer`` step. verl's losses then divide by a float32 0-D tensor instead of a Python
-    float: a bf16 masked sum is promoted to float32 instead of staying bf16; float32 sums are unchanged.
+    (with ``non_blocking=True`` so ``torch_tpu`` schedules an async H2D transfer instead of a blocking stream cut), and
+    passes the result to :func:`prepare_tpu_loss_inputs` (which overrides the loss data's entries with it, for the PPO,
+    SFT and critic losses) and to the ``graph_trainer`` step. verl's losses then divide by a float32 0-D tensor instead
+    of a Python float: a bf16 masked sum is promoted to float32 instead of staying bf16; float32 sums are unchanged.
+
+    When ``batch_num_tokens == 0`` globally (every DP rank has ``loss_mask == 0``, so every masked-sum numerator across
+    the entire global batch is ``0.0``), ``batch_num_tokens`` is clamped to ``1.0`` (matching ``GraphPolicyLoss``'s
+    ``clamp(min=1.0)``) so ``ppo_loss`` / ``sft_loss`` / ``value_loss`` produce finite ``0.0`` instead of ``0.0 / 0.0 =
+    NaN``.
     """
     if not accelerator_is_tpu():
         return {}
@@ -204,9 +267,21 @@ def device_loss_scalars(data: TensorDict, device: Any) -> dict[str, torch.Tensor
         if value is None:
             continue
         if isinstance(value, torch.Tensor):
-            out[key] = value.detach().to(device=device, dtype=torch.float32).reshape(())
+            if value.device.type == "cpu":
+                scalar = value.detach().to(dtype=torch.float32).reshape(())
+                if key == "batch_num_tokens":
+                    scalar = torch.clamp(scalar, min=1.0)
+                out[key] = scalar.to(device=device, non_blocking=True)
+            else:
+                scalar = value.detach().to(device=device, dtype=torch.float32, non_blocking=True).reshape(())
+                if key == "batch_num_tokens":
+                    scalar = torch.clamp(scalar, min=1.0)
+                out[key] = scalar
         else:
-            out[key] = torch.tensor(float(value), dtype=torch.float32).to(device=device)
+            scalar_val = float(value)
+            if key == "batch_num_tokens":
+                scalar_val = max(scalar_val, 1.0)
+            out[key] = torch.tensor(scalar_val, dtype=torch.float32).to(device=device, non_blocking=True)
     return out
 
 
@@ -320,8 +395,12 @@ def prepare_tpu_loss_inputs(
             try:
                 loss_data = pad_tensordict_rows(micro_batch, num_rows)
             except TypeError as e:
-                # A field type with no row padding: the exact row count (a static property of the run's batches).
-                logger.warning("Not padding the PPO loss rows to %d: %s", num_rows, e)
+                # Defense-in-depth fallback when tpu_padded_num_seqs was set directly without align_micro_batch_*:
+                # keep the exact row count and rate-limit warnings once per (field, type).
+                warn_key = first_unpaddable_tensordict_entry(micro_batch) or ("<unknown>", type(e).__name__)
+                if warn_key not in _WARNED_UNPADDABLE:
+                    _WARNED_UNPADDABLE.add(warn_key)
+                    logger.warning("Not padding the PPO loss rows to %d (field %r): %s", num_rows, warn_key[0], e)
                 num_rows = batch_size
         if loss_data is None:
             loss_data = _copy_tensordict_without_device(micro_batch)
