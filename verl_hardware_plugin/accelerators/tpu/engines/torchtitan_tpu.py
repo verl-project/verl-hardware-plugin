@@ -1263,12 +1263,6 @@ class TorchTitanTPUEngine(BaseEngine):
             self.trainer = Trainer(self.config)
         if engine_config.use_torch_compile:
             tpu_model_kernels.patch_torchtitan_tpu_dynamo_caches()
-            # VERL_TPU_BLOCKS_PER_COMPILE=k: one XLA program per k blocks, so the scheduler can prefetch the next
-            # block's SimpleFSDP all-gathers under the current block's compute (engines/block_grouping.py).
-            k = block_grouping.blocks_per_compile()
-            if k > 1 and not self._graph_trainer_mode:
-                for model_part in self.trainer.model_parts:
-                    block_grouping.group_compiled_blocks(model_part, k)
         self.parallel_dims = self.trainer.parallel_dims
         self._dp_group = self._build_dp_gloo_group()
         # Like torchtitan's init_distributed (which verl bypasses): no autograd multithreading, so backward-thread
@@ -1319,9 +1313,29 @@ class TorchTitanTPUEngine(BaseEngine):
             # After every module swap above: annotate the final module tree for the graph passes.
             graph_trainer_mode.prepare_model_for_graph_trainer(model_parts)
 
+        blocks_per_compile = tpu_options.blocks_per_compile or 1
+        if blocks_per_compile > 1:
+            if not engine_config.use_torch_compile or self._graph_trainer_mode:
+                logger.warning(
+                    "engine_kwargs.tpu.blocks_per_compile=%d ignored: it needs use_torch_compile=True and "
+                    "trainer_mode=eager_blocks",
+                    blocks_per_compile,
+                )
+            else:
+                # One XLA program per k blocks, so the scheduler can prefetch the next block's SimpleFSDP all-gathers
+                # under the current block's compute (engines/block_grouping.py). Last, after every module swap and
+                # recompile above (e.g. install_tpu_ep_token_dispatcher's), so the grouped per-block programs are final.
+                group_compile_fn = block_grouping.default_compile_fn(compile_config.backend)
+                for model_part in model_parts:
+                    if isinstance(model_part, torch.nn.Module):
+                        block_grouping.group_compiled_blocks(
+                            model_part, blocks_per_compile, compile_fn=group_compile_fn
+                        )
+
         if engine_config.use_torch_compile:
+            # Compiled programs: a grouped block after the first of its group has none of its own.
             n_compiled = sum(
-                getattr(m, "_compiled_call_impl", None) is not None
+                getattr(m, "_compiled_call_impl", None) is not None and not block_grouping.is_grouped_follower(m)
                 for part in model_parts
                 if isinstance(part, torch.nn.Module)
                 for m in part.modules()

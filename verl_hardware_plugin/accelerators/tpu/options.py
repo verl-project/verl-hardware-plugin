@@ -237,6 +237,12 @@ class TPUEngineOptions:
         graph_trainer: Settings passed straight to TorchTitan's ``TpuGraphTrainerCompileConfig(**cfg)``
             (e.g. ``memory_policy``, ``save_regions``, ``fsdp_barrier_policy``, ``graph_split``).
             Ignored when ``trainer_mode`` is not ``graph_trainer``.
+        blocks_per_compile: Compile this many consecutive transformer blocks as one XLA program instead of one per
+            block (default: unset, ``1``), so XLA can prefetch the next block's SimpleFSDP all-gathers under the
+            current block's compute; costs up to one more block of gathered weights / gradients in HBM. Needs
+            ``use_torch_compile`` and ``trainer_mode=eager_blocks``; blocks compiled ``fullgraph=False`` keep their own
+            program. A decoder that passes per-layer arguments or works between blocks fails loudly at the first
+            forward (see ``engines/block_grouping.py``).
     """
 
     use_splash_attention: Optional[bool] = None
@@ -272,6 +278,7 @@ class TPUEngineOptions:
     frozen_param_regex: Optional[str] = None
     trainer_mode: Optional[str] = None
     graph_trainer: Optional[dict[str, Any]] = None
+    blocks_per_compile: Optional[int] = None
 
 
 _ENGINE_KINDS: dict[str, Any] = {
@@ -308,6 +315,7 @@ _ENGINE_KINDS: dict[str, Any] = {
     "frozen_param_regex": str,
     "trainer_mode": str,
     "graph_trainer": dict,
+    "blocks_per_compile": int,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
