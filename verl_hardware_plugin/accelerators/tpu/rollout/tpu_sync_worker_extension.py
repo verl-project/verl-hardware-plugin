@@ -173,11 +173,13 @@ def _slice_from_spec(spec: list[str], local_shape: list[int], tp_size: int) -> _
 
 
 def _uses_vllm_weight_loader(vllm_model: Any, global_shapes: dict[str, list[int]]) -> bool:
-    """Whether to install received weights via the engine's own checkpoint loaders (hybrid linear-attn or MoE)."""
+    """Whether to install received weights via the engine's own checkpoint loaders (hybrid linear-attn, MoE, or
+    quantized dense weights)."""
     return (
         hasattr(type(vllm_model), "get_mamba_state_shape_from_config")
         or any(len(shape) not in (1, 2) for shape in global_shapes.values())
         or any(".linear_attn." in name or ".experts." in name for name in global_shapes)
+        or bool(direct_install.non_moe_quantized_reason(vllm_model))
     )
 
 
@@ -207,6 +209,7 @@ class TPUSyncWorkerMixin:
         parallelism: int = tpu_sync_engine.TPU_SYNC_DEFAULT_PARALLELISM,
         job_name: str = "sampler0",
         receive_into_vllm: bool = False,
+        direct_install_quantized_moe: bool = True,
     ) -> bool:
         """Initialize tpu-sync WeightSynchronizer listener and register with the central tpu-sync controller.
 
@@ -216,8 +219,10 @@ class TPUSyncWorkerMixin:
         names every rollout replica after its ``replica_rank``), so the ranks ``0..TP-1`` of several replicas do
         not collide on the controller. With ``receive_into_vllm`` the trainer sends every tensor in vLLM's layout
         (named after vLLM's parameters, see ``weight_sync/vllm_layout.py``) and this worker binds those parameters
-        as the receive buffers: no staging buffers and nothing to install. Only the first call does work: the
-        receive buffers, the synchronizer and the registration are reused by every later sync.
+        as the receive buffers: no staging buffers and nothing to install. ``direct_install_quantized_moe=False``
+        (``engine_kwargs.tpu-sync.direct_install_quantized_moe``) installs quantized MoE experts through vLLM's
+        loaders instead of requantizing them directly. Only the first call does work: the receive buffers, the
+        synchronizer and the registration are reused by every later sync.
         """
         if getattr(self, "_tpu_sync_ws", None) is not None:
             return True
@@ -268,9 +273,19 @@ class TPUSyncWorkerMixin:
         model_config = self._get_model_config()
         hf_text_config = getattr(model_config, "hf_text_config", None)
         layout, plan, no_plan_reasons = direct_install.select_layout(
-            vllm_model, global_shapes_map, hf_text_config, tp_size, rank_val
+            vllm_model,
+            global_shapes_map,
+            hf_text_config,
+            tp_size,
+            rank_val,
+            allow_quantized_moe=direct_install_quantized_moe,
         )
-        use_vllm_loaders = layout is None and _uses_vllm_weight_loader(vllm_model, global_shapes_map)
+        dense_quant_reason = direct_install.non_moe_quantized_reason(vllm_model) if layout is None else ""
+        if dense_quant_reason:
+            no_plan_reasons = [*no_plan_reasons, dense_quant_reason]
+        use_vllm_loaders = layout is None and (
+            bool(dense_quant_reason) or _uses_vllm_weight_loader(vllm_model, global_shapes_map)
+        )
         self._tpu_sync_layout = layout
         self._tpu_sync_plan = plan
         self._tpu_sync_use_vllm_loaders = use_vllm_loaders
@@ -655,6 +670,14 @@ class TPUSyncWorkerMixin:
             parent_mod = get_parent_module(resolved_key, module_dict)
             is_flipped = bool(getattr(parent_mod, "_tpu_weight_flipped", False))
             adapted = to_target_layout(src, target_local, is_flipped)
+            if (
+                target_local.dtype not in direct_install.UNQUANTIZED_PARAM_DTYPES
+                and target_local.dtype != adapted.dtype
+            ):
+                raise RuntimeError(
+                    f"tpu-sync direct install: cannot copy unscaled {adapted.dtype} into quantized "
+                    f"{resolved_key} ({target_local.dtype})"
+                )
             if parity is not None:
                 parity.check(resolved_key, target_local, adapted)
             target_local.copy_(adapted)
@@ -730,7 +753,8 @@ class TPUSyncWorkerMixin:
         result = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
         if parity is not None:
             # Covers every tensor written through copy_into, and the regions that a direct-install layout writes
-            # itself (e.g. the experts' w13 / w2), through the ``check`` passed to its install.
+            # itself (e.g. the experts' w13 / w2), through the ``check`` passed to its install. Quantized experts
+            # compare the requantized weights and scales with the live ones (``moe_weights.write_requantized``).
             result["exact_parity"] = parity.result(rank, unresolved)
         return result
 

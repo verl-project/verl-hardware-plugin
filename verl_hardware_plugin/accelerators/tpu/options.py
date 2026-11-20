@@ -492,6 +492,11 @@ class TPUSyncOptions:
             TP slice is its vLLM weight. ``auto`` enables it for dense vLLM models whose trainer layout needs no
             cross-rank exchange (e.g. ``FSDP == TP``) and falls back to staging otherwise; ``on`` (``True``) requires
             it and ``off`` (``False``) disables it.
+        direct_install_quantized_moe: Install quantized rollout MoE experts (e.g. vllm-torchtpu's FP8 MoE with
+            ``QUANTIZE_ON_LOAD_PREFIXES=experts``) directly: each rollout rank requantizes the bf16 expert slices it
+            received with the rollout's own quantizer and writes the live weights and scales (``True``, default).
+            ``False`` installs them through vLLM's checkpoint loaders instead (every rank all-gathers every tensor;
+            much slower), e.g. to rule out the direct install while debugging.
     """
 
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM
@@ -501,6 +506,7 @@ class TPUSyncOptions:
     tie_word_embeddings: Optional[bool] = None
     return_after_d2h: bool = True
     receive_into_vllm: str = "auto"
+    direct_install_quantized_moe: bool = True
 
     @property
     def verify_norms(self) -> bool:
@@ -521,6 +527,7 @@ _SYNC_KINDS: dict[str, type] = {
     "tie_word_embeddings": bool,
     "receive_into_vllm": ReceiveIntoVllmMode,
     "return_after_d2h": bool,
+    "direct_install_quantized_moe": bool,
 }
 assert set(_SYNC_KINDS) == {f.name for f in dataclasses.fields(TPUSyncOptions)}
 
