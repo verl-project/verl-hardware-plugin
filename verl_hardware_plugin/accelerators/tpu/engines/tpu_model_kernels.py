@@ -435,6 +435,16 @@ def lce_block_sizes(kernels: frozenset[str], hidden_size: int, vocab_size: int) 
 MIN_PACKED_DOCUMENT_BUDGET = 16
 
 
+def bucket_num_sequences(num_sequences: int) -> int:
+    """The sequence-count bucket of ``num_sequences``: the next power of two (at least 1).
+
+    One bucketing scheme for every static shape that follows the number of sequences in a micro-batch, which
+    ``use_dynamic_bsz`` varies from step to step: the Tokamax KDA document budget (:func:`packed_document_budget`) and
+    the rows of the PPO loss inputs (``tpu_padded_num_seqs``, ``align_micro_batch_shapes_across_ranks``).
+    """
+    return 1 << (max(int(num_sequences), 1) - 1).bit_length()
+
+
 def packed_document_budget(max_sequences_per_micro_batch: int) -> int:
     """The Tokamax KDA ``max_num_segments`` for micro-batches packing up to ``max_sequences_per_micro_batch`` sequences.
 
@@ -443,8 +453,7 @@ def packed_document_budget(max_sequences_per_micro_batch: int) -> int:
     of sequences per token-budgeted micro-batch varies from step to step, and an exact budget would recompile every
     GatedDeltaNet layer whenever it changes. A larger budget only adds empty segments.
     """
-    raw = int(max_sequences_per_micro_batch) + 1
-    return max(MIN_PACKED_DOCUMENT_BUDGET, 1 << (raw - 1).bit_length())
+    return max(MIN_PACKED_DOCUMENT_BUDGET, bucket_num_sequences(int(max_sequences_per_micro_batch) + 1))
 
 
 def set_packed_document_budget(modules: Any, num_documents: int) -> int:

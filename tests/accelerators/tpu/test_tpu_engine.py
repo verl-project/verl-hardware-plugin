@@ -352,9 +352,10 @@ def test_single_host_tpu_topology_for_one_host_replicas():
         assert single_host_tpu_topology(3) == ""  # unknown size: the caller keeps the inherited environment
     with mock.patch.dict(os.environ, {"TPU_ACCELERATOR_TYPE": "tpu7x"}):
         assert single_host_tpu_topology(8) == "2,2,1,2"  # 4 chips x 2 TensorCores
-        # TP=2 / TP=4 replicas: no validated sub-host 7x mesh, so no override (no error either).
-        assert single_host_tpu_topology(2) == ""
-        assert single_host_tpu_topology(4) == ""
+        # TP=2 / TP=4 replicas on part of a host: 1 chip x 2 TensorCores, 2 chips x 2 TensorCores.
+        assert single_host_tpu_topology(2) == "1,1,1,2"
+        assert single_host_tpu_topology(4) == "1,2,1,2"
+        assert single_host_tpu_topology(6) == ""  # unknown size: the caller keeps the inherited environment
 
 
 def test_resolve_tpu_topology_bounds_single_host():
@@ -417,7 +418,7 @@ def test_resolve_tpu_topology_bounds_tpu7x_one_process_per_core():
         assert resolve_tpu_topology_bounds(total_chips=64, num_nodes=8) == ("2,4,4,2", "2,4,4,2", "1,1,1,1", "8")
         with pytest.raises(ValueError, match="TPU 7x mesh"):
             resolve_tpu_topology_bounds(total_chips=24, num_nodes=3)
-        with pytest.raises(ValueError, match="TPU 7x mesh"):  # sub-host sizes have no validated layout
+        with pytest.raises(ValueError, match="TPU 7x mesh"):  # a sub-host trainer pool: not validated
             resolve_tpu_topology_bounds(total_chips=4, num_nodes=1)
     # The pod type alone selects the TPU 7x path too.
     with mock.patch.dict(os.environ, env, clear=True):
@@ -606,6 +607,155 @@ def test_auto_assign_accelerator_type_single_slice_shares_slice():
     nodes = [{"Alive": True, "Resources": {"TPU": 4.0, "tpu-group-0": 1.0}}]
     with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
         assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-0"
+        assert platform.auto_assign_accelerator_type("rollout_pool_1", None) == "tpu-group-0"
+
+
+@pytest.mark.parametrize("tp, replicas", [(8, 4), (4, 8), (2, 16)])
+def test_auto_assign_accelerator_type_spreads_extra_rollout_pools_round_robin(tp, replicas):
+    # A 4-host trainer slice (tpu-group-0) and four single-host rollout slices of 8 TPU 7x devices: 4 x TP=8,
+    # 8 x TP=4 or 16 x TP=2 rollout replicas, one pool each. Every rollout host gets 8 // tp replicas, and none
+    # lands on the trainer's slice.
+    platform = PlatformTPU()
+    nodes = [{"Alive": True, "Resources": {"TPU": 8.0, f"tpu-group-{g}": 1.0}} for g in (0, 0, 0, 0, 3, 1, 4, 2)]
+    with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
+        assert platform.auto_assign_accelerator_type("global_pool", None) == "tpu-group-0"
+        claimed = [platform.auto_assign_accelerator_type(f"rollout_pool_{r}", None) for r in range(replicas)]
+    assert claimed == [f"tpu-group-{1 + r % 4}" for r in range(replicas)]
+    assert {s: claimed.count(s) for s in set(claimed)} == {f"tpu-group-{g}": 8 // tp for g in (1, 2, 3, 4)}
+
+
+def test_auto_assign_accelerator_type_never_shares_a_dedicated_pool_slice():
+    # Three slices of 8 devices: the trainer (8) and a dedicated reward model pool (8) take one each, so the second
+    # TP=4 rollout replica must join the first on tpu-group-2, not the full reward slice (its placement group would
+    # never be scheduled).
+    platform = PlatformTPU()
+    nodes = [{"Alive": True, "Resources": {"TPU": 8.0, f"tpu-group-{g}": 1.0}} for g in (0, 1, 2)]
+    with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
+        assert platform.auto_assign_accelerator_type("global_pool", None) == "tpu-group-0"
+        assert platform.auto_assign_accelerator_type("reward_pool", None) == "tpu-group-1"
+        assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-2"
+        assert platform.auto_assign_accelerator_type("rollout_pool_1", None) == "tpu-group-2"
+
+
+def test_auto_assign_accelerator_type_shares_slices_only_within_a_replica_kind():
+    # Three slices of 8 devices: the trainer takes tpu-group-0 and a TP=8 reward model rollout replica claims
+    # tpu-group-1 whole, so the second TP=4 policy replica must join the first on tpu-group-2.
+    platform = PlatformTPU()
+    nodes = [{"Alive": True, "Resources": {"TPU": 8.0, f"tpu-group-{g}": 1.0}} for g in (0, 1, 2)]
+    with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
+        assert platform.auto_assign_accelerator_type("global_pool", None) == "tpu-group-0"
+        assert platform.auto_assign_accelerator_type("rollout_pool_reward_0", None) == "tpu-group-1"
+        assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-2"
+        assert platform.auto_assign_accelerator_type("rollout_pool_1", None) == "tpu-group-2"
+        # A further reward replica round-robins over the reward slices only.
+        assert platform.auto_assign_accelerator_type("rollout_pool_reward_1", None) == "tpu-group-1"
+
+
+@pytest.mark.parametrize(
+    "trainer, slice_a, slice_b",
+    [("tpu-group-0", "tpu-group-1", "tpu-group-2"), ("tpu-group-0", "tpu-group-a-0", "tpu-group-b-0")],
+)
+def test_auto_assign_accelerator_type_fills_unequal_rollout_slices_by_capacity(trainer, slice_a, slice_b):
+    # Rollout slice A is 1 host (8 devices), B is 2 hosts (16): three TP=8 policy replicas fit as A, B, B. Going
+    # round-robin would put the third on the full A, whose placement group would never be scheduled.
+    platform = PlatformTPU()
+    hosts = [trainer] * 4 + [slice_a] + [slice_b] * 2
+    nodes = [{"Alive": True, "Resources": {"TPU": 8.0, group: 1.0}} for group in hosts]
+    with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
+        assert platform.auto_assign_accelerator_type("global_pool", None) == trainer
+        claimed = [platform.auto_assign_accelerator_type(f"rollout_pool_{r}", None) for r in range(3)]
+    assert claimed == [slice_a, slice_b, slice_b]
+
+
+def test_rollout_replica_kind_is_the_pool_name_without_the_rank():
+    from verl_hardware_plugin.accelerators.tpu.platform_tpu import rollout_replica_kind
+
+    assert rollout_replica_kind("rollout_pool_0") == rollout_replica_kind("rollout_pool_12") == "rollout_pool"
+    assert rollout_replica_kind("rollout_pool_reward_3") == "rollout_pool_reward"
+    assert rollout_replica_kind("rollout_pool_teacher_1_org_teacher") == "rollout_pool_teacher_org_teacher"
+    assert rollout_replica_kind("rollout_pool_teacher_1_org_teacher") != rollout_replica_kind("rollout_pool_teacher_1")
+    assert rollout_replica_kind("global_pool") is None and rollout_replica_kind("reward_pool") is None
+
+
+@pytest.mark.parametrize("tp, expected_topology", [(2, "1,1,1,2"), (4, "1,2,1,2"), (8, "2,2,1,2")])
+def test_get_tpu_env_vars_resolves_single_host_subhost_rollout_worker_group(tp, expected_topology):
+    platform = PlatformTPU()
+    pg = SimpleNamespace(id="pg-0")
+    nodes = [
+        {
+            "NodeID": "node-ro-0",
+            "NodeManagerAddress": "10.0.0.10",
+            "Alive": True,
+            "Resources": {"TPU": 8.0},
+            "Labels": {"ray.io/tpu-pod-type": "v7x-8"},
+        }
+    ]
+    pg_table = {"state": "CREATED", "bundles_to_node_id": {i: "node-ro-0" for i in range(tp)}}
+    with (
+        mock.patch("ray.is_initialized", return_value=True),
+        mock.patch("ray.nodes", return_value=nodes),
+        mock.patch("ray._private.state.state.placement_group_table", return_value=pg_table),
+        mock.patch.dict(os.environ, {"TPU_HOST_BOUNDS": "1,1,4", "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1"}, clear=False),
+    ):
+        env = platform.get_tpu_env_vars(
+            rank=0,
+            world_size=tp,
+            local_rank=0,
+            local_world_size=tp,
+            name_prefix="rollout_standalone_0",
+            pgs=[pg],
+        )
+        assert env["TORCH_TPU_TOPOLOGY"] == expected_topology
+        assert env["CHIPS_PER_HOST"] == str(tp)
+        if tp in (2, 4):
+            with pytest.raises(ValueError, match="TPU 7x mesh"):
+                platform.get_tpu_env_vars(
+                    rank=0,
+                    world_size=tp,
+                    local_rank=0,
+                    local_world_size=tp,
+                    name_prefix="ActorRolloutRefWorker",
+                    pgs=[pg],
+                )
+
+
+def test_get_tpu_env_vars_rejects_a_rollout_replica_split_across_hosts():
+    # verl places rollout workers with Ray's best-effort PACK, which can split a placement group over hosts. A TP=4
+    # replica split 2 + 2 fails with that, not with a mesh error for 4 devices on 2 hosts.
+    platform = PlatformTPU()
+    nodes = [
+        {
+            "NodeID": f"node-ro-{h}",
+            "NodeManagerAddress": f"10.0.0.1{h}",
+            "Alive": True,
+            "Resources": {"TPU": 8.0},
+            "Labels": {"ray.io/tpu-pod-type": "v7x-16"},
+        }
+        for h in (0, 1)
+    ]
+    tables = {
+        "split": {
+            "state": "CREATED",
+            "bundles_to_node_id": {0: "node-ro-0", 1: "node-ro-0", 2: "node-ro-1", 3: "node-ro-1"},
+        },
+        "host-0": {"state": "CREATED", "bundles_to_node_id": {i: "node-ro-0" for i in range(8)}},
+        "host-1": {"state": "CREATED", "bundles_to_node_id": {i: "node-ro-1" for i in range(8)}},
+    }
+
+    def env(name_prefix, pg_ids, world_size, local_world_size):
+        pgs = [SimpleNamespace(id=pg_id) for pg_id in pg_ids]
+        return platform.get_tpu_env_vars(0, world_size, 0, local_world_size, name_prefix=name_prefix, pgs=pgs)
+
+    with (
+        mock.patch.dict(os.environ, _env_without_webhook(), clear=True),
+        mock.patch("ray.is_initialized", return_value=True),
+        mock.patch("ray.nodes", return_value=nodes),
+        mock.patch("ray._private.state.state.placement_group_table", side_effect=tables.__getitem__),
+    ):
+        with pytest.raises(RuntimeError, match=r"'rollout_standalone_0' on 2 hosts \(10\.0\.0\.10, 10\.0\.0\.11\)"):
+            env("rollout_standalone_0", ["split"], world_size=4, local_world_size=4)
+        # A replica over two hosts has one placement group per host, each on its own host.
+        assert env("rollout_standalone_1", ["host-0", "host-1"], 16, 8)["TORCH_TPU_TOPOLOGY"] == "2,2,2,2"
 
 
 def _clear_forwarded_tpu_env(monkeypatch):
@@ -1421,6 +1571,206 @@ def test_enable_context_parallel_all_gather_requires_splash():
             else:
                 TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
                 assert parallelism.spmd_backend == "spmd_types"
+
+
+def test_headtail_restore_indices_cpu_matches_load_balancer():
+    from torch.distributed.tensor.experimental._context_parallel._load_balancer import _HeadTailLoadBalancer
+
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import _headtail_restore_indices_cpu
+
+    for seq_len, cp in ((16, 2), (64, 4)):
+        expected = _HeadTailLoadBalancer(seq_len, cp, "cpu")._generate_indices(restore=True)[0]
+        restore = _headtail_restore_indices_cpu(seq_len, cp)
+        assert restore.dtype == torch.int64 and restore.device.type == "cpu"
+        assert torch.equal(restore, expected.to(torch.int64))
+        # Restoring the head-tail shard order gives back the original token order.
+        shard_order = _HeadTailLoadBalancer(seq_len, cp, "cpu")._generate_indices(restore=False)[0]
+        tokens = torch.arange(seq_len)
+        assert torch.equal(tokens[shard_order].index_select(0, restore), tokens)
+
+
+def test_gather_context_parallel_headtail_restores_order_with_one_index_tensor_per_shape():
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    cp = 2
+    engine = object.__new__(TorchTitanTPUEngine)
+    engine.trainer = SimpleNamespace(
+        config=SimpleNamespace(parallelism=SimpleNamespace(context_parallel_load_balancer="headtail"))
+    )
+    engine.parallel_dims = SimpleNamespace(cp=cp)
+    engine.get_context_parallel_group = lambda: None
+    engine._cp_restore_idx_cache = {}
+
+    def gather(seq_len):
+        shard_order = torchtitan_tpu._HeadTailLoadBalancer(seq_len, cp, "cpu")._generate_indices(restore=False)[0]
+        return engine._gather_context_parallel(torch.arange(seq_len)[shard_order].float(), seq_len)
+
+    with mock.patch.object(torchtitan_tpu.ContextParallelGather, "apply", side_effect=lambda t, g: t):
+        assert torch.equal(gather(16), torch.arange(16).float())
+        first = engine._cp_restore_idx_cache[(16, cp, torch.device("cpu"))]
+        assert torch.equal(gather(16), torch.arange(16).float())
+        assert engine._cp_restore_idx_cache[(16, cp, torch.device("cpu"))] is first  # reused, not rebuilt
+        assert torch.equal(gather(32), torch.arange(32).float())
+    assert set(engine._cp_restore_idx_cache) == {(16, cp, torch.device("cpu")), (32, cp, torch.device("cpu"))}
+
+
+def test_cp_restore_indices_uses_non_blocking_transfer():
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    engine = object.__new__(TorchTitanTPUEngine)
+    engine.parallel_dims = SimpleNamespace(cp=2)
+    engine._cp_restore_idx_cache = {}
+
+    to_calls = []
+    orig_to = torch.Tensor.to
+
+    def spy_to(self, *args, **kwargs):
+        if "device" in kwargs:
+            to_calls.append((kwargs["device"], kwargs.get("non_blocking", False)))
+        return orig_to(self, *args, **kwargs)
+
+    dev = torch.device("cpu")
+    with mock.patch.object(torch.Tensor, "to", spy_to):
+        idx = engine._cp_restore_indices(16, dev)
+        idx_again = engine._cp_restore_indices(16, dev)
+    assert idx_again is idx
+    assert to_calls == [(dev, True)]
+
+
+def test_bucket_num_sequences_and_packed_document_budget():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels
+
+    assert [tpu_model_kernels.bucket_num_sequences(n) for n in (0, 1, 2, 3, 4, 5, 8, 9)] == [1, 1, 2, 4, 4, 8, 8, 16]
+    # Unchanged document budget: one per sequence plus the padding tail, a power of two, at least the minimum.
+    minimum = tpu_model_kernels.MIN_PACKED_DOCUMENT_BUDGET
+    assert tpu_model_kernels.packed_document_budget(3) == minimum
+    assert tpu_model_kernels.packed_document_budget(minimum) == 2 * minimum
+    assert tpu_model_kernels.packed_document_budget(2 * minimum - 1) == 2 * minimum
+
+
+def _rows_mb(num_seqs):
+    ids = torch.nested.as_nested_tensor([torch.zeros(5, dtype=torch.int64)] * num_seqs, layout=torch.jagged)
+    return TensorDict({"input_ids": ids, "responses": ids}, batch_size=[num_seqs])
+
+
+def test_align_micro_batch_shapes_num_seqs_bucketing():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+
+    def padded_rows(mbs):
+        return [tu.get_non_tensor_data(m, "tpu_padded_num_seqs", None) for m in mbs]
+
+    # Off by default: no row target.
+    mbs = [_rows_mb(3), _rows_mb(2)]
+    tpu_utils.align_micro_batch_shapes_across_ranks(mbs, bucket_size=16)
+    assert padded_rows(mbs) == [None, None]
+    # Single process: the mini-batch's largest micro-batch, bucketed, for every micro-batch; at least the static rows.
+    tpu_utils.align_micro_batch_shapes_across_ranks(mbs, bucket_size=16, num_seqs_bucketing=True)
+    assert padded_rows(mbs) == [4, 4]
+    tpu_utils.align_micro_batch_shapes_across_ranks(mbs, bucket_size=16, num_seqs_bucketing=True, static_num_seqs=6)
+    assert padded_rows(mbs) == [6, 6]
+
+    # Several ranks: the row count joins the same all-reduce(MAX) as the lengths (one extra trailing entry).
+    reduced = []
+
+    def fake_all_reduce(tensor, op=None):
+        reduced.append(tensor.tolist())
+        other_rank = torch.zeros_like(tensor)
+        other_rank[-1] = 5  # another rank's micro-batch holds 5 sequences
+        tensor.copy_(torch.maximum(tensor, other_rank))
+
+    with (
+        mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+        mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+        mock.patch.object(torch.distributed, "all_reduce", side_effect=fake_all_reduce),
+    ):
+        mbs = [_rows_mb(3), _rows_mb(2)]
+        tpu_utils.align_micro_batch_shapes_across_ranks(mbs, bucket_size=16, num_seqs_bucketing=True)
+        assert len(reduced) == 1 and len(reduced[0]) == 2 * len(mbs) + 1 and reduced[0][-1] == 3
+        assert padded_rows(mbs) == [8, 8]
+        mbs = [_rows_mb(3), _rows_mb(2)]
+        tpu_utils.align_micro_batch_num_seqs(mbs, static_num_seqs=0)
+        assert reduced[-1] == [3] and padded_rows(mbs) == [8, 8]
+
+
+class _RecordingEngine:
+    """Records what ``forward_backward_batch`` hands each micro-batch's ``forward_step``."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, micro_batch, loss_function, forward_only, loss_scalars=None):
+        self.calls.append(
+            (
+                int(micro_batch.batch_size[0]),
+                tu.get_non_tensor_data(micro_batch, "tpu_padded_num_seqs", None),
+                loss_scalars,
+            )
+        )
+        return torch.tensor(0.0), {"loss": 0.0, "metrics": {}, "model_output": {}}
+
+
+def _fwd_bwd_engine(tpu_kwargs, *, simple_fsdp=False):
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngineWithLMHead
+
+    engine = object.__new__(TorchTitanTPUEngineWithLMHead)
+    engine.engine_config = SimpleNamespace(
+        tensor_parallel_size=1, context_parallel_size=1, engine_kwargs={"tpu": tpu_kwargs}, seq_bucket_size=None
+    )
+    engine.get_data_parallel_group = lambda: None
+    engine.get_data_parallel_size = lambda: 1
+    engine._use_simple_fsdp = simple_fsdp
+    engine.parallel_dims = SimpleNamespace(cp_enabled=False)
+    engine._tpu_kernels = frozenset()
+    engine._tpu_eager_mode = None
+    engine.trainer = SimpleNamespace(train_context=nullcontext)
+    engine.forward_step = _RecordingEngine()
+    return engine
+
+
+@pytest.mark.parametrize("simple_fsdp", [False, True])
+@pytest.mark.parametrize(
+    "loss_mode,tpu_kwargs,on_tpu,expected_rows",
+    [
+        ("vanilla", {}, True, 4),  # default on TPU: bucketed rows and a 0-D device batch_num_tokens
+        ("vanilla", {"static_micro_batch_num_seqs": 6}, True, 6),
+        ("vanilla", {"loss_row_bucketing": False}, True, None),  # opt-out
+        ("geo_mean", {}, True, None),  # pad rows would rescale geo_mean
+        ("vanilla", {}, False, 4),  # off TPU: rows still bucketed, batch_num_tokens stays a host number
+    ],
+)
+def test_forward_backward_batch_row_bucketing_and_loss_scalars(
+    simple_fsdp, loss_mode, tpu_kwargs, on_tpu, expected_rows
+):
+    from verl.workers.config import ActorConfig
+    from verl.workers.config.actor import PolicyLossConfig
+    from verl.workers.utils.losses import ppo_loss
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+    from verl_hardware_plugin.accelerators.tpu.losses import loss_inputs
+
+    config = ActorConfig(
+        strategy="fsdp", rollout_n=1, ppo_micro_batch_size_per_gpu=4, policy_loss=PolicyLossConfig(loss_mode=loss_mode)
+    )
+    loss_fn = functools.partial(ppo_loss, config=config)
+    data = TensorDict({"loss_mask": torch.ones(5, 4, dtype=torch.int64)}, batch_size=[5])
+    micro_batches = [_rows_mb(3), _rows_mb(2)]
+    engine = _fwd_bwd_engine(tpu_kwargs, simple_fsdp=simple_fsdp)
+    with (
+        mock.patch.object(torchtitan_tpu, "prepare_micro_batches", return_value=(micro_batches, None)),
+        mock.patch.object(torchtitan_tpu, "postprocess_batch_func", side_effect=lambda output_lst, **kw: output_lst),
+        mock.patch.object(torchtitan_tpu, "get_device_id", return_value=torch.device("cpu")),
+        mock.patch.object(loss_inputs, "accelerator_is_tpu", return_value=on_tpu),
+    ):
+        engine.forward_backward_batch(data, loss_fn, forward_only=True)
+    calls = engine.forward_step.calls
+    assert [(rows, padded) for rows, padded, _ in calls] == [(3, expected_rows), (2, expected_rows)]
+    scalars = calls[0][2]
+    assert all(call[2] is scalars for call in calls)  # computed once per mini-batch
+    if on_tpu:
+        assert set(scalars) == {"batch_num_tokens"}
+        assert scalars["batch_num_tokens"].shape == torch.Size([]) and float(scalars["batch_num_tokens"]) == 20.0
+    else:
+        assert scalars == {}
 
 
 def test_cp_attention_owner_dispatches_to_inner_attention_cp_shard():
@@ -3522,320 +3872,3 @@ def test_align_micro_batch_shapes_gdn_row_slot_len_multi_seq():
     slotted = ids_pad[slot_src]
     restored = slotted[contig_src]
     assert torch.equal(restored[:orig_len], ids.values())
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# static_micro_batch_seqs in TorchTitanTPUEngine.forward_backward_batch (CPU, toy model)
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-class _ToyPolicy:
-    """Log-prob of the label at packed position t: -softplus(theta[label_t] + w * position_t / 64), in float64.
-
-    It depends only on the token and its position in its sequence, so the padding never changes a real token's value.
-    """
-
-    def __init__(self):
-        gen = torch.Generator().manual_seed(7)
-        self.theta = (0.3 * torch.randn(64, generator=gen, dtype=torch.float64)).requires_grad_(True)
-        self.w = torch.tensor(0.2, dtype=torch.float64, requires_grad=True)
-
-    def forward_step(self, micro_batch, loss_function, calls, kernel):
-        """The engine's per-micro-batch path on CPU: pad, "model", trimmed view with the padded leaf, loss inputs."""
-        from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
-            TPU_PADDED_NUM_SEQS_KEY,
-            TPU_PADDED_VALUES_ATTR,
-        )
-        from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import prepare_tpu_loss_inputs
-
-        ids, positions, labels, orig = pad_packed_inputs_for_tpu(
-            micro_batch["input_ids"], micro_batch["position_ids"], micro_batch, "cpu", 32
-        )
-        padded = -torch.nn.functional.softplus(self.theta[labels] + self.w * positions.to(torch.float64) / 64)
-        offsets = micro_batch["input_ids"].offsets()
-        log_probs = torch.nested.nested_tensor_from_jagged(padded.detach()[:orig].clone(), offsets)
-        setattr(log_probs, TPU_PADDED_VALUES_ATTR, padded)
-        loss_output, loss_data = prepare_tpu_loss_inputs({"log_probs": log_probs}, micro_batch)
-        calls.append(
-            SimpleNamespace(
-                seqs=int(micro_batch.batch_size[0]),
-                rows=tuple(loss_data["advantages"].shape) if loss_function is not None else None,
-                padded_len=int(ids.shape[0]),
-                num_seqs_key=tu.get_non_tensor_data(micro_batch, TPU_PADDED_NUM_SEQS_KEY, None),
-                budget=kernel.max_num_segments,
-            )
-        )
-        if loss_function is None:
-            loss, metrics = torch.tensor(1.0), {}
-        else:
-            loss, metrics = loss_function(model_output=loss_output, data=loss_data)
-        model_output = {"log_probs": torch.nested.nested_tensor_from_jagged(padded.detach()[:orig].clone(), offsets)}
-        return loss, {"model_output": model_output, "loss": float(loss.detach()), "metrics": metrics}
-
-
-def _static_seqs_mini_batch(n, seed, max_prompt=20, max_response=40):
-    """A packed PPO mini-batch of ``n`` sequences for verl's dynamic micro-batching (256-token budget)."""
-    import random
-
-    from verl.utils.dataset.dataset_utils import DatasetPadMode
-
-    rng = random.Random(seed)
-    gen = torch.Generator().manual_seed(seed)
-    lengths = [(rng.randint(2, max_prompt), rng.randint(1, max_response)) for _ in range(n)]
-
-    def nested(rows):
-        return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
-
-    data = TensorDict(
-        {
-            "input_ids": nested([torch.randint(1, 50, (p + r,), generator=gen) for p, r in lengths]),
-            "position_ids": nested([torch.arange(p + r) for p, r in lengths]),
-            "prompts": nested([torch.randint(1, 50, (p,), generator=gen) for p, _ in lengths]),
-            "responses": nested([torch.randint(1, 50, (r,), generator=gen) for _, r in lengths]),
-            "response_mask": nested([torch.ones(r, dtype=torch.int64) for _, r in lengths]),
-            "loss_mask": nested(
-                [torch.cat([torch.zeros(p, dtype=torch.int64), torch.ones(r, dtype=torch.int64)]) for p, r in lengths]
-            ),
-            "old_log_probs": nested([(-0.5 - torch.rand(r, generator=gen)).double() for _, r in lengths]),
-            "advantages": nested([torch.randn(r, generator=gen).double() for _, r in lengths]),
-        },
-        batch_size=[n],
-    )
-    tu.assign_non_tensor(
-        data,
-        use_dynamic_bsz=True,
-        use_remove_padding=True,
-        pad_mode=DatasetPadMode.NO_PADDING,
-        max_token_len_per_gpu=256,
-        global_batch_size=n,
-        temperature=1.0,
-    )
-    return data
-
-
-def _ppo_loss_function(**actor_kwargs):
-    from verl.workers.config import ActorConfig
-    from verl.workers.utils.losses import ppo_loss
-
-    config = ActorConfig(
-        strategy="fsdp", rollout_n=8, ppo_micro_batch_size_per_gpu=4, loss_agg_mode="token-mean", **actor_kwargs
-    )
-    return functools.partial(ppo_loss, config=config)
-
-
-class _TokamaxGatedDeltaKernelStandIn(torch.nn.Module):
-    """Stands in for torchtitan's Tokamax GatedDeltaNet kernel module (matched by class name)."""
-
-    def __init__(self):
-        super().__init__()
-        self.max_num_segments = 1
-
-
-_TokamaxGatedDeltaKernelStandIn.__name__ = "TokamaxGatedDeltaKernel"
-
-
-@pytest.fixture
-def static_seqs_engine(monkeypatch):
-    """A TorchTitanTPUEngineWithLMHead without a model: the toy policy's forward step, one process, SimpleFSDP."""
-    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
-
-    monkeypatch.setattr(torchtitan_tpu, "tpu_synchronize", lambda *args, **kwargs: None)
-
-    def make(tpu_kwargs, kernels=frozenset({"kda"})):
-        toy, calls, kernel = _ToyPolicy(), [], _TokamaxGatedDeltaKernelStandIn()
-        engine = object.__new__(torchtitan_tpu.TorchTitanTPUEngineWithLMHead)
-        engine.engine_config = SimpleNamespace(
-            engine_kwargs={"tpu": {"seq_bucket_size": 32, **tpu_kwargs}},
-            tensor_parallel_size=1,
-            context_parallel_size=1,
-            data_parallel_shard_size=1,
-            data_parallel_replicate_size=1,
-        )
-        engine.parallel_dims = SimpleNamespace(cp_enabled=False, pp_enabled=False)
-        engine._use_simple_fsdp, engine._tpu_eager_mode, engine._simple_fsdp_loss_scale = True, None, None
-        engine._tpu_kernels = kernels
-        engine.module = [torch.nn.ModuleList([kernel])]
-        engine.trainer = SimpleNamespace(train_context=nullcontext)
-        engine.get_data_parallel_group = lambda: None
-        engine.forward_step = lambda micro_batch, loss_function, forward_only: toy.forward_step(
-            micro_batch, loss_function, calls, kernel
-        )
-        return engine, toy, calls
-
-    return make
-
-
-STATIC_8K_LIKE = {"static_micro_batch_len": 256, "static_max_response_len": 64}  # one packed shape, one width
-
-
-def test_static_micro_batch_seqs_pads_only_ppo_loss_rows_and_keeps_verls_partition(static_seqs_engine):
-    """The option tags every micro-batch of verl's ppo_loss; the partition, the loss and the grads stay the same."""
-    from verl.workers.utils.losses import ppo_loss
-
-    results = {}
-    for seqs in (None, 16):
-        engine, toy, calls = static_seqs_engine({**STATIC_8K_LIKE, "static_micro_batch_seqs": seqs})
-        output = engine.forward_backward_batch(_static_seqs_mini_batch(48, seed=3), _ppo_loss_function())
-        results[seqs] = (output, toy.theta.grad.clone(), toy.w.grad.clone(), calls)
-    (out_v, theta_v, w_v, calls_v), (out_s, theta_s, w_s, calls_s) = results[None], results[16]
-
-    assert [c.seqs for c in calls_s] == [c.seqs for c in calls_v]  # verl's partition, unchanged
-    assert len(calls_s) > 2 and len({c.seqs for c in calls_s}) > 1  # several micro-batches of varying sizes
-    assert max(c.seqs for c in calls_s) <= 16
-    assert {c.padded_len for c in calls_s} == {256}
-    assert {c.rows for c in calls_s} == {(16, 64)}  # one loss-row count and width
-    assert {c.rows for c in calls_v} == {(c.seqs, 64) for c in calls_v}
-    assert {c.num_seqs_key for c in calls_s} == {16} and {c.num_seqs_key for c in calls_v} == {None}
-    assert len(out_s["loss"]) == len(out_v["loss"])
-    for a, b in zip(out_s["loss"], out_v["loss"], strict=True):
-        assert a == pytest.approx(b, rel=1e-12, abs=1e-12)
-    torch.testing.assert_close(theta_s, theta_v, rtol=1e-12, atol=1e-14)
-    torch.testing.assert_close(w_s, w_v, rtol=1e-12, atol=1e-14)
-
-    # Any other loss keeps the exact rows: its padded inputs would lack the fields it reads.
-    def other_loss(config, model_output, data, dp_group=None):
-        return ppo_loss(config, model_output, data, dp_group)
-
-    engine, _, calls = static_seqs_engine({**STATIC_8K_LIKE, "static_micro_batch_seqs": 16})
-    engine.forward_backward_batch(
-        _static_seqs_mini_batch(48, seed=3),
-        functools.partial(other_loss, config=_ppo_loss_function().keywords["config"]),
-    )
-    assert {c.num_seqs_key for c in calls} == {None} and {c.rows for c in calls} == {(c.seqs, 64) for c in calls}
-
-
-def test_static_micro_batch_seqs_is_the_floor_of_the_gated_delta_net_document_budget(static_seqs_engine, monkeypatch):
-    """With Tokamax kda kernels the document budget is sized for N sequences, so it stays constant across calls."""
-    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
-
-    set_budget = torchtitan_tpu.tpu_model_kernels.set_packed_document_budget
-    updates = []
-
-    def recording_set_budget(modules, budget):
-        updated = set_budget(modules, budget)
-        updates.append((budget, updated))
-        return updated
-
-    monkeypatch.setattr(torchtitan_tpu.tpu_model_kernels, "set_packed_document_budget", recording_set_budget)
-    budget = torchtitan_tpu.tpu_model_kernels.packed_document_budget
-    long_seqs = _static_seqs_mini_batch(48, seed=3)  # at most 7 sequences per micro-batch
-    short_seqs = _static_seqs_mini_batch(96, seed=4, max_prompt=8, max_response=12)  # 16 or more
-
-    def run(engine):
-        engine.forward_backward_batch(long_seqs.clone(), _ppo_loss_function())
-        with torch.no_grad():  # compute_log_prob: no loss
-            engine.forward_backward_batch(short_seqs.clone(), None, forward_only=True)
-
-    engine, _, calls = static_seqs_engine({**STATIC_8K_LIKE, "static_micro_batch_seqs": 24})
-    run(engine)
-    counts = [max(c.seqs for c in calls if c.rows is not None), max(c.seqs for c in calls if c.rows is None)]
-    assert counts[0] < 16 <= counts[1] <= 24
-    assert updates == [(budget(24), 1), (budget(24), 0)]  # one budget; the second call recompiles nothing
-    assert {c.budget for c in calls} == {budget(24)} == {32}
-
-    # Without the option the budget follows the largest micro-batch, bucketed (main's behaviour): it changes here.
-    updates.clear()
-    engine, _, calls = static_seqs_engine(STATIC_8K_LIKE)
-    run(engine)
-    assert updates == [(budget(counts[0]), 1), (budget(counts[1]), 1)] == [(16, 1), (32, 1)]
-
-
-def test_static_micro_batch_seqs_warns_once_per_new_count_above_it(static_seqs_engine, caplog):
-    import logging
-
-    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
-
-    def warnings_in(records):
-        return [r.getMessage() for r in records if "static_micro_batch_seqs=" in r.getMessage()]
-
-    engine, _, calls = static_seqs_engine({**STATIC_8K_LIKE, "static_micro_batch_seqs": 2}, kernels=frozenset())
-    with caplog.at_level(logging.WARNING, logger=torchtitan_tpu.logger.name):
-        engine.forward_backward_batch(_static_seqs_mini_batch(48, seed=3), _ppo_loss_function())
-        first = warnings_in(caplog.records)
-        engine.forward_backward_batch(_static_seqs_mini_batch(48, seed=3), _ppo_loss_function())
-        second = warnings_in(caplog.records)
-    above = sorted({c.seqs for c in calls if c.seqs > 2})
-    assert above and len(first) == 1 and str(above) in first[0]
-    assert "PPO loss inputs keep their own row count" in first[0] and "GatedDeltaNet" not in first[0]
-    assert second == first  # the same counts again: no new warning
-    # Rows above N keep their own count; the others are padded to N.
-    assert {c.rows for c in calls} == {(max(c.seqs, 2), 64) for c in calls}
-
-    # A forward-only call (no loss) without Tokamax kernels: N changes no shape, so nothing to warn about.
-    engine, _, _ = static_seqs_engine({**STATIC_8K_LIKE, "static_micro_batch_seqs": 2}, kernels=frozenset())
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger=torchtitan_tpu.logger.name), torch.no_grad():
-        engine.forward_backward_batch(_static_seqs_mini_batch(48, seed=3), None, forward_only=True)
-    assert warnings_in(caplog.records) == []
-
-    # A forward-only call with Tokamax kernels: only the document budget follows the counts above N.
-    engine, _, _ = static_seqs_engine({**STATIC_8K_LIKE, "static_micro_batch_seqs": 2})
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger=torchtitan_tpu.logger.name), torch.no_grad():
-        engine.forward_backward_batch(_static_seqs_mini_batch(48, seed=3), None, forward_only=True)
-    messages = warnings_in(caplog.records)
-    assert len(messages) == 1 and "GatedDeltaNet document budget" in messages[0]
-    assert "PPO loss inputs" not in messages[0]
-
-
-def test_static_micro_batch_seqs_keeps_the_exact_rows_of_geo_mean(static_seqs_engine, caplog):
-    """geo_mean averages over every row: its loss inputs keep their exact rows, with one warning per engine."""
-    import logging
-
-    from verl.workers.config.actor import PolicyLossConfig
-    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
-
-    results = {}
-    for seqs in (None, 16):
-        engine, toy, calls = static_seqs_engine({**STATIC_8K_LIKE, "static_micro_batch_seqs": seqs})
-        caplog.clear()
-        with caplog.at_level(logging.WARNING, logger=torchtitan_tpu.logger.name):
-            for _ in range(2):  # the second call warns no more
-                loss_function = _ppo_loss_function(policy_loss=PolicyLossConfig(loss_mode="geo_mean"))
-                output = engine.forward_backward_batch(_static_seqs_mini_batch(48, seed=3), loss_function)
-        warnings = [r.getMessage() for r in caplog.records if "'geo_mean'" in r.getMessage()]
-        results[seqs] = (output["loss"], toy.theta.grad.clone(), calls, warnings)
-
-    loss_v, theta_v, _, warnings_v = results[None]
-    loss_s, theta_s, calls_s, warnings_s = results[16]
-    assert {c.num_seqs_key for c in calls_s} == {None}
-    assert {c.rows for c in calls_s} == {(c.seqs, 64) for c in calls_s}  # the exact rows
-    assert loss_s == pytest.approx(loss_v, rel=1e-12, abs=1e-12)
-    torch.testing.assert_close(theta_s, theta_v, rtol=1e-12, atol=1e-14)
-    assert warnings_v == [] and len(warnings_s) == 1 and "exact rows" in warnings_s[0]
-
-
-def test_static_micro_batch_seqs_keeps_the_engines_own_ppo_metrics(static_seqs_engine, monkeypatch):
-    """forward_step's own token-mean PPO metrics are the same with padding rows (the toy policy as the model)."""
-    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
-    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import TPU_PADDED_VALUES_ATTR
-
-    monkeypatch.setattr(torchtitan_tpu, "get_device_name", lambda: "cpu")
-    names = ("actor/ppo_kl_token_mean", "actor/ppo_k3_token_mean", "actor/logprob_gap_abs_token_mean")
-    results = {}
-    for seqs in (None, 16):
-        engine, toy, _ = static_seqs_engine({**STATIC_8K_LIKE, "static_micro_batch_seqs": seqs})
-        del engine.forward_step  # the engine's own forward_step, around the toy policy
-
-        def model_outputs(logits, output_args, micro_batch, toy=toy):
-            input_ids = micro_batch["input_ids"]
-            _, positions, labels, orig = pad_packed_inputs_for_tpu(
-                input_ids, micro_batch["position_ids"], micro_batch, "cpu", 32
-            )
-            padded = -torch.nn.functional.softplus(toy.theta[labels] + toy.w * positions.to(torch.float64) / 64)
-            log_probs = torch.nested.nested_tensor_from_jagged(padded.detach()[:orig].clone(), input_ids.offsets())
-            setattr(log_probs, TPU_PADDED_VALUES_ATTR, padded)
-            return {"log_probs": log_probs}
-
-        engine.prepare_model_inputs = lambda micro_batch: (None, {}, {}, {})
-        engine.model_forward_step = lambda **kwargs: None
-        engine.prepare_model_outputs = model_outputs
-        output = engine.forward_backward_batch(_static_seqs_mini_batch(48, seed=3), _ppo_loss_function())
-        values = {name: getattr(output["metrics"][name], "values", output["metrics"][name]) for name in names}
-        results[seqs] = (values, toy.theta.grad.clone())
-
-    (metrics_v, theta_v), (metrics_s, theta_s) = results[None], results[16]
-    assert len(metrics_v[names[0]]) > 2 and any(value > 0 for value in metrics_v[names[2]])
-    for name in names:
-        assert metrics_s[name] == pytest.approx(metrics_v[name], rel=1e-6, abs=1e-9), name
-    torch.testing.assert_close(theta_s, theta_v, rtol=1e-12, atol=1e-14)

@@ -297,7 +297,7 @@ def test_pack_rl_loss_targets_uses_verl_response_positions():
 
     # Same positions as the eager engine's loss-input gather (verl's no_padding_2_padding convention).
     width = micro_batch["response_mask"].shape[1]
-    index, valid = _response_gather_index(micro_batch, width, padded_len)
+    index, valid = _response_gather_index(micro_batch, width, padded_len, int(micro_batch.batch_size[0]))
     for packed, key in ((old_log_probs, "old_log_probs"), (advantages, "advantages"), (loss_mask, "response_mask")):
         torch.testing.assert_close(packed[index][valid], micro_batch[key][valid].float())
         outside = torch.ones(padded_len, dtype=torch.bool)
@@ -636,6 +636,65 @@ def test_graph_mode_step_matches_eager_ppo_loss_on_one_micro_batch():
     )
     with pytest.raises(RuntimeError, match="TODO-2"):
         engine._graph_trainer_forward_backward(data, [micro_batch], None, loss_fn, global_tokens)
+
+
+def test_graph_mode_step_uses_the_mini_batch_device_token_count():
+    """The traced step gets the engine's per-mini-batch 0-D token count (device_loss_scalars), the same tensor the
+    eager verl loss divides by, instead of building another one per micro-batch."""
+    padded_len = 48
+    micro_batch = _engine_micro_batch([3, 5, 2], [4, 6, 5], 1)
+    global_tokens = float(micro_batch["response_mask"].sum())
+    tu.assign_non_tensor(micro_batch, batch_num_tokens=global_tokens)
+    loss_fn = functools.partial(ppo_loss, config=_actor_config())
+
+    losses, seen = [], []
+    for scalars in (None, {"batch_num_tokens": torch.tensor(global_tokens)}):
+        torch.manual_seed(0)
+        engine = _graph_engine(_TinyLM(), padded_len)
+        step = engine.trainer.forward_backward_step
+
+        def record(*, input_dict, global_valid_tokens, step=step):
+            seen.append(global_valid_tokens)
+            return step(input_dict=input_dict, global_valid_tokens=global_valid_tokens)
+
+        engine.trainer.forward_backward_step = record
+        out = engine._graph_trainer_forward_backward(
+            micro_batch.copy(), [micro_batch], None, loss_fn, global_tokens, scalars
+        )
+        losses.append(out["loss"][0])
+    assert seen[1] is scalars["batch_num_tokens"]
+    assert float(seen[0]) == float(seen[1]) == global_tokens
+    assert losses[1] == pytest.approx(losses[0], rel=1e-6)
+
+
+def test_graph_mode_step_handles_zero_batch_num_tokens():
+    """``batch_num_tokens == 0`` (all response tokens masked out globally) gives finite ``0.0`` loss/grads and passes
+    ``check_loss_consistency`` both via ``device_loss_scalars`` and via the CPU fallback."""
+    from verl_hardware_plugin.accelerators.tpu.losses import loss_inputs
+
+    padded_len = 48
+    micro_batch = _engine_micro_batch([3, 5, 2], [4, 6, 5], 1)
+    micro_batch["response_mask"] = torch.zeros_like(micro_batch["response_mask"])
+    tu.assign_non_tensor(micro_batch, batch_num_tokens=0.0)
+    loss_fn = functools.partial(ppo_loss, config=_actor_config(policy_loss=_ActorConfig(loss_mode="vanilla")))
+
+    with mock.patch.object(loss_inputs, "accelerator_is_tpu", return_value=True):
+        tpu_scalars = loss_inputs.device_loss_scalars(micro_batch, torch.device("cpu"))
+    assert float(tpu_scalars["batch_num_tokens"]) == 1.0
+
+    for scalars in (None, {}, tpu_scalars):
+        torch.manual_seed(0)
+        model = _TinyLM()
+        engine = _graph_engine(model, padded_len)
+        out = engine._graph_trainer_forward_backward(micro_batch.copy(), [micro_batch], None, loss_fn, 0.0, scalars)
+        assert out["loss"] == [0.0]
+        assert engine.trainer.calls == [((padded_len,), 1.0)]
+        for p in model.parameters():
+            assert p.grad is not None and torch.isfinite(p.grad).all() and float(p.grad.abs().max()) == 0.0
+        for name in ("actor/ppo_kl_token_mean", "actor/ppo_k3_token_mean", "actor/logprob_gap_abs_token_mean"):
+            metric = out["metrics"][name]
+            val = metric.aggregate() if hasattr(metric, "aggregate") else float(metric)
+            assert val == 0.0
 
 
 def test_build_graph_trainer_config():

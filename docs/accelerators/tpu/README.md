@@ -111,7 +111,7 @@ replacement. verl's `TorchtitanEngineConfig` has no `engine_kwargs` field yet; t
 
 | Component | Where the options go | Read by | Options |
 |-----------|----------------------|---------|---------|
-| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `static_max_response_len`, `static_micro_batch_seqs`, `splash_max_block_size`, `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `trainer_mode`, `graph_trainer`, `context_parallel_strategy`, `qwen3_pallas_experts`, `moe_paired_gemm`; see [Training Engine](./engine.md) |
+| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`, `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `trainer_mode`, `graph_trainer`, `context_parallel_strategy`, `qwen3_pallas_experts`, `moe_paired_gemm`; see [Training Engine](./engine.md) |
 | Rollout (vLLM on TPU) | `actor_rollout_ref.rollout.engine_kwargs.vllm.*` | verl core, passed to vLLM as is | vLLM engine arguments. The TPU replica forces `enable_sleep_mode=False` and keeps upstream's `distributed_executor_backend=mp`; there are no TPU-only rollout options. |
 | Weight sync | `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.*` | verl core passes them to the checkpoint engine's constructor; `options.py`: `TPUSyncOptions` | `tpu-sync`: `parallelism`, `verify_parity`, `release_buffers_after_sync`, `tie_word_embeddings`, `return_after_d2h`; `ray-plasma-store`: none. See [Weight Sync](./weight_sync.md#configuration) |
 
@@ -168,7 +168,8 @@ A pool that uses part of a slice, and a Ray trainer pool, whose mesh is resolved
 The generation comes from the `ray.io/tpu-pod-type` node label of the pool's hosts or
 from `TPU_ACCELERATOR_TYPE`; set `TORCH_TPU_TOPOLOGY='x,y,z,cores'` to override. Rollout engines on TPU 7x
 use one worker per TensorCore, e.g. a TP=8 engine per host; on every generation an engine's mesh is its
-own worker count.
+own worker count. A TP=2 or TP=4 rollout engine on one TPU 7x host takes `1,1,1,2` (one chip) or `1,2,1,2`
+(two chips) from `TPU_V7X_SUBHOST_TOPOLOGY_MAP`.
 
 ### Device memory
 

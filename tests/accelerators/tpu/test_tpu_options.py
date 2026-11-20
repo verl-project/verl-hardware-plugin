@@ -110,6 +110,31 @@ def test_resolvers_read_engine_kwargs():
     assert get_tpu_seq_bucket_size(_cfg(pad_to_length=True, pad_to_length_bucket=512)) == 512
 
 
+def test_loss_row_bucketing_and_static_micro_batch_num_seqs_options():
+    assert get_tpu_engine_options(_cfg()).loss_row_bucketing is None
+    assert get_tpu_engine_options(_cfg()).static_micro_batch_num_seqs is None
+
+    opts = get_tpu_engine_options(_cfg({"loss_row_bucketing": "false", "static_micro_batch_num_seqs": "8"}))
+    assert opts.loss_row_bucketing is False
+    assert opts.static_micro_batch_num_seqs == 8
+
+    opts_on = get_tpu_engine_options(_cfg({"loss_row_bucketing": True, "static_micro_batch_num_seqs": 1}))
+    assert opts_on.loss_row_bucketing is True
+    assert opts_on.static_micro_batch_num_seqs == 1
+
+    for bad_bool in ("maybe", 2):
+        with pytest.raises(ValueError, match="loss_row_bucketing"):
+            get_tpu_engine_options(_cfg({"loss_row_bucketing": bad_bool}))
+
+    for bad_seqs in (0, -1, -8, "0", "-3", True, False):
+        with pytest.raises(ValueError, match="static_micro_batch_num_seqs"):
+            get_tpu_engine_options(_cfg({"static_micro_batch_num_seqs": bad_seqs}))
+
+    for bad_direct in (0, -1, True, False):
+        with pytest.raises(ValueError, match="static_micro_batch_num_seqs"):
+            TPUEngineOptions(static_micro_batch_num_seqs=bad_direct)  # type: ignore[arg-type]
+
+
 def test_legacy_field_and_env_still_work_with_a_warning(monkeypatch, caplog):
     legacy = _cfg(use_torch_compile=True, use_splash_attention=None, use_simple_fsdp=False, tpu_eager_mode=None)
     with caplog.at_level(logging.WARNING, logger=tpu_options.__name__):
@@ -283,15 +308,3 @@ def test_ac_save_splash_and_routing_option():
         SimpleNamespace(engine_kwargs={"tpu": {"ac_save_splash_and_routing": False}})
     )
     assert opts_off.ac_save_splash_and_routing is False
-
-
-def test_static_micro_batch_seqs_option():
-    assert get_tpu_engine_options(_cfg()).static_micro_batch_seqs is None
-    # Command-line overrides may arrive as strings.
-    assert get_tpu_engine_options(_cfg({"static_micro_batch_seqs": "64"})).static_micro_batch_seqs == 64
-    assert get_tpu_engine_options(_cfg({"static_micro_batch_seqs": 64})) == TPUEngineOptions(static_micro_batch_seqs=64)
-    for bad in (0, -1, True, "x"):
-        with pytest.raises(ValueError, match="Invalid TPU engine option static_micro_batch_seqs"):
-            get_tpu_engine_options(_cfg({"static_micro_batch_seqs": bad}))
-    with pytest.raises(ValueError, match="Unknown TPU engine option"):
-        get_tpu_engine_options(_cfg({"static_micro_batch_seq": 64}))
