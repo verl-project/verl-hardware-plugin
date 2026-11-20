@@ -32,6 +32,7 @@ verl_hardware_plugin/accelerators/tpu/
 ├── engines/                          # verl core: verl/workers/engine/
 │   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SimpleFSDP, SPMD)
 │   ├── graph_trainer_mode.py         # Opt-in trainer_mode=graph_trainer: TorchTitan TpuGraphTrainer whole-step compile
+│   ├── host_sync.py                  # Opt-in defer_metric_sync: one batched read of the step's losses and metrics
 │   ├── tpu_utils.py                  # Attention, SimpleFSDP, compile and sequence-bucketing helpers; option resolvers
 │   ├── fused_logprob.py              # Fused LM-head log-prob: Tokamax forward kernel + chunked PyTorch backward
 │   └── weight_export.py              # Exports the engine's weights as local FSDP shards or full tensors
@@ -66,6 +67,7 @@ tests/accelerators/tpu/
 ├── test_tpu_allreduce_patch.py       # patches/reduce_avg_allreduce_patch.py
 ├── test_tpu_engine.py                # platform_tpu.py and engines/ (torchtitan_tpu, tpu_utils, weight_export)
 ├── test_tpu_graph_trainer_mode.py    # engines/graph_trainer_mode.py and fused_logprob.py tracing
+├── test_tpu_host_sync.py             # engines/host_sync.py and forward_backward_batch with defer_metric_sync on / off
 ├── test_tpu_options.py               # options.py (engine_kwargs.tpu, engine_kwargs.tpu-sync, deprecated env vars)
 ├── test_tpu_loss_inputs.py           # losses/loss_inputs.py
 ├── test_tpu_vllm_rollout.py          # rollout/tpu_vllm.py
@@ -111,7 +113,7 @@ replacement. verl's `TorchtitanEngineConfig` has no `engine_kwargs` field yet; t
 
 | Component | Where the options go | Read by | Options |
 |-----------|----------------------|---------|---------|
-| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`, `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `trainer_mode`, `graph_trainer`, `context_parallel_strategy`, `qwen3_pallas_experts`, `moe_paired_gemm`; see [Training Engine](./engine.md) |
+| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`, `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `trainer_mode`, `graph_trainer`, `defer_metric_sync`, `context_parallel_strategy`, `qwen3_pallas_experts`, `moe_paired_gemm`; see [Training Engine](./engine.md) |
 | Rollout (vLLM on TPU) | `actor_rollout_ref.rollout.engine_kwargs.vllm.*` | verl core, passed to vLLM as is | vLLM engine arguments. The TPU replica forces `enable_sleep_mode=False` and keeps upstream's `distributed_executor_backend=mp`; there are no TPU-only rollout options. |
 | Weight sync | `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.*` | verl core passes them to the checkpoint engine's constructor; `options.py`: `TPUSyncOptions` | `tpu-sync`: `parallelism`, `verify_parity`, `release_buffers_after_sync`, `tie_word_embeddings`, `return_after_d2h`; `ray-plasma-store`: none. See [Weight Sync](./weight_sync.md#configuration) |
 

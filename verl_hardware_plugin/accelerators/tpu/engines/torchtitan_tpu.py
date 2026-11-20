@@ -1636,7 +1636,6 @@ class TorchTitanTPUEngine(BaseEngine):
         if graph_mode:
             return self._graph_trainer_forward_backward(data, micro_batches, indices, loss_function, batch_num_tokens)
 
-        output_lst = []
         ctx = torch.no_grad() if forward_only else nullcontext()
         timeline_ctx = (
             timeline.span(
@@ -1656,16 +1655,33 @@ class TorchTitanTPUEngine(BaseEngine):
             row_ctx = set_unflatten_seq_len(self._gdn_row_slot_len)
         else:
             row_ctx = nullcontext()
-        # VERL_TPU_DEFER_METRIC_SYNC=1: keep each micro-batch's loss and scalar metrics on the device and read them
-        # back once after the loop (engines/host_sync.py), instead of a blocking .item() between forward and backward.
-        defer_scalars = host_sync.defer_metric_sync_enabled()
-        mb_sync_wait = host_sync.micro_batch_sync_wait()
-        with (
-            timeline_ctx,
-            tpu_eager_mode_context(self._tpu_eager_mode),
-            row_ctx,
-            host_sync.defer_metric_items(defer_scalars),
-        ):
+        # engine_kwargs.tpu.defer_metric_sync: forward_step keeps the loss on the device instead of a blocking .item()
+        # between forward and backward; the step's deferred scalars are read back once after the loop (host_sync.py).
+        defer_scalars = bool(tpu_options.defer_metric_sync)
+        if defer_scalars:
+            host_sync.warn_if_metrics_not_deferred()
+        self._defer_scalar_reads = defer_scalars
+        try:
+            output_lst = self._run_micro_batches(micro_batches, loss_function, forward_only, ctx, timeline_ctx, row_ctx)
+        finally:
+            self._defer_scalar_reads = False
+        if defer_scalars:
+            host_sync.materialize_step_scalars(output_lst)
+
+        return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+
+    def _run_micro_batches(
+        self,
+        micro_batches: list[TensorDict],
+        loss_function: Callable,
+        forward_only: bool,
+        ctx: Any,
+        timeline_ctx: Any,
+        row_ctx: Any,
+    ) -> list[dict[str, Any]]:
+        """Forward (and backward) of every micro-batch of the eager trainer; returns the ``forward_step`` outputs."""
+        output_lst = []
+        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), row_ctx:
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                     loss, output = self.forward_step(
@@ -1678,14 +1694,11 @@ class TorchTitanTPUEngine(BaseEngine):
                             tpu_synchronize(loss, wait=False)
                             loss.backward()
                             del loss
-                            tpu_synchronize(wait=mb_sync_wait)
+                            tpu_synchronize(wait=True)
                     else:
                         del loss
                 output_lst.append(output)
-        if defer_scalars:
-            host_sync.materialize_host_scalars(output_lst)
-
-        return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        return output_lst
 
     def _graph_trainer_forward_backward(
         self,
@@ -2757,8 +2770,8 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
                 output = {
                     "model_output": detach_tree(model_output),
-                    # A 0-d device tensor under VERL_TPU_DEFER_METRIC_SYNC=1, read back after the micro-batch loop.
-                    "loss": loss.detach() if host_sync.defer_metric_sync_enabled() else loss.detach().item(),
+                    # engine_kwargs.tpu.defer_metric_sync: a 0-d device tensor, read back after the micro-batch loop.
+                    "loss": loss.detach() if getattr(self, "_defer_scalar_reads", False) else loss.detach().item(),
                     "metrics": metrics,
                 }
 

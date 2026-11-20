@@ -237,6 +237,12 @@ class TPUEngineOptions:
         graph_trainer: Settings passed straight to TorchTitan's ``TpuGraphTrainerCompileConfig(**cfg)``
             (e.g. ``memory_policy``, ``save_regions``, ``fsdp_barrier_policy``, ``graph_split``).
             Ignored when ``trainer_mode`` is not ``graph_trainer``.
+        defer_metric_sync: Eager trainer: keep each micro-batch's loss on the device instead of reading it back
+            with ``.item()`` between its forward and backward, and read all of the step's deferred losses and
+            ``Metric`` values back once after the micro-batch loop, in one batched transfer (``engines/host_sync.py``,
+            default: ``False``). The scalar PPO loss metrics are deferred only with a verl whose ``Metric`` keeps
+            device tensors (verl-project/verl#8776); with an older verl the host still blocks on them once per
+            micro-batch. Logged values are unchanged. ``trainer_mode=graph_trainer`` ignores it.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -272,6 +278,7 @@ class TPUEngineOptions:
     frozen_param_regex: Optional[str] = None
     trainer_mode: Optional[str] = None
     graph_trainer: Optional[dict[str, Any]] = None
+    defer_metric_sync: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, Any] = {
@@ -308,6 +315,7 @@ _ENGINE_KINDS: dict[str, Any] = {
     "frozen_param_regex": str,
     "trainer_mode": str,
     "graph_trainer": dict,
+    "defer_metric_sync": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 

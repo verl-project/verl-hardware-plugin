@@ -1,138 +1,102 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Deferring the per-micro-batch host syncs of ``forward_backward_batch`` (``VERL_TPU_DEFER_METRIC_SYNC=1``).
+"""Deferred host reads of each micro-batch's loss and metrics (``engine_kwargs.tpu.defer_metric_sync``).
 
-Every micro-batch of the eager engine reads several 0-d device tensors back to the host before its backward runs:
-``loss.detach().item()`` in ``forward_step`` and verl's ``Metric.append``, which calls ``.item()`` on each scalar
-tensor metric of ``ppo_loss`` (``actor/pg_loss``, ``actor/pg_clipfrac``, ``actor/ppo_kl``, ...). The first of them
-blocks the host until the whole micro-batch forward has run on the device, so the device then idles while the host
-dispatches the backward. With the flag on, those scalars stay on the device during the micro-batch loop and are read
-back once afterwards, grouped by dtype, in one stacked transfer per dtype (:func:`materialize_host_scalars`).
+By default ``forward_step`` reads every micro-batch's loss back with ``loss.detach().item()``. That blocks the host
+until the micro-batch forward has finished on the device, and only then is the backward dispatched, so the device
+idles while the host traces and dispatches it.
 
-The reported loss and metrics are unchanged: the same tensors, read later. Off by default.
+With ``defer_metric_sync=True`` the loss stays a 0-d device tensor during the micro-batch loop, and
+:func:`materialize_step_scalars` reads all deferred scalars back after the loop, in one batched transfer per
+(device, dtype). The reported values are unchanged: the same tensors, read later.
+
+The scalar *metrics* of verl's PPO loss are a separate matter: they are deferred by verl itself, whose ``Metric``
+keeps device tensors and reads them lazily, and whose policy losses return tensor metrics (verl-project/verl#8776).
+With a verl release from before that change, ``Metric`` and the policy losses still call ``.item()`` inside the loss
+function, so only the loss read is deferred and the host still blocks once per micro-batch (a one-time warning
+says so). This module does not patch verl.
 """
 
 from __future__ import annotations
 
-import contextlib
+import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import torch
 
-DEFER_METRIC_SYNC_ENV = "VERL_TPU_DEFER_METRIC_SYNC"
-MB_SYNC_WAIT_ENV = "VERL_TPU_MB_SYNC_WAIT"
+from verl.utils.metric import Metric
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_warned_legacy_verl = False
 
 
-def defer_metric_sync_enabled() -> bool:
-    """Whether ``VERL_TPU_DEFER_METRIC_SYNC=1`` keeps micro-batch scalars on the device until the loop ends."""
-    return os.environ.get(DEFER_METRIC_SYNC_ENV, "0") == "1"
+def verl_defers_metric_reads() -> bool:
+    """Whether the installed verl's ``Metric`` keeps scalar tensors on the device until they are read."""
+    return hasattr(Metric, "materialize_all")
 
 
-def micro_batch_sync_wait() -> bool:
-    """Whether each micro-batch's backward is waited for (``VERL_TPU_MB_SYNC_WAIT``, default ``1``).
+def warn_if_metrics_not_deferred() -> None:
+    """Warns once when ``defer_metric_sync`` can only defer the loss read (verl before verl-project/verl#8776)."""
+    global _warned_legacy_verl
+    if not _warned_legacy_verl and not verl_defers_metric_reads():
+        _warned_legacy_verl = True
+        logger.warning(
+            "engine_kwargs.tpu.defer_metric_sync: the installed verl reads PPO loss metrics with .item() inside the "
+            "loss function, so the host still blocks once per micro-batch; only the loss read is deferred. A verl "
+            "with lazy Metric values (verl-project/verl#8776) removes that sync too."
+        )
 
-    ``0`` only dispatches the backward (``tpu_synchronize(wait=False)``), so the host prepares the next micro-batch
-    while the device still runs this one.
-    """
-    return os.environ.get(MB_SYNC_WAIT_ENV, "1") != "0"
+
+def _scalars_to_host_fallback(tensors: Sequence[torch.Tensor]) -> list[Any]:
+    """``[t.item() for t in tensors]`` with one stacked transfer per (device, dtype), for verl without it."""
+    host: list[Any] = [None] * len(tensors)
+    groups: dict[tuple[torch.device, torch.dtype], list[int]] = {}
+    for i, t in enumerate(tensors):
+        if type(t) is torch.Tensor and t.numel() == 1:
+            groups.setdefault((t.device, t.dtype), []).append(i)
+        else:  # DTensor and other subclasses: read one by one, exactly as .item() did
+            host[i] = t.detach().item()
+    with torch.no_grad():
+        for idx in groups.values():
+            group = [tensors[i].detach().reshape(()) for i in idx]
+            # Pad to a power of two (repeating a tensor) so a varying micro-batch count compiles few stack shapes.
+            group += group[:1] * ((1 << (len(group) - 1).bit_length()) - len(group))
+            for i, v in zip(idx, torch.stack(group).cpu().tolist(), strict=False):
+                host[i] = v
+    return host
 
 
-@contextlib.contextmanager
-def defer_metric_items(enabled: bool = True) -> Iterator[None]:
-    """Makes ``verl.utils.metric.Metric.append`` keep scalar tensors instead of calling ``.item()`` on them.
-
-    Only for the duration of the context, and only in this process; :func:`materialize_host_scalars` must convert
-    the kept tensors before the metrics leave the engine (they are pickled for ``all_gather_object``).
-    """
-    if not enabled:
-        yield
-        return
-    from verl.utils.metric import Metric
-
-    original_append = Metric.append
-
-    def _append(self, value):
-        if isinstance(value, torch.Tensor):
-            if value.numel() != 1:
-                raise ValueError("Only scalar tensors can be converted to float")
-            self.values.append(value.detach().reshape(()))
-            return
-        return original_append(self, value)
-
-    Metric.append = _append
+def _materialize(scalars: list[Any], metrics: Iterable[Metric]) -> None:
     try:
-        yield
-    finally:
-        Metric.append = original_append
-
-
-def _collect(obj: Any, found: list[torch.Tensor]) -> None:
-    from verl.utils.metric import Metric
-
-    if isinstance(obj, torch.Tensor):
-        if obj.numel() == 1:
-            found.append(obj)
-    elif isinstance(obj, Metric):
-        for v in obj.values:
-            _collect(v, found)
-    elif isinstance(obj, dict):
-        for v in obj.values():
-            _collect(v, found)
-    elif isinstance(obj, list | tuple):
-        for v in obj:
-            _collect(v, found)
-
-
-def _replace(obj: Any, values: dict[int, Any]) -> Any:
-    from verl.utils.metric import Metric
-
-    if isinstance(obj, torch.Tensor):
-        return values.get(id(obj), obj)
-    if isinstance(obj, Metric):
-        obj.values = [_replace(v, values) for v in obj.values]
-        return obj
-    if isinstance(obj, dict):
-        for k in list(obj.keys()):
-            obj[k] = _replace(obj[k], values)
-        return obj
-    if isinstance(obj, list):
-        obj[:] = [_replace(v, values) for v in obj]
-        return obj
-    if isinstance(obj, tuple):
-        return tuple(_replace(v, values) for v in obj)
-    return obj
+        from verl.utils.metric import materialize_scalars
+    except ImportError:  # verl before verl-project/verl#8776: Metric values are already Python numbers
+        slots = [i for i, v in enumerate(scalars) if isinstance(v, torch.Tensor)]
+        for i, v in zip(slots, _scalars_to_host_fallback([scalars[i] for i in slots]), strict=True):
+            scalars[i] = v
+        return
+    materialize_scalars(scalars, metrics=metrics)
 
 
 @torch.no_grad()
-def materialize_host_scalars(output_lst: list[dict[str, Any]]) -> None:
-    """Replaces every scalar tensor of the outputs' ``loss`` and ``metrics`` with a Python number, in place.
+def materialize_step_scalars(output_lst: list[dict[str, Any]]) -> None:
+    """Reads the deferred ``loss`` and ``Metric`` values of ``forward_step`` outputs back to the host, in place.
 
-    The tensors are stacked per (device, dtype) and copied to the host once per group, i.e. one D2H transfer (and one
-    small device program) per group instead of one blocking ``.item()`` per scalar. ``model_output`` is untouched.
+    Only the ``loss`` entries and the values held by ``Metric`` objects in ``metrics`` are converted, i.e. exactly
+    what ``.item()`` would have converted with the option off; anything else (``model_output``, raw tensors in
+    ``metrics``) is left as is.
     """
-    found: list[torch.Tensor] = []
+    with_loss = [o for o in output_lst if "loss" in o]
+    losses = [o["loss"] for o in with_loss]
+    metrics: dict[int, Metric] = {}
     for o in output_lst:
-        _collect(o.get("loss"), found)
-        _collect(o.get("metrics"), found)
-    if not found:
-        return
-    groups: dict[tuple[str, torch.dtype], list[torch.Tensor]] = {}
-    seen: set[int] = set()
-    for t in found:
-        if id(t) in seen:
-            continue
-        seen.add(id(t))
-        groups.setdefault((str(t.device), t.dtype), []).append(t)
-    values: dict[int, Any] = {}
-    for tensors in groups.values():
-        host = torch.stack([t.detach().reshape(()) for t in tensors]).cpu().tolist()
-        for t, v in zip(tensors, host, strict=True):
-            values[id(t)] = v
-    for o in output_lst:
-        if "loss" in o:
-            o["loss"] = _replace(o["loss"], values)
-        if "metrics" in o:
-            o["metrics"] = _replace(o["metrics"], values)
+        for value in (o.get("metrics") or {}).values():
+            if isinstance(value, Metric):
+                metrics.setdefault(id(value), value)
+    _materialize(losses, metrics.values())
+    for o, loss in zip(with_loss, losses, strict=True):
+        o["loss"] = loss
