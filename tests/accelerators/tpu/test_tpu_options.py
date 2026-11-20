@@ -93,6 +93,11 @@ def test_engine_kwargs_are_parsed_and_typed():
         ({"param_dtype": "float16"}, "param_dtype must be float32 or bfloat16"),
         ({"fp32_master": True}, "fp32_master needs param_dtype=bfloat16"),
         ({"param_dtype": "float32", "fp32_master": True}, "fp32_master needs param_dtype=bfloat16"),
+        ({"context_parallel_strategy": "ring"}, "context_parallel_strategy must be one of"),
+        (
+            {"context_parallel_gdn_strategy": "all_to_all", "context_parallel_gdn_reduce_dtype": "bfloat16"},
+            "context_parallel_gdn_reduce_dtype only applies when",
+        ),
     ],
 )
 def test_bad_engine_kwargs_raise(tpu, match):
@@ -108,6 +113,31 @@ def test_resolvers_read_engine_kwargs():
     assert resolve_tpu_use_fused_linear_cross_entropy(no_fused) is False
     assert get_tpu_seq_bucket_size(_cfg({"seq_bucket_size": 128}, pad_to_length=True, pad_to_length_bucket=512)) == 128
     assert get_tpu_seq_bucket_size(_cfg(pad_to_length=True, pad_to_length_bucket=512)) == 512
+
+
+def test_loss_row_bucketing_and_static_micro_batch_num_seqs_options():
+    assert get_tpu_engine_options(_cfg()).loss_row_bucketing is None
+    assert get_tpu_engine_options(_cfg()).static_micro_batch_num_seqs is None
+
+    opts = get_tpu_engine_options(_cfg({"loss_row_bucketing": "false", "static_micro_batch_num_seqs": "8"}))
+    assert opts.loss_row_bucketing is False
+    assert opts.static_micro_batch_num_seqs == 8
+
+    opts_on = get_tpu_engine_options(_cfg({"loss_row_bucketing": True, "static_micro_batch_num_seqs": 1}))
+    assert opts_on.loss_row_bucketing is True
+    assert opts_on.static_micro_batch_num_seqs == 1
+
+    for bad_bool in ("maybe", 2):
+        with pytest.raises(ValueError, match="loss_row_bucketing"):
+            get_tpu_engine_options(_cfg({"loss_row_bucketing": bad_bool}))
+
+    for bad_seqs in (0, -1, -8, "0", "-3", True, False):
+        with pytest.raises(ValueError, match="static_micro_batch_num_seqs"):
+            get_tpu_engine_options(_cfg({"static_micro_batch_num_seqs": bad_seqs}))
+
+    for bad_direct in (0, -1, True, False):
+        with pytest.raises(ValueError, match="static_micro_batch_num_seqs"):
+            TPUEngineOptions(static_micro_batch_num_seqs=bad_direct)  # type: ignore[arg-type]
 
 
 def test_legacy_field_and_env_still_work_with_a_warning(monkeypatch, caplog):
@@ -146,28 +176,56 @@ def test_tpu_sync_options_are_parsed_and_typed():
     assert get_tpu_sync_options(None) == TPUSyncOptions()
     assert get_tpu_sync_options({}) == TPUSyncOptions(
         parallelism=8,
+        group_size=16,
         verify_parity="off",
         release_buffers_after_sync=True,
         tie_word_embeddings=None,
         return_after_d2h=True,
+        receive_into_vllm="auto",
+        direct_install_quantized_moe=True,
     )
     # Command-line overrides may arrive as strings.
     options = get_tpu_sync_options(
         {
             "parallelism": "4",
+            "group_size": "128",
             "verify_parity": "true",
             "release_buffers_after_sync": "0",
             "tie_word_embeddings": 1,
             "return_after_d2h": "false",
+            "receive_into_vllm": "false",
+            "direct_install_quantized_moe": "false",
         }
     )
     assert options == TPUSyncOptions(
         parallelism=4,
+        group_size=128,
         verify_parity="norm",
         release_buffers_after_sync=False,
         tie_word_embeddings=True,
         return_after_d2h=False,
+        receive_into_vllm="off",
+        direct_install_quantized_moe=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "auto"),
+        ("auto", "auto"),
+        (" AUTO ", "auto"),
+        (True, "on"),
+        ("true", "on"),
+        ("on", "on"),
+        (False, "off"),
+        ("false", "off"),
+        ("off", "off"),
+    ],
+)
+def test_tpu_sync_receive_into_vllm_modes(value, expected):
+    options = get_tpu_sync_options({} if value is None else {"receive_into_vllm": value})
+    assert options.receive_into_vllm == expected
 
 
 @pytest.mark.parametrize(
@@ -188,7 +246,9 @@ def test_tpu_sync_verify_parity_modes(value, mode, norms, exact):
     assert (options.verify_parity, options.verify_norms, options.verify_exact) == (mode, norms, exact)
 
 
-@pytest.mark.parametrize("kwargs", [{"paralelism": 4}, {"parallelism": 0}, {"verify_parity": "maybe"}])
+@pytest.mark.parametrize(
+    "kwargs", [{"paralelism": 4}, {"parallelism": 0}, {"group_size": 0}, {"verify_parity": "maybe"}]
+)
 def test_tpu_sync_options_reject_unknown_keys_and_bad_values(kwargs):
     with pytest.raises(ValueError, match="engine_kwargs.tpu-sync"):
         get_tpu_sync_options(kwargs)
@@ -261,3 +321,106 @@ def test_ac_save_splash_and_routing_option():
         SimpleNamespace(engine_kwargs={"tpu": {"ac_save_splash_and_routing": False}})
     )
     assert opts_off.ac_save_splash_and_routing is False
+
+
+def test_rollout_fp8_moe_option():
+    from types import SimpleNamespace
+
+    # Default unset: neither flag is forced.
+    opts = tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {}}))
+    assert opts.rollout_expert_parallel is None and opts.rollout_fp8_moe is None
+
+    # rollout_fp8_moe=True implies rollout_expert_parallel=True when unset.
+    opts_on = tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"rollout_fp8_moe": True}}))
+    assert opts_on.rollout_fp8_moe is True and opts_on.rollout_expert_parallel is True
+
+    # Explicit rollout_fp8_moe=False leaves rollout_expert_parallel untouched.
+    opts_off = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(engine_kwargs={"tpu": {"rollout_expert_parallel": True, "rollout_fp8_moe": False}})
+    )
+    assert opts_off.rollout_expert_parallel is True and opts_off.rollout_fp8_moe is False
+
+    # Conflicting rollout_fp8_moe=True + rollout_expert_parallel=False fails loudly.
+    with pytest.raises(ValueError, match="rollout_fp8_moe=True conflicts with rollout_expert_parallel=False"):
+        tpu_options.get_tpu_engine_options(
+            SimpleNamespace(engine_kwargs={"tpu": {"rollout_expert_parallel": False, "rollout_fp8_moe": True}})
+        )
+
+
+def test_context_parallel_strategy_and_gdn_option_validation():
+    opts = tpu_options.get_tpu_engine_options(
+        _cfg(
+            {
+                "context_parallel_strategy": " ALL_GATHER ",
+                "context_parallel_gdn_strategy": " ALLGATHER_REDUCESCATTER ",
+                "context_parallel_gdn_reduce_dtype": " BFLOAT16 ",
+            }
+        )
+    )
+    assert opts.context_parallel_strategy == "all_gather"
+    assert opts.context_parallel_gdn_strategy == "allgather_reducescatter"
+    assert opts.context_parallel_gdn_reduce_dtype == "bfloat16"
+
+    for tpu_dict in (
+        {"context_parallel_gdn_strategy": "all_to_all"},
+        {"context_parallel_gdn_reduce_dtype": "float32"},
+    ):
+        with pytest.raises(ValueError, match="context_parallel_size > 1"):
+            resolve_tpu_torchtitan_options(_cfg(tpu_dict, context_parallel_size=1, use_torch_compile=False))
+
+
+def test_cp_gdn_slot_and_static_logprob_options():
+    opts = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(
+            engine_kwargs={
+                "tpu": {
+                    "cp_full_positions": "true",
+                    "gdn_auto_row_slot_len": "32768",
+                    "fuse_gdn_projections": True,
+                    "sort_micro_batches_by_slot": "1",
+                    "static_log_prob_micro_batch_len": 65536,
+                }
+            }
+        )
+    )
+    assert opts.cp_full_positions is True
+    assert opts.gdn_auto_row_slot_len == 32768
+    assert opts.fuse_gdn_projections is True
+    assert opts.sort_micro_batches_by_slot is True
+    assert opts.static_log_prob_micro_batch_len == 65536
+
+    with pytest.raises(ValueError, match="Invalid TPU engine option gdn_auto_row_slot_len"):
+        tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"gdn_auto_row_slot_len": 0}}))
+
+    with pytest.raises(ValueError, match="Invalid TPU engine option static_log_prob_micro_batch_len"):
+        tpu_options.get_tpu_engine_options(
+            SimpleNamespace(engine_kwargs={"tpu": {"static_log_prob_micro_batch_len": -4}})
+        )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        tpu_options.get_tpu_engine_options(
+            SimpleNamespace(engine_kwargs={"tpu": {"gdn_auto_row_slot_len": 16384, "gdn_row_slot_len": 16384}})
+        )
+
+    for bad_static_cfg in (
+        {"gdn_auto_row_slot_len": 32768, "static_micro_batch_len": 16384},
+        {"gdn_auto_row_slot_len": 32768, "static_micro_batch_len": 49152},
+        {"gdn_auto_row_slot_len": 32768, "static_log_prob_micro_batch_len": 16384},
+        {"gdn_auto_row_slot_len": 32768, "static_log_prob_micro_batch_len": 40000},
+    ):
+        with pytest.raises(ValueError, match="divisible by gdn_auto_row_slot_len"):
+            tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": bad_static_cfg}))
+
+    valid_static = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(
+            engine_kwargs={
+                "tpu": {
+                    "gdn_auto_row_slot_len": 32768,
+                    "static_micro_batch_len": 32768,
+                    "static_log_prob_micro_batch_len": 98304,
+                }
+            }
+        )
+    )
+    assert valid_static.static_micro_batch_len == 32768
+    assert valid_static.static_log_prob_micro_batch_len == 98304

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.accelerators.tpu import test_qwen3_5_layout as q35
 from verl_hardware_plugin.accelerators.tpu.rollout import moe_weights, qwen3_moe_layout
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import ExactParityCheck
 
@@ -333,3 +334,163 @@ def test_trainer_expert_stack_wire_needs_trainer_ep_1():
     assert qwen3_moe_layout.trainer_expert_stack_wire("qwen3_5_moe", 4) is None  # other models are not affected
     with pytest.raises(ValueError, match="expert_parallel_size=2 is not supported"):
         qwen3_moe_layout.trainer_expert_stack_wire("qwen3_moe", 2)
+
+
+# FP8 experts (vllm-torchtpu's VllmFp8MoEMethodTPU): the same shared plan / writer as Qwen3.5 (moe_weights).
+FP8 = q35.FP8
+fake_vllm_torchtpu_fp8 = q35.fake_vllm_torchtpu_fp8  # the pytest fixture
+
+
+def _fp8_vllm_model(tp_size, tp_rank, use_ep):
+    model = _vllm_model(tp_size, tp_rank, use_ep=use_ep, method=q35.VllmFp8MoEMethodTPU)
+    local_experts, inter = (E // tp_size, INTER) if use_ep else (E, INTER // tp_size)
+    for layer in model.model.layers:
+        experts = layer.mlp.experts
+        for leaf, shape, dtype in (
+            ("w13_weight", (local_experts, HID, 256), FP8),
+            ("w13_weight_scale_inv", (local_experts, 1, 1, 256), torch.float32),
+            ("w2_weight", (local_experts, 128, HID), FP8),
+            ("w2_weight_scale_inv", (local_experts, 1, 1, HID), torch.float32),
+        ):
+            setattr(experts, leaf, torch.nn.Parameter(torch.zeros(shape, dtype=dtype), requires_grad=False))
+    assert inter <= 128
+    return model
+
+
+@pytest.mark.parametrize("tp_size,use_ep", [(1, False), (2, True), (2, False), (4, False)])
+def test_fp8_plan_and_install(fake_vllm_torchtpu_fp8, tp_size, use_ep):
+    """Qwen3 MoE FP8 experts install directly (no per-model branch): each rank's live FP8 weights and scales are the
+    rollout quantizer applied to its own bf16 slice, whole experts with EP or every expert's I slice without."""
+    hf = _hf_experts(torch.Generator().manual_seed(0))
+    hf = {n: t.bfloat16().float() for n, t in hf.items()}
+    full = _stacked(hf)
+    for tp_rank in range(tp_size):
+        model = _fp8_vllm_model(tp_size, tp_rank, use_ep)
+        plan, why = qwen3_moe_layout.plan_direct_install(model, SHAPES, CONFIG, tp_size, tp_rank)
+        assert why == "" and plan.moe_layout == moe_weights.MOE_LAYOUT_TPU_FP8 and plan.moe_requant is not None
+        model_sd = {
+            f"{layer}.mlp.experts.{leaf}": getattr(model.model.layers[i].mlp.experts, leaf).data
+            for i, layer in enumerate(LAYERS)
+            for leaf in ("w13_weight", "w13_weight_scale_inv", "w2_weight", "w2_weight_scale_inv")
+        }
+        staging = {n: t.bfloat16() for n, t in _received(full, plan).items()}
+        consumed = qwen3_moe_layout.install(staging, model_sd, lambda k, sd=model_sd: k if k in sd else None, plan)
+        assert consumed == {n for n in staging if ".experts." in n} and not plan.padding_checked
+        for layer in LAYERS:
+            w13, w2 = _vllm_reference(hf, layer, tp_rank, tp_size, padded=False, expert_parallel=plan.expert_parallel)
+            inter = w2.shape[-1]
+            reference = q35._requantized_reference(w13[:, :inter], w13[:, inter:], w2)
+            for leaf, ref in reference.items():
+                q35._assert_bits_equal(model_sd[f"{layer}.mlp.experts.{leaf}"], ref, f"rank {tp_rank} {layer} {leaf}")
+
+
+def test_fp8_plan_refusals(fake_vllm_torchtpu_fp8):
+    model = _fp8_vllm_model(2, 0, True)
+    plan, why = qwen3_moe_layout.plan_direct_install(model, SHAPES, CONFIG, 2, 0, allow_quantized_moe=False)
+    assert plan is None and "quantized experts is off" in why
+    # A pre-quantized FP8 checkpoint also quantizes dense linears (VllmFp8LinearMethodTPU): direct install refuses it
+    # rather than overwriting FP8 weights with unscaled bf16 via copy_into.
+    fp8_dense = _fp8_vllm_model(2, 0, True)
+    fp8_dense.model.layers[0].mlp.gate.quant_method = type("VllmFp8LinearMethodTPU", (), {})()
+    plan, why = qwen3_moe_layout.plan_direct_install(fp8_dense, SHAPES, CONFIG, 2, 0)
+    assert plan is None and "VllmFp8LinearMethodTPU" in why
+    model.model.layers[1].mlp.experts.w2_weight.data = torch.zeros(E // 2, 128, HID + 1, dtype=FP8)
+    plan, why = qwen3_moe_layout.plan_direct_install(model, SHAPES, CONFIG, 2, 0)
+    assert plan is None and "model.layers.1.mlp.experts.w2_weight is (2, 128, 9)" in why
+
+
+def test_qwen3_moe_trainer_quantized_ep_zero_copy():
+    """Qwen3 MoE shares the same trainer-quantized zero-copy EP path via TrainerWeights + moe_weights."""
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+
+    hf = _hf_experts(torch.Generator().manual_seed(5))
+    stacked = _stacked(hf)
+    expert_stacks = []
+    for name, stack in sorted(stacked.items()):
+        if not name.endswith((".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")):
+            continue
+        prefix, proj = name.rsplit(".", 2)[0], name.split(".")[-2]
+        slots = [(f"{prefix}.{e}.{proj}.weight", tuple(stack.shape[1:])) for e in range(E)]
+        expert_stacks.append((stack, slots))
+    dense = {n: t for n, t in stacked.items() if n.endswith(qwen3_moe_layout.ROUTER_SUFFIX)}
+    tw = TrainerWeights(
+        dense,
+        expert_stacks,
+        "cpu",
+        expert_stack_wire=qwen3_moe_layout.expert_stack_wire_name,
+        rollout_expert_parallel=True,
+        rollout_fp8_moe=True,
+    )
+    sent = {n: t for n, t, _ in tw.local_shards()}
+    shapes = {n: list(t.shape) for n, t in sent.items()}
+
+    tp_size = 2
+    for tp_rank in range(tp_size):
+        model = _fp8_vllm_model(tp_size, tp_rank, use_ep=True)
+        plan, why = qwen3_moe_layout.plan_direct_install(model, shapes, CONFIG, tp_size, tp_rank)
+        assert why == "" and plan is not None and plan.moe_layout == moe_weights.MOE_LAYOUT_TPU_EP_QUANT
+        model_sd = {
+            **{
+                f"{layer}.mlp.experts.{leaf}": getattr(model.model.layers[i].mlp.experts, leaf).data
+                for i, layer in enumerate(LAYERS)
+                for leaf in ("w13_weight", "w13_weight_scale_inv", "w2_weight", "w2_weight_scale_inv")
+            },
+            **{n: t.clone() for n, t in dense.items()},
+        }
+        find = lambda k, sd=model_sd: k if k in sd else None  # noqa: E731
+        targets = qwen3_moe_layout.zero_copy_targets(plan, model_sd, find, shapes)
+        assert len(targets) == 2 * len(LAYERS)
+        el = E // tp_size
+        rows = slice(tp_rank * el, (tp_rank + 1) * el)
+        for name, target in targets.items():
+            target.copy_(sent[name][rows])  # simulate tpu-sync zero-copy H2D
+        staging = {
+            n: t[rows].clone()
+            for n, t in sent.items()
+            if n.endswith(moe_weights.EP_FP8_SCALE_SUFFIXES + moe_weights.EP_EXPERT_BLOCK_SUFFIXES)
+        }
+        consumed = qwen3_moe_layout.install(staging, model_sd, find, plan)
+        assert consumed == set(staging)
+        for layer in LAYERS:
+            w13_ref, w2_ref = _vllm_reference(hf, layer, tp_rank, tp_size, padded=False, expert_parallel=True)
+            inter = w2_ref.shape[-1]
+            ref = q35._requantized_reference(w13_ref[:, :inter], w13_ref[:, inter:], w2_ref)
+            for leaf, expected in ref.items():
+                q35._assert_bits_equal(
+                    model_sd[f"{layer}.mlp.experts.{leaf}"], expected, f"rank {tp_rank} {layer} {leaf}"
+                )
+
+
+def test_qwen3_moe_bf16_ep_loader_fallback_splits_to_per_expert_weights():
+    """When Qwen3 MoE with ``rollout_expert_parallel=True`` (BF16 ``w13_ep`` / ``w2_ep``) falls back to vLLM's loaders,
+    ``direct_install.loader_weights`` preserves ``model_type='qwen3_moe'`` through ``qwen3_5_layout`` and splits both
+    stacks back into HF's per-expert ``<layer>.mlp.experts.<e>.{gate,up,down}_proj.weight`` tensors."""
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+    from verl_hardware_plugin.accelerators.tpu.rollout import direct_install
+
+    hf = {k: v.to(torch.bfloat16) for k, v in _hf_experts(torch.Generator().manual_seed(9)).items()}
+    stacked = _stacked(hf)
+    expert_stacks = []
+    for name, stack in sorted(stacked.items()):
+        if not name.endswith((".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")):
+            continue
+        prefix, proj = name.rsplit(".", 2)[0], name.split(".")[-2]
+        slots = [(f"{prefix}.{e}.{proj}.weight", tuple(stack.shape[1:])) for e in range(E)]
+        expert_stacks.append((stack, slots))
+    dense = {n: t for n, t in stacked.items() if n.endswith(qwen3_moe_layout.ROUTER_SUFFIX)}
+    tw = TrainerWeights(
+        dense,
+        expert_stacks,
+        "cpu",
+        expert_stack_wire=qwen3_moe_layout.expert_stack_wire_name,
+        rollout_expert_parallel=True,
+        rollout_fp8_moe=False,
+    )
+    sent = {n: t for n, t, _ in tw.local_shards()}
+    assert any(n.endswith(".mlp.experts.w13_ep") for n in sent)
+    assert direct_install.loader_error({n: list(t.shape) for n, t in sent.items()}, CONFIG) == ""
+
+    restored = dict(direct_install.loader_weights(iter(sorted(sent.items())), CONFIG))
+    assert set(restored) == set(hf)
+    for name, expected in hf.items():
+        assert torch.equal(restored[name], expected), name

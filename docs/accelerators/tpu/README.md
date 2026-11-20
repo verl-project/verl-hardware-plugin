@@ -31,6 +31,7 @@ verl_hardware_plugin/accelerators/tpu/
 ├── options.py                        # Every TPU-only option: engine, tpu-sync, platform; see Configuration
 ├── engines/                          # verl core: verl/workers/engine/
 │   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SimpleFSDP, SPMD)
+│   ├── graph_trainer_mode.py         # Opt-in trainer_mode=graph_trainer: TorchTitan TpuGraphTrainer whole-step compile
 │   ├── tpu_utils.py                  # Attention, SimpleFSDP, compile and sequence-bucketing helpers; option resolvers
 │   ├── fused_logprob.py              # Fused LM-head log-prob: Tokamax forward kernel + chunked PyTorch backward
 │   └── weight_export.py              # Exports the engine's weights as local FSDP shards or full tensors
@@ -64,6 +65,7 @@ tests/accelerators/tpu/
 ├── test_tpu_device_api.py            # device_api.py
 ├── test_tpu_allreduce_patch.py       # patches/reduce_avg_allreduce_patch.py
 ├── test_tpu_engine.py                # platform_tpu.py and engines/ (torchtitan_tpu, tpu_utils, weight_export)
+├── test_tpu_graph_trainer_mode.py    # engines/graph_trainer_mode.py and fused_logprob.py tracing
 ├── test_tpu_options.py               # options.py (engine_kwargs.tpu, engine_kwargs.tpu-sync, deprecated env vars)
 ├── test_tpu_loss_inputs.py           # losses/loss_inputs.py
 ├── test_tpu_vllm_rollout.py          # rollout/tpu_vllm.py
@@ -83,7 +85,8 @@ docs/accelerators/tpu/
 ├── README.md                         # This file
 ├── install_guidance.md               # Installation and environment setup
 ├── quick_start.md                    # Selecting and verifying the platform
-├── rollout.md                        # Running the vLLM rollout on TPU; TorchTitan engine options (engine_kwargs.tpu)
+├── engine.md                         # TorchTitan TPU training engine options (engine_kwargs.tpu) and GraphTrainer
+├── rollout.md                        # Running the vLLM and SGLang rollouts on TPU
 ├── weight_sync.md                    # Choosing and configuring the weight sync (ray-plasma-store / tpu-sync)
 └── timeline.md                       # Recording (`VERL_TPU_TIMELINE=1`) and viewing the unified Timeline + HBM report
 ```
@@ -92,7 +95,8 @@ docs/accelerators/tpu/
 
 - [Installation Guide](./install_guidance.md) — prerequisites and environment setup
 - [Quick Start](./quick_start.md) — select the TPU platform and verify it resolves
-- [vLLM Rollout](./rollout.md) — run GRPO with the vLLM rollout on TPU, and set the TorchTitan engine's TPU options (`engine_kwargs.tpu`)
+- [Training Engine](./engine.md) — configure TorchTitan engine options on TPU (`engine_kwargs.tpu`), MoE kernels, and GraphTrainer whole-step compilation
+- [vLLM & SGLang Rollout](./rollout.md) — run GRPO with vLLM / SGLang rollout on TPU
 - [Weight Sync](./weight_sync.md) — send the trainer's weights to the rollout peer to peer with `tpu-sync`
 - [RL Timeline & HBM Profiler](./timeline.md) — see what the trainer and rollout chips do and their 1 Hz HBM usage in every step (`VERL_TPU_TIMELINE=1`)
 - [GRPO example](https://github.com/verl-project/verl/tree/main/examples/tpu/grpo) — end-to-end GRPO recipes in verl (`Dockerfile`, KubeRay `RayCluster`, Qwen3-0.6B / Qwen3-4B scripts)
@@ -107,14 +111,14 @@ replacement. verl's `TorchtitanEngineConfig` has no `engine_kwargs` field yet; t
 
 | Component | Where the options go | Read by | Options |
 |-----------|----------------------|---------|---------|
-| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`, `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `context_parallel_strategy`, `qwen3_pallas_experts`, `moe_paired_gemm`; see [vLLM Rollout](./rollout.md) |
+| Engine (TorchTitan on TPU) | `actor_rollout_ref.{actor,ref}.torchtitan.engine_kwargs.tpu.*` | `options.py`: `TPUEngineOptions` | `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`, `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`, `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `trainer_mode`, `graph_trainer`, `context_parallel_strategy`, `context_parallel_gdn_strategy`, `context_parallel_gdn_reduce_dtype`, `qwen3_pallas_experts`, `moe_paired_gemm`; see [Training Engine](./engine.md) |
 | Rollout (vLLM on TPU) | `actor_rollout_ref.rollout.engine_kwargs.vllm.*` | verl core, passed to vLLM as is | vLLM engine arguments. The TPU replica forces `enable_sleep_mode=False` and keeps upstream's `distributed_executor_backend=mp`; there are no TPU-only rollout options. |
 | Weight sync | `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.*` | verl core passes them to the checkpoint engine's constructor; `options.py`: `TPUSyncOptions` | `tpu-sync`: `parallelism`, `verify_parity`, `release_buffers_after_sync`, `tie_word_embeddings`, `return_after_d2h`; `ray-plasma-store`: none. See [Weight Sync](./weight_sync.md#configuration) |
 
 Process-wide settings that are not part of any verl config stay environment variables, set in the shell that
 runs the recipe; the platform forwards them to every worker: libtpu / XLA flags (`LIBTPU_INIT_ARGS`, `XLA_FLAGS`),
-`VERL_TPU_CHIPS_PER_HOST` (`options.tpu_chips_per_host_override`; the platform resolves the topology before any
-verl config exists), and `VERL_TPU_TIMELINE` ([RL Timeline & HBM Profiler](./timeline.md)).
+`TORCH_TPU_TOPOLOGY`, `VERL_TPU_CHIPS_PER_HOST` (`options.tpu_chips_per_host_override`; the platform resolves the
+topology before any verl config exists), and `VERL_TPU_TIMELINE` ([RL Timeline & HBM Profiler](./timeline.md)).
 
 Deprecated channels, still read for compatibility (each logs a one-time warning; an environment variable still
 overrides the config, as before):
@@ -150,7 +154,7 @@ The two variables serve different purposes and must not be merged.
 | Generation | HBM per device | Topologies with a built-in mapping |
 |------------|----------------|------------------------------------|
 | v6e | 32 GB per chip | `v6e-4`, `v6e-8`, `v6e-32`, and by chip count 1 to 256 |
-| TPU 7x (`tpu7x`) | 96 GB per TensorCore (192 GB per dual-core chip) | by device count: 8 (one `2x2x1` host), 16, 32, 64, 128 (`4x4x4`) |
+| TPU 7x (`tpu7x`) | 96 GB per TensorCore (192 GB per dual-core chip) | any slice, or block of hosts of a slice (from the hosts' Ray slice coordinates); fallback by device count: 8 (one `2x2x1` host), 16, 32, 64, 128 (`4x4x4`), 256 (`4x4x8`) |
 
 On TPU 7x a chip has two TensorCores that `torch_tpu` drives as two devices, one process each: a host is
 8 devices, a slice is a 4-D mesh `x,y,z,cores` (`TORCH_TPU_TOPOLOGY`), and libtpu lays the mesh out by process:
@@ -158,13 +162,18 @@ when it starts, `torch_tpu` sets `CLOUD_TPU_TASK_ID` to the process's global ran
 its local rank, i.e. its core. Under `torchrun` and in the rollout, which resolve the mesh inside a TPU pod, a
 pool that spans its GKE slice takes the mesh from the slice shape the TPU webhook puts in the pod
 (`TPU_HOST_BOUNDS` times `TPU_CHIPS_PER_HOST_BOUNDS`, plus the core axis, as torchtitan's launcher computes it).
-A pool that uses part of a slice, and a Ray trainer pool, whose mesh is resolved where its workers are created
-(usually on the Ray head, which has no webhook variables), take the whole-host shape for their device count from
-`TPU_V7X_TOPOLOGY_MAP` in `platform_tpu.py`.
+A Ray pool of whole hosts, whose mesh is resolved where its workers are created (usually on the Ray head, which has
+no webhook variables), takes the block of hosts it holds in its slice: the `ray.io/tpu-worker-id` and
+`ray.io/tpu-topology` labels Ray sets on each TPU node give the hosts' coordinates (worker ids count x-fastest over the
+slice's grid of `2x2x1` hosts), and the mesh is the hosts' bounding box times the chips per host. Hosts that do not
+fill a box are rejected (set `TORCH_TPU_TOPOLOGY`). Only without those labels (or outside Ray, for a pool that uses
+part of a slice) does a pool take the fallback shape for its device count from `TPU_V7X_TOPOLOGY_MAP` in
+`platform_tpu.py`.
 The generation comes from the `ray.io/tpu-pod-type` node label of the pool's hosts or
 from `TPU_ACCELERATOR_TYPE`; set `TORCH_TPU_TOPOLOGY='x,y,z,cores'` to override. Rollout engines on TPU 7x
 use one worker per TensorCore, e.g. a TP=8 engine per host; on every generation an engine's mesh is its
-own worker count.
+own worker count. A TP=2 or TP=4 rollout engine on one TPU 7x host takes `1,1,1,2` (one chip) or `1,2,1,2`
+(two chips) from `TPU_V7X_SUBHOST_TOPOLOGY_MAP`.
 
 ### Device memory
 

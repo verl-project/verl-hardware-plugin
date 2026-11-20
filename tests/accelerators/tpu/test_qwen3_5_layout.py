@@ -406,8 +406,11 @@ EP_SHAPES = {
 
 
 def test_plan_expert_parallel():
-    def ep_model(tp, method=VllmUnquantizedFusedMoEMethod, use_ep=True):
+    def ep_model(tp, method=VllmUnquantizedFusedMoEMethod, use_ep=True, aligned_inter=INTER):
         exp = _Experts(method(), use_ep=use_ep)
+        local_e = max(1, E // tp)
+        exp.w13_weight = torch.nn.Parameter(torch.zeros(local_e, HID, 2 * aligned_inter, dtype=torch.bfloat16))
+        exp.w2_weight = torch.nn.Parameter(torch.zeros(local_e, aligned_inter, HID, dtype=torch.bfloat16))
         if use_ep:
             exp.ep_size, exp.ep_rank = tp, 0
         return _vllm_model(gdn=_GDN(tp_size=tp), experts=exp)
@@ -417,6 +420,23 @@ def test_plan_expert_parallel():
     # moe_intermediate_size need not split over the ranks under EP (the experts are not sliced).
     odd = SimpleNamespace(**{**vars(CONFIG), "moe_intermediate_size": 5})
     assert qwen3_5_layout.plan_direct_install(ep_model(1), EP_SHAPES, odd, 1, 0)[0] is not None
+    # Unaligned BF16 EP (live w13_weight padded to 128 while wire w13_ep is unpadded 2*INTER=8) is refused at plan time.
+    assert (
+        "w13_weight is (3, 6, 256)"
+        in qwen3_5_layout.plan_direct_install(ep_model(1, aligned_inter=128), EP_SHAPES, CONFIG, 1, 0)[1]
+    )
+    # Armed fused decode kernel and non-persistent weight buffer are refused at plan time.
+    armed_model = ep_model(1)
+    armed_model.experts.quant_method._moe_tp_decode_op = object()
+    assert (
+        "fused shared+routed decode kernel"
+        in qwen3_5_layout.plan_direct_install(armed_model, EP_SHAPES, CONFIG, 1, 0)[1]
+    )
+    non_pers = ep_model(1)
+    w2_buf = non_pers.experts.w2_weight.detach().clone()
+    del non_pers.experts.w2_weight
+    non_pers.experts.register_buffer("w2_weight", w2_buf, persistent=False)
+    assert "has no w2_weight" in qwen3_5_layout.plan_direct_install(non_pers, EP_SHAPES, CONFIG, 1, 0)[1]
     no_ep = ep_model(1, use_ep=False)
     assert "does not use expert parallelism" in qwen3_5_layout.plan_direct_install(no_ep, EP_SHAPES, CONFIG, 1, 0)[1]
     quant = ep_model(1, method=Fp8MoEMethod)
@@ -541,3 +561,685 @@ def test_fsdp_dim0_shard_efsdp_times_ep_whole_experts():
     dt._tpu_sync_owned = True  # type: ignore[attr-defined]
     [(name, exported, shard)] = list(TrainerWeights({"w13_ep": dt}, [], "cpu").local_shards())
     assert name == "w13_ep" and shard == (8, 7) and exported.data_ptr() == local.data_ptr()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Quantized (FP8) experts: requantized on the rollout from the received bf16 slices (moe_weights.write_requantized).
+# ---------------------------------------------------------------------------------------------------------------
+
+FP8 = torch.float8_e4m3fn
+
+
+def reference_quantize_and_format(w, *, name, quant_dtype, block_size, activation=""):
+    """A CPU copy of vllm-torchtpu's ``_quantize_and_format_single_moe_weight`` + ``quantize_tensor(axis=-1)``:
+    128-padding of each w13 half / of w2's intermediate dim, per-row (or per-block) amax scales with the reciprocal
+    multiply, transpose to the GMM layout, scale [E, K / block or 1, 1, N]."""
+    assert w.dtype == torch.float32 and activation != "swigluoai"
+    if name == "w13":
+        half = w.shape[1] // 2
+        aligned = (half + 127) // 128 * 128
+        if aligned != half:
+            pad = w.new_zeros(w.shape[0], aligned - half, w.shape[2])
+            w = torch.cat([w[:, :half], pad, w[:, half:], pad], dim=1)
+    else:
+        inter = w.shape[2]
+        aligned = (inter + 127) // 128 * 128
+        if aligned != inter:
+            w = torch.cat([w, w.new_zeros(w.shape[0], w.shape[1], aligned - inter)], dim=2)
+    if block_size is not None and w.shape[-1] % block_size:
+        raise ValueError(f"{name} contracting dimension {w.shape[-1]} is not divisible by block_size={block_size}")
+    bs = block_size or w.shape[-1]
+    blocked = w.reshape(*w.shape[:-1], w.shape[-1] // bs, bs)
+    info = torch.finfo(quant_dtype)
+    scale = blocked.abs().amax(dim=-1, keepdim=True) * torch.tensor(1.0 / float(info.max))
+    scale_inv = torch.where(scale == 0, torch.zeros_like(scale), 1.0 / scale)
+    q = torch.clamp(blocked * scale_inv, min=float(info.min), max=float(info.max)).reshape_as(w).to(quant_dtype)
+    scale = scale.squeeze(-1)  # [E, N, K / block]
+    return q.transpose(1, 2).contiguous(), scale.transpose(1, 2).contiguous().to(torch.float32).unsqueeze(2)
+
+
+@pytest.fixture
+def fake_vllm_torchtpu_fp8(monkeypatch):
+    """vllm-torchtpu's FP8 module, quantizing with ``reference_quantize_and_format``.
+
+    Set ``.block_size`` for ``MOE_REQUANTIZE_BLOCK_SIZE`` and ``._REQUANT_CHUNK_BYTES`` for the chunk budget.
+    """
+    import sys
+    import types
+
+    full = moe_weights.VLLM_TORCHTPU_FP8_MODULE
+    mod = types.ModuleType(full)
+    mod.block_size = None
+    mod._get_moe_quant_config = lambda log_prefix: ("float8_e4m3fn", FP8, mod.block_size)
+    mod._quantize_and_format_single_moe_weight = reference_quantize_and_format
+    parts = full.split(".")
+    for i in range(1, len(parts) + 1):
+        name = ".".join(parts[:i])
+        module = mod if i == len(parts) else sys.modules.get(name) or types.ModuleType(name)
+        monkeypatch.setitem(sys.modules, name, module)
+        if i > 1:
+            monkeypatch.setattr(sys.modules[".".join(parts[: i - 1])], parts[i - 1], module, raising=False)
+    return mod
+
+
+class VllmFp8MoEMethodTPU:  # vllm-torchtpu's FP8 MoE method (matched by class name)
+    def __init__(self, activation="silu"):
+        self._tpu_activation_str = activation  # what process_weights_after_loading quantized with
+
+
+class _Fp8Experts(torch.nn.Module):
+    """vLLM's FP8 MoE layer as vllm-torchtpu leaves it: w13 [E, H, 2A], w2 [E, A, H] in FP8, FP32 GMM scales."""
+
+    def __init__(self, num_experts, inter, hidden, block_size=None, method=None, **attrs):
+        super().__init__()
+        aligned = (inter + 127) // 128 * 128
+        nb13, nb2 = (hidden // block_size, aligned // block_size) if block_size else (1, 1)
+        shapes = {
+            "w13_weight": ((num_experts, hidden, 2 * aligned), FP8),
+            "w13_weight_scale_inv": ((num_experts, nb13, 1, 2 * aligned), torch.float32),
+            "w2_weight": ((num_experts, aligned, hidden), FP8),
+            "w2_weight_scale_inv": ((num_experts, nb2, 1, hidden), torch.float32),
+        }
+        for leaf, (shape, dtype) in shapes.items():
+            setattr(self, leaf, torch.nn.Parameter(torch.zeros(shape, dtype=dtype), requires_grad=False))
+        self.quant_method = method if method is not None else VllmFp8MoEMethodTPU()
+        self.use_ep = False
+        for k, v in attrs.items():
+            setattr(self, k, v)
+
+    def expert_sd(self, prefix=EXPERTS):
+        return {f"{prefix}.{leaf}": t.data for leaf, t in self.named_parameters()}
+
+
+def _fp8_model_sd(experts, tp_rank, tp_size):
+    """vLLM's state dict of rank ``tp_rank``: the GatedDeltaNet tensors (NaN: must all be written) and the experts."""
+    full = _hf_tensors(torch.Generator().manual_seed(0))
+    sd = {
+        name: torch.full_like(t, float("nan"))
+        for name, t in _vllm_reference(full, tp_rank, tp_size, 128).items()
+        if ".experts." not in name
+    }
+    return {**sd, **experts.expert_sd()}
+
+
+def _requantized_reference(gate, up, down, block_size=None):
+    """The rollout's quantizer applied to rank-local bf16 slices: what vLLM's load-time quantization holds."""
+    kw = dict(quant_dtype=FP8, block_size=block_size, activation="silu")
+    w13, s13 = reference_quantize_and_format(torch.cat([gate, up], dim=1).float(), name="w13", **kw)
+    w2, s2 = reference_quantize_and_format(down.float(), name="w2", **kw)
+    return {"w13_weight": w13, "w13_weight_scale_inv": s13, "w2_weight": w2, "w2_weight_scale_inv": s2}
+
+
+def _assert_bits_equal(actual, expected, msg):
+    assert actual.dtype == expected.dtype and actual.shape == expected.shape, msg
+    if actual.dtype == FP8:
+        actual, expected = actual.view(torch.uint8), expected.view(torch.uint8)
+    assert torch.equal(actual, expected), msg
+
+
+def test_plan_fp8_moe(fake_vllm_torchtpu_fp8):
+    """The FP8 plan resolves vllm-torchtpu's format once and validates the live weights and scales up front."""
+
+    def plan(experts=None, tp=2, rank=0, **kw):
+        experts = experts if experts is not None else _Fp8Experts(E, INTER // tp, HID)
+        model = _vllm_model(gdn=_GDN(tp_rank=rank, tp_size=tp), experts=experts)
+        return qwen3_5_layout.plan_direct_install(model, SHAPES, CONFIG, tp, rank, **kw)
+
+    p, why = plan()
+    assert why == "" and p.moe_layout == moe_weights.MOE_LAYOUT_TPU_FP8 and not p.expert_parallel
+    assert (p.moe_requant.quant_dtype, p.moe_requant.block_size, p.moe_requant.activation) == (FP8, None, "silu")
+    assert p.moe_requant.quantize_and_format is reference_quantize_and_format
+    assert p.moe_requant.chunk_bytes == 1 << 30
+    # The activation comes from the live module (what vllm-torchtpu quantized and runs with), not a constant.
+    gelu = _Fp8Experts(E, INTER // 2, HID, method=VllmFp8MoEMethodTPU("gelu"))
+    assert plan(gelu)[0].moe_requant.activation == "gelu"
+    no_str = _Fp8Experts(E, INTER // 2, HID, method=type("VllmFp8MoEMethodTPU", (), {})(), activation="SiLU")
+    assert plan(no_str)[0].moe_requant.activation == "silu"  # vLLM's layer.activation when the method has none
+
+    def reason(*args, **kw):
+        p, why = plan(*args, **kw)
+        assert p is None
+        return why
+
+    assert "direct install of quantized experts is off" in reason(allow_quantized_moe=False)
+    wrong_dtype = _Fp8Experts(E, INTER // 2, HID)
+    wrong_dtype.w2_weight.data = torch.zeros(E, 128, HID, dtype=torch.bfloat16)
+    assert "w2_weight is (3, 128, 6) torch.bfloat16, requantizing gives (3, 128, 6) torch.float8_e4m3fn" in reason(
+        wrong_dtype
+    )
+    no_scale = _Fp8Experts(E, INTER // 2, HID)
+    del no_scale.w2_weight_scale_inv
+    assert "has no w2_weight_scale_inv" in reason(no_scale)
+    fake_vllm_torchtpu_fp8.block_size = 4  # MOE_REQUANTIZE_BLOCK_SIZE=4 does not divide the hidden size 6
+    assert "does not divide the contracting dimensions" in reason()
+    fake_vllm_torchtpu_fp8.block_size = 2  # blockwise scales: [E, H / 2, 1, 2A] and [E, A / 2, 1, H]
+    assert "w13_weight_scale_inv is (3, 1, 1, 256)" in reason()
+    assert plan(_Fp8Experts(E, INTER // 2, HID, block_size=2))[0].moe_requant.block_size == 2
+    for bad_bs in (0, -2, (128, 128), True):
+        fake_vllm_torchtpu_fp8.block_size = bad_bs
+        assert "not a positive int" in reason()
+    fake_vllm_torchtpu_fp8.block_size = None
+    # Non-persistent scale buffer (excluded from state_dict) is caught at plan time, not mid-install.
+    non_persistent = _Fp8Experts(E, INTER // 2, HID)
+    s2 = non_persistent.w2_weight_scale_inv.detach().clone()
+    del non_persistent.w2_weight_scale_inv
+    non_persistent.register_buffer("w2_weight_scale_inv", s2, persistent=False)
+    assert "has no w2_weight_scale_inv" in reason(non_persistent)
+    # swigluoai on _tpu_activation_str, expert w2_bias, and armed fused decode kernels are refused at plan time.
+    assert "swigluoai" in reason(_Fp8Experts(E, INTER // 2, HID, method=VllmFp8MoEMethodTPU("swigluoai")))
+    assert "bias" in reason(_Fp8Experts(E, INTER // 2, HID, w2_bias=torch.zeros(HID)))
+    armed = VllmFp8MoEMethodTPU()
+    armed._fused_moe_decode_op = object()
+    assert "fused shared+routed decode kernel" in reason(_Fp8Experts(E, INTER // 2, HID, method=armed))
+    # Current vllm-torchtpu main exposes envs.TPU_MOE_REQUANT_CHUNK_BYTES instead of _REQUANT_CHUNK_BYTES.
+    fake_vllm_torchtpu_fp8.envs = SimpleNamespace(TPU_MOE_REQUANT_CHUNK_BYTES=256 * 1024)
+    assert plan()[0].moe_requant.chunk_bytes == 256 * 1024
+    fake_vllm_torchtpu_fp8.envs = SimpleNamespace(TPU_MOE_REQUANT_CHUNK_BYTES=0)
+    assert "must be positive" in reason()
+    del fake_vllm_torchtpu_fp8.envs
+    fake_vllm_torchtpu_fp8._quantize_and_format_single_moe_weight = lambda w, *, name, dtype: None  # renamed kwargs
+    assert "unexpected signature" in reason()
+    del fake_vllm_torchtpu_fp8._quantize_and_format_single_moe_weight
+    assert "lacks _quantize_and_format_single_moe_weight" in reason()
+
+
+def test_plan_refuses_quantized_non_expert_layers_and_mismatched_expert_blocks(fake_vllm_torchtpu_fp8):
+    """Direct install requires non-expert weights to stay unquantized (copy_into writes unscaled bf16), and validates
+    both the MoE module count and per-block 3-D wire shapes on Qwen3.5."""
+    VllmUnquantizedLinearMethod = type("VllmUnquantizedLinearMethod", (), {})
+    UnquantizedEmbeddingMethod = type("UnquantizedEmbeddingMethod", (), {})
+    VllmFp8LinearMethodTPU = type("VllmFp8LinearMethodTPU", (), {})
+
+    # Unquantized linear / embedding methods on non-expert modules are accepted.
+    ok_model = _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID))
+    ok_model.gdn.in_proj_qkvz.quant_method = VllmUnquantizedLinearMethod()
+    ok_model.embed_tokens = torch.nn.Embedding(16, HID)
+    ok_model.embed_tokens.quant_method = UnquantizedEmbeddingMethod()
+    assert qwen3_5_layout.plan_direct_install(ok_model, SHAPES, CONFIG, 2, 0)[0] is not None
+
+    # Pre-quantized FP8 checkpoint / QUANTIZE_ON_LOAD_PREFIXES beyond experts: non-expert FP8 linears are refused.
+    fp8_linear_model = _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID))
+    fp8_linear_model.gdn.in_proj_qkvz.quant_method = VllmFp8LinearMethodTPU()
+    plan, why = qwen3_5_layout.plan_direct_install(fp8_linear_model, SHAPES, CONFIG, 2, 0)
+    assert plan is None and "VllmFp8LinearMethodTPU" in why
+
+    scaled_model = _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID))
+    scaled_model.shared_expert = torch.nn.Linear(HID, INTER)
+    scaled_model.shared_expert.register_parameter("weight_scale", torch.nn.Parameter(torch.ones(INTER)))
+    plan, why = qwen3_5_layout.plan_direct_install(scaled_model, SHAPES, CONFIG, 2, 0)
+    assert plan is None and "has weight_scale" in why
+
+    fp8_param_model = _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID))
+    fp8_param_model.gdn.in_proj_qkvz.weight = torch.nn.Parameter(
+        torch.zeros(2 * K + 2 * V, HID, dtype=FP8), requires_grad=False
+    )
+    plan, why = qwen3_5_layout.plan_direct_install(fp8_param_model, SHAPES, CONFIG, 2, 0)
+    assert plan is None and "quantized dtype" in why
+
+    # Mismatched MoE module count (e.g. an extra draft-model MoE layer) or bad 3-D expert wire shapes are refused.
+    extra_moe = _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID))
+    extra_moe.draft_experts = _Fp8Experts(E, INTER // 2, HID)
+    plan, why = qwen3_5_layout.plan_direct_install(extra_moe, SHAPES, CONFIG, 2, 0)
+    assert plan is None and "2 fused-MoE layers" in why
+
+    folded_shapes = {**SHAPES, f"{EXPERTS}.down_proj": [E * HID, INTER]}
+    plan, why = qwen3_5_layout.plan_direct_install(
+        _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID)), folded_shapes, CONFIG, 2, 0
+    )
+    assert plan is None and "3-D expert tensors" in why
+
+    transposed_down = {**SHAPES, f"{EXPERTS}.down_proj": [E, INTER, HID]}
+    plan, why = qwen3_5_layout.plan_direct_install(
+        _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID)), transposed_down, CONFIG, 2, 0
+    )
+    assert plan is None and "the config gives" in why
+
+    # Rank-local shape check in install() rejects wrong TP slices before write_requantized pads them to 128.
+    experts = _Fp8Experts(E, INTER // 2, HID)
+    valid_model = _vllm_model(experts=experts)
+    valid_plan, _ = qwen3_5_layout.plan_direct_install(valid_model, SHAPES, CONFIG, 2, 0)
+    bad_staging = _received(_hf_tensors(torch.Generator().manual_seed(0)), 0, 2)
+    bad_staging[f"{EXPERTS}.gate_proj"] = torch.zeros(E, INTER, HID, dtype=torch.bfloat16)  # TP=1 slice on TP=2 plan
+    model_sd = _fp8_model_sd(experts, 0, 2)
+    with pytest.raises(RuntimeError, match="on this rank, expected"):
+        qwen3_5_layout.install(
+            bad_staging, model_sd, lambda k: k if k in model_sd else None, _copy_into(model_sd), valid_plan
+        )
+
+
+def test_plan_fp8_moe_without_vllm_torchtpu_falls_back():
+    """No importable vllm-torchtpu requantizer: the plan refuses (vLLM's loaders install), nothing is written."""
+    model = _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID))
+    plan, why = qwen3_5_layout.plan_direct_install(model, SHAPES, CONFIG, 2, 0)
+    assert plan is None and "cannot import vllm-torchtpu's FP8 MoE requantizer" in why
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize("block_size", [None, 2])
+def test_fp8_install_equals_requantizing_the_local_shard(fake_vllm_torchtpu_fp8, tp_size, block_size):
+    """Each rank's live FP8 experts and scales are bit for bit the rollout quantizer applied to its own bf16 TP slice
+    (I_r = 4 / tp is padded to 128, w2's per-H scales cover only the local slice), the GatedDeltaNet tensors are
+    written as for bf16, and every received tensor is consumed."""
+    fake_vllm_torchtpu_fp8.block_size = block_size
+    full = _hf_tensors(torch.Generator().manual_seed(0))
+    for name in (f"{EXPERTS}.gate_up_proj", f"{EXPERTS}.down_proj"):
+        full[name] = full[name].bfloat16().float()  # the trainer sends bf16
+    for tp_rank in range(tp_size):
+        experts = _Fp8Experts(E, INTER // tp_size, HID, block_size=block_size)
+        model = _vllm_model(gdn=_GDN(tp_rank=tp_rank, tp_size=tp_size), experts=experts)
+        plan, why = qwen3_5_layout.plan_direct_install(model, SHAPES, CONFIG, tp_size, tp_rank)
+        assert why == "", why
+        staging = {n: t.bfloat16() if ".experts." in n else t for n, t in _received(full, tp_rank, tp_size).items()}
+        model_sd = _fp8_model_sd(experts, tp_rank, tp_size)
+        consumed = qwen3_5_layout.install(
+            staging, model_sd, lambda k, sd=model_sd: k if k in sd else None, _copy_into(model_sd), plan
+        )
+        assert consumed == set(staging) and not plan.padding_checked  # requantized: no padding check ran
+
+        inter_r = INTER // tp_size
+        gate_up, down = full[f"{EXPERTS}.gate_up_proj"], full[f"{EXPERTS}.down_proj"]
+        gate = gate_up[:, tp_rank * inter_r : (tp_rank + 1) * inter_r]
+        up = gate_up[:, INTER + tp_rank * inter_r : INTER + (tp_rank + 1) * inter_r]
+        local_down = down[..., tp_rank * inter_r : (tp_rank + 1) * inter_r]
+        for leaf, ref in _requantized_reference(gate, up, local_down, block_size).items():
+            _assert_bits_equal(model_sd[f"{EXPERTS}.{leaf}"], ref, f"rank {tp_rank} {leaf}")
+        w2 = model_sd[f"{EXPERTS}.w2_weight"]
+        assert not w2[:, inter_r:].float().any()  # fresh zero padding
+        if block_size is None:  # w2's per-output-channel scales: amax over this rank's I_r slice only
+            torch.testing.assert_close(
+                model_sd[f"{EXPERTS}.w2_weight_scale_inv"][:, 0, 0], local_down.abs().amax(-1) / 448.0
+            )
+        reference = _vllm_reference(full, tp_rank, tp_size, 128)
+        for name in (f"{GDN}.in_proj_qkvz.weight", f"{GDN}.conv1d.weight", f"{GDN}.A_log", f"{GDN}.dt_bias"):
+            torch.testing.assert_close(model_sd[name], reference[name], rtol=0, atol=0, msg=name)
+
+
+def test_fp8_install_exact_parity_compares_the_requantized_experts(fake_vllm_torchtpu_fp8):
+    """verify_parity=exact: vLLM quantized the same bf16 checkpoint on load, so the requantized weights and scales
+    must match the live ones bit for bit; a changed live value is reported, not silently overwritten."""
+    from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import ExactParityCheck
+
+    full = _hf_tensors(torch.Generator().manual_seed(0))
+    experts = _Fp8Experts(E, INTER // 2, HID)
+    model = _vllm_model(gdn=_GDN(tp_rank=0, tp_size=2), experts=experts)
+    plan, _ = qwen3_5_layout.plan_direct_install(model, SHAPES, CONFIG, 2, 0)
+    staging = {n: t.bfloat16() if ".experts." in n else t for n, t in _received(full, 0, 2).items()}
+    model_sd = _fp8_model_sd(experts, 0, 2)
+
+    def find(key):
+        return key if key in model_sd else None
+
+    qwen3_5_layout.install(staging, model_sd, find, _copy_into(model_sd), plan)  # vLLM's load-time state
+    parity = ExactParityCheck()
+    qwen3_5_layout.install(staging, model_sd, find, _copy_into(model_sd), plan, check=parity.check)
+    assert parity.checked == 4 and parity.mismatched == []  # w13, its scale, w2, its scale
+    model_sd[f"{EXPERTS}.w2_weight_scale_inv"][1, 0, 0, 2] *= 2
+    parity = ExactParityCheck()
+    qwen3_5_layout.install(staging, model_sd, find, _copy_into(model_sd), plan, check=parity.check)
+    assert [line.split(":")[0] for line in parity.mismatched] == [f"{EXPERTS}.w2_weight_scale_inv[requantized]"]
+
+
+def test_fp8_requantization_is_chunked_and_materialized(fake_vllm_torchtpu_fp8, monkeypatch):
+    """Experts are requantized a chunk at a time (vllm-torchtpu's ``_REQUANT_CHUNK_BYTES``), each chunk and each
+    written weight materialized; the result is bit-identical to one whole-stack quantization."""
+    fake_vllm_torchtpu_fp8._REQUANT_CHUNK_BYTES = 1  # one expert per chunk
+    synced = []
+    monkeypatch.setattr(moe_weights, "tpu_synchronize", lambda tensors: synced.append(len(tensors)))
+    full = _hf_tensors(torch.Generator().manual_seed(3))
+    experts = _Fp8Experts(E, INTER, HID)
+    model = _vllm_model(gdn=_GDN(tp_rank=0, tp_size=1), experts=experts)
+    plan, _ = qwen3_5_layout.plan_direct_install(model, SHAPES, CONFIG, 1, 0)
+    assert plan.moe_requant.chunk_bytes == 1
+    staging = _received(full, 0, 1)
+    model_sd = _fp8_model_sd(experts, 0, 1)
+    qwen3_5_layout.install(staging, model_sd, lambda k: k if k in model_sd else None, _copy_into(model_sd), plan)
+    # w13: E chunks of (weight, scale) then the written (weight, scale); w2 likewise.
+    assert synced == [2] * (E + 1) * 2
+    gate_up, down = full[f"{EXPERTS}.gate_up_proj"], full[f"{EXPERTS}.down_proj"]
+    reference = _requantized_reference(gate_up[:, :INTER], gate_up[:, INTER:], down)
+    for leaf, ref in reference.items():
+        _assert_bits_equal(model_sd[f"{EXPERTS}.{leaf}"], ref, leaf)
+
+
+def test_fp8_install_under_vllm_expert_parallelism(fake_vllm_torchtpu_fp8):
+    """vLLM EP over the TP group: each rank requantizes its whole experts (dim-0 slices) into its FP8 weights."""
+    ep_cfg = SimpleNamespace(**{**vars(CONFIG), "num_experts": 4, "moe_intermediate_size": 5})
+    gen = torch.Generator().manual_seed(7)
+    full = _hf_tensors(gen)
+    full[f"{EXPERTS}.gate_up_proj"] = torch.randn(4, 10, HID, generator=gen)
+    full[f"{EXPERTS}.down_proj"] = torch.randn(4, HID, 5, generator=gen)
+    sent = qwen3_5_layout.make_tpu_sync_local_layout(ep_cfg)(dict(full))
+    shapes = {n: list(t.shape) for n, t in sent.items()}
+    for tp_rank in range(2):
+        experts = _Fp8Experts(2, 5, HID, use_ep=True, ep_size=2, ep_rank=tp_rank)
+        model = _vllm_model(gdn=_GDN(tp_rank=tp_rank, tp_size=2), experts=experts)
+        plan, why = qwen3_5_layout.plan_direct_install(model, shapes, ep_cfg, 2, tp_rank)
+        assert why == "" and plan.expert_parallel and plan.moe_layout == moe_weights.MOE_LAYOUT_TPU_FP8
+        staging = {}
+        for name, t in sent.items():
+            rule = qwen3_5_layout.sampler_sharding_rule(name, list(t.shape), 2, plan)
+            if rule is None:
+                rule = (["tp", ""], [t.shape[0] // 2, t.shape[1]]) if t.ndim == 2 else ([""], list(t.shape))
+            spec, local = rule
+            if "tp" in spec:
+                dim = spec.index("tp")
+                t = t.narrow(dim, tp_rank * local[dim], local[dim])
+            staging[name] = t.clone()
+        model_sd = {
+            f"{GDN}.in_proj_qkvz.weight": torch.zeros(HID, (2 * K + 2 * V) // 2),
+            f"{GDN}.conv1d.weight": torch.zeros((2 * K + V) // 2, 1, CONV_K),
+            f"{GDN}.A_log": torch.zeros(NV // 2),
+            f"{GDN}.dt_bias": torch.zeros(NV // 2),
+            **experts.expert_sd(),
+        }
+        consumed = qwen3_5_layout.install(
+            staging, model_sd, lambda k, sd=model_sd: k if k in sd else None, _copy_into(model_sd), plan
+        )
+        assert consumed == set(staging)
+        mine = slice(tp_rank * 2, (tp_rank + 1) * 2)
+        gate_up, down = full[f"{EXPERTS}.gate_up_proj"][mine], full[f"{EXPERTS}.down_proj"][mine]
+        for leaf, ref in _requantized_reference(gate_up[:, :5], gate_up[:, 5:], down).items():
+            _assert_bits_equal(model_sd[f"{EXPERTS}.{leaf}"], ref, f"rank {tp_rank} {leaf}")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Trainer-side quantized MoE export (rollout_fp8_moe / auto-discovered ExpertWireQuant).
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _fp8_sent(full: dict, quant=True) -> dict:
+    return qwen3_5_layout.make_tpu_sync_local_layout(CONFIG, expert_parallel=True, fp8_moe=quant)(dict(full))
+
+
+@pytest.mark.parametrize("block_size", [None, 2])
+@pytest.mark.parametrize("inter", [INTER, 128])
+def test_trainer_fp8_expert_parallel_matches_vllm_torchtpu_reference(block_size, inter):
+    """Trainer-side quantization matches vllm-torchtpu's ``_quantize_and_format_single_moe_weight`` bit for bit,
+    including 128-alignment padding (inter=8 -> 128), blockwise scales, and all-zero output channels."""
+    cfg = SimpleNamespace(**{**vars(CONFIG), "moe_intermediate_size": inter})
+    gen = torch.Generator().manual_seed(7)
+    full = _hf_tensors(gen)
+    full[f"{EXPERTS}.gate_up_proj"] = torch.randn(E, 2 * inter, HID, generator=gen)
+    full[f"{EXPERTS}.down_proj"] = torch.randn(E, HID, inter, generator=gen)
+    full[f"{EXPERTS}.down_proj"][1, 2].zero_()  # all-zero channel stays exact zero (no NaN)
+
+    quant = moe_weights.ExpertWireQuant(FP8, block_size=block_size, activation="silu")
+    out = qwen3_5_layout.make_tpu_sync_local_layout(cfg, expert_parallel=True, fp8_moe=quant)(dict(full))
+    w13, s13 = out[f"{EXPERTS}.w13_ep"], out[f"{EXPERTS}.w13_scale_ep"]
+    w2, s2 = out[f"{EXPERTS}.w2_ep"], out[f"{EXPERTS}.w2_scale_ep"]
+    aligned = (inter + 127) // 128 * 128
+    assert w13.dtype == w2.dtype == FP8 and s13.dtype == s2.dtype == torch.float32
+    assert tuple(w13.shape) == (E, HID, 2 * aligned) and tuple(w2.shape) == (E, aligned, HID)
+    assert w13.is_contiguous() and w2.is_contiguous() and s13.is_contiguous() and s2.is_contiguous()
+    for t in (w13, s13, w2, s2):
+        assert t._tpu_sync_owned and t._tpu_sync_keep_dtype
+
+    ref = _requantized_reference(
+        full[f"{EXPERTS}.gate_up_proj"][:, :inter],
+        full[f"{EXPERTS}.gate_up_proj"][:, inter:],
+        full[f"{EXPERTS}.down_proj"],
+        block_size=block_size,
+    )
+    _assert_bits_equal(w13, ref["w13_weight"], "w13_weight")
+    _assert_bits_equal(w2, ref["w2_weight"], "w2_weight")
+    _assert_bits_equal(s13.unsqueeze(2), ref["w13_weight_scale_inv"], "w13_scale")
+    _assert_bits_equal(s2.unsqueeze(2), ref["w2_weight_scale_inv"], "w2_scale")
+    assert not torch.isnan(w2.float()).any() and not (s2[1, :, 2] != 0).any()
+
+    with pytest.raises(ValueError, match="needs rollout_expert_parallel"):
+        qwen3_5_layout.make_tpu_sync_local_layout(CONFIG, expert_parallel=False, fp8_moe=True)
+
+
+def test_plan_and_install_fp8_expert_parallel_with_parity():
+    """Zero-copy FP8 EP plan validates live weights + scales, binds FP8 weights directly, installs 4-D scales, and runs
+    the exact parity check on scales."""
+    from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import ExactParityCheck
+
+    full = _hf_tensors(torch.Generator().manual_seed(0))
+    sent = _fp8_sent(full)
+    shapes = {n: list(t.shape) for n, t in sent.items()}
+
+    def ep_fp8_model(tp_size=1, tp_rank=0, **kw):
+        exp = _Fp8Experts(E // tp_size, INTER, HID, use_ep=True, ep_size=tp_size, ep_rank=tp_rank, **kw)
+        return _vllm_model(gdn=_GDN(tp_rank=tp_rank, tp_size=tp_size), experts=exp), exp
+
+    model1, _ = ep_fp8_model()
+    plan, reason = qwen3_5_layout.plan_direct_install(model1, shapes, CONFIG, 1, 0)
+    assert reason == "" and plan is not None and plan.moe_layout == moe_weights.MOE_LAYOUT_TPU_EP_FP8
+    assert moe_weights.describe_moe_quant(model1) == {
+        "quant_dtype": "torch.float8_e4m3fn",
+        "block_size": None,
+        "activation": "silu",
+    }
+
+    # Refusals: FP8 wire into bf16 rollout, bf16 wire into FP8 rollout, opt-out, missing scale, bad scale shape.
+    bf16_ep = _vllm_model(gdn=_GDN(tp_size=1), experts=_Experts(VllmUnquantizedFusedMoEMethod(), use_ep=True))
+    bf16_ep.experts.ep_size, bf16_ep.experts.ep_rank = 1, 0
+    assert "QUANTIZE_ON_LOAD_PREFIXES=experts" in qwen3_5_layout.plan_direct_install(bf16_ep, shapes, CONFIG, 1, 0)[1]
+    assert "rollout_fp8_moe" in qwen3_5_layout.plan_direct_install(model1, EP_SHAPES, CONFIG, 1, 0)[1]
+    assert (
+        "quantized experts is off"
+        in (qwen3_5_layout.plan_direct_install(model1, shapes, CONFIG, 1, 0, allow_quantized_moe=False)[1])
+    )
+    missing = {n: s for n, s in shapes.items() if not n.endswith("w2_scale_ep")}
+    assert "lacks" in qwen3_5_layout.plan_direct_install(model1, missing, CONFIG, 1, 0)[1]
+
+    ep_cfg = SimpleNamespace(**{**vars(CONFIG), "num_experts": 4})
+    gen4 = torch.Generator().manual_seed(2)
+    full4 = {
+        **full,
+        f"{EXPERTS}.gate_up_proj": torch.randn(4, 2 * INTER, HID, generator=gen4),
+        f"{EXPERTS}.down_proj": torch.randn(4, HID, INTER, generator=gen4),
+    }
+    sent4 = qwen3_5_layout.make_tpu_sync_local_layout(ep_cfg, expert_parallel=True, fp8_moe=True)(dict(full4))
+    shapes4 = {n: list(t.shape) for n, t in sent4.items()}
+    for tp_size in (1, 2):
+        el = 4 // tp_size
+        for tp_rank in range(tp_size):
+            exp = _Fp8Experts(el, INTER, HID, use_ep=True, ep_size=tp_size, ep_rank=tp_rank)
+            model = _vllm_model(gdn=_GDN(tp_rank=tp_rank, tp_size=tp_size), experts=exp)
+            plan, why = qwen3_5_layout.plan_direct_install(model, shapes4, ep_cfg, tp_size, tp_rank)
+            assert why == "", why
+            model_sd = exp.expert_sd()
+            find = lambda k, sd=model_sd: k if k in sd else None  # noqa: E731
+            targets = qwen3_5_layout.zero_copy_targets(plan, model_sd, find, shapes4)
+            assert set(targets) == {f"{EXPERTS}.w13_ep", f"{EXPERTS}.w2_ep"}
+            assert targets[f"{EXPERTS}.w2_ep"].data_ptr() == model_sd[f"{EXPERTS}.w2_weight"].data_ptr()
+            rows = slice(tp_rank * el, (tp_rank + 1) * el)
+            staging = {n: t[rows].clone() for n, t in sent4.items() if n.endswith(moe_weights.EP_FP8_SCALE_SUFFIXES)}
+            staging.update({n: t[rows] for n, t in sent4.items() if n.endswith(moe_weights.EP_EXPERT_BLOCK_SUFFIXES)})
+            consumed = qwen3_5_layout.install(staging, model_sd, find, None, plan)
+            assert consumed == set(staging)
+            torch.testing.assert_close(
+                model_sd[f"{EXPERTS}.w13_weight_scale_inv"], sent4[f"{EXPERTS}.w13_scale_ep"][rows].unsqueeze(2)
+            )
+            torch.testing.assert_close(
+                model_sd[f"{EXPERTS}.w2_weight_scale_inv"], sent4[f"{EXPERTS}.w2_scale_ep"][rows].unsqueeze(2)
+            )
+            # ExactParityCheck covers the installed scales and detects mismatches.
+            parity = ExactParityCheck()
+            qwen3_5_layout.install(staging, model_sd, find, None, plan, check=parity.check)
+            assert parity.checked == 2 and parity.mismatched == []
+            model_sd[f"{EXPERTS}.w13_weight_scale_inv"][0, 0, 0, 0] += 1.0
+            parity_bad = ExactParityCheck()
+            qwen3_5_layout.install(staging, model_sd, find, None, plan, check=parity_bad.check)
+            assert len(parity_bad.mismatched) == 1
+
+
+def test_trainer_weights_fp8_dtensor_shard0_and_shard1_and_auto_discovery(monkeypatch):
+    """TrainerWeights exports quantized EP experts locally for FSDP Shard(0), gathers in bf16 first for Shard(1), and
+    auto-discovers the rollout's quant format from describe_vllm_params."""
+    from torch.distributed.tensor import DTensor, Shard
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+
+    class _FakeMesh:
+        ndim = 1
+        device_type = "cpu"
+
+        def size(self, d: int = 0) -> int:
+            return 2
+
+        def get_coordinate(self):
+            return [1]
+
+    gen = torch.Generator().manual_seed(11)
+    full_gu = torch.randn(4, 2 * INTER, HID, generator=gen, dtype=torch.bfloat16)
+    full_dn = torch.randn(4, HID, INTER, generator=gen, dtype=torch.bfloat16)
+
+    # 1. Shard(0): rank 1 holds experts [2, 3], quantized locally without gathering.
+    gu_s0 = DTensor(
+        full_gu[2:].clone(),
+        DTensorSpec(_FakeMesh(), (Shard(0),), tensor_meta=TensorMeta(full_gu.shape, full_gu.stride(), full_gu.dtype)),  # type: ignore[arg-type]
+        requires_grad=False,
+    )
+    dn_s0 = DTensor(
+        full_dn[2:].clone(),
+        DTensorSpec(_FakeMesh(), (Shard(0),), tensor_meta=TensorMeta(full_dn.shape, full_dn.stride(), full_dn.dtype)),  # type: ignore[arg-type]
+        requires_grad=False,
+    )
+    tw_s0 = TrainerWeights(
+        {f"{EXPERTS}.gate_up_proj": gu_s0, f"{EXPERTS}.down_proj": dn_s0},
+        [],
+        "cpu",
+        local_transform=qwen3_5_layout.make_tpu_sync_local_layout(CONFIG),
+        rollout_expert_parallel=True,
+    )
+    assert tw_s0.needs_moe_quant_probe
+    tw_s0.configure_moe_wire(
+        {"tp_size": 2, "params": {}, "moe_quant": {"quant_dtype": "torch.float8_e4m3fn", "block_size": 2}}
+    )
+    exported_s0 = {name: (t, shard) for name, t, shard in tw_s0.local_shards()}
+    assert exported_s0[f"{EXPERTS}.w13_ep"][1] == (2, 1) and exported_s0[f"{EXPERTS}.w13_scale_ep"][1] == (2, 1)
+    assert tuple(exported_s0[f"{EXPERTS}.w13_ep"][0].shape) == (2, HID, 256)
+    assert tuple(exported_s0[f"{EXPERTS}.w13_scale_ep"][0].shape) == (2, HID // 2, 256)
+    ref_s0 = _requantized_reference(
+        full_gu[2:, :INTER].float(), full_gu[2:, INTER:].float(), full_dn[2:].float(), block_size=2
+    )
+    _assert_bits_equal(exported_s0[f"{EXPERTS}.w13_ep"][0], ref_s0["w13_weight"], "Shard(0) w13")
+    _assert_bits_equal(exported_s0[f"{EXPERTS}.w2_ep"][0], ref_s0["w2_weight"], "Shard(0) w2")
+
+    # 2. Shard(1) (SimpleFSDP when fsdp_degree > num_experts): gathered in bf16 before quantization.
+    gu_s1 = DTensor(
+        full_gu[:, :INTER].clone(),
+        DTensorSpec(_FakeMesh(), (Shard(1),), tensor_meta=TensorMeta(full_gu.shape, full_gu.stride(), full_gu.dtype)),  # type: ignore[arg-type]
+        requires_grad=False,
+    )
+    monkeypatch.setattr(DTensor, "full_tensor", lambda self: full_gu if self.shape == full_gu.shape else full_dn)
+    tw_s1 = TrainerWeights(
+        {f"{EXPERTS}.gate_up_proj": gu_s1, f"{EXPERTS}.down_proj": full_dn.clone()},
+        [],
+        "cpu",
+        rollout_expert_parallel=True,
+        rollout_fp8_moe=True,
+    )
+    exported_s1 = {name: (t, shard) for name, t, shard in tw_s1.local_shards()}
+    assert exported_s1[f"{EXPERTS}.w13_ep"][1] is None and tuple(exported_s1[f"{EXPERTS}.w13_ep"][0].shape) == (
+        4,
+        HID,
+        256,
+    )
+
+    # 3. rollout_fp8_moe=True fails loudly if the rollout reports unquantized MoE or ineligible MoE.
+    tw_mismatch = TrainerWeights({}, [], "cpu", rollout_expert_parallel=True, rollout_fp8_moe=True)
+    with pytest.raises(RuntimeError, match="not quantized"):
+        tw_mismatch.configure_moe_wire({"tp_size": 2, "params": {"w": {}}})
+    tw_inelig = TrainerWeights({}, [], "cpu", rollout_expert_parallel=True, rollout_fp8_moe=True)
+    with pytest.raises(RuntimeError, match="use_ep=False"):
+        tw_inelig.configure_moe_wire({"tp_size": 2, "moe_quant_ineligible_reason": "use_ep=False"})
+
+
+def test_describe_moe_quant_eligibility_and_global_dtypes_verification():
+    """``describe_moe_quant`` checks all zero-copy EP conditions; ``plan_direct_install`` verifies exact 1-byte wire
+    dtypes via ``global_dtypes``; ``loader_error`` rejects trainer-quantized wire tensors before staging."""
+    from verl_hardware_plugin.accelerators.tpu.rollout import direct_install
+
+    # 1. Valid EP FP8 (including blockwise CPU-fallback inference).
+    bs2_model = _vllm_model(
+        gdn=_GDN(tp_size=1), experts=_Fp8Experts(E, INTER, HID, block_size=2, use_ep=True, ep_size=1, ep_rank=0)
+    )
+    assert moe_weights.describe_moe_quant(bs2_model, tp_size=1) == {
+        "quant_dtype": "torch.float8_e4m3fn",
+        "block_size": 2,
+        "activation": "silu",
+    }
+
+    # 2. Ineligible rollout configurations return None from describe_moe_quant and explain why.
+    no_ep = _vllm_model(gdn=_GDN(tp_size=2), experts=_Fp8Experts(E, INTER // 2, HID, use_ep=False))
+    assert moe_weights.describe_moe_quant(no_ep, tp_size=2) is None
+    assert "use_ep=False" in (moe_weights.moe_quant_ineligible_reason(no_ep, tp_size=2) or "")
+
+    bad_ep_size = _vllm_model(
+        gdn=_GDN(tp_size=2), experts=_Fp8Experts(E, INTER, HID, use_ep=True, ep_size=1, ep_rank=0)
+    )
+    assert moe_weights.describe_moe_quant(bad_ep_size, tp_size=2) is None
+    assert "ep_size=1" in (moe_weights.moe_quant_ineligible_reason(bad_ep_size, tp_size=2) or "")
+
+    fp8_dense = _vllm_model(gdn=_GDN(tp_size=1), experts=_Fp8Experts(E, INTER, HID, use_ep=True, ep_size=1, ep_rank=0))
+    fp8_dense.gdn.in_proj_qkvz.quant_method = type("VllmFp8LinearMethodTPU", (), {})()
+    assert moe_weights.describe_moe_quant(fp8_dense, tp_size=1) is None
+    assert "VllmFp8LinearMethodTPU" in (moe_weights.moe_quant_ineligible_reason(fp8_dense, tp_size=1) or "")
+
+    swiglu_m = _vllm_model(
+        gdn=_GDN(tp_size=1),
+        experts=_Fp8Experts(E, INTER, HID, method=VllmFp8MoEMethodTPU("swigluoai"), use_ep=True, ep_size=1, ep_rank=0),
+    )
+    assert moe_weights.describe_moe_quant(swiglu_m, tp_size=1) is None
+    assert "swigluoai" in (moe_weights.moe_quant_ineligible_reason(swiglu_m, tp_size=1) or "")
+
+    armed_qm = VllmFp8MoEMethodTPU()
+    armed_qm._fused_moe_decode_op = object()
+    armed_m = _vllm_model(
+        gdn=_GDN(tp_size=1), experts=_Fp8Experts(E, INTER, HID, method=armed_qm, use_ep=True, ep_size=1, ep_rank=0)
+    )
+    assert moe_weights.describe_moe_quant(armed_m, tp_size=1) is None
+
+    bad_s13 = _vllm_model(gdn=_GDN(tp_size=1), experts=_Fp8Experts(E, INTER, HID, use_ep=True, ep_size=1, ep_rank=0))
+    bad_s13.experts.w13_weight_scale_inv = torch.nn.Parameter(
+        torch.zeros(E, 4, 1, 256), requires_grad=False
+    )  # 6 % 4 != 0
+    assert moe_weights.describe_moe_quant(bad_s13, tp_size=1) is None
+
+    # 3. Exact 1-byte wire dtype verification via global_dtypes (int8 vs float8_e4m3fn refused!).
+    full = _hf_tensors(torch.Generator().manual_seed(0))
+    sent = _fp8_sent(full)
+    shapes = {n: list(t.shape) for n, t in sent.items()}
+    dtypes_ok = {n: str(t.dtype) for n, t in sent.items() if t.dtype != torch.bfloat16}
+    valid_m = _vllm_model(gdn=_GDN(tp_size=1), experts=_Fp8Experts(E, INTER, HID, use_ep=True, ep_size=1, ep_rank=0))
+    sel_ok = direct_install.select_layout(valid_m, shapes, CONFIG, 1, 0, global_dtypes=dtypes_ok)
+    assert sel_ok.layout is qwen3_5_layout.LAYOUT
+
+    dtypes_int8 = {**dtypes_ok, f"{EXPERTS}.w13_ep": "torch.int8"}
+    sel_bad = direct_install.select_layout(valid_m, shapes, CONFIG, 1, 0, global_dtypes=dtypes_int8)
+    assert sel_bad.layout is None and any("torch.int8" in r for r in sel_bad.reasons)
+
+    dtypes_bad_scale = {**dtypes_ok, f"{EXPERTS}.w13_scale_ep": "torch.bfloat16"}
+    sel_bad_s = direct_install.select_layout(valid_m, shapes, CONFIG, 1, 0, global_dtypes=dtypes_bad_scale)
+    assert sel_bad_s.layout is None and any("torch.float32" in r for r in sel_bad_s.reasons)
+
+    # 4. loader_error fast-fails on quantized scale suffixes or quantized global_dtypes.
+    assert "cannot install trainer-quantized" in direct_install.loader_error(shapes, CONFIG)
+    assert "cannot install quantized wire tensor" in direct_install.loader_error(
+        EP_SHAPES, CONFIG, global_dtypes={f"{EXPERTS}.w13_ep": "torch.float8_e4m3fn"}
+    )
+
+
+def test_incomplete_ep_expert_stack_group_raises():
+    """Missing one of gate_proj / up_proj / down_proj in expert_stacks under rollout_expert_parallel raises."""
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+    from verl_hardware_plugin.accelerators.tpu.rollout import qwen3_moe_layout
+
+    gate = torch.randn(E, INTER, HID, dtype=torch.bfloat16)
+    up = torch.randn(E, INTER, HID, dtype=torch.bfloat16)
+    slots_g = [(f"{EXPERTS}.{e}.gate_proj.weight", (INTER, HID)) for e in range(E)]
+    slots_u = [(f"{EXPERTS}.{e}.up_proj.weight", (INTER, HID)) for e in range(E)]
+    tw = TrainerWeights(
+        {},
+        [(gate, slots_g), (up, slots_u)],
+        "cpu",
+        expert_stack_wire=qwen3_moe_layout.expert_stack_wire_name,
+        rollout_expert_parallel=True,
+    )
+    with pytest.raises(RuntimeError, match="incomplete MoE expert stack projections"):
+        list(tw.local_shards())

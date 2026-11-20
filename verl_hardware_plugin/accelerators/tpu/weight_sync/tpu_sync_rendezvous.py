@@ -30,6 +30,7 @@ class TpuSyncRendezvousState:
     def __init__(self) -> None:
         self.controller_address: Optional[str] = None
         self.global_shapes: dict[str, list[int]] = {}
+        self.global_dtypes: dict[str, str] = {}
         self.vllm_params: Optional[dict[str, Any]] = None
         self.stats: dict[int, dict[str, Any]] = {}
 
@@ -48,6 +49,14 @@ class TpuSyncRendezvousState:
     def get_global_shapes(self) -> dict[str, list[int]]:
         """Returns the shapes recorded by ``set_global_shapes`` (empty before the first sync)."""
         return self.global_shapes
+
+    def set_global_dtypes(self, dtypes: dict[str, str]) -> None:
+        """Records wire dtypes for tensors whose wire dtype is not ``torch.bfloat16`` (e.g. FP32 scales)."""
+        self.global_dtypes = dict(dtypes)
+
+    def get_global_dtypes(self) -> dict[str, str]:
+        """Returns the non-bf16 wire dtypes recorded by ``set_global_dtypes``."""
+        return self.global_dtypes
 
     def set_vllm_params(self, params: dict[str, Any]) -> None:
         """Records the rollout's vLLM parameter description (``describe_vllm_params``) for ``receive_into_vllm``."""

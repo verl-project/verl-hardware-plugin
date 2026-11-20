@@ -48,6 +48,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 TPU_ENGINE_KWARGS_KEY = "tpu"
 # Parallel transfer streams per worker, unless engine_kwargs.tpu-sync.parallelism overrides it.
 TPU_SYNC_DEFAULT_PARALLELISM = 8
+# Consecutive tensors per transfer stage of the controller, unless engine_kwargs.tpu-sync.group_size overrides it.
+TPU_SYNC_DEFAULT_GROUP_SIZE = 16
 
 _warned: set[str] = set()
 
@@ -56,6 +58,15 @@ def _warn_once(key: str, message: str) -> None:
     if key not in _warned:
         _warned.add(key)
         logger.warning(message)
+
+
+def _to_plain_dict(value: Any) -> Any:
+    """Recursively converts mappings and iterables into plain dicts and lists."""
+    if isinstance(value, Mapping):
+        return {str(k): _to_plain_dict(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_to_plain_dict(v) for v in value]
+    return value
 
 
 def _parse(name: str, kind: type, value: Any, source: str, label: str = "TPU") -> Any:
@@ -67,8 +78,12 @@ def _parse(name: str, kind: type, value: Any, source: str, label: str = "TPU") -
         if value == "":
             return None
     try:
-        if kind is ParityMode:
-            return ParityMode.parse(value)
+        if kind is dict:
+            if isinstance(value, Mapping):
+                return _to_plain_dict(value)
+            raise ValueError(f"expected a mapping, got {type(value).__name__}")
+        if hasattr(kind, "parse"):
+            return kind.parse(value)
         if kind is bool:
             if isinstance(value, bool):
                 return value
@@ -146,6 +161,17 @@ class TPUEngineOptions:
             (default: ``DEFER_AND_FUSE`` with ``use_torch_compile``).
         context_parallel_strategy: Context-parallel attention strategy when ``context_parallel_size > 1``:
             ``all_gather`` (load-balanced KV all-gather with Splash Attention, default) or ``ulysses`` (all-to-all).
+        context_parallel_gdn_strategy: How the context-parallel GatedDeltaNet (Qwen3.5) moves its inputs between
+            the token and head layouts: ``all_to_all`` or ``allgather_reducescatter`` (default: unset, torchtitan's
+            ``GatedDeltaNetContextParallelTransform`` default). Passed to the transform as ``strategy``; needs
+            ``context_parallel_size > 1``, a model with GatedDeltaNet layers, and a torchtitan whose transform has
+            that field (an older one is rejected when this is set). A performance A/B option, independent of
+            ``context_parallel_strategy``.
+        context_parallel_gdn_reduce_dtype: dtype of both the forward ``out_proj`` reduce-scatter and the backward
+            input-gradient reduce-scatter under ``context_parallel_gdn_strategy='allgather_reducescatter'``,
+            ``float32`` or ``bfloat16`` (default: unset, the transform's default). Passed as ``reduce_dtype``, with
+            the same torchtitan requirement; rejected under ``all_to_all``, when ``context_parallel_size <= 1``, or
+            on models without GatedDeltaNet layers.
         optim_impl: torchtitan optimizer implementation (default: ``fused``, ``for-loop`` with TP).
         seq_bucket_size: Packed sequence length bucket in tokens (default: ``pad_to_length_bucket`` when
             ``pad_to_length`` is set, else 256).
@@ -160,11 +186,21 @@ class TPUEngineOptions:
             unset preserves its default and FP32 master parameters.
         fp32_logits: Preserve FP32 LM-head accumulators with BF16 operands; ``False`` requests BF16 logits.
             Either explicit value disables the automatic fused-linear-loss default so this head is used.
-        rollout_expert_parallel: Export Qwen3.5 MoE experts in vLLM's expert-parallel layout so the rollout
-            receives them straight into its expert weights with no HBM staging copy (default: ``False``, see
-            ``rollout/qwen3_5_layout.py``). Temporary for large MoEs whose expert shard cannot afford a second HBM
-            staging copy alongside weights + KV cache (e.g. Qwen3.5-397B-A17B); remove once ``tpu-sync`` stages on
-            host DRAM and H2Ds directly into vLLM weights (the default ``False`` path already supports vLLM EP).
+        rollout_expert_parallel: Export MoE experts in vLLM's expert-parallel layout so the rollout receives
+            them straight into its expert weights with no HBM staging copy (default: ``False``, see
+            ``rollout/moe_weights.py``; supported by Qwen3.5 and Qwen3 MoE). Temporary for large MoEs whose expert
+            shard cannot afford a second HBM staging copy alongside weights + KV cache (e.g. Qwen3.5-397B-A17B); remove
+            once ``tpu-sync`` stages on host DRAM and H2Ds directly into vLLM weights (the default ``False`` path
+            already supports vLLM EP).
+        rollout_fp8_moe: Trainer-side expert quantization for ``rollout_expert_parallel`` when the rollout runs
+            vllm-torchtpu's quantized MoE (e.g. ``QUANTIZE_ON_LOAD_PREFIXES=experts`` with
+            ``VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=QUANTIZE_ON_LOAD_PREFIXES``). Unset (default): when
+            ``rollout_expert_parallel=True`` and the rollout reports quantized MoE via ``describe_vllm_params``, the
+            trainer automatically quantizes each expert stack in the rollout's ``(quant_dtype, block_size)`` format and
+            sends quantized weights (received zero-copy into ``w13_weight`` / ``w2_weight``) plus FP32 scales (copied
+            into ``w*_weight_scale_inv``), halving expert wire bytes and avoiding a bf16 staging copy. ``True`` forces
+            trainer-side quantization (and implies ``rollout_expert_parallel=True`` when unset); ``False`` disables
+            trainer-side quantization.
         param_dtype: Storage dtype of the trained parameters, their gradients and (with the default AdamW) the
             optimizer states: ``float32`` (default) or ``bfloat16``. ``bfloat16`` halves the parameter and gradient
             memory (pure bf16 training, no fp32 master), e.g. for models whose fp32 training state does not fit.
@@ -198,9 +234,19 @@ class TPUEngineOptions:
             "attention.inner_attention")`` benchmark memory policy).
         static_micro_batch_len: Pad every packed micro-batch to at least this many tokens (rounded up to the
             sequence bucket), e.g. the ``use_dynamic_bsz`` token budget, so the trainer compiles one sequence shape
-            instead of one per length bucket it meets (default: unset, off).
+            instead of one per length bucket it meets (default: unset, off). When ``gdn_auto_row_slot_len`` is set,
+            must be ``>= gdn_auto_row_slot_len`` and divisible by ``gdn_auto_row_slot_len``.
         static_max_response_len: Pad every micro-batch's response-length bucket to at least this many tokens (e.g.
             ``max_response_length``), so response-shaped tensors also keep one shape (default: unset, off).
+        loss_row_bucketing: Pad the PPO loss inputs of every micro-batch with fully masked rows up to a common row
+            count (``tpu_padded_num_seqs``: the most sequences in any micro-batch of the mini-batch on any rank,
+            rounded up to a power of two), so the loss programs do not recompile whenever ``use_dynamic_bsz`` changes
+            the number of sequences per micro-batch (default: ``True``). Applied only with verl's ``ppo_loss`` and a
+            policy loss that ignores fully masked rows (``losses.loss_inputs.loss_rows_can_be_padded``); ``geo_mean``,
+            ``bypass_mode`` and custom ``register_policy_loss`` losses keep the exact row count. ``False`` turns it off.
+        static_micro_batch_num_seqs: With ``loss_row_bucketing``, pad the PPO loss inputs to at least this many rows
+            (e.g. the largest number of sequences a micro-batch can hold), so the loss keeps one row shape
+            (default: unset, the power-of-two bucket only).
         splash_max_block_size: Largest Splash attention block size, a power of two >= 128 (default: ``512``,
             torchtitan's). Long packed micro-batches run faster with ``1024``.
         mixed_precision_reduce: dtype of the FSDP gradient reduce-scatter, ``float32`` (default, torchtitan's) or
@@ -209,13 +255,47 @@ class TPUEngineOptions:
             matmul, sharing the routed-token loads (default: ``False``).
         moe_native_weight_layout: Qwen3 MoE: store the expert weights in the kernel-native ``(E, K, N)`` layout;
             ``state_dict()`` / ``load_state_dict()`` still use the canonical layout and names (default: ``False``).
+        cp_full_positions: Under context parallelism, pass the pre-``cp_shard`` unsharded 1-D ``positions`` to
+            ``model.forward`` as ``cp_full_positions`` (``google-pytorch/torchtitan#216``), eliminating per-layer
+            ``all_gather(positions)`` across both Ulysses and KV all-gather CP (default: unset, off). Fails loudly if
+            the installed torchtitan lacks ``cp_full_positions`` or on 3-D MRoPE / multimodal batches.
+        gdn_auto_row_slot_len: Dynamic per-micro-batch row-slot length (e.g. ``32768``) for models whose ``forward``
+            accepts ``gated_delta_document_resets`` (``google-pytorch/torchtitan#216``). Micro-batches whose single-doc
+            sequences start at position ``0`` and fit ``gdn_auto_row_slot_len`` rows are permuted into slots and run
+            unsegmented (``set_unflatten_seq_len(slot_len)``, ``gated_delta_document_resets=False``); single-document
+            micro-batches starting at position ``0`` run unsegmented at ``padded_len``; multi-document or continuation
+            micro-batches run segmented. Ranks agree via bitwise-AND all-reduce so SPMD collectives share one compiled
+            shape. Mutually exclusive with ``gdn_row_slot_len``; requires ``use_fused_linear_cross_entropy``,
+            ``tensor_parallel_size == 1``, contiguous CP layout (no ``headtail`` balancer), and any configured
+            ``static_micro_batch_len`` / ``static_log_prob_micro_batch_len`` to be ``>= gdn_auto_row_slot_len`` and
+            divisible by ``gdn_auto_row_slot_len``.
+        fuse_gdn_projections: Set ``fuse_input_projections=True`` on every GatedDeltaNet config in ``model_spec.model``
+            before build (``google-pytorch/torchtitan#216``), fusing the six bias-free input projections into one
+            matmul (default: unset, off). Requires ``tensor_parallel_size == 1`` (``TP == 1``) and fails loudly if TP is
+            enabled or if no module config declares ``fuse_input_projections``.
+        sort_micro_batches_by_slot: Order each mini-batch's micro-batches by ``(slot_category, -total_tokens, idx)``
+            using the shared slot classifier so micro-batches compiling to the same slot / segmentation program run
+            back to back (default: unset, off).
+        static_log_prob_micro_batch_len: Static packed micro-batch length in tokens for forward-only
+            (old / reference log-prob) passes, overriding ``static_micro_batch_len`` when ``forward_only=True``
+            (default: unset, off). When ``gdn_auto_row_slot_len`` is set, must be ``>= gdn_auto_row_slot_len`` and
+            divisible by ``gdn_auto_row_slot_len``.
         gdn_row_slot_len: Qwen3.5: start every sequence of a packed micro-batch at a multiple of this many tokens
             and run the GatedDeltaNet over rows of this length (one sequence per row) instead of restarting it at
             packed documents through Tokamax ``segment_ids`` (default: unset, off). Needs every sequence <= this
-            length and ``static_micro_batch_len`` = sequences per micro-batch x this.
+            length, ``static_micro_batch_len`` = sequences per micro-batch x this, and ``context_parallel_size == 1``
+            (use ``gdn_auto_row_slot_len`` with ``context_parallel_strategy='ulysses'`` under CP).
         frozen_param_regex: Parameters whose FQN matches this regex (``re.search``) are not trained: their
             gradients are dropped before the gradient norm and the optimizer step, e.g. ``moe.router.gate`` freezes
             the MoE router (default: unset, train every parameter).
+        trainer_mode: How the actor's training step runs: ``eager_blocks`` (default: TorchTitan ``Trainer``,
+            per-TransformerBlock ``torch.compile`` and eager loss / backward) or ``graph_trainer`` (TorchTitan's
+            ``TpuGraphTrainer`` traces forward + RL loss + backward of a micro-batch into one graph and compiles it
+            whole, see ``engines/graph_trainer_mode.py``). ``graph_trainer`` needs ``use_simple_fsdp`` and
+            ``static_micro_batch_len`` (one traced shape for every micro-batch) and trains actors only.
+        graph_trainer: Settings passed straight to TorchTitan's ``TpuGraphTrainerCompileConfig(**cfg)``
+            (e.g. ``memory_policy``, ``save_regions``, ``fsdp_barrier_policy``, ``graph_split``).
+            Ignored when ``trainer_mode`` is not ``graph_trainer``.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -224,6 +304,8 @@ class TPUEngineOptions:
     fuse_qkv: Optional[bool] = None
     tpu_eager_mode: Optional[str] = None
     context_parallel_strategy: Optional[str] = None
+    context_parallel_gdn_strategy: Optional[str] = None
+    context_parallel_gdn_reduce_dtype: Optional[str] = None
     optim_impl: Optional[str] = None
     seq_bucket_size: Optional[int] = None
     model_kernels: Optional[str] = None
@@ -233,6 +315,7 @@ class TPUEngineOptions:
     mixed_precision_param: Optional[str] = None
     fp32_logits: Optional[bool] = None
     rollout_expert_parallel: Optional[bool] = None
+    rollout_fp8_moe: Optional[bool] = None
     param_dtype: Optional[str] = None
     optimizer_host_offload: Optional[bool] = None
     fp32_master: Optional[bool] = None
@@ -243,21 +326,41 @@ class TPUEngineOptions:
     ac_save_splash_and_routing: Optional[bool] = None
     static_micro_batch_len: Optional[int] = None
     static_max_response_len: Optional[int] = None
+    loss_row_bucketing: Optional[bool] = None
+    static_micro_batch_num_seqs: Optional[int] = None
     splash_max_block_size: Optional[int] = None
     mixed_precision_reduce: Optional[str] = None
     moe_paired_grouped_mm: Optional[bool] = None
     moe_native_weight_layout: Optional[bool] = None
+    cp_full_positions: Optional[bool] = None
+    gdn_auto_row_slot_len: Optional[int] = None
+    fuse_gdn_projections: Optional[bool] = None
+    sort_micro_batches_by_slot: Optional[bool] = None
+    static_log_prob_micro_batch_len: Optional[int] = None
     gdn_row_slot_len: Optional[int] = None
     frozen_param_regex: Optional[str] = None
+    trainer_mode: Optional[str] = None
+    graph_trainer: Optional[dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        if self.static_micro_batch_num_seqs is not None and (
+            isinstance(self.static_micro_batch_num_seqs, bool) or self.static_micro_batch_num_seqs < 1
+        ):
+            raise ValueError(
+                f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.static_micro_batch_num_seqs must be >= 1, "
+                f"got {self.static_micro_batch_num_seqs!r}"
+            )
 
 
-_ENGINE_KINDS: dict[str, type] = {
+_ENGINE_KINDS: dict[str, Any] = {
     "use_splash_attention": bool,
     "use_simple_fsdp": bool,
     "use_fused_linear_cross_entropy": bool,
     "fuse_qkv": bool,
     "tpu_eager_mode": str,
     "context_parallel_strategy": str,
+    "context_parallel_gdn_strategy": str,
+    "context_parallel_gdn_reduce_dtype": str,
     "optim_impl": str,
     "seq_bucket_size": int,
     "model_kernels": str,
@@ -267,6 +370,7 @@ _ENGINE_KINDS: dict[str, type] = {
     "mixed_precision_param": str,
     "fp32_logits": bool,
     "rollout_expert_parallel": bool,
+    "rollout_fp8_moe": bool,
     "param_dtype": str,
     "optimizer_host_offload": bool,
     "fp32_master": bool,
@@ -277,14 +381,35 @@ _ENGINE_KINDS: dict[str, type] = {
     "ac_save_splash_and_routing": bool,
     "static_micro_batch_len": int,
     "static_max_response_len": int,
+    "loss_row_bucketing": bool,
+    "static_micro_batch_num_seqs": int,
     "splash_max_block_size": int,
     "mixed_precision_reduce": str,
     "moe_paired_grouped_mm": bool,
     "moe_native_weight_layout": bool,
+    "cp_full_positions": bool,
+    "gdn_auto_row_slot_len": int,
+    "fuse_gdn_projections": bool,
+    "sort_micro_batches_by_slot": bool,
+    "static_log_prob_micro_batch_len": int,
     "gdn_row_slot_len": int,
     "frozen_param_regex": str,
+    "trainer_mode": str,
+    "graph_trainer": dict,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
+
+# String options with a fixed set of values (lower-cased, checked by get_tpu_engine_options).
+_ENGINE_CHOICES: dict[str, tuple[str, ...]] = {
+    "context_parallel_strategy": ("all_gather", "ulysses"),
+    "context_parallel_gdn_strategy": ("all_to_all", "allgather_reducescatter"),
+    "context_parallel_gdn_reduce_dtype": ("float32", "bfloat16"),
+}
+
+# engine_kwargs.tpu.trainer_mode values.
+TRAINER_MODE_EAGER_BLOCKS = "eager_blocks"
+TRAINER_MODE_GRAPH_TRAINER = "graph_trainer"
+_TRAINER_MODES = (TRAINER_MODE_EAGER_BLOCKS, TRAINER_MODE_GRAPH_TRAINER)
 
 # Deprecated channels, read for compatibility: option -> environment variable / top-level config field.
 _ENGINE_LEGACY_ENV_VARS = {
@@ -345,6 +470,14 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
         )
     if values.get("fp32_master") and values.get("param_dtype") != "bfloat16":
         raise ValueError(f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.fp32_master needs param_dtype=bfloat16")
+    if values.get("rollout_fp8_moe") is True:
+        if values.get("rollout_expert_parallel") is False:
+            raise ValueError(
+                f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.rollout_fp8_moe=True conflicts with "
+                "rollout_expert_parallel=False"
+            )
+        if values.get("rollout_expert_parallel") is None:
+            values["rollout_expert_parallel"] = True
     if values.get("ep_dispatcher") is not None:
         ep_disp = values["ep_dispatcher"].strip().lower()
         if ep_disp not in ("auto", "ragged", "static"):
@@ -353,11 +486,65 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
                 f"got {values['ep_dispatcher']!r}"
             )
         values["ep_dispatcher"] = ep_disp
+    for name, choices in _ENGINE_CHOICES.items():
+        if values.get(name) is not None:
+            choice = values[name].strip().lower()
+            if choice not in choices:
+                raise ValueError(
+                    f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.{name} must be one of {choices}, got {values[name]!r}"
+                )
+            values[name] = choice
+    if (
+        values.get("context_parallel_gdn_reduce_dtype") is not None
+        and values.get("context_parallel_gdn_strategy") == "all_to_all"
+    ):
+        raise ValueError(
+            f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.context_parallel_gdn_reduce_dtype only applies when "
+            "context_parallel_gdn_strategy='allgather_reducescatter', got context_parallel_gdn_strategy='all_to_all'"
+        )
+    for pos_int_key in ("gdn_auto_row_slot_len", "static_log_prob_micro_batch_len"):
+        if values.get(pos_int_key) is not None and values[pos_int_key] < 1:
+            raise ValueError(
+                f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.{pos_int_key} must be >= 1, got {values[pos_int_key]!r}"
+            )
+    if values.get("gdn_auto_row_slot_len") and values.get("gdn_row_slot_len"):
+        raise ValueError(
+            f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.gdn_auto_row_slot_len and gdn_row_slot_len are mutually exclusive"
+        )
+    auto_slot_len = values.get("gdn_auto_row_slot_len")
+    if auto_slot_len:
+        for static_key in ("static_micro_batch_len", "static_log_prob_micro_batch_len"):
+            static_val = values.get(static_key)
+            if static_val is not None and (static_val < auto_slot_len or static_val % auto_slot_len != 0):
+                raise ValueError(
+                    f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.{static_key} ({static_val}) must be >= "
+                    f"gdn_auto_row_slot_len ({auto_slot_len}) and divisible by gdn_auto_row_slot_len"
+                )
     if values.get("ep_token_chunks") is not None and values["ep_token_chunks"] < 1:
         raise ValueError(
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ep_token_chunks must be >= 1, got {values['ep_token_chunks']!r}"
         )
+    if values.get("static_micro_batch_num_seqs") is not None and values["static_micro_batch_num_seqs"] < 1:
+        raise ValueError(
+            f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.static_micro_batch_num_seqs must be >= 1, "
+            f"got {values['static_micro_batch_num_seqs']!r}"
+        )
+    _normalize_trainer_mode(values)
     return TPUEngineOptions(**values)
+
+
+def _normalize_trainer_mode(values: dict[str, Any]) -> None:
+    """Checks ``trainer_mode`` (lower-cased in place)."""
+    key = f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}"
+    val = values.get("trainer_mode")
+    if val is None:
+        return
+    if not isinstance(val, str):
+        raise ValueError(f"{key}.trainer_mode must be a string, got {type(val).__name__}")
+    mode = val.strip().lower()
+    if mode not in _TRAINER_MODES:
+        raise ValueError(f"{key}.trainer_mode must be one of {_TRAINER_MODES}, got {val!r}")
+    values["trainer_mode"] = mode
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -391,12 +578,40 @@ class ParityMode:
         return mode
 
 
+class ReceiveIntoVllmMode:
+    """Values of ``engine_kwargs.tpu-sync.receive_into_vllm`` (see ``weight_sync/vllm_layout.py``).
+
+    * ``auto`` (default): receive straight into vLLM's parameters when the rollout is vLLM and the trainer's
+      weights can be exported in vLLM's layout without cross-rank exchange; fall back to rollout staging buffers
+      otherwise (e.g. SGLang, MoE / hybrid linear-attention models, ``FSDP != TP``, or replicated GQA KV heads).
+    * ``on``: require direct receive into vLLM's parameters; raise when unsupported.
+    * ``off``: always use rollout staging buffers.
+
+    A bool is accepted for compatibility: ``True`` means ``on``, ``False`` means ``off``.
+    """
+
+    MODES = ("auto", "on", "off")
+    _ALIASES = {"false": "off", "0": "off", "no": "off", "none": "off", "true": "on", "1": "on", "yes": "on"}
+
+    @classmethod
+    def parse(cls, value: Any) -> str:
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        mode = str(value).strip().lower()
+        mode = cls._ALIASES.get(mode, mode)
+        if mode not in cls.MODES:
+            raise ValueError(value)
+        return mode
+
+
 @dataclasses.dataclass(frozen=True)
 class TPUSyncOptions:
     """Options of the ``tpu-sync`` checkpoint engine.
 
     Attributes:
         parallelism: Parallel transfer streams per worker.
+        group_size: Number of consecutive tensors the tpu-sync controller plans and schedules as one stage of the
+            transfer (``1`` makes every tensor its own stage).
         verify_parity: Weight-sync check, one of ``ParityMode.MODES`` (``off`` by default): ``norm`` compares
             trainer and rollout weight norms after every sync, ``exact`` compares every tensor the rollout
             received on the step-0 sync bit for bit with the checkpoint vLLM loaded, ``all`` runs both. A failed
@@ -411,18 +626,27 @@ class TPUSyncOptions:
             ``WeightSynchronizer.d2h()`` returns a future (verl#8626); with an older ``tpu-sync-torch`` the sync runs
             to the end as before. Relies on ``CheckpointEngineManager.wait_for_weight_update`` (verl#8530) before
             validation and at the end of training.
-        receive_into_vllm: The rollout receives every tensor straight into vLLM's parameters, with no HBM staging
-            copy. The trainer exports its weights in vLLM's layout (fused, transposed, one virtual tensor per vLLM
-            parameter), so each rollout rank's TP slice is its vLLM weight. Dense models with FSDP degree equal to
-            the rollout TP degree only, for now (see ``weight_sync/vllm_layout.py``).
+        receive_into_vllm: One of ``ReceiveIntoVllmMode.MODES`` (``auto`` by default). When active, the rollout
+            receives every tensor straight into vLLM's parameters with no HBM staging copy: the trainer exports its
+            weights in vLLM's layout (fused, transposed, one virtual tensor per vLLM parameter), so each rollout rank's
+            TP slice is its vLLM weight. ``auto`` enables it for dense vLLM models whose trainer layout needs no
+            cross-rank exchange (e.g. ``FSDP == TP``) and falls back to staging otherwise; ``on`` (``True``) requires
+            it and ``off`` (``False``) disables it.
+        direct_install_quantized_moe: Install quantized rollout MoE experts (e.g. vllm-torchtpu's FP8 MoE with
+            ``QUANTIZE_ON_LOAD_PREFIXES=experts``) directly: each rollout rank requantizes the bf16 expert slices it
+            received with the rollout's own quantizer and writes the live weights and scales (``True``, default).
+            ``False`` installs them through vLLM's checkpoint loaders instead (every rank all-gathers every tensor;
+            much slower), e.g. to rule out the direct install while debugging.
     """
 
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM
+    group_size: int = TPU_SYNC_DEFAULT_GROUP_SIZE
     verify_parity: str = "off"
     release_buffers_after_sync: bool = True
     tie_word_embeddings: Optional[bool] = None
     return_after_d2h: bool = True
-    receive_into_vllm: bool = False
+    receive_into_vllm: str = "auto"
+    direct_install_quantized_moe: bool = True
 
     @property
     def verify_norms(self) -> bool:
@@ -437,11 +661,13 @@ class TPUSyncOptions:
 
 _SYNC_KINDS: dict[str, type] = {
     "parallelism": int,
+    "group_size": int,
     "verify_parity": ParityMode,
     "release_buffers_after_sync": bool,
     "tie_word_embeddings": bool,
-    "receive_into_vllm": bool,
+    "receive_into_vllm": ReceiveIntoVllmMode,
     "return_after_d2h": bool,
+    "direct_install_quantized_moe": bool,
 }
 assert set(_SYNC_KINDS) == {f.name for f in dataclasses.fields(TPUSyncOptions)}
 

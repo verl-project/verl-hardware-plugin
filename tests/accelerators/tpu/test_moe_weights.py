@@ -98,3 +98,44 @@ def test_expert_param_finds_and_caches_nested_keys():
     )
     with pytest.raises(RuntimeError, match="expected one vLLM parameter"):
         moe_weights.expert_param(model_sd, find, "model.layers.4.mlp.experts", "w13_weight", cache)
+
+
+def test_format_ep_expert_weight_syncs_tpu_on_single_and_multi_chunk(monkeypatch):
+    """``format_ep_expert_weight`` materializes lazy TPU tensors on both single-chunk and multi-chunk exports."""
+    synced: list[int] = []
+    monkeypatch.setattr(moe_weights, "_is_tpu_tensor", lambda _t: True)
+    monkeypatch.setattr(moe_weights, "tpu_synchronize", lambda tensors: synced.append(len(tensors)))
+
+    w13_in = torch.randn(E, 2 * INTER, HID, dtype=torch.bfloat16)
+    quant = moe_weights.ExpertWireQuant(moe_weights.FP8_MOE_DTYPE, block_size=None, activation="silu")
+
+    # 1. Unquantized BF16 EP: single sync of [out_w].
+    out_bf16, scale_bf16 = moe_weights.format_ep_expert_weight(w13_in, "w13", quant=None)
+    assert scale_bf16 is None and out_bf16.shape == (E, HID, 2 * INTER)
+    assert synced == [1]
+
+    # 2. Single-chunk quantized (num_experts <= per_chunk): syncs [q_gmm, scale] once (no double sync).
+    synced.clear()
+    q_single, s_single = moe_weights.format_ep_expert_weight(w13_in, "w13", quant=quant)
+    assert s_single is not None and synced == [2]
+
+    # 3. Multi-chunk quantized (chunk_bytes=1 -> 1 expert per chunk): syncs each chunk plus the concatenated pair.
+    synced.clear()
+    q_multi, s_multi = moe_weights.format_ep_expert_weight(w13_in, "w13", quant=quant, chunk_bytes=1)
+    assert s_multi is not None and synced == [2] * (E + 1)
+    assert torch.equal(q_single.view(torch.uint8), q_multi.view(torch.uint8))
+    assert torch.equal(s_single, s_multi)
+
+
+def test_expert_wire_quant_and_pad_validation():
+    """``ExpertWireQuant`` rejects invalid dtypes, boolean/non-positive block_size, and swigluoai."""
+    for bad_bs in (True, False, 0, -2, "128", (128, 128)):
+        with pytest.raises(ValueError, match="positive int"):
+            moe_weights.ExpertWireQuant.from_dict({"quant_dtype": "torch.float8_e4m3fn", "block_size": bad_bs})
+    for bad_dtype in ("torch.bfloat16", "torch.float32", "torch.uint8", "not_a_dtype"):
+        with pytest.raises(ValueError, match="dtype"):
+            moe_weights.ExpertWireQuant.from_dict({"quant_dtype": bad_dtype})
+    with pytest.raises(ValueError, match="not supported"):
+        moe_weights.ExpertWireQuant.from_dict({"quant_dtype": "torch.float8_e4m3fn", "activation": "swigluoai"})
+    with pytest.raises(ValueError, match="not supported"):
+        moe_weights._pad_expert_for_gmm(torch.zeros(1, 4, 4), "w13", "swigluoai")

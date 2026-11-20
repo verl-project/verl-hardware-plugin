@@ -155,6 +155,8 @@ class _FakeTpuSync:
         self.d2h_future = False
         # When set, every transfer waits for it before it copies anything.
         self.transfer_gate: threading.Event | None = None
+        # IPs of the host's data NICs that WeightSynchronizer.get_local_endpoints() reports; none by default.
+        self.data_nic_ips: list[str] = []
 
     def enable_d2h_future(self, monkeypatch):
         """Makes the fake ``tpu-sync-torch`` a build whose ``WeightSynchronizer.d2h()`` returns a future."""
@@ -258,6 +260,10 @@ class _FakeTpuSync:
                 self.host = None  # trainer side: the host copies of the last d2h()
                 self.received = None  # rollout side: what the last transfer delivered, written by h2d()
                 world.synchronizers.append(self)
+
+            def get_local_endpoints(self):
+                # One endpoint per data NIC of the host, all on this synchronizer's port (see set_data_nics()).
+                return [{"endpoint": f"{ip}:{self.local_port}", "shards": [0]} for ip in world.data_nic_ips]
 
             def test_only_set_skip_tiling(self, plan):
                 self.skip_tiling = list(plan)
@@ -834,6 +840,52 @@ def test_setup_tpu_sync_controller_wraps_registry_errors(fake_tpu_sync, monkeypa
 # ---------------------------------------------------------------------------
 
 
+def _endpoints_ws(endpoints, local_port=5555):
+    return SimpleNamespace(local_port=local_port, get_local_endpoints=lambda: endpoints)
+
+
+@pytest.mark.parametrize(
+    ("ws", "index", "expected"),
+    [
+        # No data NIC reported (or an older tpu-sync without get_local_endpoints): the node IP.
+        (_endpoints_ws([]), 3, "10.0.0.1:5555"),
+        (SimpleNamespace(local_port=5555), 0, "10.0.0.1:5555"),
+        # One data NIC: every process uses it.
+        (_endpoints_ws([{"endpoint": "10.30.0.1:5555", "shards": [0]}]), 3, "10.30.0.1:5555"),
+        # Two data NICs: the processes of a host take them in turn.
+        (_endpoints_ws([{"endpoint": "10.30.0.1:5555"}, {"endpoint": "10.105.0.1:5555"}]), 0, "10.30.0.1:5555"),
+        (_endpoints_ws([{"endpoint": "10.30.0.1:5555"}, {"endpoint": "10.105.0.1:5555"}]), 5, "10.105.0.1:5555"),
+        # Wildcard and loopback addresses are not reachable from other hosts.
+        (_endpoints_ws([{"endpoint": "0.0.0.0:5555"}, {"endpoint": "127.0.0.1:5555"}]), 1, "10.0.0.1:5555"),
+        (_endpoints_ws([{"endpoint": "[::]:5555"}, {"endpoint": "[fd00::1]:5555"}]), 0, "[fd00::1]:5555"),
+    ],
+)
+def test_data_plane_address(ws, index, expected):
+    assert tpu_sync_engine.data_plane_address(ws, "10.0.0.1", index) == expected
+
+
+def test_data_plane_address_falls_back_when_endpoints_fail():
+    def fail():
+        raise RuntimeError("not supported")
+
+    ws = SimpleNamespace(local_port=5555, get_local_endpoints=fail)
+    assert tpu_sync_engine.data_plane_address(ws, "10.0.0.1", 0) == "10.0.0.1:5555"
+
+
+def test_send_weights_registers_a_data_nic_per_rank(fake_tpu_sync):
+    fake_tpu_sync.data_nic_ips = ["10.30.0.1", "10.105.0.1"]
+    tpu_sync_engine.setup_tpu_sync_controller()
+    for rank in range(4):
+        asyncio.run(_trainer_engine(rank=rank).send_weights(iter(_trainer_weights().items()), global_steps=1))
+
+    for rank, ws in enumerate(fake_tpu_sync.synchronizers):
+        registration = fake_tpu_sync.registrations[TpuSyncId("trainer", str(rank), "weights")]
+        nic = fake_tpu_sync.data_nic_ips[rank % 2]
+        assert registration.data_addresses == [f"{nic}:{ws.local_port}"]
+        # The control RPCs still go to the node IP.
+        assert registration.listener_address == f"10.0.0.1:{ws.listener_port}"
+
+
 def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu_sync):
     tpu_sync_engine.setup_tpu_sync_controller()
     weights = _trainer_weights()
@@ -843,7 +895,7 @@ def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu
 
     (ws,) = fake_tpu_sync.synchronizers
     assert [t.data_ptr() for t in ws.tensors] == [weights[n].data_ptr() for n in names]  # bound in place
-    assert (ws.parallelism, ws.bind_ip) == (8, "10.0.0.1")
+    assert (ws.parallelism, ws.bind_ip) == (8, None)  # tpu-sync picks the data NICs itself
     assert ws.kwargs == {"unsafe_skip_buffer_lock": True, "auto_h2d": False}
     assert ws.d2h_calls == 0  # the controller-driven push does the D2H; send_weights only binds
     registration = fake_tpu_sync.registrations[TpuSyncId("trainer", "0", "weights")]
@@ -1023,25 +1075,54 @@ def test_merge_rank_stats_matches_full_tensor_stats():
 # ---------------------------------------------------------------------------
 
 
+def test_update_tpu_sync_weights_over_data_nics_with_group_size(fake_tpu_sync, worker_ext):
+    """Both sides register data-NIC endpoints and the configured group_size reaches the controller."""
+    fake_tpu_sync.data_nic_ips = ["10.30.0.1", "10.105.0.1"]
+    tp = trainer_ranks = 2
+    weights = _trainer_weights(seed=0)
+    engines = [_trainer_engine(rank, receive_into_vllm=False) for rank in range(trainer_ranks)]
+    models = [_FakeVllmModel(tp) for _ in range(tp)]
+    samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+    manager, _ = _make_manager(
+        engines, lambda rank: iter(weights.items()), samplers, [], group_size=128, receive_into_vllm=False
+    )
+
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+
+    (transfer,) = fake_tpu_sync.transfers
+    assert transfer["group_size"] == 128
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights, rank, tp))
+    addresses = [registration.data_addresses[0] for registration in fake_tpu_sync.registrations.values()]
+    assert {address.rsplit(":", 1)[0] for address in addresses} == set(fake_tpu_sync.data_nic_ips)
+
+
 @pytest.mark.parametrize("tie_word_embeddings", [False, True])
 def test_update_tpu_sync_weights_end_to_end(fake_tpu_sync, worker_ext, caplog, tie_word_embeddings):
     tp = trainer_ranks = 2
     weights = {"current": _trainer_weights(seed=0)}
     engines = [
-        _trainer_engine(rank, verify_parity=True, tie_word_embeddings=tie_word_embeddings)
+        _trainer_engine(rank, verify_parity=True, tie_word_embeddings=tie_word_embeddings, receive_into_vllm=False)
         for rank in range(trainer_ranks)
     ]
     models = [_FakeVllmModel(tp) for _ in range(tp)]
     samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
     events: list = []
     manager, server = _make_manager(
-        engines, lambda rank: iter(weights["current"].items()), samplers, events, verify_parity=True, parallelism=4
+        engines,
+        lambda rank: iter(weights["current"].items()),
+        samplers,
+        events,
+        verify_parity=True,
+        parallelism=4,
+        receive_into_vllm=False,
     )
 
     # Initial sync (step 0): nothing to abort and no parity check.
     with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
         metrics = asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
     assert events == [
+        "describe_vllm_params",
         "update_weights",
         "init_tpu_sync_on_worker",
         "release_sync_buffers",
@@ -1061,6 +1142,7 @@ def test_update_tpu_sync_weights_end_to_end(fake_tpu_sync, worker_ext, caplog, t
     assert transfer["src_units"] == [TpuSyncId("trainer", str(r), "weights") for r in range(trainer_ranks)]
     assert transfer["dst_units"] == [TpuSyncId("sampler0", str(r), "weights") for r in range(tp)]
     assert (transfer["parallelism"], transfer["req_id"], transfer["dst_mem_type"]) == (4, "verl_step_0", "DRAM")
+    assert transfer["group_size"] == 16  # the default
     # The listener port is OS-assigned (0 at creation) and the bound port is what the controller learns.
     listener_ports = [sampler._tpu_sync_ws.listener_port for sampler in samplers]
     assert len(set(listener_ports)) == tp and all(port > 0 for port in listener_ports)
@@ -1116,12 +1198,13 @@ def test_update_tpu_sync_weights_installs_tp_shards_into_transposed_weights(fake
     models = [_FakeVllmModel(tp, flip_o_proj=True) for _ in range(tp)]
     samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
     manager, _ = _make_manager(
-        [_trainer_engine(rank) for rank in range(trainer_ranks)],
+        [_trainer_engine(rank, receive_into_vllm=False) for rank in range(trainer_ranks)],
         lambda rank: iter(weights.items()),
         samplers,
         [],
         backend=backend,
         parallelism=3,
+        receive_into_vllm=False,
     )
     asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
 
@@ -1147,7 +1230,7 @@ def test_update_tpu_sync_weights_from_local_shards(
     """
     weights = {"current": _trainer_weights(seed=0)}
     engines = [
-        _trainer_engine(rank, verify_parity=True, tie_word_embeddings=tie_word_embeddings)
+        _trainer_engine(rank, verify_parity=True, tie_word_embeddings=tie_word_embeddings, receive_into_vllm=False)
         for rank in range(trainer_ranks)
     ]
     models = [_FakeVllmModel(tp) for _ in range(tp)]
@@ -1158,6 +1241,7 @@ def test_update_tpu_sync_weights_from_local_shards(
         samplers,
         [],
         verify_parity=True,
+        receive_into_vllm=False,
     )
 
     for step in (1, 2):
@@ -1259,7 +1343,7 @@ def test_receive_into_vllm_binds_every_vllm_parameter(
 
 def test_receive_into_vllm_needs_fsdp_equal_to_tp_for_fused_parameters(fake_tpu_sync, worker_ext):
     """F != TP, or replicated KV heads with local shards, would need an exchange among trainer ranks for the fused
-    qkv / gate_up (not implemented): the export fails clearly."""
+    qkv / gate_up (not implemented): when receive_into_vllm is forced on, the export fails clearly."""
     weights = _trainer_weights()
     manager, _, _ = _receive_into_vllm_setup(worker_ext, lambda rank: _LocalShardWeights(weights, rank, 4), 4, 2)
     with pytest.raises(Exception, match="FSDP degree 4 != rollout TP 2"):
@@ -1267,6 +1351,92 @@ def test_receive_into_vllm_needs_fsdp_equal_to_tp_for_fused_parameters(fake_tpu_
     manager, _, _ = _receive_into_vllm_setup(worker_ext, lambda rank: _LocalShardWeights(weights, rank, 4), 4, 4)
     with pytest.raises(Exception, match="replicated KV heads"):
         asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+
+
+def test_receive_into_vllm_auto_enables_by_default_and_falls_back_when_unsupported(fake_tpu_sync, worker_ext, caplog):
+    """Default ``receive_into_vllm="auto"`` binds vLLM parameters directly when supported (dense, FSDP == TP) and
+    falls back cleanly to rollout staging buffers otherwise (FSDP != TP, replicated KV heads, MoE/hybrid models, or
+    non-vLLM rollout workers such as SGLang)."""
+    weights = _trainer_weights()
+
+    # 1. Default ("auto") on supported dense FSDP=2 == TP=2 (including 0-D vLLM state_dict buffers like _k_scale):
+    #    binds vLLM parameters directly with no staging copy.
+    models = [_FakeVllmModel(2, flip_linears=True) for _ in range(2)]
+    for m in models:
+        m.model.layers[0].self_attn.register_buffer("_k_scale", torch.tensor(1.0, dtype=torch.float32))
+    samplers = [_make_sampler(worker_ext, rank, 2, model) for rank, model in enumerate(models)]
+    engines = [_trainer_engine(rank, verify_parity=True) for rank in range(2)]
+    manager, _ = _make_manager(
+        engines, lambda rank: _LocalShardWeights(weights, rank, 2), samplers, [], verify_parity=True
+    )
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    for rank, model in enumerate(models):
+        expected = {
+            **_expected_vllm_state(weights, rank, 2, flip_linears=True),
+            LAYER + "self_attn._k_scale": torch.tensor(1.0),
+        }
+        _assert_state(model, expected)
+    for sampler, model in zip(samplers, models, strict=True):
+        assert sampler._tpu_sync_bound_names == set(VLLM_PARAMS)
+        assert {t.data_ptr() for t in sampler._tpu_sync_ws.tensors} == {
+            p.data_ptr() for n, p in model.state_dict().items() if n in VLLM_PARAMS
+        }
+
+    # 2. Default ("auto") when FSDP=4 != TP=2: logs fallback and completes via staging buffers.
+    fake_tpu_sync.registry_state = TpuSyncRendezvousState()
+    fake_tpu_sync.registry = _FakeActorHandle(fake_tpu_sync.registry_state)
+    models = [_FakeVllmModel(2, flip_o_proj=True) for _ in range(2)]
+    samplers = [_make_sampler(worker_ext, rank, 2, model) for rank, model in enumerate(models)]
+    engines = [_trainer_engine(rank, verify_parity=True) for rank in range(4)]
+    manager, _ = _make_manager(
+        engines, lambda rank: _LocalShardWeights(weights, rank, 4), samplers, [], verify_parity=True
+    )
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert "receive_into_vllm=auto falling back to rollout staging buffers" in caplog.text
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights, rank, 2, flip_o_proj=True))
+    assert all(not getattr(s, "_tpu_sync_bound_names", None) for s in samplers)
+
+    # 3. Default ("auto") on a model declaring MoE expert_params_mapping: falls back to staging buffers.
+    fake_tpu_sync.registry_state = TpuSyncRendezvousState()
+    fake_tpu_sync.registry = _FakeActorHandle(fake_tpu_sync.registry_state)
+    models = [_FakeVllmModel(2) for _ in range(2)]
+    for m in models:
+        m.expert_params_mapping = [("w13_weight", "gate_proj.weight", 0, "w1")]
+    samplers = [_make_sampler(worker_ext, rank, 2, model) for rank, model in enumerate(models)]
+    engines = [_trainer_engine(rank, verify_parity=True) for rank in range(2)]
+    manager, _ = _make_manager(
+        engines, lambda rank: _LocalShardWeights(weights, rank, 2), samplers, [], verify_parity=True
+    )
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert "expert_params_mapping" in caplog.text
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights, rank, 2))
+    assert all(not getattr(s, "_tpu_sync_bound_names", None) for s in samplers)
+
+    # 4. Default ("auto") on a non-vLLM rollout worker (no vllm_config, e.g. SGLang): falls back to staging buffers.
+    fake_tpu_sync.registry_state = TpuSyncRendezvousState()
+    fake_tpu_sync.registry = _FakeActorHandle(fake_tpu_sync.registry_state)
+    models = [_FakeVllmModel(2) for _ in range(2)]
+    samplers = [_make_sampler(worker_ext, rank, 2, model) for rank, model in enumerate(models)]
+    for s in samplers:
+        del s.vllm_config
+        s._get_tp_size = lambda: 2
+        s._get_model_config = lambda: SimpleNamespace(get_total_num_kv_heads=lambda: KV_HEADS)
+    engines = [_trainer_engine(rank, verify_parity=True) for rank in range(2)]
+    manager, _ = _make_manager(
+        engines, lambda rank: _LocalShardWeights(weights, rank, 2), samplers, [], verify_parity=True
+    )
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert "no vLLM parameter description" in caplog.text
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights, rank, 2))
 
 
 def test_receive_into_vllm_exact_parity_compares_with_what_vllm_loaded(fake_tpu_sync, worker_ext):
@@ -2001,11 +2171,12 @@ def test_update_tpu_sync_weights_gqa_replicated_kv_heads(fake_tpu_sync, worker_e
     models = [_FakeVllmModel(tp) for _ in range(tp)]
     samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
     manager, _ = _make_manager(
-        [_trainer_engine(rank, verify_parity=verify_parity) for rank in range(2)],
+        [_trainer_engine(rank, verify_parity=verify_parity, receive_into_vllm=False) for rank in range(2)],
         lambda rank: iter(weights.items()),
         samplers,
         [],
         verify_parity=verify_parity,
+        receive_into_vllm=False,
     )
     with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
         asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
@@ -2034,7 +2205,7 @@ def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, worker_ex
     assert sampler.init_tpu_sync_on_worker("10.0.0.2:7777", shapes, parallelism=4) is True
 
     (ws,) = fake_tpu_sync.synchronizers
-    assert (ws.parallelism, ws.bind_ip) == (4, "10.0.0.1")
+    assert (ws.parallelism, ws.bind_ip) == (4, None)  # tpu-sync picks the data NICs itself
     assert ws.listener_port > 0  # OS-assigned (requested as 0), registered with the controller below
     assert [tuple(t.shape) for t in ws.tensors] == [(8, 64), (128, 128), (128,)]
     assert all(t.dtype == torch.bfloat16 for t in ws.tensors)
@@ -2075,6 +2246,39 @@ def test_sampler_init_registers_under_its_replica_job_name(fake_tpu_sync, worker
     assert TpuSyncId("sampler0", "1", "weights") not in fake_tpu_sync.registrations
     registration = fake_tpu_sync.registrations[TpuSyncId("sampler1", "1", "weights")]
     assert registration.listener_address == f"10.0.0.1:{ws.listener_port}"
+
+
+@pytest.mark.parametrize("direct_quantized", [True, False])
+def test_sampler_init_passes_the_quantized_moe_opt_out_to_the_layout_plans(
+    fake_tpu_sync, worker_ext, monkeypatch, direct_quantized
+):
+    """engine_kwargs.tpu-sync.direct_install_quantized_moe reaches every layout's plan (False: loader fallback)."""
+    from verl_hardware_plugin.accelerators.tpu.rollout import direct_install
+
+    seen = []
+
+    def select_layout(*args, **kwargs):
+        seen.append(kwargs.get("allow_quantized_moe"))
+        return direct_install.LayoutSelection(None, None, [])
+
+    monkeypatch.setattr(direct_install, "select_layout", select_layout)
+    sampler = _make_sampler(worker_ext, rank=0, tp=2, model=_FakeVllmModel(2))
+    kwargs = {} if direct_quantized else {"direct_install_quantized_moe": False}
+    assert sampler.init_tpu_sync_on_worker("10.0.0.2:7777", {"model.norm.weight": [128]}, **kwargs) is True
+    assert seen == [direct_quantized]
+
+
+def test_sampler_init_registers_a_data_nic_per_rank(fake_tpu_sync, worker_ext):
+    fake_tpu_sync.data_nic_ips = ["10.30.0.2", "10.105.0.2"]
+    tp = 4
+    for rank in range(tp):
+        sampler = _make_sampler(worker_ext, rank=rank, tp=tp, model=_FakeVllmModel(tp))
+        assert sampler.init_tpu_sync_on_worker("10.0.0.2:7777", {"model.norm.weight": [128]}, parallelism=4)
+
+    for rank, ws in enumerate(fake_tpu_sync.synchronizers):
+        registration = fake_tpu_sync.registrations[TpuSyncId("sampler0", str(rank), "weights")]
+        assert registration.data_addresses == [f"{fake_tpu_sync.data_nic_ips[rank % 2]}:{ws.local_port}"]
+        assert registration.listener_address == f"10.0.0.1:{ws.listener_port}"
 
 
 @pytest.mark.parametrize("address, shapes", [(None, {"model.norm.weight": [128]}), ("10.0.0.2:7777", {})])
@@ -2345,3 +2549,407 @@ def test_qwen3_moe_with_unsupported_expert_placement_falls_back_to_vllm_loaders(
         assert sorted(received) == sorted(expected)
         for name, tensor in expected.items():
             assert torch.equal(received[name], tensor), name
+
+
+def test_quantized_dense_weights_fall_back_to_loaders_and_copy_into_rejects_fp8(fake_tpu_sync, worker_ext, caplog):
+    """Dense models with quantized linears use vLLM's loaders at init; copy_into also refuses unscaled bf16 -> fp8."""
+    quant_model = _FakeVllmModel(2)
+    quant_model.model.layers[0].self_attn.qkv_proj.quant_method = type("VllmFp8LinearMethodTPU", (), {})()
+    sampler = _make_sampler(worker_ext, rank=0, tp=2, model=quant_model)
+    with caplog.at_level(logging.WARNING, logger=worker_ext.__name__):
+        assert sampler.init_tpu_sync_on_worker("10.0.0.2:7777", {"model.norm.weight": [HIDDEN]}) is True
+    assert sampler._tpu_sync_use_vllm_loaders is True
+    assert "VllmFp8LinearMethodTPU" in caplog.text
+
+    # Defense-in-depth: even if a parameter becomes FP8 after init, copy_into raises instead of casting unscaled bf16.
+    plain_model = _FakeVllmModel(1)
+    direct_sampler = _make_sampler(worker_ext, rank=0, tp=1, model=plain_model)
+    assert direct_sampler.init_tpu_sync_on_worker("10.0.0.2:7777", {"model.norm.weight": [HIDDEN]}) is True
+    assert direct_sampler._tpu_sync_use_vllm_loaders is False
+    direct_sampler._tpu_sync_ws.received = [torch.ones(HIDDEN, dtype=torch.bfloat16)]
+    plain_model.model.norm.weight = nn.Parameter(torch.zeros(HIDDEN, dtype=torch.float8_e4m3fn), requires_grad=False)
+    with pytest.raises(RuntimeError, match="cannot copy unscaled .* into quantized"):
+        direct_sampler.install_tpu_sync_weights()
+
+
+def test_update_tpu_sync_weights_auto_discovers_rollout_fp8_moe_zero_copy(fake_tpu_sync, worker_ext):
+    """End-to-end FP8 zero-copy EP sync: ``describe_vllm_params`` reports the rollout's FP8 MoE format, trainer
+    auto-quantizes the expert stacks, ``global_dtypes`` sizes the rollout's FP32 scale staging buffers, and the FP8
+    weights land zero-copy in ``w13_weight`` / ``w2_weight`` while ``install`` writes ``w*_weight_scale_inv``."""
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+    from verl_hardware_plugin.accelerators.tpu.rollout import qwen3_moe_layout
+
+    class VllmFp8MoEMethodTPU:
+        _tpu_activation_str = "silu"
+
+    tp = 2
+    trainer_ranks = 2
+    raw = _moe_trainer_weights(seed=3)
+
+    def make_fp8_model(rank):
+        m = _FakeQwen3MoeVllmModel(tp, rank, use_ep=True)
+        exp = m.model.layers[0].mlp.experts
+        local = MOE_E // tp
+        exp.quant_method = VllmFp8MoEMethodTPU()
+        exp.w13_weight = nn.Parameter(torch.zeros(local, HIDDEN, 2 * MOE_PAD, dtype=torch.float8_e4m3fn), False)
+        exp.w2_weight = nn.Parameter(torch.zeros(local, MOE_PAD, HIDDEN, dtype=torch.float8_e4m3fn), False)
+        exp.w13_weight_scale_inv = nn.Parameter(torch.zeros(local, 1, 1, 2 * MOE_PAD, dtype=torch.float32), False)
+        exp.w2_weight_scale_inv = nn.Parameter(torch.zeros(local, 1, 1, HIDDEN, dtype=torch.float32), False)
+        m.expert_params_mapping = [("w13_weight", "gate_proj", "w1")]  # triggers auto fallback of receive_into_vllm
+        return m
+
+    models = [make_fp8_model(rank) for rank in range(tp)]
+    samplers = [_make_moe_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+
+    def make_trainer_weights(rank):
+        per_rank = MOE_E // trainer_ranks
+        sl = slice(rank * per_rank, (rank + 1) * per_rank)
+        dense = {k: v.clone() for k, v in raw.items() if ".experts." not in k}
+        stacks = []
+        for proj in MOE_PROJS:
+            full_s = raw[f"{MOE_EXPERTS}.{proj}.weight"]
+            from torch.distributed.tensor import DTensor, Shard
+            from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+
+            class _M:
+                ndim = 1
+                device_type = "cpu"
+
+                def size(self, d=0):
+                    return trainer_ranks
+
+                def get_coordinate(self):
+                    return [rank]
+
+            dt = DTensor(
+                full_s[sl].clone(),
+                DTensorSpec(_M(), (Shard(0),), tensor_meta=TensorMeta(full_s.shape, full_s.stride(), full_s.dtype)),  # type: ignore[arg-type]
+                requires_grad=False,
+            )
+            slots = [(f"{MOE_EXPERTS}.{e}.{proj}.weight", tuple(full_s.shape[1:])) for e in range(MOE_E)]
+            stacks.append((dt, slots))
+        return TrainerWeights(
+            dense,
+            stacks,
+            "cpu",
+            expert_stack_wire=qwen3_moe_layout.expert_stack_wire_name,
+            rollout_expert_parallel=True,  # rollout_fp8_moe left None -> auto-discovered from describe_vllm_params!
+        )
+
+    w13_ptrs = [m.model.layers[0].mlp.experts.w13_weight.data_ptr() for m in models]
+    manager, _ = _make_manager(
+        [_trainer_engine(rank) for rank in range(trainer_ranks)],
+        make_trainer_weights,
+        samplers,
+        [],
+    )
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+
+    for rank, (sampler, model) in enumerate(zip(samplers, models, strict=True)):
+        exp = model.model.layers[0].mlp.experts
+        # Zero-copy: live FP8 buffer pointer unchanged, staging points straight to w13_weight, scale staging is FP32.
+        assert exp.w13_weight.data_ptr() == w13_ptrs[rank]
+        assert sampler._tpu_sync_staging[f"{MOE_EXPERTS}.w13_ep"].data_ptr() == w13_ptrs[rank]
+        assert sampler._tpu_sync_staging[f"{MOE_EXPERTS}.w13_scale_ep"].dtype == torch.float32
+        # Dequantized weights closely reconstruct this rank's bf16 experts.
+        sl = slice(rank * (MOE_E // tp), (rank + 1) * (MOE_E // tp))
+        gate = raw[f"{MOE_EXPERTS}.gate_proj.weight"][sl]
+        inter = gate.shape[1]
+        deq_gate = exp.w13_weight[..., :inter].float().transpose(1, 2) * exp.w13_weight_scale_inv[
+            :, 0, :, :inter
+        ].transpose(1, 2)
+        torch.testing.assert_close(deq_gate, gate.float(), atol=0.2, rtol=0.1)
+
+
+def test_fp8_moe_zero_copy_exact_parity_and_receive_into_vllm_off_caching(fake_tpu_sync, worker_ext, monkeypatch):
+    """``verify_parity='exact'`` checks zero-copy FP8 ``w13_weight`` / ``w2_weight`` bit for bit (catching a 1-element
+    corruption in ``w13_weight``), ``receive_into_vllm='off'`` still auto-discovers ``moe_quant``, and each trainer
+    engine caches ``get_vllm_params`` across steps."""
+    from torch.distributed.tensor import DTensor, Shard
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+    from verl_hardware_plugin.accelerators.tpu.rollout import moe_weights, qwen3_moe_layout
+
+    class VllmFp8MoEMethodTPU:
+        _tpu_activation_str = "silu"
+
+    tp = trainer_ranks = 2
+    raw = _moe_trainer_weights(seed=5)
+    quant = moe_weights.ExpertWireQuant(torch.float8_e4m3fn, None, "silu")
+
+    def make_fp8_checkpoint_model(rank):
+        m = _FakeQwen3MoeVllmModel(tp, rank, use_ep=True)
+        # Pre-populate dense weights with the exact checkpoint slices so step-0 exact parity succeeds.
+        expected_dense = _expected_moe_state(raw, rank, tp, use_ep=True)
+        sd = m.state_dict()
+        for k, v in expected_dense.items():
+            if ".experts." not in k:
+                sd[k].copy_(v)
+        exp = m.model.layers[0].mlp.experts
+        sl = slice(rank * (MOE_E // tp), (rank + 1) * (MOE_E // tp))
+        gate_up = torch.cat([raw[f"{MOE_EXPERTS}.gate_proj.weight"][sl], raw[f"{MOE_EXPERTS}.up_proj.weight"][sl]], 1)
+        down = raw[f"{MOE_EXPERTS}.down_proj.weight"][sl]
+        w13, s13 = moe_weights.format_ep_expert_weight(gate_up, "w13", quant)
+        w2, s2 = moe_weights.format_ep_expert_weight(down, "w2", quant)
+        assert s13 is not None and s2 is not None
+        exp.quant_method = VllmFp8MoEMethodTPU()
+        exp.w13_weight = nn.Parameter(w13.clone(), False)
+        exp.w2_weight = nn.Parameter(w2.clone(), False)
+        exp.w13_weight_scale_inv = nn.Parameter(s13.unsqueeze(2).clone(), False)
+        exp.w2_weight_scale_inv = nn.Parameter(s2.unsqueeze(2).clone(), False)
+        return m
+
+    def make_trainer_weights(rank):
+        per_rank = MOE_E // trainer_ranks
+        sl = slice(rank * per_rank, (rank + 1) * per_rank)
+        dense = {k: v.clone() for k, v in raw.items() if ".experts." not in k}
+        stacks = []
+        for proj in MOE_PROJS:
+            full_s = raw[f"{MOE_EXPERTS}.{proj}.weight"]
+
+            class _M:
+                ndim = 1
+                device_type = "cpu"
+
+                def size(self, d=0):
+                    return trainer_ranks
+
+                def get_coordinate(self):
+                    return [rank]
+
+            dt = DTensor(
+                full_s[sl].clone(),
+                DTensorSpec(_M(), (Shard(0),), tensor_meta=TensorMeta(full_s.shape, full_s.stride(), full_s.dtype)),  # type: ignore[arg-type]
+                requires_grad=False,
+            )
+            slots = [(f"{MOE_EXPERTS}.{e}.{proj}.weight", tuple(full_s.shape[1:])) for e in range(MOE_E)]
+            stacks.append((dt, slots))
+        return TrainerWeights(
+            dense,
+            stacks,
+            "cpu",
+            expert_stack_wire=qwen3_moe_layout.expert_stack_wire_name,
+            rollout_expert_parallel=True,
+        )
+
+    get_vllm_calls = [0]
+    orig_get = fake_tpu_sync.registry_state.get_vllm_params
+
+    def counted_get_vllm_params():
+        get_vllm_calls[0] += 1
+        return orig_get()
+
+    monkeypatch.setattr(fake_tpu_sync.registry_state, "get_vllm_params", counted_get_vllm_params)
+
+    # 1. Exact parity passes on step 0 with receive_into_vllm="off" (auto-quantized zero-copy FP8 experts),
+    #    and step 1 reuses the cached get_vllm_params on each trainer engine (1 RPC per rank total).
+    models = [make_fp8_checkpoint_model(rank) for rank in range(tp)]
+    samplers = [_make_moe_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+    engines = [_trainer_engine(rank, verify_parity="exact", receive_into_vllm="off") for rank in range(trainer_ranks)]
+    manager, _ = _make_manager(
+        engines, make_trainer_weights, samplers, [], verify_parity="exact", receive_into_vllm="off"
+    )
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    assert get_vllm_calls[0] == trainer_ranks  # once per rank on step 0
+    published = orig_get()
+    assert published is not None and published.get("dense_receive_disabled") is True and "params" not in published
+    assert "moe_quant" in published
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    assert get_vllm_calls[0] == trainer_ranks  # cached on step 1: zero extra get_vllm_params RPCs!
+
+    # 2. Corrupting 1 FP8 element in live w13_weight on rank 1 (while scales stay exact) raises TPUSyncParityError.
+    fake_tpu_sync.registry_state = TpuSyncRendezvousState()
+    fake_tpu_sync.registry = _FakeActorHandle(fake_tpu_sync.registry_state)
+    bad_models = [make_fp8_checkpoint_model(rank) for rank in range(tp)]
+    bad_w13 = bad_models[1].model.layers[0].mlp.experts.w13_weight.data
+    bad_w13[0, 0, 0] = torch.tensor(-float(bad_w13[0, 0, 0].float().item()) - 4.0, dtype=torch.float8_e4m3fn)
+    bad_samplers = [_make_moe_sampler(worker_ext, rank, tp, m) for rank, m in enumerate(bad_models)]
+    bad_engines = [
+        _trainer_engine(rank, verify_parity="exact", receive_into_vllm="off") for rank in range(trainer_ranks)
+    ]
+    bad_manager, _ = _make_manager(
+        bad_engines, make_trainer_weights, bad_samplers, [], verify_parity="exact", receive_into_vllm="off"
+    )
+    with pytest.raises(parity.TPUSyncParityError, match=r"w13_ep"):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(bad_manager, global_steps=0))
+
+
+def test_qwen3_moe_bf16_rollout_ep_falls_back_to_vllm_loaders_when_unaligned(fake_tpu_sync, worker_ext, monkeypatch):
+    """Unaligned ``MOE_I % 128 != 0`` BF16 ``rollout_expert_parallel=True`` cleanly refuses direct install at plan time
+    and falls back to vLLM's checkpoint loaders, splitting ``w13_ep`` / ``w2_ep`` into per-expert HF tensors."""
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+    from verl_hardware_plugin.accelerators.tpu.rollout import qwen3_moe_layout
+
+    tp = 2
+    weights = _moe_trainer_weights(seed=2)
+    models = [_FakeQwen3MoeVllmModel(tp, rank, use_ep=True) for rank in range(tp)]
+    samplers = [_make_moe_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+    loaded: list[dict] = []
+    for sampler in samplers:
+        received: dict = {}
+        loaded.append(received)
+        sampler.model_runner.reload_weights = lambda weights_iterator, is_checkpoint_format, r=received: r.update(
+            weights_iterator
+        )
+
+    def all_gather(t, dim=0):
+        for sampler in samplers:
+            if sampler._tpu_sync_ws.received is not None:
+                sampler._tpu_sync_ws.h2d()
+        for sampler in samplers:
+            for name, staged in sampler._tpu_sync_staging.items():
+                if staged is t:
+                    return torch.cat([s._tpu_sync_staging[name] for s in samplers], dim=dim)
+        raise AssertionError("not a staging tensor")
+
+    vllm_mod, distributed = ModuleType("vllm"), ModuleType("vllm.distributed")
+    distributed.get_tp_group = lambda: SimpleNamespace(all_gather=all_gather)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed)
+
+    def make_bf16_ep_weights(_rank):
+        dense = {k: v.clone() for k, v in weights.items() if ".experts." not in k}
+        stacks = []
+        for proj in MOE_PROJS:
+            s = weights[f"{MOE_EXPERTS}.{proj}.weight"].clone()
+            slots = [(f"{MOE_EXPERTS}.{e}.{proj}.weight", tuple(s.shape[1:])) for e in range(MOE_E)]
+            stacks.append((s, slots))
+        return TrainerWeights(
+            dense,
+            stacks,
+            "cpu",
+            expert_stack_wire=qwen3_moe_layout.expert_stack_wire_name,
+            rollout_expert_parallel=True,
+            rollout_fp8_moe=False,
+        )
+
+    manager, _ = _make_manager([_trainer_engine(rank) for rank in range(2)], make_bf16_ep_weights, samplers, [])
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+
+    assert all(s._tpu_sync_layout is None and s._tpu_sync_use_vllm_loaders for s in samplers)
+    expected = {n: t for n, t in weights.items() if ".experts." not in n}
+    for proj in MOE_PROJS:
+        for e, block in enumerate(weights[f"{MOE_EXPERTS}.{proj}.weight"].unbind(0)):
+            expected[f"{MOE_EXPERTS}.{e}.{proj}.weight"] = block
+    for received in loaded:
+        assert sorted(received) == sorted(expected)
+        for name, tensor in expected.items():
+            assert torch.equal(received[name], tensor), name
+
+
+def test_fp8_moe_ineligible_rollout_direct_install_opt_out_and_worker_guards(fake_tpu_sync, worker_ext, monkeypatch):
+    """Covers ``direct_install_quantized_moe=False``, ineligible rollout FP8 MoE, fast-fail ``loader_error`` before
+    staging allocation, zero-copy / scale wire dtype checks in ``init_tpu_sync_on_worker``, and non-swallowed
+    rendezvous errors."""
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+    from verl_hardware_plugin.accelerators.tpu.rollout import qwen3_moe_layout
+
+    class VllmFp8MoEMethodTPU:
+        _tpu_activation_str = "silu"
+
+    def make_fp8_model(tp, rank, use_ep=True):
+        m = _FakeQwen3MoeVllmModel(tp, rank, use_ep=use_ep)
+        exp = m.model.layers[0].mlp.experts
+        local = MOE_E // tp if use_ep else MOE_E
+        exp.quant_method = VllmFp8MoEMethodTPU()
+        exp.w13_weight = nn.Parameter(torch.zeros(local, HIDDEN, 2 * MOE_PAD, dtype=torch.float8_e4m3fn), False)
+        exp.w2_weight = nn.Parameter(torch.zeros(local, MOE_PAD, HIDDEN, dtype=torch.float8_e4m3fn), False)
+        exp.w13_weight_scale_inv = nn.Parameter(torch.zeros(local, 1, 1, 2 * MOE_PAD, dtype=torch.float32), False)
+        exp.w2_weight_scale_inv = nn.Parameter(torch.zeros(local, 1, 1, HIDDEN, dtype=torch.float32), False)
+        m.expert_params_mapping = [("w13_weight", "gate_proj", "w1")]
+        return m
+
+    raw = _moe_trainer_weights(seed=8)
+
+    def make_forced_fp8_weights(_rank):
+        dense = {k: v.clone() for k, v in raw.items() if ".experts." not in k}
+        stacks = [
+            (
+                raw[f"{MOE_EXPERTS}.{p}.weight"].clone(),
+                [
+                    (f"{MOE_EXPERTS}.{e}.{p}.weight", tuple(raw[f"{MOE_EXPERTS}.{p}.weight"].shape[1:]))
+                    for e in range(MOE_E)
+                ],
+            )
+            for p in MOE_PROJS
+        ]
+        return TrainerWeights(
+            dense,
+            stacks,
+            "cpu",
+            expert_stack_wire=qwen3_moe_layout.expert_stack_wire_name,
+            rollout_expert_parallel=True,
+            rollout_fp8_moe=True,
+        )
+
+    # 1. direct_install_quantized_moe=False strips moe_quant and makes forced rollout_fp8_moe=True fail clearly.
+    samplers_opt_out = [_make_moe_sampler(worker_ext, r, 2, make_fp8_model(2, r, use_ep=True)) for r in range(2)]
+    mgr_opt_out, _ = _make_manager(
+        [_trainer_engine(r) for r in range(2)],
+        make_forced_fp8_weights,
+        samplers_opt_out,
+        [],
+        direct_install_quantized_moe=False,
+    )
+    with pytest.raises(RuntimeError, match="direct_install_quantized_moe=False"):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(mgr_opt_out, global_steps=0))
+
+    # 2. Rollout FP8 MoE with use_ep=False sets moe_quant_ineligible_reason and rejects forced rollout_fp8_moe=True.
+    fake_tpu_sync.registry_state = TpuSyncRendezvousState()
+    fake_tpu_sync.registry = _FakeActorHandle(fake_tpu_sync.registry_state)
+    samplers_no_ep = [_make_moe_sampler(worker_ext, r, 2, make_fp8_model(2, r, use_ep=False)) for r in range(2)]
+    mgr_no_ep, _ = _make_manager([_trainer_engine(r) for r in range(2)], make_forced_fp8_weights, samplers_no_ep, [])
+    with pytest.raises(RuntimeError, match="use_ep=False"):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(mgr_no_ep, global_steps=0))
+
+    # 3. init_tpu_sync_on_worker fast-fails via loader_error BEFORE allocating staging buffers when quantized scales
+    #    hit loader fallback, and rejects missing/mismatched global_dtypes on zero-copy FP8 targets.
+    fp8_shapes = {
+        f"{MOE_EXPERTS}.w13_ep": [MOE_E, HIDDEN, 2 * MOE_PAD],
+        f"{MOE_EXPERTS}.w13_scale_ep": [MOE_E, 1, 2 * MOE_PAD],
+        f"{MOE_EXPERTS}.w2_ep": [MOE_E, MOE_PAD, HIDDEN],
+        f"{MOE_EXPERTS}.w2_scale_ep": [MOE_E, 1, HIDDEN],
+        f"{LAYER}mlp.gate.weight": [MOE_E, HIDDEN],
+    }
+    no_ep_sampler = _make_moe_sampler(worker_ext, 0, 2, make_fp8_model(2, 0, use_ep=False))
+    with pytest.raises(RuntimeError, match="cannot install trainer-quantized expert tensor"):
+        no_ep_sampler.init_tpu_sync_on_worker("10.0.0.1:7777", fp8_shapes)
+    assert not hasattr(no_ep_sampler, "_tpu_sync_staging")  # raised before staging buffer allocation!
+
+    ep_sampler = _make_moe_sampler(worker_ext, 0, 2, make_fp8_model(2, 0, use_ep=True))
+    # Missing global_dtypes -> zero-copy target is float8_e4m3fn while wire_dtype defaults to bfloat16 -> rejected!
+    with pytest.raises(RuntimeError, match="wire dtype .* != rollout zero-copy weight dtype"):
+        ep_sampler.init_tpu_sync_on_worker("10.0.0.1:7777", fp8_shapes)
+
+    ep_sampler2 = _make_moe_sampler(worker_ext, 0, 2, make_fp8_model(2, 0, use_ep=True))
+    # Partial global_dtypes missing w13_scale_ep -> scale staging would default to bfloat16 -> rejected!
+    with pytest.raises(RuntimeError, match=r"expert scale .*expected torch\.float32"):
+        ep_sampler2.init_tpu_sync_on_worker(
+            "10.0.0.1:7777",
+            fp8_shapes,
+            global_dtypes={
+                f"{MOE_EXPERTS}.w13_ep": "torch.float8_e4m3fn",
+                f"{MOE_EXPERTS}.w2_ep": "torch.float8_e4m3fn",
+            },
+        )
+
+    # 4. send_weights propagates set_global_dtypes and get_vllm_params failures instead of swallowing them.
+    tpu_sync_engine.setup_tpu_sync_controller()
+    eng = _trainer_engine(0)
+    monkeypatch.setattr(
+        fake_tpu_sync.registry_state,
+        "set_global_dtypes",
+        lambda _d: (_ for _ in ()).throw(RuntimeError("set_global_dtypes boom")),
+    )
+    with pytest.raises(RuntimeError, match="set_global_dtypes boom"):
+        asyncio.run(eng.send_weights({"fp8_t": torch.zeros(4, 4, dtype=torch.float8_e4m3fn)}, global_steps=0))
+
+    eng2 = _trainer_engine(0)
+    monkeypatch.setattr(
+        fake_tpu_sync.registry_state,
+        "get_vllm_params",
+        lambda: (_ for _ in ()).throw(RuntimeError("get_vllm_params boom")),
+    )
+    with pytest.raises(RuntimeError, match="get_vllm_params boom"):
+        asyncio.run(eng2.send_weights(make_forced_fp8_weights(0), global_steps=0))

@@ -102,6 +102,64 @@ def _qwen3_5_config_registry() -> Any:
     return config_registry
 
 
+def _import_tpu_grouped_experts() -> Any:
+    """Imports torchtitan's TPU ``grouped_experts`` module (``components/`` on HEAD, top-level on older branches)."""
+    for mod_name in (
+        "torchtitan.experiments.tpu.components.grouped_experts",
+        "torchtitan.experiments.tpu.grouped_experts",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None:
+            return mod
+    last_exc: Optional[ImportError] = None
+    for mod_name in (
+        "torchtitan.experiments.tpu.components.grouped_experts",
+        "torchtitan.experiments.tpu.grouped_experts",
+    ):
+        try:
+            return importlib.import_module(mod_name)
+        except ImportError as e:
+            last_exc = e
+            continue
+    raise RuntimeError(
+        "TPU MoE grouped experts require a TPU torchtitan build with grouped_experts "
+        "(components/grouped_experts.py); unavailable on upstream torchtitan HEAD."
+    ) from last_exc
+
+
+def _import_tpu_token_dispatcher() -> Any:
+    """Imports torchtitan's TPU ``token_dispatcher`` module (``components/`` on HEAD, top-level on older branches)."""
+    for mod_name in (
+        "torchtitan.experiments.tpu.components.token_dispatcher",
+        "torchtitan.experiments.tpu.token_dispatcher",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None:
+            return mod
+    last_exc: Optional[ImportError] = None
+    for mod_name in (
+        "torchtitan.experiments.tpu.components.token_dispatcher",
+        "torchtitan.experiments.tpu.token_dispatcher",
+    ):
+        try:
+            return importlib.import_module(mod_name)
+        except ImportError as e:
+            last_exc = e
+            continue
+    raise RuntimeError(
+        "TPU MoE token dispatcher requires a TPU torchtitan build with token_dispatcher "
+        "(components/token_dispatcher.py); unavailable on upstream torchtitan HEAD."
+    ) from last_exc
+
+
+def _has_tpu_grouped_experts() -> bool:
+    try:
+        _import_tpu_grouped_experts()
+    except RuntimeError:
+        return False
+    return True
+
+
 def _has_tokamax_kda() -> bool:
     """Whether an installed Tokamax build provides ``tokamax._src.ops.kda`` (PyPI 0.0.14 does not)."""
     try:
@@ -120,7 +178,9 @@ def _available_kernels(torchtitan_name: str) -> frozenset[str]:
         return frozenset()
     kernels: set[str] = set()
     if hasattr(config_registry, "_use_tpu_moe_kernels"):  # google-pytorch/torchtitan#73
-        kernels.update(("moe", "lce"))
+        kernels.add("lce")
+        if _has_tpu_grouped_experts():
+            kernels.add("moe")
     if hasattr(config_registry, "TOKAMAX_GATED_DELTA_OVERRIDE") and _has_tokamax_kda():
         kernels.add("kda")  # google-pytorch/torchtitan#74
     return frozenset(kernels)
@@ -176,7 +236,7 @@ def configure_model_spec(
     """
     if "moe" not in kernels:
         return
-    from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
+    TpuGroupedExperts = _import_tpu_grouped_experts().TpuGroupedExperts
 
     _qwen3_5_config_registry()._use_tpu_moe_kernels(SimpleNamespace(model_spec=model_spec))
     paired_under_ep = expert_parallel_degree > 1 and configure_qwen3_5_expert_parallel(
@@ -280,8 +340,8 @@ def qwen3_moe_model_registry_kwargs() -> dict[str, Any]:
 
     Same order as torchtitan's Qwen3-30B-A3B TPU recipe. The default dispatcher's backward is ~5x slower on TPU.
     """
-    from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExpertsConverter
-    from torchtitan.experiments.tpu.token_dispatcher import TpuTokenDispatcherConverter
+    TpuGroupedExpertsConverter = _import_tpu_grouped_experts().TpuGroupedExpertsConverter
+    TpuTokenDispatcherConverter = _import_tpu_token_dispatcher().TpuTokenDispatcherConverter
 
     return {"converters": [TpuTokenDispatcherConverter.Config(), TpuGroupedExpertsConverter.Config()]}
 
@@ -312,8 +372,9 @@ def configure_qwen3_moe(
         ValueError: if ``expert_parallel_size > 1``, or if ``seq_bucket_size * top_k`` is not a multiple of the
             256-row tile.
     """
-    from torchtitan.experiments.tpu.grouped_experts import TpuGroupedExperts
     from torchtitan.models.common.moe import MoE
+
+    TpuGroupedExperts = _import_tpu_grouped_experts().TpuGroupedExperts
 
     if expert_parallel_size > 1:
         raise ValueError(
@@ -435,6 +496,16 @@ def lce_block_sizes(kernels: frozenset[str], hidden_size: int, vocab_size: int) 
 MIN_PACKED_DOCUMENT_BUDGET = 16
 
 
+def bucket_num_sequences(num_sequences: int) -> int:
+    """The sequence-count bucket of ``num_sequences``: the next power of two (at least 1).
+
+    One bucketing scheme for every static shape that follows the number of sequences in a micro-batch, which
+    ``use_dynamic_bsz`` varies from step to step: the Tokamax KDA document budget (:func:`packed_document_budget`) and
+    the rows of the PPO loss inputs (``tpu_padded_num_seqs``, ``align_micro_batch_shapes_across_ranks``).
+    """
+    return 1 << (max(int(num_sequences), 1) - 1).bit_length()
+
+
 def packed_document_budget(max_sequences_per_micro_batch: int) -> int:
     """The Tokamax KDA ``max_num_segments`` for micro-batches packing up to ``max_sequences_per_micro_batch`` sequences.
 
@@ -443,8 +514,7 @@ def packed_document_budget(max_sequences_per_micro_batch: int) -> int:
     of sequences per token-budgeted micro-batch varies from step to step, and an exact budget would recompile every
     GatedDeltaNet layer whenever it changes. A larger budget only adds empty segments.
     """
-    raw = int(max_sequences_per_micro_batch) + 1
-    return max(MIN_PACKED_DOCUMENT_BUDGET, 1 << (raw - 1).bit_length())
+    return max(MIN_PACKED_DOCUMENT_BUDGET, bucket_num_sequences(int(max_sequences_per_micro_batch) + 1))
 
 
 def set_packed_document_budget(modules: Any, num_documents: int) -> int:
@@ -503,9 +573,11 @@ def set_ep_capacity_factor(modules: Any, capacity_factor: float) -> int:
 
 
 _DYNAMO_CACHE_TARGETS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("torchtitan.experiments.tpu.kernels.pallas_vmem", ("tpu_generation",)),
     ("torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta", ("_tpu_generation", "_import_kda")),
     ("torchtitan.experiments.tpu.kernels.ragged_gather_tc", ("_tpu_generation",)),
     ("torchtitan.experiments.tpu.kernels.causal_conv1d", ("_tpu_generation",)),
+    ("torchtitan.experiments.tpu.kernels.pallas_vmem", ("tpu_generation",)),
 )
 
 

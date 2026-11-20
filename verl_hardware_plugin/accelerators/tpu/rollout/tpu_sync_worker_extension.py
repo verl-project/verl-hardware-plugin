@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import torch
 
-from verl_hardware_plugin.accelerators.tpu.rollout import direct_install
+from verl_hardware_plugin.accelerators.tpu.rollout import direct_install, moe_weights
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_api
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_checkpoint_engine as tpu_sync_engine
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import ExactParityCheck, compute_tensor_stats
@@ -173,11 +173,13 @@ def _slice_from_spec(spec: list[str], local_shape: list[int], tp_size: int) -> _
 
 
 def _uses_vllm_weight_loader(vllm_model: Any, global_shapes: dict[str, list[int]]) -> bool:
-    """Whether to install received weights via the engine's own checkpoint loaders (hybrid linear-attn or MoE)."""
+    """Whether to install received weights via the engine's own checkpoint loaders (hybrid linear-attn, MoE, or
+    quantized dense weights)."""
     return (
         hasattr(type(vllm_model), "get_mamba_state_shape_from_config")
         or any(len(shape) not in (1, 2) for shape in global_shapes.values())
         or any(".linear_attn." in name or ".experts." in name for name in global_shapes)
+        or bool(direct_install.non_moe_quantized_reason(vllm_model))
     )
 
 
@@ -207,6 +209,8 @@ class TPUSyncWorkerMixin:
         parallelism: int = tpu_sync_engine.TPU_SYNC_DEFAULT_PARALLELISM,
         job_name: str = "sampler0",
         receive_into_vllm: bool = False,
+        direct_install_quantized_moe: bool = True,
+        global_dtypes: Optional[dict[str, str]] = None,
     ) -> bool:
         """Initialize tpu-sync WeightSynchronizer listener and register with the central tpu-sync controller.
 
@@ -216,8 +220,10 @@ class TPUSyncWorkerMixin:
         names every rollout replica after its ``replica_rank``), so the ranks ``0..TP-1`` of several replicas do
         not collide on the controller. With ``receive_into_vllm`` the trainer sends every tensor in vLLM's layout
         (named after vLLM's parameters, see ``weight_sync/vllm_layout.py``) and this worker binds those parameters
-        as the receive buffers: no staging buffers and nothing to install. Only the first call does work: the
-        receive buffers, the synchronizer and the registration are reused by every later sync.
+        as the receive buffers: no staging buffers and nothing to install. ``direct_install_quantized_moe=False``
+        (``engine_kwargs.tpu-sync.direct_install_quantized_moe``) installs quantized MoE experts through vLLM's
+        loaders instead of requantizing them directly. Only the first call does work: the receive buffers, the
+        synchronizer and the registration are reused by every later sync.
         """
         if getattr(self, "_tpu_sync_ws", None) is not None:
             return True
@@ -227,7 +233,9 @@ class TPUSyncWorkerMixin:
             logger.warning("tpu-sync Sampler: could not locate rollout model to bind parameters.")
             return False
 
-        bind_ip = get_ip(controller_address).strip("[]")
+        # The IP that reaches the controller serves the control RPCs; the weights go over the data NICs that
+        # tpu-sync finds itself (see ``tpu_sync_engine.data_plane_address``).
+        control_ip = get_ip(controller_address).strip("[]")
         rank_val = getattr(self, "rank", 0)
         # The listener port is assigned by the OS, as on the trainer side, and registered with the controller
         # below; fixed ``base + rank`` ports collided when two replicas shared a host.
@@ -250,7 +258,14 @@ class TPUSyncWorkerMixin:
 
         if receive_into_vllm:
             return self._init_receive_into_vllm(
-                vllm_model, controller_addr, global_shapes_map, tp_size, parallelism, job_name, bind_ip, listener_port
+                vllm_model,
+                controller_addr,
+                global_shapes_map,
+                tp_size,
+                parallelism,
+                job_name,
+                control_ip,
+                listener_port,
             )
 
         # Models with a direct-install layout (``direct_install``: e.g. Qwen3.5, Qwen3 MoE) install each rank's slices
@@ -259,17 +274,33 @@ class TPUSyncWorkerMixin:
         model_config = self._get_model_config()
         hf_text_config = getattr(model_config, "hf_text_config", None)
         layout, plan, no_plan_reasons = direct_install.select_layout(
-            vllm_model, global_shapes_map, hf_text_config, tp_size, rank_val
+            vllm_model,
+            global_shapes_map,
+            hf_text_config,
+            tp_size,
+            rank_val,
+            allow_quantized_moe=direct_install_quantized_moe,
+            global_dtypes=global_dtypes,
         )
-        use_vllm_loaders = layout is None and _uses_vllm_weight_loader(vllm_model, global_shapes_map)
+        dense_quant_reason = direct_install.non_moe_quantized_reason(vllm_model) if layout is None else ""
+        if dense_quant_reason:
+            no_plan_reasons = [*no_plan_reasons, dense_quant_reason]
+        use_vllm_loaders = layout is None and (
+            bool(dense_quant_reason) or _uses_vllm_weight_loader(vllm_model, global_shapes_map)
+        )
         self._tpu_sync_layout = layout
         self._tpu_sync_plan = plan
         self._tpu_sync_use_vllm_loaders = use_vllm_loaders
         # The loaders need the trainer's tensors back in HF's layout (``DirectInstallLayout.loader_weights``).
         self._tpu_sync_hf_text_config = hf_text_config
-        loader_error = direct_install.loader_error(global_shapes_map, hf_text_config) if layout is None else ""
+        loader_error = (
+            direct_install.loader_error(global_shapes_map, hf_text_config, global_dtypes=global_dtypes)
+            if layout is None
+            else ""
+        )
         if loader_error:
-            raise RuntimeError(f"tpu-sync Sampler Rank {rank_val}: {loader_error}")
+            reasons_suffix = f" ({'; '.join(no_plan_reasons)})" if no_plan_reasons else ""
+            raise RuntimeError(f"tpu-sync Sampler Rank {rank_val}: {loader_error}{reasons_suffix}")
         install_mode = (
             f"{layout.name} direct" if layout is not None else "vllm loaders" if use_vllm_loaders else "direct"
         )
@@ -325,6 +356,12 @@ class TPUSyncWorkerMixin:
 
             # Allocate a local staging buffer with matching layout (the trainer sends bf16), or receive straight
             # into the rollout weight.
+            wire_dtype = torch.bfloat16
+            if global_dtypes and name in global_dtypes:
+                resolved_dtype = moe_weights.resolve_wire_dtype(global_dtypes[name])
+                if resolved_dtype is None:
+                    raise ValueError(f"tpu-sync: unknown wire dtype {global_dtypes[name]!r} for {name}")
+                wire_dtype = resolved_dtype
             t = zero_copy.get(name)
             if t is not None:
                 if list(t.shape) != list(shard.local_shape):
@@ -332,9 +369,19 @@ class TPUSyncWorkerMixin:
                         f"tpu-sync Sampler Rank {rank_val}: {name} slice {shard.local_shape} != rollout weight "
                         f"{list(t.shape)}"
                     )
+                if t.dtype != wire_dtype:
+                    raise RuntimeError(
+                        f"tpu-sync Sampler Rank {rank_val}: {name} wire dtype {wire_dtype} != rollout zero-copy "
+                        f"weight dtype {t.dtype}"
+                    )
             else:
+                if name.endswith(moe_weights.EP_FP8_SCALE_SUFFIXES) and wire_dtype != torch.float32:
+                    raise RuntimeError(
+                        f"tpu-sync Sampler Rank {rank_val}: {name} is an expert scale (expected torch.float32), "
+                        f"got staging dtype {wire_dtype} (missing global_dtypes?)"
+                    )
                 device = torch.device(tpu_sync_engine.TPU_SYNC_DEVICE)
-                t = torch.empty(shard.local_shape, dtype=torch.bfloat16, device=device)
+                t = torch.empty(shard.local_shape, dtype=wire_dtype, device=device)
             staging_tensors[name] = t
             staging_sharded[name] = "tp" in shard.sharding_spec
             valid_params.append((name, t))
@@ -356,6 +403,7 @@ class TPUSyncWorkerMixin:
         self._tpu_sync_staging_sharded = staging_sharded
         self._sorted_vllm_params = valid_params
         self._tpu_sync_replicas = replicas
+        self._tpu_sync_zero_copy_names = frozenset(zero_copy)
         if zero_copy:
             logger.info(
                 f"tpu-sync Sampler Rank {rank_val}: {len(zero_copy)} tensors "
@@ -376,7 +424,6 @@ class TPUSyncWorkerMixin:
             local_port=0,
             parallelism=parallelism,
             listener_port=listener_port,
-            bind_ip=bind_ip,
         )
 
         # Whether a tensor can skip the CPU (de)tiling pass is decided by tpu-sync's planner per transfer, from the
@@ -390,10 +437,11 @@ class TPUSyncWorkerMixin:
         try:
             ctrl_client = tpu_sync_api.controller_client(controller_addr)
             unit_id = tpu_sync_api.unit_id(job_name, str(rank_val))
+            data_address = tpu_sync_engine.data_plane_address(self._tpu_sync_ws, control_ip, rank_val)
             ctrl_client.register_work_unit(
                 unit_id,
-                [f"{bind_ip}:{self._tpu_sync_ws.local_port}"],
-                f"{bind_ip}:{self._tpu_sync_ws.listener_port}",
+                [data_address],
+                f"{control_ip}:{self._tpu_sync_ws.listener_port}",
                 mesh_shape=[1, tp_size],
                 variables=variable_protos,
                 mesh_axes=["fsdp", "tp"],
@@ -405,7 +453,7 @@ class TPUSyncWorkerMixin:
             f"tpu-sync Sampler Rank {rank_val} bound {len(valid_params)} dynamic staging tensors and registered "
             f"directly with the tpu-sync controller ({controller_addr}) as {job_name}/{rank_val}: "
             f"mesh_shape=[1, {tp_size}], "
-            f"data_port={self._tpu_sync_ws.local_port}, listener_port={self._tpu_sync_ws.listener_port}"
+            f"data_address={data_address}, listener_port={self._tpu_sync_ws.listener_port}"
         )
 
         return True
@@ -423,8 +471,17 @@ class TPUSyncWorkerMixin:
         """
         vllm_model = self._get_vllm_model()
         worker: Any = getattr(self, "worker", self)
-        tp_size = int(worker.vllm_config.parallel_config.tensor_parallel_size)
+        vllm_config = getattr(worker, "vllm_config", None)
+        if vllm_model is None or vllm_config is None:
+            # Non-vLLM rollout workers (e.g. SGLang) do not expose vLLM's parameter metadata.
+            return {}
+        tp_size = int(vllm_config.parallel_config.tensor_parallel_size)
         model_sd = vllm_model.state_dict()
+        unsupported_reason = ""
+        if hasattr(type(vllm_model), "get_mamba_state_shape_from_config"):
+            unsupported_reason = f"{type(vllm_model).__name__} uses hybrid Mamba/linear-attention state"
+        elif getattr(vllm_model, "expert_params_mapping", None):
+            unsupported_reason = f"{type(vllm_model).__name__} declares MoE expert_params_mapping"
         modules = dict(vllm_model.named_modules())
         packed = dict(getattr(vllm_model, "packed_modules_mapping", None) or {})
         params: dict[str, dict] = {}
@@ -448,7 +505,19 @@ class TPUSyncWorkerMixin:
                 output_sizes = tuple(int(s) for s in getattr(module, "output_sizes", ()) or ())
                 kv_replicas = int(getattr(module, "num_kv_head_replicas", 1) or 1)
             params[key] = VllmParam(tuple(t.shape), str(t.dtype), flipped, sources, output_sizes, kv_replicas).to_dict()
-        return {"tp_size": tp_size, "params": params}
+        result: dict[str, Any] = {"tp_size": tp_size, "params": params}
+        if unsupported_reason:
+            result["unsupported_reason"] = unsupported_reason
+        rank_attr = getattr(self, "rank", None)
+        tp_rank = int(rank_attr) if isinstance(rank_attr, int) else None
+        moe_quant = moe_weights.describe_moe_quant(vllm_model, tp_size=tp_size, tp_rank=tp_rank)
+        if moe_quant is not None:
+            result["moe_quant"] = moe_quant
+        else:
+            ineligible = moe_weights.moe_quant_ineligible_reason(vllm_model, tp_size=tp_size, tp_rank=tp_rank)
+            if ineligible:
+                result["moe_quant_ineligible_reason"] = ineligible
+        return result
 
     def _init_receive_into_vllm(
         self,
@@ -458,7 +527,7 @@ class TPUSyncWorkerMixin:
         tp_size: int,
         parallelism: int,
         job_name: str,
-        bind_ip: str,
+        control_ip: str,
         listener_port: int,
     ) -> bool:
         """``init_tpu_sync_on_worker`` for ``receive_into_vllm``: bind vLLM's parameters as the receive buffers.
@@ -522,6 +591,7 @@ class TPUSyncWorkerMixin:
         self._sorted_vllm_params = valid_params
         self._tpu_sync_replicas = replicas
         self._tpu_sync_bound_names = set(bound)
+        self._tpu_sync_zero_copy_names = frozenset()
         self._tpu_sync_layout = None
         self._tpu_sync_plan = None
         self._tpu_sync_use_vllm_loaders = False
@@ -536,13 +606,12 @@ class TPUSyncWorkerMixin:
             local_port=0,
             parallelism=parallelism,
             listener_port=listener_port,
-            bind_ip=bind_ip,
         )
         ctrl_client = tpu_sync_api.controller_client(controller_addr)
         ctrl_client.register_work_unit(
             tpu_sync_api.unit_id(job_name, str(rank_val)),
-            [f"{bind_ip}:{self._tpu_sync_ws.local_port}"],
-            f"{bind_ip}:{self._tpu_sync_ws.listener_port}",
+            [tpu_sync_engine.data_plane_address(self._tpu_sync_ws, control_ip, rank_val)],
+            f"{control_ip}:{self._tpu_sync_ws.listener_port}",
             mesh_shape=[1, tp_size],
             variables=variable_protos,
             mesh_axes=["fsdp", "tp"],
@@ -574,6 +643,12 @@ class TPUSyncWorkerMixin:
         bound_before = (
             {name: self._tpu_sync_staging[name].detach().to("cpu", copy=True) for name in sorted(bound_names)}
             if exact_parity and bound_names
+            else {}
+        )
+        zero_copy_names: frozenset[str] = getattr(self, "_tpu_sync_zero_copy_names", frozenset())
+        zero_copy_before = (
+            {name: self._tpu_sync_staging[name].detach().to("cpu", copy=True) for name in sorted(zero_copy_names)}
+            if exact_parity and zero_copy_names
             else {}
         )
         t_h2d_start = time.perf_counter()
@@ -624,6 +699,9 @@ class TPUSyncWorkerMixin:
         model_sd = vllm_model.state_dict() if hasattr(vllm_model, "state_dict") else vllm_model.model.state_dict()
         module_dict = dict(vllm_model.named_modules()) if hasattr(vllm_model, "named_modules") else {}
         parity = ExactParityCheck() if exact_parity else None
+        if parity is not None and zero_copy_before:
+            for name in sorted(zero_copy_before):
+                parity.check(name, zero_copy_before[name], self._tpu_sync_staging[name].detach().to("cpu", copy=True))
 
         def find_model_key(k: str) -> Optional[str]:
             resolved = resolve_model_key(k, model_sd)
@@ -635,6 +713,14 @@ class TPUSyncWorkerMixin:
             parent_mod = get_parent_module(resolved_key, module_dict)
             is_flipped = bool(getattr(parent_mod, "_tpu_weight_flipped", False))
             adapted = to_target_layout(src, target_local, is_flipped)
+            if (
+                target_local.dtype not in direct_install.UNQUANTIZED_PARAM_DTYPES
+                and target_local.dtype != adapted.dtype
+            ):
+                raise RuntimeError(
+                    f"tpu-sync direct install: cannot copy unscaled {adapted.dtype} into quantized "
+                    f"{resolved_key} ({target_local.dtype})"
+                )
             if parity is not None:
                 parity.check(resolved_key, target_local, adapted)
             target_local.copy_(adapted)
@@ -710,7 +796,8 @@ class TPUSyncWorkerMixin:
         result = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
         if parity is not None:
             # Covers every tensor written through copy_into, and the regions that a direct-install layout writes
-            # itself (e.g. the experts' w13 / w2), through the ``check`` passed to its install.
+            # itself (e.g. the experts' w13 / w2), through the ``check`` passed to its install. Quantized experts
+            # compare the requantized weights and scales with the live ones (``moe_weights.write_requantized``).
             result["exact_parity"] = parity.result(rank, unresolved)
         return result
 

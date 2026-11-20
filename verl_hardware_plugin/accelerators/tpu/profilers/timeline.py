@@ -204,7 +204,9 @@ def start_hbm_sampler(
     group: str,
     lane: str = HBM_LANE,
     period: Optional[float] = None,
-    ports: tuple[int, ...] = (8431, 8432, 8433, 8434),
+    # One libtpu runtime-metrics port per TPU process: 8431.. for up to 8 processes per host (TPU v7x runs one
+    # process per TensorCore, 8 per host; v5p/v6e use the first 4).
+    ports: tuple[int, ...] = tuple(range(8431, 8439)),
 ) -> bool:
     """Start a daemon thread that polls ``tpu_info`` local chip HBM usage every ``period`` seconds.
 
@@ -231,8 +233,13 @@ def start_hbm_sampler(
 
             chip_type, count = device.get_local_chips()
             if not chip_type or not count:
+                print(f"[verl-timeline] HBM sampler for {group} disabled: tpu_info found no local chips", flush=True)
                 return False
-        except Exception:
+            # v7x runs one process per TensorCore, so libtpu reports the duty cycle per TensorCore: only
+            # get_chip_usage_new pairs it with memory (get_chip_usage repeats it per chip and fails its length check).
+            get_chip_usage = metrics.get_chip_usage_new if chip_type is device.TpuChip.V7X else metrics.get_chip_usage
+        except Exception as exc:
+            print(f"[verl-timeline] HBM sampler for {group} disabled: {type(exc).__name__}: {exc}", flush=True)
             return False
         _hbm_sampler_started.add(group)
 
@@ -242,7 +249,7 @@ def start_hbm_sampler(
             by_dev: dict[int, tuple[int, int, float]] = {}
             for port in ports:
                 try:
-                    usages = metrics.get_chip_usage(chip_type, addr=f"localhost:{port}")
+                    usages = get_chip_usage(chip_type, addr=f"localhost:{port}")
                 except Exception:
                     continue
                 for u in usages:
@@ -282,6 +289,8 @@ def run_hbm_csv_monitor(
     from tpu_info import device, metrics  # type: ignore[import-not-found]
 
     chip_type, count = device.get_local_chips()
+    # Same choice as start_hbm_sampler: v7x (one process per TensorCore) needs get_chip_usage_new.
+    get_chip_usage = metrics.get_chip_usage_new if chip_type is device.TpuChip.V7X else metrics.get_chip_usage
     with open(out_path, "a", buffering=1) as fh:
         fh.write(f"# chip_type={chip_type} count={count} ports={list(ports)}\n")
         fh.write("unix_time,port,device_id,memory_usage_bytes,total_memory_bytes,duty_cycle_pct\n")
@@ -289,7 +298,7 @@ def run_hbm_csv_monitor(
             t0 = time.time()
             for port in ports:
                 try:
-                    usages = metrics.get_chip_usage(chip_type, addr=f"localhost:{port}")
+                    usages = get_chip_usage(chip_type, addr=f"localhost:{port}")
                 except Exception:
                     continue
                 for u in usages:

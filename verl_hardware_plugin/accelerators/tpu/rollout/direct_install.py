@@ -16,15 +16,29 @@ adapters to the signatures below) and add it to ``direct_install_layouts()``.
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, NamedTuple, Optional
 
 import torch
 
+# Unscaled floating-point parameter dtypes that ``copy_into`` may write directly; quantized dtypes (FP8, int8, FP4)
+# carry separate scale tensors and would be silently corrupted by an unscaled ``copy_``.
+UNQUANTIZED_PARAM_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+_UNQUANTIZED_LINEAR_METHODS = (
+    "UnquantizedLinearMethod",
+    "VllmUnquantizedLinearMethod",
+    "UnquantizedEmbeddingMethod",
+)
+_QUANTIZED_WEIGHT_ATTRS = ("weight_scale", "weight_scale_inv", "weight_packed", "qweight")
+
 # ``(sharding_spec, local_shape)`` of a tensor on one TP rank, e.g. ``(["tp", ""], [rows // tp, cols])``.
 ShardingRule = tuple[list[str], list[int]]
-# ``(vllm_model, global_shapes, hf_text_config, tp_size, worker_rank) -> (plan, "")`` or ``(None, reason)``.
-PlanFn = Callable[[Any, dict[str, list[int]], Any, int, int], tuple[Optional[Any], str]]
+# ``(vllm_model, global_shapes, hf_text_config, tp_size, worker_rank, allow_quantized_moe=True) -> (plan, "")`` or
+# ``(None, reason)``. ``allow_quantized_moe=False`` (``engine_kwargs.tpu-sync.direct_install_quantized_moe``) refuses
+# quantized experts, so vLLM's loaders install them.
+PlanFn = Callable[..., tuple[Optional[Any], str]]
 # ``(staging, model_sd, find_model_key, copy_into, plan, check) -> staging names used``.
 # ``copy_into(vllm_key, tensor)`` copies a tensor in vLLM's checkpoint layout (and runs the parity check);
 # ``check``, if not None, is the exact parity check for regions written without ``copy_into``.
@@ -51,8 +65,9 @@ class DirectInstallLayout:
     # vLLM-loader fallback (no layout planned): ``(weights, hf_text_config) -> weights`` back in HF's checkpoint
     # layout, undoing how the trainer sends this model's tensors over tpu-sync.
     loader_weights: Optional[Callable[[WeightsIterator, Any], WeightsIterator]] = None
-    # vLLM-loader fallback: ``(global_shapes, hf_text_config) -> error`` ("" if ``loader_weights`` can undo them).
-    loader_error: Optional[Callable[[dict[str, list[int]], Any], str]] = None
+    # vLLM-loader fallback: ``(global_shapes, hf_text_config, *, global_dtypes=None) -> error`` ("" when
+    # ``loader_weights`` can undo them).
+    loader_error: Optional[Callable[..., str]] = None
 
 
 class LayoutSelection(NamedTuple):
@@ -61,6 +76,14 @@ class LayoutSelection(NamedTuple):
     layout: Optional[DirectInstallLayout]  # None: no layout plans (dense path or vLLM's loaders)
     plan: Any  # ``layout.plan``'s plan, passed to ``layout.install``
     reasons: list[str]  # why the layouts tried before ``layout`` (all of them if None) refused
+
+
+def _accepts_kwarg(fn: Callable[..., Any], kwarg: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return kwarg in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def direct_install_layouts() -> tuple[DirectInstallLayout, ...]:
@@ -78,11 +101,26 @@ def select_layout(
     tp_size: int,
     worker_rank: int,
     layouts: Optional[tuple[DirectInstallLayout, ...]] = None,
+    allow_quantized_moe: bool = True,
+    global_dtypes: Optional[Mapping[str, str]] = None,
 ) -> LayoutSelection:
     """The first of ``layouts`` (default ``direct_install_layouts()``) that can install into ``vllm_model``."""
     reasons: list[str] = []
     for layout in direct_install_layouts() if layouts is None else layouts:
-        plan, reason = layout.plan(vllm_model, global_shapes, hf_text_config, tp_size, worker_rank)
+        extra = (
+            {"global_dtypes": global_dtypes}
+            if global_dtypes is not None and _accepts_kwarg(layout.plan, "global_dtypes")
+            else {}
+        )
+        plan, reason = layout.plan(
+            vllm_model,
+            global_shapes,
+            hf_text_config,
+            tp_size,
+            worker_rank,
+            allow_quantized_moe=allow_quantized_moe,
+            **extra,
+        )
         if plan is not None:
             return LayoutSelection(layout, plan, reasons)
         reasons.append(reason)
@@ -100,11 +138,60 @@ def loader_weights(
 
 
 def loader_error(
-    global_shapes: dict[str, list[int]], hf_text_config: Any, layouts: Optional[tuple[DirectInstallLayout, ...]] = None
+    global_shapes: dict[str, list[int]],
+    hf_text_config: Any = None,
+    layouts: Optional[tuple[DirectInstallLayout, ...]] = None,
+    *,
+    global_dtypes: Optional[Mapping[str, str]] = None,
 ) -> str:
     """Why vLLM's loaders cannot take the trainer's tensors (the first layout's ``loader_error``), or ``""``."""
     for layout in direct_install_layouts() if layouts is None else layouts:
-        error = layout.loader_error(global_shapes, hf_text_config) if layout.loader_error is not None else ""
+        if layout.loader_error is None:
+            continue
+        extra = (
+            {"global_dtypes": global_dtypes}
+            if global_dtypes is not None and _accepts_kwarg(layout.loader_error, "global_dtypes")
+            else {}
+        )
+        error = layout.loader_error(global_shapes, hf_text_config, **extra)
         if error:
             return error
+    return ""
+
+
+def non_moe_quantized_reason(vllm_model: Any, moe_modules: Sequence[tuple[str, Any]] = ()) -> str:
+    """Why ``vllm_model``'s non-expert layers cannot be written by ``copy_into`` (quantized), or ``""``.
+
+    ``copy_into`` copies unscaled bf16 slices straight into ``model_sd[key]``: on a quantized linear or embedding
+    parameter (e.g. ``VllmFp8LinearMethodTPU``'s ``float8_e4m3fn`` ``weight`` paired with ``weight_scale``) PyTorch's
+    ``copy_`` silently casts the unscaled values and leaves the old scale in place.
+    """
+    modules = list(vllm_model.named_modules()) if hasattr(vllm_model, "named_modules") else []
+    moe_objs = [m for _, m in moe_modules] or [
+        m for _, m in modules if hasattr(m, "w13_weight") and hasattr(m, "quant_method")
+    ]
+    moe_ids = {id(m) for m in moe_objs}
+    moe_param_ids = {id(p) for m in moe_objs if isinstance(m, torch.nn.Module) for p in m.parameters()}
+    for name, m in modules:
+        if id(m) in moe_ids:
+            continue
+        qm = getattr(m, "quant_method", None)
+        if qm is not None and hasattr(m, "weight") and type(qm).__name__ not in _UNQUANTIZED_LINEAR_METHODS:
+            return f"vLLM's non-expert {name or type(m).__name__} uses quantized method {type(qm).__name__}"
+        for attr in _QUANTIZED_WEIGHT_ATTRS:
+            if isinstance(getattr(m, attr, None), torch.Tensor):
+                return f"vLLM's non-expert {name or type(m).__name__} has {attr}"
+    named_params = (
+        vllm_model.named_parameters()
+        if hasattr(vllm_model, "named_parameters")
+        else vllm_model.state_dict().items()
+        if hasattr(vllm_model, "state_dict")
+        else ()
+    )
+    for key, param in named_params:
+        if id(param) in moe_param_ids or ".experts." in f".{key}.":
+            continue
+        local = param.to_local() if hasattr(param, "to_local") else param
+        if isinstance(local, torch.Tensor) and local.dtype not in UNQUANTIZED_PARAM_DTYPES:
+            return f"vLLM's non-expert parameter {key} has quantized dtype {local.dtype}"
     return ""
