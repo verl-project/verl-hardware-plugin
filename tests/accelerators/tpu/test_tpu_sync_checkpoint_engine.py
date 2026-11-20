@@ -1287,6 +1287,10 @@ def _receive_into_vllm_setup(worker_ext, weights_for_rank, trainer_ranks, tp, ev
     return manager, models, samplers
 
 
+# get_tpu_sync_options refuses receive_into_vllm=on (True) together with tie_word_embeddings (a regex).
+REFUSED_WITH_TIE = r"receive_into_vllm=on \(True\) cannot be combined with tie_word_embeddings=True"
+
+
 @pytest.mark.parametrize(
     ("trainer_ranks", "tp", "local_shards"),
     [(2, 2, False), (2, 2, True), (4, 4, False)],  # tp=4 > KV_HEADS: replicated KV heads, full tensors only
@@ -1304,7 +1308,7 @@ def test_receive_into_vllm_binds_every_vllm_parameter(
     else:
         weights_for_rank = lambda rank: iter(weights["current"].items())  # noqa: E731
     if tie_word_embeddings:
-        with pytest.raises(ValueError, match="receive_into_vllm=True cannot be combined with tie_word_embeddings=True"):
+        with pytest.raises(ValueError, match=REFUSED_WITH_TIE):
             _receive_into_vllm_setup(
                 worker_ext, weights_for_rank, trainer_ranks, tp, verify_parity=True, tie_word_embeddings=True
             )
@@ -1339,27 +1343,73 @@ def test_receive_into_vllm_binds_every_vllm_parameter(
 
 
 def test_receive_into_vllm_with_tie_word_embeddings_is_refused(fake_tpu_sync):
-    """receive_into_vllm together with tie_word_embeddings is refused where the options are parsed: by the trainer
-    ranks' engine, and by the driver before it starts a sync (nothing would fill vLLM's lm_head from the embedding).
-    Each option alone is accepted."""
-    refused = "receive_into_vllm=True cannot be combined with tie_word_embeddings=True"
-    with pytest.raises(ValueError, match=refused):
+    """receive_into_vllm=on (True) together with tie_word_embeddings is refused where the options are parsed: by the
+    trainer ranks' engine, and by the driver before it starts a sync (nothing would fill vLLM's lm_head from the
+    embedding). With tie_word_embeddings, auto (the default) and off (False) resolve to off; without it, on stays on."""
+    with pytest.raises(ValueError, match=REFUSED_WITH_TIE):
         tpu_sync_engine.TPUSyncCheckpointEngine(receive_into_vllm=True, tie_word_embeddings=True)
-    with pytest.raises(ValueError, match=refused):  # command-line overrides may arrive as strings
-        tpu_sync_engine.TPUSyncCheckpointEngine(receive_into_vllm="true", tie_word_embeddings="1")
+    for value in ("on", "true"):  # command-line overrides may arrive as strings
+        with pytest.raises(ValueError, match=REFUSED_WITH_TIE):
+            tpu_sync_engine.TPUSyncCheckpointEngine(receive_into_vllm=value, tie_word_embeddings="1")
     events: list = []
     manager, _ = _make_manager([], None, [], events, receive_into_vllm=True, tie_word_embeddings=True)
-    with pytest.raises(ValueError, match=refused):
+    with pytest.raises(ValueError, match=REFUSED_WITH_TIE):
         asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
     assert events == []
     assert not hasattr(manager, "_tpu_sync_controller")
 
     engine = tpu_sync_engine.TPUSyncCheckpointEngine(receive_into_vllm=True, tie_word_embeddings=False)
-    assert (engine.receive_into_vllm, engine.tie_word_embeddings) == (True, False)
+    assert (engine.receive_into_vllm, engine.tie_word_embeddings) == ("on", False)
     engine = tpu_sync_engine.TPUSyncCheckpointEngine(receive_into_vllm=True)
-    assert (engine.receive_into_vllm, engine.tie_word_embeddings) == (True, None)
-    engine = tpu_sync_engine.TPUSyncCheckpointEngine(tie_word_embeddings=True)
-    assert (engine.receive_into_vllm, engine.tie_word_embeddings) == (False, True)
+    assert (engine.receive_into_vllm, engine.tie_word_embeddings) == ("on", None)
+    for kwargs in ({}, {"receive_into_vllm": "auto"}, {"receive_into_vllm": False}, {"receive_into_vllm": "off"}):
+        engine = tpu_sync_engine.TPUSyncCheckpointEngine(tie_word_embeddings=True, **kwargs)
+        assert (engine.receive_into_vllm, engine.tie_word_embeddings) == ("off", True)
+        assert engine._effective_receive_into_vllm is False
+
+
+@pytest.mark.parametrize("receive_into_vllm", [None, "auto", False, "off"], ids=["default", "auto", "False", "off"])
+def test_tie_word_embeddings_syncs_through_the_staging_buffers(fake_tpu_sync, worker_ext, caplog, receive_into_vllm):
+    """On a dense FSDP == TP setup, where receive_into_vllm=auto binds vLLM's parameters (the control),
+    tie_word_embeddings resolves auto to off, and off (False) stays off: the driver asks the rollout for no parameter
+    description, every rank stages and installs, lm_head is copied from the embedding and the check passes."""
+    tp = 2
+    weights = {"current": _trainer_weights(seed=0)}
+
+    def setup(**kwargs):
+        models = [_FakeVllmModel(tp) for _ in range(tp)]
+        samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+        engines = [_trainer_engine(rank, **kwargs) for rank in range(tp)]
+        weights_for_rank = lambda rank: _LocalShardWeights(weights["current"], rank, tp)  # noqa: E731
+        manager, _ = _make_manager(engines, weights_for_rank, samplers, [], **kwargs)
+        return manager, models, samplers, engines
+
+    # The control: the same setup without tie_word_embeddings receives straight into vLLM's parameters.
+    manager, _, samplers, _ = setup()
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+    assert all(sampler._tpu_sync_bound_names == set(VLLM_PARAMS) for sampler in samplers)
+
+    fake_tpu_sync.registry_state = TpuSyncRendezvousState()
+    fake_tpu_sync.registry = _FakeActorHandle(fake_tpu_sync.registry_state)
+    kwargs = {"tie_word_embeddings": True}
+    if receive_into_vllm is not None:
+        kwargs["receive_into_vllm"] = receive_into_vllm
+    manager, models, samplers, engines = setup(**kwargs)
+    assert all((e.receive_into_vllm, e._effective_receive_into_vllm) == ("off", False) for e in engines)
+    for step in (0, 1):
+        weights["current"] = _trainer_weights(seed=step)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=tpu_sync_engine.__name__):
+            asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=step))
+        for rank, model in enumerate(models):
+            _assert_state(model, _expected_vllm_state(weights["current"], rank, tp, lm_head_from_embed=True))
+        lines = _tied_lines(caplog.text, step)
+        assert len(lines) == tp
+        assert all("lm_head copied" in line and "(bitwise equal)" in line for line in lines)
+    assert not hasattr(manager, "_tpu_sync_vllm_params_checked")  # no describe_vllm_params call
+    assert fake_tpu_sync.registry_state.get_vllm_params() is None
+    assert all(not getattr(sampler, "_tpu_sync_bound_names", None) for sampler in samplers)
+    assert "lm_head.weight" not in fake_tpu_sync.registry_state.get_global_shapes()
 
 
 def test_receive_into_vllm_needs_fsdp_equal_to_tp_for_fused_parameters(fake_tpu_sync, worker_ext):
@@ -2159,7 +2209,9 @@ def _share_lm_head(model):
 def _tied_setup(worker_ext, checkpoint, tie_word_embeddings, verify_parity="off", tp=2, wrap=None):
     """TP=``tp`` rollout models holding ``checkpoint`` (what vLLM loaded), and 2 trainer ranks sending local shards
     of ``current["weights"]`` (``checkpoint`` until a test changes it). ``tie_word_embeddings=None`` leaves the option
-    unset; ``wrap`` transforms each rollout model before the sampler gets it.
+    unset and sets ``receive_into_vllm=off``: on this setup ``auto`` would receive straight into vLLM's parameters,
+    which installs nothing, so there would be no check to report (with the option set, ``auto`` resolves to ``off``
+    itself). ``wrap`` transforms each rollout model before the sampler gets it.
     """
     models = [_FakeVllmModel(tp) for _ in range(tp)]
     for rank, model in enumerate(models):
@@ -2168,7 +2220,9 @@ def _tied_setup(worker_ext, checkpoint, tie_word_embeddings, verify_parity="off"
     samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(served)]
     current = {"weights": checkpoint}
     events: list = []
-    kwargs = {} if tie_word_embeddings is None else {"tie_word_embeddings": tie_word_embeddings}
+    kwargs: dict = (
+        {"receive_into_vllm": "off"} if tie_word_embeddings is None else {"tie_word_embeddings": tie_word_embeddings}
+    )
     manager, _ = _make_manager(
         [_trainer_engine(rank, verify_parity=verify_parity, **kwargs) for rank in range(2)],
         lambda rank: _LocalShardWeights(current["weights"], rank, 2),
