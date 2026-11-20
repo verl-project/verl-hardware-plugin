@@ -3904,3 +3904,180 @@ def test_align_micro_batch_shapes_gdn_row_slot_len_multi_seq():
     slotted = ids_pad[slot_src]
     restored = slotted[contig_src]
     assert torch.equal(restored[:orig_len], ids.values())
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# static_micro_batch_num_seqs and the GatedDeltaNet document budget in forward_backward_batch (CPU, toy model)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class _ToyPolicy:
+    """Log-prob of the label at packed position t: -softplus(theta[label_t] + w * position_t / 64), in float64.
+
+    It depends only on the token and its position in its sequence, so the padding never changes a real token's value.
+    """
+
+    def __init__(self):
+        gen = torch.Generator().manual_seed(7)
+        self.theta = (0.3 * torch.randn(64, generator=gen, dtype=torch.float64)).requires_grad_(True)
+        self.w = torch.tensor(0.2, dtype=torch.float64, requires_grad=True)
+
+    def forward_step(self, micro_batch, loss_function, calls, kernel):
+        """The engine's per-micro-batch path on CPU: pad, "model", trimmed view with the padded leaf, loss inputs."""
+        from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import TPU_PADDED_VALUES_ATTR
+        from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import prepare_tpu_loss_inputs
+
+        ids, positions, labels, orig = pad_packed_inputs_for_tpu(
+            micro_batch["input_ids"], micro_batch["position_ids"], micro_batch, "cpu", 32
+        )
+        padded = -torch.nn.functional.softplus(self.theta[labels] + self.w * positions.to(torch.float64) / 64)
+        offsets = micro_batch["input_ids"].offsets()
+        log_probs = torch.nested.nested_tensor_from_jagged(padded.detach()[:orig].clone(), offsets)
+        setattr(log_probs, TPU_PADDED_VALUES_ATTR, padded)
+        loss_output, loss_data = prepare_tpu_loss_inputs({"log_probs": log_probs}, micro_batch)
+        calls.append(
+            SimpleNamespace(
+                seqs=int(micro_batch.batch_size[0]),
+                rows=tuple(loss_data["advantages"].shape) if loss_function is not None else None,
+                budget=kernel.max_num_segments,
+            )
+        )
+        if loss_function is None:
+            loss, metrics = torch.tensor(1.0), {}
+        else:
+            loss, metrics = loss_function(model_output=loss_output, data=loss_data)
+        model_output = {"log_probs": torch.nested.nested_tensor_from_jagged(padded.detach()[:orig].clone(), offsets)}
+        return loss, {"model_output": model_output, "loss": float(loss.detach()), "metrics": metrics}
+
+
+def _static_seqs_mini_batch(n, seed, max_prompt=20, max_response=40):
+    """A packed PPO mini-batch of ``n`` sequences for verl's dynamic micro-batching (256-token budget)."""
+    import random
+
+    from verl.utils.dataset.dataset_utils import DatasetPadMode
+
+    rng = random.Random(seed)
+    gen = torch.Generator().manual_seed(seed)
+    lengths = [(rng.randint(2, max_prompt), rng.randint(1, max_response)) for _ in range(n)]
+
+    def nested(rows):
+        return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+    data = TensorDict(
+        {
+            "input_ids": nested([torch.randint(1, 50, (p + r,), generator=gen) for p, r in lengths]),
+            "position_ids": nested([torch.arange(p + r) for p, r in lengths]),
+            "prompts": nested([torch.randint(1, 50, (p,), generator=gen) for p, _ in lengths]),
+            "responses": nested([torch.randint(1, 50, (r,), generator=gen) for _, r in lengths]),
+            "response_mask": nested([torch.ones(r, dtype=torch.int64) for _, r in lengths]),
+            "loss_mask": nested(
+                [torch.cat([torch.zeros(p, dtype=torch.int64), torch.ones(r, dtype=torch.int64)]) for p, r in lengths]
+            ),
+            "old_log_probs": nested([(-0.5 - torch.rand(r, generator=gen)).double() for _, r in lengths]),
+            "advantages": nested([torch.randn(r, generator=gen).double() for _, r in lengths]),
+        },
+        batch_size=[n],
+    )
+    tu.assign_non_tensor(
+        data,
+        use_dynamic_bsz=True,
+        use_remove_padding=True,
+        pad_mode=DatasetPadMode.NO_PADDING,
+        max_token_len_per_gpu=256,
+        global_batch_size=n,
+        temperature=1.0,
+    )
+    return data
+
+
+def _ppo_loss_function(**actor_kwargs):
+    from verl.workers.config import ActorConfig
+    from verl.workers.utils.losses import ppo_loss
+
+    config = ActorConfig(
+        strategy="fsdp", rollout_n=8, ppo_micro_batch_size_per_gpu=4, loss_agg_mode="token-mean", **actor_kwargs
+    )
+    return functools.partial(ppo_loss, config=config)
+
+
+class _TokamaxGatedDeltaKernelStandIn(torch.nn.Module):
+    """Stands in for torchtitan's Tokamax GatedDeltaNet kernel module (matched by class name)."""
+
+    def __init__(self):
+        super().__init__()
+        self.max_num_segments = 1
+
+
+_TokamaxGatedDeltaKernelStandIn.__name__ = "TokamaxGatedDeltaKernel"
+
+
+@pytest.fixture
+def static_seqs_engine(monkeypatch):
+    """A TorchTitanTPUEngineWithLMHead without a model: the toy policy's forward step, one process, SimpleFSDP."""
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+
+    monkeypatch.setattr(torchtitan_tpu, "tpu_synchronize", lambda *args, **kwargs: None)
+
+    def make(tpu_kwargs, kernels=frozenset({"kda"})):
+        toy, calls, kernel = _ToyPolicy(), [], _TokamaxGatedDeltaKernelStandIn()
+        engine = object.__new__(torchtitan_tpu.TorchTitanTPUEngineWithLMHead)
+        engine.engine_config = SimpleNamespace(
+            engine_kwargs={"tpu": {"seq_bucket_size": 32, **tpu_kwargs}},
+            tensor_parallel_size=1,
+            context_parallel_size=1,
+            data_parallel_shard_size=1,
+            data_parallel_replicate_size=1,
+        )
+        engine.parallel_dims = SimpleNamespace(cp_enabled=False, pp_enabled=False)
+        engine._use_simple_fsdp, engine._tpu_eager_mode, engine._simple_fsdp_loss_scale = True, None, None
+        engine._tpu_kernels = kernels
+        engine.module = [torch.nn.ModuleList([kernel])]
+        engine.trainer = SimpleNamespace(train_context=nullcontext)
+        engine.get_data_parallel_group = lambda: None
+        engine.forward_step = lambda micro_batch, loss_function, forward_only, loss_scalars=None: toy.forward_step(
+            micro_batch, loss_function, calls, kernel
+        )
+        return engine, toy, calls
+
+    return make
+
+
+STATIC_8K_LIKE = {"static_micro_batch_len": 256, "static_max_response_len": 64}  # one packed shape, one width
+
+
+def test_static_micro_batch_num_seqs_is_the_floor_of_the_gated_delta_net_document_budget(
+    static_seqs_engine, monkeypatch
+):
+    """With Tokamax kda kernels the document budget is sized for N sequences, so it stays constant across calls."""
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+
+    set_budget = torchtitan_tpu.tpu_model_kernels.set_packed_document_budget
+    updates = []
+
+    def recording_set_budget(modules, budget):
+        updated = set_budget(modules, budget)
+        updates.append((budget, updated))
+        return updated
+
+    monkeypatch.setattr(torchtitan_tpu.tpu_model_kernels, "set_packed_document_budget", recording_set_budget)
+    budget = torchtitan_tpu.tpu_model_kernels.packed_document_budget
+    long_seqs = _static_seqs_mini_batch(48, seed=3)  # at most 7 sequences per micro-batch
+    short_seqs = _static_seqs_mini_batch(96, seed=4, max_prompt=8, max_response=12)  # 16 or more
+
+    def run(engine):
+        engine.forward_backward_batch(long_seqs.clone(), _ppo_loss_function())
+        with torch.no_grad():  # compute_log_prob: no loss
+            engine.forward_backward_batch(short_seqs.clone(), None, forward_only=True)
+
+    engine, _, calls = static_seqs_engine({**STATIC_8K_LIKE, "static_micro_batch_num_seqs": 24})
+    run(engine)
+    counts = [max(c.seqs for c in calls if c.rows is not None), max(c.seqs for c in calls if c.rows is None)]
+    assert counts[0] < 16 <= counts[1] <= 24
+    assert updates == [(budget(24), 1), (budget(24), 0)]  # one budget; the second call recompiles nothing
+    assert {c.budget for c in calls} == {budget(24)} == {32}
+
+    # Without the option the budget follows the largest micro-batch, bucketed (main's behaviour): it changes here.
+    updates.clear()
+    engine, _, calls = static_seqs_engine(STATIC_8K_LIKE)
+    run(engine)
+    assert updates == [(budget(counts[0]), 1), (budget(counts[1]), 1)] == [(16, 1), (32, 1)]

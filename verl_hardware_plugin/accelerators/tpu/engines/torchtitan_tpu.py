@@ -1657,8 +1657,10 @@ class TorchTitanTPUEngine(BaseEngine):
         if "kda" in getattr(self, "_tpu_kernels", ()) and not getattr(self, "_gdn_row_slot_len", 0):
             # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
             # micro-batch is one packed document, plus the bucket-padding tail; bucketed so that use_dynamic_bsz's
-            # varying sequence counts do not recompile the kernels (see packed_document_budget).
-            budget = tpu_model_kernels.packed_document_budget(max(int(mb.batch_size[0]) for mb in micro_batches))
+            # varying sequence counts do not recompile the kernels (see packed_document_budget), and sized for at
+            # least static_micro_batch_num_seqs sequences, so it stays constant while no micro-batch has more.
+            num_seqs = max(int(mb.batch_size[0]) for mb in micro_batches)
+            budget = tpu_model_kernels.packed_document_budget(max(num_seqs, static_num_seqs))
             updated = tpu_model_kernels.set_packed_document_budget(self.module, budget)
             if updated:
                 logger.info("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)

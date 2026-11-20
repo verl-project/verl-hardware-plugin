@@ -225,7 +225,8 @@ class TPUEngineOptions:
             (e.g. the largest number of sequences a micro-batch can hold), so the loss keeps one row shape
             (default: unset, the power-of-two bucket only). With it, ``bypass_mode`` gets padded rows too: its loss
             and gradients do not change, but with verl 0.9.1 some of its ``rollout_corr/*`` diagnostics count the
-            padding rows (docs/accelerators/tpu/engine.md lists them).
+            padding rows (docs/accelerators/tpu/engine.md lists them). With Tokamax's GatedDeltaNet kernels it is
+            also the floor of their packed-document budget, for every call, with or without row bucketing.
         splash_max_block_size: Largest Splash attention block size, a power of two >= 128 (default: ``512``,
             torchtitan's). Long packed micro-batches run faster with ``1024``.
         mixed_precision_reduce: dtype of the FSDP gradient reduce-scatter, ``float32`` (default, torchtitan's) or
