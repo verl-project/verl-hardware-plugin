@@ -146,6 +146,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
     assert get_tpu_sync_options(None) == TPUSyncOptions()
     assert get_tpu_sync_options({}) == TPUSyncOptions(
         parallelism=8,
+        group_size=16,
         verify_parity="off",
         release_buffers_after_sync=True,
         tie_word_embeddings=None,
@@ -156,6 +157,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
     options = get_tpu_sync_options(
         {
             "parallelism": "4",
+            "group_size": "128",
             "verify_parity": "true",
             "release_buffers_after_sync": "0",
             "tie_word_embeddings": 1,
@@ -165,6 +167,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
     )
     assert options == TPUSyncOptions(
         parallelism=4,
+        group_size=128,
         verify_parity="norm",
         release_buffers_after_sync=False,
         tie_word_embeddings=True,
@@ -210,7 +213,9 @@ def test_tpu_sync_verify_parity_modes(value, mode, norms, exact):
     assert (options.verify_parity, options.verify_norms, options.verify_exact) == (mode, norms, exact)
 
 
-@pytest.mark.parametrize("kwargs", [{"paralelism": 4}, {"parallelism": 0}, {"verify_parity": "maybe"}])
+@pytest.mark.parametrize(
+    "kwargs", [{"paralelism": 4}, {"parallelism": 0}, {"group_size": 0}, {"verify_parity": "maybe"}]
+)
 def test_tpu_sync_options_reject_unknown_keys_and_bad_values(kwargs):
     with pytest.raises(ValueError, match="engine_kwargs.tpu-sync"):
         get_tpu_sync_options(kwargs)

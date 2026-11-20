@@ -48,6 +48,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 TPU_ENGINE_KWARGS_KEY = "tpu"
 # Parallel transfer streams per worker, unless engine_kwargs.tpu-sync.parallelism overrides it.
 TPU_SYNC_DEFAULT_PARALLELISM = 8
+# Consecutive tensors per transfer stage of the controller, unless engine_kwargs.tpu-sync.group_size overrides it.
+TPU_SYNC_DEFAULT_GROUP_SIZE = 16
 
 _warned: set[str] = set()
 
@@ -468,6 +470,8 @@ class TPUSyncOptions:
 
     Attributes:
         parallelism: Parallel transfer streams per worker.
+        group_size: Number of consecutive tensors the tpu-sync controller plans and schedules as one stage of the
+            transfer (``1`` makes every tensor its own stage).
         verify_parity: Weight-sync check, one of ``ParityMode.MODES`` (``off`` by default): ``norm`` compares
             trainer and rollout weight norms after every sync, ``exact`` compares every tensor the rollout
             received on the step-0 sync bit for bit with the checkpoint vLLM loaded, ``all`` runs both. A failed
@@ -491,6 +495,7 @@ class TPUSyncOptions:
     """
 
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM
+    group_size: int = TPU_SYNC_DEFAULT_GROUP_SIZE
     verify_parity: str = "off"
     release_buffers_after_sync: bool = True
     tie_word_embeddings: Optional[bool] = None
@@ -510,6 +515,7 @@ class TPUSyncOptions:
 
 _SYNC_KINDS: dict[str, type] = {
     "parallelism": int,
+    "group_size": int,
     "verify_parity": ParityMode,
     "release_buffers_after_sync": bool,
     "tie_word_embeddings": bool,
