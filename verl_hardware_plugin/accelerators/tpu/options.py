@@ -161,6 +161,14 @@ class TPUEngineOptions:
             (default: ``DEFER_AND_FUSE`` with ``use_torch_compile``).
         context_parallel_strategy: Context-parallel attention strategy when ``context_parallel_size > 1``:
             ``all_gather`` (load-balanced KV all-gather with Splash Attention, default) or ``ulysses`` (all-to-all).
+        context_parallel_gdn_strategy: How the context-parallel GatedDeltaNet (Qwen3.5) moves its inputs between
+            the token and head layouts: ``all_to_all`` or ``allgather_reducescatter`` (default: unset, torchtitan's
+            ``GatedDeltaNetContextParallelTransform`` default). Passed to the transform as ``strategy``; needs a
+            torchtitan whose transform has that field (an older one is rejected when this is set). A performance
+            A/B option, independent of ``context_parallel_strategy``.
+        context_parallel_gdn_reduce_dtype: dtype of the context-parallel GatedDeltaNet's gradient reductions,
+            ``float32`` or ``bfloat16`` (default: unset, the transform's default). Passed as ``reduce_dtype``, with
+            the same torchtitan requirement.
         optim_impl: torchtitan optimizer implementation (default: ``fused``, ``for-loop`` with TP).
         seq_bucket_size: Packed sequence length bucket in tokens (default: ``pad_to_length_bucket`` when
             ``pad_to_length`` is set, else 256).
@@ -257,6 +265,8 @@ class TPUEngineOptions:
     fuse_qkv: Optional[bool] = None
     tpu_eager_mode: Optional[str] = None
     context_parallel_strategy: Optional[str] = None
+    context_parallel_gdn_strategy: Optional[str] = None
+    context_parallel_gdn_reduce_dtype: Optional[str] = None
     optim_impl: Optional[str] = None
     seq_bucket_size: Optional[int] = None
     model_kernels: Optional[str] = None
@@ -294,6 +304,8 @@ _ENGINE_KINDS: dict[str, Any] = {
     "fuse_qkv": bool,
     "tpu_eager_mode": str,
     "context_parallel_strategy": str,
+    "context_parallel_gdn_strategy": str,
+    "context_parallel_gdn_reduce_dtype": str,
     "optim_impl": str,
     "seq_bucket_size": int,
     "model_kernels": str,
@@ -324,6 +336,12 @@ _ENGINE_KINDS: dict[str, Any] = {
     "graph_trainer": dict,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
+
+# String options with a fixed set of values (lower-cased, checked by get_tpu_engine_options).
+_ENGINE_CHOICES: dict[str, tuple[str, ...]] = {
+    "context_parallel_gdn_strategy": ("all_to_all", "allgather_reducescatter"),
+    "context_parallel_gdn_reduce_dtype": ("float32", "bfloat16"),
+}
 
 # engine_kwargs.tpu.trainer_mode values.
 TRAINER_MODE_EAGER_BLOCKS = "eager_blocks"
@@ -405,6 +423,14 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
                 f"got {values['ep_dispatcher']!r}"
             )
         values["ep_dispatcher"] = ep_disp
+    for name, choices in _ENGINE_CHOICES.items():
+        if values.get(name) is not None:
+            choice = values[name].strip().lower()
+            if choice not in choices:
+                raise ValueError(
+                    f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.{name} must be one of {choices}, got {values[name]!r}"
+                )
+            values[name] = choice
     if values.get("ep_token_chunks") is not None and values["ep_token_chunks"] < 1:
         raise ValueError(
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ep_token_chunks must be >= 1, got {values['ep_token_chunks']!r}"

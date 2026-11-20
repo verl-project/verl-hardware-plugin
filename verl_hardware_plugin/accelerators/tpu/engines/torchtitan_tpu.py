@@ -76,6 +76,7 @@ from verl.workers.engine.utils import (
 from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import no_padding_2_padding
 from verl_hardware_plugin.accelerators.tpu.engines import graph_trainer_mode, tpu_model_kernels, tpu_ragged_ep
+from verl_hardware_plugin.accelerators.tpu.engines.cp_layer_transforms import context_parallel_layer_transforms
 from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
@@ -1383,7 +1384,8 @@ class TorchTitanTPUEngine(BaseEngine):
         """Turn on TPU context parallelism the way a torchtitan CP recipe does.
 
         Like ``torchtitan_recipes/muse_glimmer.py`` and the TPU ``qwen3_*_cp*`` recipes: set the SPMD backend and
-        the load balancer, swap in the TPU CP inner attention with core ``ContextParallelTransform``, then check the
+        the load balancer, swap in the TPU CP inner attention with core ``ContextParallelTransform`` (plus the CP
+        transforms of the model's non-attention sequence mixers, see ``cp_layer_transforms``), then check the
         TPU-specific rules. Core ``Trainer.Config`` validates the rest when it is built. The strategy comes from
         ``engine_kwargs.tpu.context_parallel_strategy`` so verl keeps CP as a config option.
         """
@@ -1404,7 +1406,8 @@ class TorchTitanTPUEngine(BaseEngine):
                 validate_tpu_context_parallel,
             )
 
-        strategy = get_tpu_engine_options(self.engine_config).context_parallel_strategy or "all_gather"
+        tpu_options = get_tpu_engine_options(self.engine_config)
+        strategy = tpu_options.context_parallel_strategy or "all_gather"
         if strategy == "all_gather" and not self._use_splash_attention:
             # torchtitan refuses to run its plain-PyTorch reference attention for KV all-gather CP on TPU: it builds
             # the full (S / cp, S) score matrix. Fail here, before the model is built.
@@ -1418,16 +1421,22 @@ class TorchTitanTPUEngine(BaseEngine):
         parallelism.context_parallel_load_balancer = load_balancer
         inner_attention = model.first_full_attention_backend
         cp_inner_attention = tpu_cp_inner_attention(inner_attention._owner, strategy)
-        transforms = [ContextParallelTransform(inner_attention=cp_inner_attention)]
-        try:
-            # Hybrid Qwen3.5: run the GatedDeltaNet layers head-parallel over the CP token layout, as
-            # torchtitan's qwen3_5/config_registry.py::_qwen35_cp does (google-pytorch/torchtitan#201).
-            from torchtitan.experiments.tpu.qwen3_5.cp_gated_delta import GatedDeltaNetContextParallelTransform
-        except ImportError:
-            GatedDeltaNetContextParallelTransform = None
-        if GatedDeltaNetContextParallelTransform is not None:  # no-op for models without TpuInnerGatedDeltaNet
-            transforms.append(GatedDeltaNetContextParallelTransform(load_balancer=load_balancer))
-        transform_model_config_(model, transforms)
+        # The non-attention sequence mixers the model contains (e.g. Qwen3.5's GatedDeltaNet) run over the same CP
+        # token layout through their own transforms, as torchtitan's CP recipes add them (cp_layer_transforms).
+        # Raises if the model needs one that the installed torchtitan does not ship.
+        layer_transforms = context_parallel_layer_transforms(model, load_balancer, tpu_options)
+        if layer_transforms and tpu_options.gdn_row_slot_len and load_balancer is not None:
+            # The load balancer shards the packed stream as one sequence, while the CP sequence mixers would
+            # undo the layout per gdn_row_slot_len row: the two token orders disagree.
+            raise ValueError(
+                f"gdn_row_slot_len is not supported with context_parallel_strategy={strategy!r} "
+                f"(context_parallel_load_balancer={load_balancer!r}): the load balancer shards each packed "
+                "micro-batch as one sequence, but the context-parallel GatedDeltaNet would read it as "
+                "gdn_row_slot_len-token rows. Unset gdn_row_slot_len or use context_parallel_strategy='ulysses'."
+            )
+        transform_model_config_(
+            model, [ContextParallelTransform(inner_attention=cp_inner_attention), *layer_transforms]
+        )
         validate_tpu_context_parallel(model, parallelism)
         # Runtime FSDP workaround for torch without spmd_types FSDP (see install_tpu_cp_patches).
         install_tpu_cp_patches()

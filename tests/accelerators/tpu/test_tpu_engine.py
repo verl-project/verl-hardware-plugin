@@ -41,16 +41,19 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     tpu_eager_mode_context,
     unwrap_metadata,
 )
+from verl_hardware_plugin.accelerators.tpu.options import TPUEngineOptions, get_tpu_engine_options
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
     PlatformTPU,
     configure_torchrun_tpu_env,
     gke_tpu_slice_topology,
     is_tpu_v7x,
     ray_tpu_accelerator_name,
+    ray_tpu_pool_chip_topology,
     resolve_tpu_topology_bounds,
     resolve_tpu_v7x_topology,
     tpu_generation,
     tpu_mesh_env,
+    tpu_pool_chip_topology,
     tpu_v7x_process_env,
 )
 
@@ -439,8 +442,14 @@ def test_resolve_tpu_v7x_topology_prefers_the_webhook_slice_shape():
     bigger = {"TPU_HOST_BOUNDS": "4,4,2", "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,2"}
     assert resolve_tpu_v7x_topology(512, 32, bigger) == "8,8,4,2"
     assert resolve_tpu_v7x_topology(64, 8, {**webhook, "TORCH_TPU_TOPOLOGY": "4,4,2,2"}) == "4,4,2,2"
-    # 256 TensorCores (a 4x4x8 v7x slice, 32 hosts) used as part of a larger slice: the table's shape.
-    assert resolve_tpu_v7x_topology(256, 32, bigger) == "4,4,8,2"
+    # Part of a larger slice with no host coordinates: the table's fallback shape, 4x4x8 for 32 hosts.
+    larger = {"TPU_HOST_BOUNDS": "2,4,8", "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1"}  # a 64-host 4x8x8 v7x slice
+    assert resolve_tpu_v7x_topology(256, 32, larger) == "4,4,8,2"
+    # With the block of hosts the pool holds, that block's shape wins over the table.
+    assert resolve_tpu_v7x_topology(256, 32, larger, pool_chip_topology="4,8,4") == "4,8,4,2"
+    assert resolve_tpu_v7x_topology(64, 8, webhook, pool_chip_topology="4,4,2") == "2,4,4,2"  # whole slice first
+    with pytest.raises(ValueError, match="block of chips"):
+        resolve_tpu_v7x_topology(256, 32, larger, pool_chip_topology="4,4,4")
     with pytest.raises(ValueError, match="TPU 7x mesh"):
         resolve_tpu_v7x_topology(24, 3, webhook)
     assert tpu_v7x_process_env("2,2,1,2", rank=13, local_rank=5) == {
@@ -449,6 +458,99 @@ def test_resolve_tpu_v7x_topology_prefers_the_webhook_slice_shape():
         "CLOUD_TPU_TASK_ID": "13",
         "TPU_VISIBLE_DEVICES": "5",
     }
+
+
+def test_tpu_pool_chip_topology_from_worker_ids():
+    """The block of hosts a pool holds in its slice (hosts numbered x-fastest over the host grid) times the chips per
+    host; hosts that do not fill a block are rejected rather than given a mesh that does not match the ICI."""
+    # A 64-host 4x8x8 v7x slice is a 2x4x8 grid of 2x2x1 hosts.
+    assert tpu_pool_chip_topology(range(64), "4x8x8") == "4,8,8"
+    assert tpu_pool_chip_topology(range(32), "4x8x8") == "4,8,4"  # z = 0..3: a 4x8x4 block
+    assert tpu_pool_chip_topology(range(32, 64), "4,8,8") == "4,8,4"
+    # Half of each z plane (y = 0..1, x = 0..1, every z): a 4x4x8 block, as the 256-device pool of the PR.
+    lower_half = [x + 2 * y + 8 * z for z in range(8) for y in range(2) for x in range(2)]
+    assert tpu_pool_chip_topology(lower_half, "4x8x8") == "4,4,8"
+    assert tpu_pool_chip_topology([5], "4x8x8") == "2,2,1"  # one host
+    assert tpu_pool_chip_topology(range(4), "2x2x4", "2,2,1") == "2,2,4"
+    with pytest.raises(ValueError, match="not a sub-mesh"):
+        tpu_pool_chip_topology([0, 1, 2, 4], "4x8x8")  # an L shape
+    with pytest.raises(ValueError, match="distinct hosts"):
+        tpu_pool_chip_topology([0, 0], "4x8x8")
+    with pytest.raises(ValueError, match="distinct hosts"):
+        tpu_pool_chip_topology([64], "4x8x8")
+    with pytest.raises(ValueError, match="not a grid"):
+        tpu_pool_chip_topology([0], "3x8x8")
+
+
+def _v7x_nodes(worker_ids, slice_name="slice-a", topology="4x8x8", labels=True):
+    return [
+        {
+            "NodeID": f"node-{i}",
+            "NodeManagerAddress": f"10.0.0.{i}",
+            "Alive": True,
+            "Resources": {"TPU": 8.0},
+            "Labels": {"ray.io/tpu-pod-type": "v7x-512"}
+            | (
+                {
+                    "ray.io/tpu-slice-name": slice_name,
+                    "ray.io/tpu-worker-id": str(worker_id),
+                    "ray.io/tpu-topology": topology,
+                }
+                if labels
+                else {}
+            ),
+        }
+        for i, worker_id in enumerate(worker_ids)
+    ]
+
+
+def test_ray_tpu_pool_chip_topology_reads_the_hosts_slice_coordinates():
+    lower_half = [x + 2 * y + 8 * z for z in range(8) for y in range(2) for x in range(2)]
+    ips = [f"10.0.0.{i}" for i in range(32)]
+    with mock.patch("ray.is_initialized", return_value=True):
+        with mock.patch("ray.nodes", return_value=_v7x_nodes(lower_half)):
+            assert ray_tpu_pool_chip_topology(ips) == "4,4,8"
+        with mock.patch("ray.nodes", return_value=_v7x_nodes(lower_half, labels=False)):
+            assert ray_tpu_pool_chip_topology(ips) == ""  # no coordinates: the caller falls back to the table
+        two_slices = _v7x_nodes(range(16)) + _v7x_nodes(range(16), slice_name="slice-b")
+        for i, node in enumerate(two_slices):
+            node["NodeManagerAddress"] = f"10.0.0.{i}"
+        with mock.patch("ray.nodes", return_value=two_slices):
+            assert ray_tpu_pool_chip_topology(ips) == ""
+        with mock.patch("ray.nodes", return_value=_v7x_nodes([0, 1, 2, 4])):
+            with pytest.raises(ValueError, match="TORCH_TPU_TOPOLOGY"):
+                ray_tpu_pool_chip_topology(ips[:4])
+    with mock.patch("ray.is_initialized", return_value=False):
+        assert ray_tpu_pool_chip_topology(ips) == ""
+
+
+def test_get_tpu_env_vars_derives_the_v7x_mesh_of_a_partial_slice_pool():
+    """A Ray trainer pool of 32 hosts of a 64-host slice gets the block its hosts hold; without labels, the table."""
+    platform = PlatformTPU()
+    pg = SimpleNamespace(id="pg-0")
+    lower_half = [x + 2 * y + 8 * z for z in range(8) for y in range(2) for x in range(2)]
+    pg_table = {"state": "CREATED", "bundles_to_node_id": {b: f"node-{b // 8}" for b in range(256)}}
+    for nodes, expected in ((_v7x_nodes(range(32)), "4,8,4,2"), (_v7x_nodes(lower_half), "4,4,8,2")):
+        with (
+            mock.patch("ray.is_initialized", return_value=True),
+            mock.patch("ray.nodes", return_value=nodes),
+            mock.patch("ray._private.state.state.placement_group_table", return_value=pg_table),
+            mock.patch.dict(os.environ, _env_without_webhook(), clear=True),
+        ):
+            env = platform.get_tpu_env_vars(
+                rank=0, world_size=256, local_rank=0, local_world_size=8, name_prefix="ActorRolloutRefWorker", pgs=[pg]
+            )
+        assert env["TORCH_TPU_TOPOLOGY"] == expected
+    with (
+        mock.patch("ray.is_initialized", return_value=True),
+        mock.patch("ray.nodes", return_value=_v7x_nodes(range(32), labels=False)),
+        mock.patch("ray._private.state.state.placement_group_table", return_value=pg_table),
+        mock.patch.dict(os.environ, _env_without_webhook(), clear=True),
+    ):
+        env = platform.get_tpu_env_vars(
+            rank=0, world_size=256, local_rank=0, local_world_size=8, name_prefix="ActorRolloutRefWorker", pgs=[pg]
+        )
+    assert env["TORCH_TPU_TOPOLOGY"] == "4,4,8,2"
 
 
 def test_tpu_mesh_env_applies_the_process_layout_on_tpu7x_only():
@@ -1466,28 +1568,21 @@ def test_cp_bucket_size_and_token_count():
         assert compute_global_batch_num_tokens(data, None, tp_size=1, cp_size=2) == 80
 
 
-@pytest.mark.parametrize(
-    ("strategy", "expected_lb"),
-    [("all_gather", "headtail"), ("ulysses", None)],
-)
-def test_enable_context_parallel_follows_torchtitan_cp_recipe(strategy, expected_lb):
-    """Sets SPMD backend + load balancer, applies ContextParallelTransform, validates, patches."""
-    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+def _fake_cp_modules(
+    calls: list, *, inner_attention=None, layer_modules: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
+    """``sys.modules`` fakes of the torchtitan CP API ``_enable_context_parallel`` imports.
 
-    calls = []
-
-    class _SDPA:
-        pass
-
-    class _CPSDPA:
-        pass
+    ``ContextParallelTransform`` / ``transform_model_config_`` / the cp_attention helpers record into ``calls``;
+    ``layer_modules`` adds more fake modules (e.g. a GatedDeltaNet layer and its CP transform).
+    """
 
     class _ContextParallelTransform:
         def __init__(self, inner_attention):
             self.inner_attention = inner_attention
 
     def _transform_model_config_(model, transforms):
-        calls.append(("transform", [t.inner_attention for t in transforms]))
+        calls.append(("transform", list(transforms)))
         return model
 
     fake_transform = SimpleNamespace(
@@ -1495,36 +1590,98 @@ def test_enable_context_parallel_follows_torchtitan_cp_recipe(strategy, expected
     )
     fake_cp_attention = SimpleNamespace(
         install_tpu_cp_patches=lambda: calls.append("patches"),
-        tpu_cp_inner_attention=lambda base, strat: calls.append(("inner", base, strat)) or _CPSDPA,
+        tpu_cp_inner_attention=lambda base, strat: calls.append(("inner", base, strat)) or (inner_attention or base),
         tpu_cp_load_balancer=lambda strat: "headtail" if strat == "all_gather" else None,
         validate_tpu_context_parallel=lambda model, parallelism: calls.append(
             ("validate", parallelism.spmd_backend, parallelism.context_parallel_load_balancer)
         ),
     )
-    engine = SimpleNamespace(
-        engine_config=SimpleNamespace(engine_kwargs={"tpu": {"context_parallel_strategy": strategy}}),
+    return {
+        "torchtitan": SimpleNamespace(),
+        "torchtitan.config": SimpleNamespace(transform=fake_transform),
+        "torchtitan.config.transform": fake_transform,
+        "torchtitan.experiments": SimpleNamespace(),
+        "torchtitan.experiments.tpu": SimpleNamespace(cp_attention=fake_cp_attention),
+        "torchtitan.experiments.tpu.cp_attention": fake_cp_attention,
+        **(layer_modules or {}),
+    }
+
+
+def _cp_engine(strategy: str, **tpu_options: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+        engine_config=SimpleNamespace(engine_kwargs={"tpu": {"context_parallel_strategy": strategy, **tpu_options}}),
         _use_splash_attention=True,
     )
-    parallelism = SimpleNamespace(
+
+
+def _cp_parallelism() -> SimpleNamespace:
+    return SimpleNamespace(
         context_parallel_degree=2, spmd_backend="partial_dtensor", context_parallel_load_balancer="headtail"
     )
+
+
+_GDN_LAYER_MODULE = "torchtitan.models.qwen3_5.gdn"
+_GDN_CP_MODULE = "torchtitan.experiments.tpu.qwen3_5.cp_gated_delta"
+
+
+def _fake_gdn_layer_module() -> types.ModuleType:
+    """A fake ``torchtitan.models.qwen3_5.gdn`` with a ``GatedDeltaNet.Config`` layer config type."""
+    module = types.ModuleType(_GDN_LAYER_MODULE)
+
+    class GatedDeltaNet:
+        class Config:
+            pass
+
+    module.GatedDeltaNet = GatedDeltaNet
+    return module
+
+
+def _model_with_layers(layer_config_cls: Optional[type] = None, n_layers: int = 0) -> SimpleNamespace:
+    """A model config whose ``traverse(cls)`` yields ``n_layers`` instances of ``layer_config_cls``."""
+
+    def traverse(cls):
+        if cls is layer_config_cls:
+            return [(f"layers.{i}.linear_attn", cls(), None, None) for i in range(n_layers)]
+        return []
+
+    return SimpleNamespace(first_full_attention_backend=SimpleNamespace(_owner=object), traverse=traverse)
+
+
+def _fake_gdn_cp_module(*, with_options: bool) -> types.ModuleType:
+    """A fake ``cp_gated_delta`` whose transform is a dataclass like torchtitan's (optionally with the new fields)."""
+    module = types.ModuleType(_GDN_CP_MODULE)
+    fields: list[Any] = [("load_balancer", Optional[str])]
+    if with_options:
+        fields += [("strategy", str, dataclasses.field(default="all_to_all")), ("reduce_dtype", str, "float32")]
+    module.GatedDeltaNetContextParallelTransform = dataclasses.make_dataclass(
+        "GatedDeltaNetContextParallelTransform", fields, kw_only=True
+    )
+    return module
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected_lb"),
+    [("all_gather", "headtail"), ("ulysses", None)],
+)
+def test_enable_context_parallel_follows_torchtitan_cp_recipe(strategy, expected_lb):
+    """Sets SPMD backend + load balancer, applies ContextParallelTransform, validates, patches."""
+
+    class _SDPA:
+        pass
+
+    class _CPSDPA:
+        pass
+
+    calls: list = []
     model = SimpleNamespace(first_full_attention_backend=SimpleNamespace(_owner=_SDPA))
-    with mock.patch.dict(
-        sys.modules,
-        {
-            "torchtitan": SimpleNamespace(),
-            "torchtitan.config": SimpleNamespace(transform=fake_transform),
-            "torchtitan.config.transform": fake_transform,
-            "torchtitan.experiments": SimpleNamespace(),
-            "torchtitan.experiments.tpu": SimpleNamespace(cp_attention=fake_cp_attention),
-            "torchtitan.experiments.tpu.cp_attention": fake_cp_attention,
-        },
-    ):
-        TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
+    parallelism = _cp_parallelism()
+    with mock.patch.dict(sys.modules, _fake_cp_modules(calls, inner_attention=_CPSDPA)):
+        sys.modules.pop(_GDN_LAYER_MODULE, None)  # a model without GatedDeltaNet layers: traverse is never needed
+        TorchTitanTPUEngine._enable_context_parallel(_cp_engine(strategy), parallelism, model)
 
     assert parallelism.spmd_backend == "spmd_types"
     assert parallelism.context_parallel_load_balancer == expected_lb
-    assert calls == [
+    assert [c if c[0] != "transform" else ("transform", [t.inner_attention for t in c[1]]) for c in calls] == [
         ("inner", _SDPA, strategy),
         ("transform", [_CPSDPA]),
         ("validate", "spmd_types", expected_lb),
@@ -1532,56 +1689,136 @@ def test_enable_context_parallel_follows_torchtitan_cp_recipe(strategy, expected
     ]
 
 
-def test_enable_context_parallel_adds_gated_delta_net_cp_transform_when_available():
-    """With a torchtitan that ships GatedDeltaNetContextParallelTransform, it runs after ContextParallelTransform."""
-    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
-
-    applied = []
-
-    class _ContextParallelTransform:
-        def __init__(self, inner_attention):
-            self.inner_attention = inner_attention
-
-    class _GatedDeltaNetContextParallelTransform:
-        def __init__(self, load_balancer):
-            self.load_balancer = load_balancer
-
-    fake_transform = SimpleNamespace(
-        ContextParallelTransform=_ContextParallelTransform,
-        transform_model_config_=lambda model, transforms: applied.extend(transforms) or model,
+@pytest.mark.parametrize(
+    ("strategy", "expected_lb"),
+    [("all_gather", "headtail"), ("ulysses", None)],
+)
+def test_enable_context_parallel_adds_gated_delta_net_cp_transform(strategy, expected_lb):
+    """A model with GatedDeltaNet layers also gets torchtitan's GDN CP transform, after ContextParallelTransform
+    and before validation, with the CP strategy's load balancer (``None`` under Ulysses)."""
+    layer_module = _fake_gdn_layer_module()
+    calls: list = []
+    modules = _fake_cp_modules(
+        calls,
+        layer_modules={_GDN_LAYER_MODULE: layer_module, _GDN_CP_MODULE: _fake_gdn_cp_module(with_options=False)},
     )
-    fake_cp_attention = SimpleNamespace(
-        install_tpu_cp_patches=lambda: None,
-        tpu_cp_inner_attention=lambda base, strat: base,
-        tpu_cp_load_balancer=lambda strat: "headtail" if strat == "all_gather" else None,
-        validate_tpu_context_parallel=lambda model, parallelism: None,
-    )
-    fake_cp_gated_delta = SimpleNamespace(GatedDeltaNetContextParallelTransform=_GatedDeltaNetContextParallelTransform)
-    engine = SimpleNamespace(
-        engine_config=SimpleNamespace(engine_kwargs={"tpu": {"context_parallel_strategy": "all_gather"}}),
-        _use_splash_attention=True,
-    )
-    parallelism = SimpleNamespace(
-        context_parallel_degree=2, spmd_backend="partial_dtensor", context_parallel_load_balancer=None
-    )
-    model = SimpleNamespace(first_full_attention_backend=SimpleNamespace(_owner=object))
-    with mock.patch.dict(
-        sys.modules,
-        {
-            "torchtitan": SimpleNamespace(),
-            "torchtitan.config": SimpleNamespace(transform=fake_transform),
-            "torchtitan.config.transform": fake_transform,
-            "torchtitan.experiments": SimpleNamespace(),
-            "torchtitan.experiments.tpu": SimpleNamespace(cp_attention=fake_cp_attention),
-            "torchtitan.experiments.tpu.cp_attention": fake_cp_attention,
-            "torchtitan.experiments.tpu.qwen3_5": SimpleNamespace(cp_gated_delta=fake_cp_gated_delta),
-            "torchtitan.experiments.tpu.qwen3_5.cp_gated_delta": fake_cp_gated_delta,
-        },
-    ):
-        TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
+    with mock.patch.dict(sys.modules, modules):
+        TorchTitanTPUEngine._enable_context_parallel(
+            _cp_engine(strategy), _cp_parallelism(), _model_with_layers(layer_module.GatedDeltaNet.Config, 3)
+        )
 
-    assert [type(t) for t in applied] == [_ContextParallelTransform, _GatedDeltaNetContextParallelTransform]
-    assert applied[1].load_balancer == "headtail"
+    assert [c if isinstance(c, str) else c[0] for c in calls] == ["inner", "transform", "validate", "patches"]
+    transforms = calls[1][1]
+    assert [type(t).__name__ for t in transforms] == [
+        "_ContextParallelTransform",
+        "GatedDeltaNetContextParallelTransform",
+    ]
+    assert transforms[1].load_balancer == expected_lb
+
+
+def test_enable_context_parallel_fails_loudly_without_the_gated_delta_net_cp_transform():
+    """A GatedDeltaNet model under CP with a torchtitan that lacks the GDN CP transform raises instead of running
+    the recurrence on token shards; nothing is transformed."""
+    layer_module = _fake_gdn_layer_module()
+    calls: list = []
+    with mock.patch.dict(sys.modules, _fake_cp_modules(calls, layer_modules={_GDN_LAYER_MODULE: layer_module})):
+        sys.modules.pop(_GDN_CP_MODULE, None)
+        sys.modules.pop("torchtitan.experiments.tpu.qwen3_5", None)
+        with pytest.raises(RuntimeError, match=r"2 Qwen3\.5 GatedDeltaNet layer\(s\).*torchtitan#201"):
+            TorchTitanTPUEngine._enable_context_parallel(
+                _cp_engine("all_gather"), _cp_parallelism(), _model_with_layers(layer_module.GatedDeltaNet.Config, 2)
+            )
+    assert [c[0] for c in calls if not isinstance(c, str)] == ["inner"]
+
+
+def test_enable_context_parallel_skips_the_gdn_transform_for_models_without_gdn_layers():
+    """The GatedDeltaNet module being imported is not enough: a model without its layers gets no GDN transform, so
+    an old torchtitan without cp_gated_delta still runs plain attention CP."""
+    layer_module = _fake_gdn_layer_module()
+    calls: list = []
+    with mock.patch.dict(sys.modules, _fake_cp_modules(calls, layer_modules={_GDN_LAYER_MODULE: layer_module})):
+        sys.modules.pop(_GDN_CP_MODULE, None)
+        TorchTitanTPUEngine._enable_context_parallel(
+            _cp_engine("ulysses"), _cp_parallelism(), _model_with_layers(layer_module.GatedDeltaNet.Config, 0)
+        )
+    assert [type(t).__name__ for t in calls[1][1]] == ["_ContextParallelTransform"]
+
+
+def test_enable_context_parallel_passes_gdn_options_to_the_transform():
+    """engine_kwargs.tpu.context_parallel_gdn_{strategy,reduce_dtype} reach the transform's fields; with a torchtitan
+    whose transform lacks them, setting them is an error, and leaving them unset keeps the transform's defaults."""
+    layer_module = _fake_gdn_layer_module()
+    model = _model_with_layers(layer_module.GatedDeltaNet.Config, 1)
+    options = {
+        "context_parallel_gdn_strategy": "AllGather_ReduceScatter",
+        "context_parallel_gdn_reduce_dtype": "bfloat16",
+    }
+
+    calls: list = []
+    modules = {_GDN_LAYER_MODULE: layer_module, _GDN_CP_MODULE: _fake_gdn_cp_module(with_options=True)}
+    with mock.patch.dict(sys.modules, _fake_cp_modules(calls, layer_modules=modules)):
+        TorchTitanTPUEngine._enable_context_parallel(_cp_engine("all_gather", **options), _cp_parallelism(), model)
+        gdn = calls[1][1][1]
+        assert (gdn.load_balancer, gdn.strategy, gdn.reduce_dtype) == (
+            "headtail",
+            "allgather_reducescatter",
+            "bfloat16",
+        )
+        calls.clear()
+        TorchTitanTPUEngine._enable_context_parallel(_cp_engine("all_gather"), _cp_parallelism(), model)
+        gdn = calls[1][1][1]
+        assert (gdn.strategy, gdn.reduce_dtype) == ("all_to_all", "float32")
+
+    modules = {_GDN_LAYER_MODULE: layer_module, _GDN_CP_MODULE: _fake_gdn_cp_module(with_options=False)}
+    with mock.patch.dict(sys.modules, _fake_cp_modules([], layer_modules=modules)):
+        with pytest.raises(ValueError, match="context_parallel_gdn_strategy.*no 'strategy' field"):
+            TorchTitanTPUEngine._enable_context_parallel(_cp_engine("all_gather", **options), _cp_parallelism(), model)
+
+    with pytest.raises(ValueError, match="context_parallel_gdn_strategy must be one of"):
+        get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"context_parallel_gdn_strategy": "ring"}}))
+    with pytest.raises(ValueError, match="context_parallel_gdn_reduce_dtype must be one of"):
+        get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"context_parallel_gdn_reduce_dtype": "fp8"}}))
+
+
+@pytest.mark.parametrize(("strategy", "raises"), [("all_gather", True), ("ulysses", False)])
+def test_enable_context_parallel_rejects_gdn_row_slots_with_the_headtail_layout(strategy, raises):
+    """gdn_row_slot_len makes the CP GatedDeltaNet read the stream as rows, while the head-tail load balancer shards
+    it as one sequence: rejected under all_gather CP, allowed under Ulysses (contiguous shards)."""
+    layer_module = _fake_gdn_layer_module()
+    modules = {_GDN_LAYER_MODULE: layer_module, _GDN_CP_MODULE: _fake_gdn_cp_module(with_options=False)}
+    engine = _cp_engine(strategy, gdn_row_slot_len=4096)
+    model = _model_with_layers(layer_module.GatedDeltaNet.Config, 1)
+    with mock.patch.dict(sys.modules, _fake_cp_modules([], layer_modules=modules)):
+        ctx = pytest.raises(ValueError, match="gdn_row_slot_len is not supported") if raises else nullcontext()
+        with ctx:
+            TorchTitanTPUEngine._enable_context_parallel(engine, _cp_parallelism(), model)
+
+
+def test_cp_layer_module_available_does_not_hide_broken_imports(tmp_path, monkeypatch):
+    """Only a missing module (or parent package) counts as unavailable; an ImportError raised inside an existing
+    package (a broken dependency) propagates instead of silently disabling the transform."""
+    from verl_hardware_plugin.accelerators.tpu.engines.cp_layer_transforms import module_available
+
+    pkg = tmp_path / "cp_broken_pkg_for_test"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("import cp_missing_dependency_for_test  # noqa: F401\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    assert not module_available("cp_no_such_pkg_for_test.cp_gated_delta")
+    with pytest.raises(ModuleNotFoundError, match="cp_missing_dependency_for_test"):
+        module_available("cp_broken_pkg_for_test.cp_gated_delta")
+
+
+def test_cp_layer_transform_registry_names_real_torchtitan_paths():
+    """The built-in GatedDeltaNet entry points at torchtitan#201's layer config and transform."""
+    from verl_hardware_plugin.accelerators.tpu.engines import cp_layer_transforms
+
+    spec = cp_layer_transforms.QWEN3_5_GATED_DELTA_NET
+    assert spec in cp_layer_transforms.registered_cp_layer_transforms()
+    assert spec.layer_config == "torchtitan.models.qwen3_5.gdn:GatedDeltaNet.Config"
+    assert spec.transform == "torchtitan.experiments.tpu.qwen3_5.cp_gated_delta:GatedDeltaNetContextParallelTransform"
+    assert set(spec.option_fields) <= {f.name for f in dataclasses.fields(TPUEngineOptions)}
+    assert cp_layer_transforms.register_cp_layer_transform(spec) is spec
+    assert cp_layer_transforms.registered_cp_layer_transforms().count(spec) == 1
 
 
 def test_enable_context_parallel_all_gather_requires_splash():

@@ -10,9 +10,33 @@ per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`,
 `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`,
 `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `trainer_mode`, `graph_trainer`, `model_kernels`,
-`ep_capacity_factor`, `qwen3_pallas_experts`, `moe_paired_gemm` and
-`context_parallel_strategy` (see `TPUEngineOptions` in `options.py`); an unknown key is an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
+`ep_capacity_factor`, `qwen3_pallas_experts`, `moe_paired_gemm`,
+`context_parallel_strategy`, `context_parallel_gdn_strategy` and `context_parallel_gdn_reduce_dtype` (see
+`TPUEngineOptions` in `options.py`); an unknown key is an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
 deprecated and log a warning.
+
+## Context Parallelism
+
+`context_parallel_size > 1` follows torchtitan's TPU CP recipes: the full-attention layers run the TPU CP inner
+attention of `context_parallel_strategy` (`all_gather`, the default, needs Splash; or `ulysses`). A hybrid model's
+other sequence mixers carry state through the whole sequence, so they need their own CP transform too. The engine
+looks them up by the layer types the model config contains (`engines/cp_layer_transforms.py`), so it holds no model
+names, and it raises if the model needs a transform the installed torchtitan does not ship, rather than running those
+layers on each rank's token shard (wrong log-probs and gradients, with no error).
+
+| Model | Non-attention layers | CP support | Requires |
+|---|---|---|---|
+| Dense / MoE transformers (Qwen3, Qwen3 MoE, Llama) | none | `all_gather`, `ulysses` | torchtitan TPU CP (`experiments/tpu/cp_attention.py`) |
+| Qwen3.5 (dense / MoE) | GatedDeltaNet (head-parallel under CP) | `all_gather`, `ulysses` | torchtitan with google-pytorch/torchtitan#201 (`experiments/tpu/qwen3_5/cp_gated_delta.py`, commit `36643b4c9` or later); older torchtitan raises |
+
+Qwen3.5 under CP: `n_key_heads` and `n_value_heads` must be divisible by the CP degree, and tensor parallelism is not
+supported (torchtitan's `validate_gated_delta_context_parallel` checks both). `gdn_row_slot_len` is rejected under
+`all_gather` CP: the head-tail load balancer shards each packed micro-batch as one sequence, but the CP GatedDeltaNet
+would read it as rows. `context_parallel_gdn_strategy` (`all_to_all` / `allgather_reducescatter`) and
+`context_parallel_gdn_reduce_dtype` (`float32` / `bfloat16`) go to torchtitan's `GatedDeltaNetContextParallelTransform`
+as `strategy` / `reduce_dtype`. They need a torchtitan whose transform has those fields; with an older one, setting them
+is an error. Unset, they keep the transform's defaults. Another layer type registers its transform with
+`cp_layer_transforms.register_cp_layer_transform`.
 
 ## MoE Support (Qwen3 MoE)
 
