@@ -494,7 +494,15 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
     """
     options = get_tpu_engine_options(engine_config)
     use_torch_compile = bool(getattr(engine_config, "use_torch_compile", False))
-    cp_enabled = int(getattr(engine_config, "context_parallel_size", 1) or 1) > 1
+    cp_size = int(getattr(engine_config, "context_parallel_size", 1) or 1)
+    cp_enabled = cp_size > 1
+    if not cp_enabled and (
+        options.context_parallel_gdn_strategy is not None or options.context_parallel_gdn_reduce_dtype is not None
+    ):
+        raise ValueError(
+            "engine_kwargs.tpu.context_parallel_gdn_strategy and context_parallel_gdn_reduce_dtype require "
+            f"context_parallel_size > 1 (got context_parallel_size={cp_size})"
+        )
     use_splash_attention = _or_default(options.use_splash_attention, use_torch_compile or cp_enabled)
     if use_torch_compile and not use_splash_attention:
         raise ValueError(
@@ -1257,10 +1265,22 @@ class TPUVarlenAttention(torch.nn.Module):
 
 def _is_kv_all_gather_cp(inner: torch.nn.Module) -> bool:
     """Whether ``inner`` is a torchtitan KV all-gather CP inner attention (Q shorter than K/V)."""
+    for mod_name in (
+        "torchtitan.experiments.tpu.distributed.cp_attention",
+        "torchtitan.experiments.tpu.cp_attention",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None:
+            cls = getattr(mod, "KVAllGatherCPInnerAttention", None)
+            if cls is not None:
+                return isinstance(inner, cls)
     try:
-        from torchtitan.experiments.tpu.cp_attention import KVAllGatherCPInnerAttention
+        from torchtitan.experiments.tpu.distributed.cp_attention import KVAllGatherCPInnerAttention
     except ImportError:
-        return False
+        try:
+            from torchtitan.experiments.tpu.cp_attention import KVAllGatherCPInnerAttention
+        except ImportError:
+            return False
     return isinstance(inner, KVAllGatherCPInnerAttention)
 
 

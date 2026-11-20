@@ -161,6 +161,17 @@ class TPUEngineOptions:
             (default: ``DEFER_AND_FUSE`` with ``use_torch_compile``).
         context_parallel_strategy: Context-parallel attention strategy when ``context_parallel_size > 1``:
             ``all_gather`` (load-balanced KV all-gather with Splash Attention, default) or ``ulysses`` (all-to-all).
+        context_parallel_gdn_strategy: How the context-parallel GatedDeltaNet (Qwen3.5) moves its inputs between
+            the token and head layouts: ``all_to_all`` or ``allgather_reducescatter`` (default: unset, torchtitan's
+            ``GatedDeltaNetContextParallelTransform`` default). Passed to the transform as ``strategy``; needs
+            ``context_parallel_size > 1``, a model with GatedDeltaNet layers, and a torchtitan whose transform has
+            that field (an older one is rejected when this is set). A performance A/B option, independent of
+            ``context_parallel_strategy``.
+        context_parallel_gdn_reduce_dtype: dtype of both the forward ``out_proj`` reduce-scatter and the backward
+            input-gradient reduce-scatter under ``context_parallel_gdn_strategy='allgather_reducescatter'``,
+            ``float32`` or ``bfloat16`` (default: unset, the transform's default). Passed as ``reduce_dtype``, with
+            the same torchtitan requirement; rejected under ``all_to_all``, when ``context_parallel_size <= 1``, or
+            on models without GatedDeltaNet layers.
         optim_impl: torchtitan optimizer implementation (default: ``fused``, ``for-loop`` with TP).
         seq_bucket_size: Packed sequence length bucket in tokens (default: ``pad_to_length_bucket`` when
             ``pad_to_length`` is set, else 256).
@@ -237,7 +248,7 @@ class TPUEngineOptions:
         gdn_row_slot_len: Qwen3.5: start every sequence of a packed micro-batch at a multiple of this many tokens
             and run the GatedDeltaNet over rows of this length (one sequence per row) instead of restarting it at
             packed documents through Tokamax ``segment_ids`` (default: unset, off). Needs every sequence <= this
-            length and ``static_micro_batch_len`` = sequences per micro-batch x this.
+            length, ``static_micro_batch_len`` = sequences per micro-batch x this, and ``context_parallel_size == 1``.
         frozen_param_regex: Parameters whose FQN matches this regex (``re.search``) are not trained: their
             gradients are dropped before the gradient norm and the optimizer step, e.g. ``moe.router.gate`` freezes
             the MoE router (default: unset, train every parameter).
@@ -257,6 +268,8 @@ class TPUEngineOptions:
     fuse_qkv: Optional[bool] = None
     tpu_eager_mode: Optional[str] = None
     context_parallel_strategy: Optional[str] = None
+    context_parallel_gdn_strategy: Optional[str] = None
+    context_parallel_gdn_reduce_dtype: Optional[str] = None
     optim_impl: Optional[str] = None
     seq_bucket_size: Optional[int] = None
     model_kernels: Optional[str] = None
@@ -294,6 +307,8 @@ _ENGINE_KINDS: dict[str, Any] = {
     "fuse_qkv": bool,
     "tpu_eager_mode": str,
     "context_parallel_strategy": str,
+    "context_parallel_gdn_strategy": str,
+    "context_parallel_gdn_reduce_dtype": str,
     "optim_impl": str,
     "seq_bucket_size": int,
     "model_kernels": str,
@@ -324,6 +339,13 @@ _ENGINE_KINDS: dict[str, Any] = {
     "graph_trainer": dict,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
+
+# String options with a fixed set of values (lower-cased, checked by get_tpu_engine_options).
+_ENGINE_CHOICES: dict[str, tuple[str, ...]] = {
+    "context_parallel_strategy": ("all_gather", "ulysses"),
+    "context_parallel_gdn_strategy": ("all_to_all", "allgather_reducescatter"),
+    "context_parallel_gdn_reduce_dtype": ("float32", "bfloat16"),
+}
 
 # engine_kwargs.tpu.trainer_mode values.
 TRAINER_MODE_EAGER_BLOCKS = "eager_blocks"
@@ -405,6 +427,22 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
                 f"got {values['ep_dispatcher']!r}"
             )
         values["ep_dispatcher"] = ep_disp
+    for name, choices in _ENGINE_CHOICES.items():
+        if values.get(name) is not None:
+            choice = values[name].strip().lower()
+            if choice not in choices:
+                raise ValueError(
+                    f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.{name} must be one of {choices}, got {values[name]!r}"
+                )
+            values[name] = choice
+    if (
+        values.get("context_parallel_gdn_reduce_dtype") is not None
+        and values.get("context_parallel_gdn_strategy") == "all_to_all"
+    ):
+        raise ValueError(
+            f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.context_parallel_gdn_reduce_dtype only applies when "
+            "context_parallel_gdn_strategy='allgather_reducescatter', got context_parallel_gdn_strategy='all_to_all'"
+        )
     if values.get("ep_token_chunks") is not None and values["ep_token_chunks"] < 1:
         raise ValueError(
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ep_token_chunks must be >= 1, got {values['ep_token_chunks']!r}"

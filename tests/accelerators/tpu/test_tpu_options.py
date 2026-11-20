@@ -93,6 +93,11 @@ def test_engine_kwargs_are_parsed_and_typed():
         ({"param_dtype": "float16"}, "param_dtype must be float32 or bfloat16"),
         ({"fp32_master": True}, "fp32_master needs param_dtype=bfloat16"),
         ({"param_dtype": "float32", "fp32_master": True}, "fp32_master needs param_dtype=bfloat16"),
+        ({"context_parallel_strategy": "ring"}, "context_parallel_strategy must be one of"),
+        (
+            {"context_parallel_gdn_strategy": "all_to_all", "context_parallel_gdn_reduce_dtype": "bfloat16"},
+            "context_parallel_gdn_reduce_dtype only applies when",
+        ),
     ],
 )
 def test_bad_engine_kwargs_raise(tpu, match):
@@ -315,3 +320,25 @@ def test_rollout_fp8_moe_option():
         tpu_options.get_tpu_engine_options(
             SimpleNamespace(engine_kwargs={"tpu": {"rollout_expert_parallel": False, "rollout_fp8_moe": True}})
         )
+
+
+def test_context_parallel_strategy_and_gdn_option_validation():
+    opts = tpu_options.get_tpu_engine_options(
+        _cfg(
+            {
+                "context_parallel_strategy": " ALL_GATHER ",
+                "context_parallel_gdn_strategy": " ALLGATHER_REDUCESCATTER ",
+                "context_parallel_gdn_reduce_dtype": " BFLOAT16 ",
+            }
+        )
+    )
+    assert opts.context_parallel_strategy == "all_gather"
+    assert opts.context_parallel_gdn_strategy == "allgather_reducescatter"
+    assert opts.context_parallel_gdn_reduce_dtype == "bfloat16"
+
+    for tpu_dict in (
+        {"context_parallel_gdn_strategy": "all_to_all"},
+        {"context_parallel_gdn_reduce_dtype": "float32"},
+    ):
+        with pytest.raises(ValueError, match="context_parallel_size > 1"):
+            resolve_tpu_torchtitan_options(_cfg(tpu_dict, context_parallel_size=1, use_torch_compile=False))

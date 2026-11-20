@@ -37,6 +37,7 @@ import math
 import os
 import re
 import shutil
+import sys
 from collections.abc import Collection, Iterable, Mapping
 from contextlib import nullcontext
 from functools import partial
@@ -76,6 +77,10 @@ from verl.workers.engine.utils import (
 from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import no_padding_2_padding
 from verl_hardware_plugin.accelerators.tpu.engines import graph_trainer_mode, tpu_model_kernels, tpu_ragged_ep
+from verl_hardware_plugin.accelerators.tpu.engines.cp_layer_transforms import (
+    context_parallel_layer_transforms,
+    module_available,
+)
 from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
@@ -894,6 +899,88 @@ def _splash_and_routing_selective_ac_config() -> Any:
     return _SPLASH_ROUTING_SELECTIVE_AC_CLS.Config()
 
 
+def _import_tpu_selective_ac() -> Any:
+    """Imports ``TPUSelectiveAC`` (``components/`` on HEAD, top-level on older branches, else ``SelectiveAC``)."""
+    for mod_name in (
+        "torchtitan.experiments.tpu.components.activation_checkpoint",
+        "torchtitan.experiments.tpu.activation_checkpoint",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "TPUSelectiveAC"):
+            return mod.TPUSelectiveAC
+    try:
+        from torchtitan.experiments.tpu.components.activation_checkpoint import TPUSelectiveAC
+    except ImportError:
+        try:
+            from torchtitan.experiments.tpu.activation_checkpoint import TPUSelectiveAC
+        except ImportError:
+            from torchtitan.distributed.activation_checkpoint import SelectiveAC as TPUSelectiveAC
+    return TPUSelectiveAC
+
+
+def _import_tpu_cp_attention() -> Any:
+    """Imports torchtitan's TPU ``cp_attention`` module (``distributed/`` on HEAD, top-level on older branches)."""
+    for mod_name in (
+        "torchtitan.experiments.tpu.distributed.cp_attention",
+        "torchtitan.experiments.tpu.cp_attention",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None:
+            return mod
+    for mod_name in (
+        "torchtitan.experiments.tpu.distributed.cp_attention",
+        "torchtitan.experiments.tpu.cp_attention",
+    ):
+        if module_available(mod_name):
+            return importlib.import_module(mod_name)
+    raise RuntimeError(
+        "Context parallelism on TPU requires a TPU torchtitan build with cp_attention "
+        "(distributed/cp_attention.py); turn context parallelism off on upstream torchtitan HEAD."
+    )
+
+
+def _import_set_unflatten_seq_len() -> Any:
+    """Imports ``set_unflatten_seq_len`` (``components/unflatten_shim`` on HEAD, top-level on older branches)."""
+    for mod_name in (
+        "torchtitan.experiments.tpu.components.unflatten_shim",
+        "torchtitan.experiments.tpu.unflatten_shim",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "set_unflatten_seq_len"):
+            return mod.set_unflatten_seq_len
+    last_exc: Optional[ImportError] = None
+    for mod_name in (
+        "torchtitan.experiments.tpu.components.unflatten_shim",
+        "torchtitan.experiments.tpu.unflatten_shim",
+    ):
+        try:
+            return importlib.import_module(mod_name).set_unflatten_seq_len
+        except ImportError as e:
+            last_exc = e
+            continue
+    raise RuntimeError(
+        "unflatten_shim (components/unflatten_shim.py) requires a TPU torchtitan build; "
+        "turn gdn_row_slot_len off on upstream torchtitan HEAD."
+    ) from last_exc
+
+
+def _validate_cp_gdn_options_for_degree(context_parallel_size: int, tpu_options: Any) -> None:
+    """Rejects ``context_parallel_gdn_*`` options when ``context_parallel_size <= 1``."""
+    if int(context_parallel_size or 1) > 1:
+        return
+    set_opts = [
+        f"engine_kwargs.tpu.{name}={getattr(tpu_options, name)!r}"
+        for name in ("context_parallel_gdn_strategy", "context_parallel_gdn_reduce_dtype")
+        if getattr(tpu_options, name, None) is not None
+    ]
+    if set_opts:
+        raise ValueError(
+            f"{', '.join(set_opts)} requires context_parallel_size > 1 "
+            f"(got context_parallel_size={context_parallel_size}); "
+            "unset GatedDeltaNet CP options when context parallelism is disabled."
+        )
+
+
 def _add_rollout_consistency_metrics(
     loss_function: Callable, loss_model_output: dict[str, Any], loss_data: TensorDict, metrics: dict[str, Any]
 ) -> None:
@@ -962,20 +1049,17 @@ class TorchTitanTPUEngine(BaseEngine):
             optimizer_config: Configuration for optimizer.
             checkpoint_config: Configuration for checkpointing.
         """
+        tpu_options = get_tpu_engine_options(engine_config)
+        _validate_cp_gdn_options_for_degree(getattr(engine_config, "context_parallel_size", 1), tpu_options)
+
         from torchtitan.components.checkpointer import CheckpointManager
         from torchtitan.components.loss import CrossEntropyLoss
         from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer, ParamGroupConfig
         from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
         from torchtitan.distributed.activation_checkpoint import FullAC
-
-        try:
-            from torchtitan.experiments.tpu.components.activation_checkpoint import TPUSelectiveAC
-        except ImportError:
-            try:
-                from torchtitan.experiments.tpu.activation_checkpoint import TPUSelectiveAC
-            except ImportError:
-                from torchtitan.distributed.activation_checkpoint import SelectiveAC as TPUSelectiveAC
         from torchtitan.trainer import Trainer
+
+        TPUSelectiveAC = _import_tpu_selective_ac()
 
         super().__init__()
 
@@ -998,7 +1082,6 @@ class TorchTitanTPUEngine(BaseEngine):
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
         self._torchtitan_name = torchtitan_name
 
-        tpu_options = get_tpu_engine_options(self.engine_config)
         self._tpu_options = tpu_options
 
         # Get ModelSpec from model registry
@@ -1383,28 +1466,21 @@ class TorchTitanTPUEngine(BaseEngine):
         """Turn on TPU context parallelism the way a torchtitan CP recipe does.
 
         Like ``torchtitan_recipes/muse_glimmer.py`` and the TPU ``qwen3_*_cp*`` recipes: set the SPMD backend and
-        the load balancer, swap in the TPU CP inner attention with core ``ContextParallelTransform``, then check the
+        the load balancer, swap in the TPU CP inner attention with core ``ContextParallelTransform`` (plus the CP
+        transforms of the model's non-attention sequence mixers, see ``cp_layer_transforms``), then check the
         TPU-specific rules. Core ``Trainer.Config`` validates the rest when it is built. The strategy comes from
         ``engine_kwargs.tpu.context_parallel_strategy`` so verl keeps CP as a config option.
         """
         from torchtitan.config.transform import ContextParallelTransform, transform_model_config_
 
-        try:
-            from torchtitan.experiments.tpu.distributed.cp_attention import (
-                install_tpu_cp_patches,
-                tpu_cp_inner_attention,
-                tpu_cp_load_balancer,
-                validate_tpu_context_parallel,
-            )
-        except ImportError:
-            from torchtitan.experiments.tpu.cp_attention import (
-                install_tpu_cp_patches,
-                tpu_cp_inner_attention,
-                tpu_cp_load_balancer,
-                validate_tpu_context_parallel,
-            )
+        cp_attention = _import_tpu_cp_attention()
+        install_tpu_cp_patches = cp_attention.install_tpu_cp_patches
+        tpu_cp_inner_attention = cp_attention.tpu_cp_inner_attention
+        tpu_cp_load_balancer = cp_attention.tpu_cp_load_balancer
+        validate_tpu_context_parallel = cp_attention.validate_tpu_context_parallel
 
-        strategy = get_tpu_engine_options(self.engine_config).context_parallel_strategy or "all_gather"
+        tpu_options = get_tpu_engine_options(self.engine_config)
+        strategy = tpu_options.context_parallel_strategy or "all_gather"
         if strategy == "all_gather" and not self._use_splash_attention:
             # torchtitan refuses to run its plain-PyTorch reference attention for KV all-gather CP on TPU: it builds
             # the full (S / cp, S) score matrix. Fail here, before the model is built.
@@ -1413,11 +1489,26 @@ class TorchTitanTPUEngine(BaseEngine):
                 "all-gather CP has no other TPU attention kernel. Turn splash on, or use "
                 "context_parallel_strategy='ulysses'."
             )
+        if tpu_options.gdn_row_slot_len:
+            raise ValueError(
+                f"gdn_row_slot_len is not supported with context_parallel_size > 1 "
+                f"(got gdn_row_slot_len={tpu_options.gdn_row_slot_len}, context_parallel_strategy={strategy!r}): "
+                "static gdn_row_slot_len permutes input_ids and positions into row slots without permuting labels "
+                "before cp_shard, and does not post-gather-unpermute outputs across CP shards. "
+                "Unset gdn_row_slot_len or turn context parallelism off."
+            )
         parallelism.spmd_backend = "spmd_types"
-        parallelism.context_parallel_load_balancer = tpu_cp_load_balancer(strategy)
+        load_balancer = tpu_cp_load_balancer(strategy)
+        parallelism.context_parallel_load_balancer = load_balancer
         inner_attention = model.first_full_attention_backend
         cp_inner_attention = tpu_cp_inner_attention(inner_attention._owner, strategy)
-        transform_model_config_(model, [ContextParallelTransform(inner_attention=cp_inner_attention)])
+        # The non-attention sequence mixers the model contains (e.g. Qwen3.5's GatedDeltaNet) run over the same CP
+        # token layout through their own transforms, as torchtitan's CP recipes add them (cp_layer_transforms).
+        # Raises if the model needs one that the installed torchtitan does not ship.
+        layer_transforms = context_parallel_layer_transforms(model, load_balancer, tpu_options)
+        transform_model_config_(
+            model, [ContextParallelTransform(inner_attention=cp_inner_attention), *layer_transforms]
+        )
         validate_tpu_context_parallel(model, parallelism)
         # Runtime FSDP workaround for torch without spmd_types FSDP (see install_tpu_cp_patches).
         install_tpu_cp_patches()
@@ -1658,10 +1749,7 @@ class TorchTitanTPUEngine(BaseEngine):
         )
 
         if getattr(self, "_gdn_row_slot_len", 0):
-            try:
-                from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
-            except ImportError:
-                from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+            set_unflatten_seq_len = _import_set_unflatten_seq_len()
 
             row_ctx = set_unflatten_seq_len(self._gdn_row_slot_len)
         else:
