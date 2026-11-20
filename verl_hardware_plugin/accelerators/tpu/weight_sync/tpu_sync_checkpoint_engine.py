@@ -396,6 +396,12 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
 
         # Materialize weights in a single pass and filter tied embeddings
         if isinstance(weights, TrainerWeights):
+            if weights.needs_moe_quant_probe:
+                try:
+                    published_vllm = await self.registry.get_vllm_params.remote()
+                except Exception:
+                    published_vllm = None
+                weights.configure_moe_wire(published_vllm)
             exported = list(weights.local_shards())
             shard_info = {name: shard for name, _, shard in exported if shard is not None}
             named_weights = [(name, tensor) for name, tensor, _ in exported]
@@ -575,7 +581,10 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         # since tensor shapes are static across training iterations and only need to be communicated once.
         try:
             global_shapes = {name: full_shape(name, p) for name, p in valid_weights}
+            global_dtypes = {name: str(p.dtype) for name, p in valid_weights if p.dtype != torch.bfloat16}
             await self.registry.set_global_shapes.remote(global_shapes)
+            if hasattr(self.registry, "set_global_dtypes"):
+                await self.registry.set_global_dtypes.remote(global_dtypes)
         except Exception as e:
             logger.warning(f"Could not record global shapes in the tpu-sync rendezvous: {e}")
 
@@ -1013,9 +1022,16 @@ async def _finish_tpu_sync(
     t_init_sampler_start = time.perf_counter()
     # vLLM's workers are not Ray processes, so the driver hands them what the trainer published in step 1.
     global_shapes = await manager._tpu_sync_rendezvous.get_global_shapes.remote()
-    # Only passed when off, so rollout workers of other engines keep their signature.
+    global_dtypes = (
+        await manager._tpu_sync_rendezvous.get_global_dtypes.remote()
+        if hasattr(manager._tpu_sync_rendezvous, "get_global_dtypes")
+        else {}
+    )
+    # Optional kwargs are only passed when needed, so rollout workers of other engines keep their signature.
     direct_quantized = getattr(options, "direct_install_quantized_moe", True)
-    extra_init_kwargs = {} if direct_quantized else {"direct_install_quantized_moe": False}
+    extra_init_kwargs: dict[str, Any] = {} if direct_quantized else {"direct_install_quantized_moe": False}
+    if global_dtypes:
+        extra_init_kwargs["global_dtypes"] = global_dtypes
     await asyncio.gather(
         *[
             replica.server_handle.collective_rpc.remote(

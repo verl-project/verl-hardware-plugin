@@ -54,10 +54,18 @@ from verl_hardware_plugin.accelerators.tpu.rollout.direct_install import (
     non_moe_quantized_reason,
 )
 from verl_hardware_plugin.accelerators.tpu.rollout.moe_weights import (
+    EP_EXPERT_BLOCK_SUFFIXES,
+    EP_FP8_SCALE_SUFFIXES,
+    MOE_LAYOUT_TPU_EP,
+    MOE_LAYOUT_TPU_EP_QUANT,
     MOE_QUANTIZED_LAYOUTS,
     MoeRequant,
     ParityCheckFn,
+    ep_sharding_rule,
+    ep_zero_copy_targets,
+    plan_ep_moe_layers,
     plan_moe_layers,
+    write_ep_scales,
     write_experts,
 )
 
@@ -176,6 +184,14 @@ def split_expert_stacks(weights: Iterator[tuple[str, torch.Tensor]]) -> Iterator
     ``.weight`` suffix) pass through.
     """
     for name, tensor in weights:
+        if name.endswith(EP_FP8_SCALE_SUFFIXES) or (
+            name.endswith(EP_EXPERT_BLOCK_SUFFIXES)
+            and tensor.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            raise RuntimeError(
+                f"tpu-sync: cannot install trainer-quantized expert tensor {name} ({tensor.dtype}) via vLLM's "
+                "checkpoint loaders; inspect the rejected direct-install plan log above"
+            )
         m = _WIRE_RE.match(name)
         if m is None or tensor.ndim != 3:
             yield name, tensor
@@ -212,18 +228,27 @@ def plan_direct_install(
     per_expert = sorted(n for n in global_shapes if _PER_EXPERT_RE.search(n))
     if per_expert:
         return None, f"the trainer sent per-expert tensors (no expert stacks), e.g. {per_expert[0]}"
-    blocks = sorted({m.group(1) for n in global_shapes if (m := _WIRE_RE.match(n)) is not None})
+    wire_ep = any(n.endswith(EP_EXPERT_BLOCK_SUFFIXES) for n in global_shapes)
+    wire_quant = any(n.endswith(EP_FP8_SCALE_SUFFIXES) for n in global_shapes)
+    if wire_quant and not wire_ep:
+        return None, "the trainer sent quantized expert scales without the expert-parallel layout"
+    if wire_ep:
+        layer_prefixes = sorted({n.split(".mlp.experts.", 1)[0] for n in global_shapes if ".mlp.experts." in n})
+        blocks = [f"{lp}.mlp.experts" for lp in layer_prefixes]
+    else:
+        blocks = sorted({m.group(1) for n in global_shapes if (m := _WIRE_RE.match(n)) is not None})
     if not blocks:
         return None, "the trainer sent no expert stacks"
-    # Every block must be complete and match the config: a bad one would otherwise fail mid-install, after earlier
-    # layers of the live vLLM model were already overwritten.
-    for block in blocks:
-        for proj, shape in dims.wire_shapes().items():
-            name = f"{block}.{proj}.weight"
-            if name not in global_shapes:
-                return None, f"{block} lacks {proj}"
-            if list(global_shapes[name]) != shape:
-                return None, f"{name} is {list(global_shapes[name])}, the config gives {shape}"
+    if not wire_ep:
+        # Every block must be complete and match the config: a bad one would otherwise fail mid-install, after earlier
+        # layers of the live vLLM model were already overwritten.
+        for block in blocks:
+            for proj, shape in dims.wire_shapes().items():
+                name = f"{block}.{proj}.weight"
+                if name not in global_shapes:
+                    return None, f"{block} lacks {proj}"
+                if list(global_shapes[name]) != shape:
+                    return None, f"{name} is {list(global_shapes[name])}, the config gives {shape}"
 
     modules = list(vllm_model.named_modules()) if hasattr(vllm_model, "named_modules") else []
     moe_modules = [(n, m) for n, m in modules if hasattr(m, "w13_weight") and hasattr(m, "quant_method")]
@@ -232,15 +257,27 @@ def plan_direct_install(
     quant_why = non_moe_quantized_reason(vllm_model, moe_modules)
     if quant_why:
         return None, quant_why
-    moe_plan, why = plan_moe_layers(
-        moe_modules,
-        dims.num_experts,
-        dims.moe_intermediate_size,
-        dims.hidden_size,
-        tp_size,
-        worker_rank,
-        allow_quantized=allow_quantized_moe,
-    )
+    if wire_ep:
+        moe_plan, why = plan_ep_moe_layers(
+            moe_modules,
+            global_shapes,
+            layer_prefixes,
+            dims.num_experts,
+            dims.moe_intermediate_size,
+            tp_size,
+            worker_rank,
+            allow_quantized=allow_quantized_moe,
+        )
+    else:
+        moe_plan, why = plan_moe_layers(
+            moe_modules,
+            dims.num_experts,
+            dims.moe_intermediate_size,
+            dims.hidden_size,
+            tp_size,
+            worker_rank,
+            allow_quantized=allow_quantized_moe,
+        )
     if moe_plan is None:
         return None, why
 
@@ -266,6 +303,9 @@ def sampler_sharding_rule(
     """``(sharding_spec, local_shape)`` of a Qwen3-MoE-specific tensor, or ``None`` to use the dense path's rules."""
     if name.endswith(ROUTER_SUFFIX):
         return [""] * len(global_shape), list(global_shape)
+    ep_rule = ep_sharding_rule(name, global_shape, tp_size)
+    if ep_rule is not None:
+        return ep_rule
     m = _WIRE_RE.match(name)
     if m is None:
         return None
@@ -291,6 +331,12 @@ def install(
     ``plan.expert_keys``. The router and every other tensor go through the dense path.
     """
     consumed: set[str] = set()
+    if plan.moe_layout in (MOE_LAYOUT_TPU_EP, MOE_LAYOUT_TPU_EP_QUANT):
+        consumed.update(n for n in staging if n.endswith(EP_EXPERT_BLOCK_SUFFIXES))
+        if plan.moe_layout == MOE_LAYOUT_TPU_EP_QUANT:
+            consumed.update(write_ep_scales(staging, model_sd, find_model_key, plan.expert_keys, check=check))
+        plan.padding_checked = plan.moe_layout != MOE_LAYOUT_TPU_EP_QUANT
+        return consumed
     num_local, inter, hidden = plan.local_experts, plan.local_intermediate, plan.dims.hidden_size
     for name in list(staging):
         m = _WIRE_RE.match(name)
@@ -333,10 +379,22 @@ def _loader_weights(weights: Iterator[tuple[str, torch.Tensor]], hf_text_config:
     return split_expert_stacks(weights)
 
 
+def zero_copy_targets(
+    plan: DirectInstallPlan,
+    model_sd: dict[str, torch.Tensor],
+    find_model_key: Callable[[str], Optional[str]],
+    global_shapes: dict[str, list[int]],
+) -> dict[str, torch.Tensor]:
+    return ep_zero_copy_targets(
+        plan.moe_layout, plan.tp_size, plan.expert_keys, model_sd, find_model_key, global_shapes
+    )
+
+
 LAYOUT = DirectInstallLayout(
     name="qwen3_moe",
     plan=plan_direct_install,
     sharding_rule=sampler_sharding_rule,
     install=_install,
+    zero_copy_targets=zero_copy_targets,
     loader_weights=_loader_weights,
 )

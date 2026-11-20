@@ -55,14 +55,21 @@ from verl_hardware_plugin.accelerators.tpu.rollout.direct_install import (
     non_moe_quantized_reason,
 )
 from verl_hardware_plugin.accelerators.tpu.rollout.moe_weights import (
+    EP_EXPERT_BLOCK_SUFFIXES,
+    EP_EXPERT_TENSORS,
+    EP_FP8_SCALE_SUFFIXES,
+    FP8_MOE_DTYPE,
     MOE_LAYOUT_TPU_EP,
+    MOE_LAYOUT_TPU_EP_QUANT,
     MOE_QUANTIZED_LAYOUTS,
+    ExpertWireQuant,
     MoeRequant,
     ParityCheckFn,
-    expert_param,
-    moe_attr,
-    moe_parallel_mode,
+    ep_zero_copy_targets,
+    format_ep_expert_weight,
+    plan_ep_moe_layers,
     plan_moe_layers,
+    write_ep_scales,
     write_experts,
 )
 
@@ -132,26 +139,7 @@ GDN_LAYER_SUFFIXES = (
 EXPERT_BLOCK_SUFFIXES = (*SPLIT_TENSORS[2].pieces, ".mlp.experts.down_proj")
 
 
-# TODO(tpu): Remove ``rollout_expert_parallel`` / ``EP_EXPERT_TENSORS`` / ``zero_copy_targets`` once tpu-sync stages
-# received weights in host DRAM, linearizes/transposes on host, and H2Ds directly into vLLM weights. Standard
-# ``EXPERT_BLOCK_SUFFIXES`` already install directly under vLLM expert parallelism (``plan.expert_parallel`` shards them
-# on dim 0); this transposed wire layout exists only to avoid the HBM staging copy on large MoEs such as
-# Qwen3.5-397B-A17B where 42.2 GiB/rank of expert staging buffers would OOM 94.7 GiB HBM alongside weights + KV cache.
-class EPExpertTensor(NamedTuple):
-    """An HF expert stack sent in vLLM's expert-parallel layout (``engine_kwargs.tpu.rollout_expert_parallel``)."""
-
-    hf: str  # suffix of the HF tensor
-    ep: str  # suffix of the tpu-sync tensor: the HF tensor with its last two dimensions transposed
-    leaf: str  # vLLM's expert weight it is received into
-
-
-EP_EXPERT_TENSORS = (
-    EPExpertTensor(".mlp.experts.gate_up_proj", ".mlp.experts.w13_ep", "w13_weight"),
-    EPExpertTensor(".mlp.experts.down_proj", ".mlp.experts.w2_ep", "w2_weight"),
-)
-EP_EXPERT_BLOCK_SUFFIXES = tuple(t.ep for t in EP_EXPERT_TENSORS)
-for _t in EP_EXPERT_TENSORS:
-    SPLIT_TP_DIMS[_t.ep] = 0
+SPLIT_TP_DIMS.update({sfx: 0 for sfx in EP_EXPERT_BLOCK_SUFFIXES + EP_FP8_SCALE_SUFFIXES})
 # vLLM fuses these into one parameter: (fused suffix, source suffixes in concat order).
 FUSED_TARGETS = (
     (
@@ -214,7 +202,9 @@ class DirectInstallPlan:
 
 
 def make_tpu_sync_local_layout(
-    hf_text_config: Any, expert_parallel: bool = False
+    hf_text_config: Any,
+    expert_parallel: bool = False,
+    fp8_moe: bool | ExpertWireQuant = False,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
     """Trainer side: the ``TrainerWeights.local_transform`` that exports the ``SPLIT_TENSORS`` as their pieces.
 
@@ -232,6 +222,11 @@ def make_tpu_sync_local_layout(
     # that replicated tensor. Small for Qwen3.5-35B-A3B (~32 MiB per layer, ~1 GB per sync, one layer at a time). To
     # export them as local shards with no gather, take torchtitan's unfused q / k / v before the adapter fuses them
     # (for local_shards() only: plain iteration needs HF's fused tensors).
+    if fp8_moe and not expert_parallel:
+        raise ValueError("tpu-sync: rollout_fp8_moe needs rollout_expert_parallel")
+    wire_quant: Optional[ExpertWireQuant] = (
+        fp8_moe if isinstance(fp8_moe, ExpertWireQuant) else (ExpertWireQuant(FP8_MOE_DTYPE, None) if fp8_moe else None)
+    )
     dims = Qwen3_5Dims.from_config(hf_text_config)
     qkv_rows = (dims.key_dim, dims.key_dim, dims.value_dim)
 
@@ -239,10 +234,17 @@ def make_tpu_sync_local_layout(
         if expert_parallel:
             for ep in EP_EXPERT_TENSORS:
                 for name in [n for n in chunk if n.endswith(ep.hf)]:
-                    ep_tensor = chunk.pop(name).transpose(-2, -1).contiguous()
-                    # A fresh copy, not the parameter: the export sends it without another copy.
+                    prefix = name[: -len(ep.hf)]
+                    hf_tensor = chunk.pop(name)
+                    ep_tensor, scale = format_ep_expert_weight(hf_tensor, ep.kind, wire_quant)
+                    del hf_tensor
                     ep_tensor._tpu_sync_owned = True
-                    chunk[name[: -len(ep.hf)] + ep.ep] = ep_tensor
+                    if scale is not None:
+                        ep_tensor._tpu_sync_keep_dtype = True
+                        scale._tpu_sync_owned = True
+                        scale._tpu_sync_keep_dtype = True
+                        chunk[prefix + ep.scale] = scale
+                    chunk[prefix + ep.ep] = ep_tensor
         for split in SPLIT_TENSORS:
             for name in [n for n in chunk if n.endswith(split.fused)]:
                 tensor = chunk.pop(name)
@@ -269,6 +271,14 @@ def refuse_split_tensors(weights: Iterator[tuple[str, torch.Tensor]]) -> Iterato
     """
     pending: dict[str, dict[str, torch.Tensor]] = {}
     for name, tensor in weights:
+        if name.endswith(EP_FP8_SCALE_SUFFIXES) or (
+            name.endswith(EP_EXPERT_BLOCK_SUFFIXES)
+            and tensor.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            raise RuntimeError(
+                f"tpu-sync: cannot install trainer-quantized expert tensor {name} ({tensor.dtype}) via vLLM's "
+                "checkpoint loaders; inspect the rejected direct-install plan log above"
+            )
         ep = next((t for t in EP_EXPERT_TENSORS if name.endswith(t.ep)), None)
         if ep is not None:
             yield name[: -len(ep.ep)] + ep.hf, tensor.transpose(-2, -1)
@@ -321,6 +331,9 @@ def plan_direct_install(
     if dims.num_k_heads % tp_size or dims.num_v_heads % tp_size:
         return None, f"GatedDeltaNet heads ({dims.num_k_heads} k, {dims.num_v_heads} v) do not split over TP={tp_size}"
     wire_ep = any(n.endswith(EP_EXPERT_BLOCK_SUFFIXES) for n in global_shapes)
+    wire_quant = any(n.endswith(EP_FP8_SCALE_SUFFIXES) for n in global_shapes)
+    if wire_quant and not wire_ep:
+        return None, "the trainer sent quantized expert scales without the expert-parallel layout"
 
     expected_rows = {
         ".in_proj_q.weight": dims.key_dim,
@@ -340,7 +353,8 @@ def plan_direct_install(
         return None, "the trainer sent no GatedDeltaNet (linear_attn) tensors"
     expert_blocks = {n.split(".mlp.experts.", 1)[0] for n in global_shapes if ".mlp.experts." in n}
     expert_suffixes = EP_EXPERT_BLOCK_SUFFIXES if wire_ep else EXPERT_BLOCK_SUFFIXES
-    for layers, suffixes in ((gdn_layers, GDN_LAYER_SUFFIXES), (expert_blocks, expert_suffixes)):
+    required_expert_suffixes = expert_suffixes + (EP_FP8_SCALE_SUFFIXES if wire_quant else ())
+    for layers, suffixes in ((gdn_layers, GDN_LAYER_SUFFIXES), (expert_blocks, required_expert_suffixes)):
         for layer in sorted(layers):
             missing = [s for s in suffixes if layer + s not in global_shapes]
             if missing:
@@ -397,16 +411,19 @@ def plan_direct_install(
             )
 
         if wire_ep:
-            for mod_name, m in moe_modules:
-                method = type(m.quant_method).__name__
-                if not bool(moe_attr(m, "use_ep", False)):
-                    return None, "the trainer sent the expert-parallel layout but vLLM does not use expert parallelism"
-                if method != "VllmUnquantizedFusedMoEMethod":
-                    return None, f"expert-parallel direct install needs vllm-torchtpu's unquantized MoE, not {method}"
-                ep_mode, why = moe_parallel_mode(m, num_experts, dims.moe_intermediate_size, tp_size, tp_rank)
-                if ep_mode is None:
-                    return None, f"vLLM's {mod_name}: {why}"
-            moe_layout, expert_parallel = MOE_LAYOUT_TPU_EP, True
+            ep_plan, why = plan_ep_moe_layers(
+                moe_modules,
+                global_shapes,
+                expert_blocks,
+                num_experts,
+                dims.moe_intermediate_size,
+                tp_size,
+                tp_rank,
+                allow_quantized=allow_quantized_moe,
+            )
+            if ep_plan is None:
+                return None, why
+            moe_layout, expert_parallel, moe_requant = ep_plan
         else:
             cfg_hidden = getattr(hf_text_config, "hidden_size", None)
             hidden = (
@@ -460,24 +477,9 @@ def zero_copy_targets(
     of each expert tensor is its vLLM ``w13_weight`` / ``w2_weight``, so those weights are bound to tpu-sync as the
     receive buffers: no HBM staging copy of the experts, and nothing to install after the transfer.
     """
-    if plan.moe_layout != MOE_LAYOUT_TPU_EP:
-        return {}
-    targets = {}
-    for name, shape in global_shapes.items():
-        ep = next((t for t in EP_EXPERT_TENSORS if name.endswith(t.ep)), None)
-        if ep is None:
-            continue
-        prefix = name[: -len(ep.ep)] + ".mlp.experts"
-        weight = _local(model_sd[expert_param(model_sd, find_model_key, prefix, ep.leaf, plan.expert_keys)])
-        expected = (shape[0] // plan.tp_size, *shape[1:])
-        if tuple(weight.shape) != expected or weight.dtype != torch.bfloat16 or not weight.is_contiguous():
-            raise RuntimeError(
-                f"{_ERROR_PREFIX}: vLLM's {prefix}.{ep.leaf} is {tuple(weight.shape)} {weight.dtype} "
-                f"(contiguous={weight.is_contiguous()}); the expert-parallel layout needs {expected}, bfloat16, "
-                "contiguous"
-            )
-        targets[name] = weight
-    return targets
+    return ep_zero_copy_targets(
+        plan.moe_layout, plan.tp_size, plan.expert_keys, model_sd, find_model_key, global_shapes
+    )
 
 
 def sampler_sharding_rule(
@@ -557,9 +559,11 @@ def install(
             write(f"{prefix}.{vec}", rank_rows(f"{prefix}.{vec}", dims.num_v_heads))
         consumed.update(qkvz + conv + [f"{prefix}.A_log", f"{prefix}.dt_bias"])
 
-    if plan.moe_layout == MOE_LAYOUT_TPU_EP:
-        # Received straight into vLLM's expert weights (zero_copy_targets): nothing to copy.
+    if plan.moe_layout in (MOE_LAYOUT_TPU_EP, MOE_LAYOUT_TPU_EP_QUANT):
+        # Received straight into vLLM's expert weights (zero_copy_targets); quantized runs also install the FP32 scales.
         consumed.update(n for n in staging if n.endswith(EP_EXPERT_BLOCK_SUFFIXES))
+        if plan.moe_layout == MOE_LAYOUT_TPU_EP_QUANT:
+            consumed.update(write_ep_scales(staging, model_sd, find_model_key, plan.expert_keys, check=check))
     for name in list(staging):
         m = _EXPERTS_RE.match(name)
         if m is None:
@@ -608,7 +612,7 @@ def install(
         )
         consumed.update(pieces)
     # Requantized experts are written whole (fresh zero padding), so no padding is checked for them.
-    plan.padding_checked = plan.moe_layout not in MOE_QUANTIZED_LAYOUTS
+    plan.padding_checked = plan.moe_layout not in (MOE_QUANTIZED_LAYOUTS | {MOE_LAYOUT_TPU_EP_QUANT})
     return consumed
 
 

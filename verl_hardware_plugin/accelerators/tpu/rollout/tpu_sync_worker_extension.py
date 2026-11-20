@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import torch
 
-from verl_hardware_plugin.accelerators.tpu.rollout import direct_install
+from verl_hardware_plugin.accelerators.tpu.rollout import direct_install, moe_weights
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_api
 from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_checkpoint_engine as tpu_sync_engine
 from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import ExactParityCheck, compute_tensor_stats
@@ -210,6 +210,7 @@ class TPUSyncWorkerMixin:
         job_name: str = "sampler0",
         receive_into_vllm: bool = False,
         direct_install_quantized_moe: bool = True,
+        global_dtypes: Optional[dict[str, str]] = None,
     ) -> bool:
         """Initialize tpu-sync WeightSynchronizer listener and register with the central tpu-sync controller.
 
@@ -358,7 +359,14 @@ class TPUSyncWorkerMixin:
                     )
             else:
                 device = torch.device(tpu_sync_engine.TPU_SYNC_DEVICE)
-                t = torch.empty(shard.local_shape, dtype=torch.bfloat16, device=device)
+                staging_dtype = torch.bfloat16
+                if global_dtypes and name in global_dtypes:
+                    dtype_name = str(global_dtypes[name]).removeprefix("torch.")
+                    resolved_dtype = getattr(torch, dtype_name, None)
+                    if not isinstance(resolved_dtype, torch.dtype):
+                        raise ValueError(f"tpu-sync: unknown wire dtype {global_dtypes[name]!r} for {name}")
+                    staging_dtype = resolved_dtype
+                t = torch.empty(shard.local_shape, dtype=staging_dtype, device=device)
             staging_tensors[name] = t
             staging_sharded[name] = "tp" in shard.sharding_spec
             valid_params.append((name, t))
@@ -484,6 +492,9 @@ class TPUSyncWorkerMixin:
         result: dict[str, Any] = {"tp_size": tp_size, "params": params}
         if unsupported_reason:
             result["unsupported_reason"] = unsupported_reason
+        moe_quant = moe_weights.describe_moe_quant(vllm_model)
+        if moe_quant is not None:
+            result["moe_quant"] = moe_quant
         return result
 
     def _init_receive_into_vllm(

@@ -291,3 +291,27 @@ def test_ac_save_splash_and_routing_option():
         SimpleNamespace(engine_kwargs={"tpu": {"ac_save_splash_and_routing": False}})
     )
     assert opts_off.ac_save_splash_and_routing is False
+
+
+def test_rollout_fp8_moe_option():
+    from types import SimpleNamespace
+
+    # Default unset: neither flag is forced.
+    opts = tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {}}))
+    assert opts.rollout_expert_parallel is None and opts.rollout_fp8_moe is None
+
+    # rollout_fp8_moe=True implies rollout_expert_parallel=True when unset.
+    opts_on = tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"rollout_fp8_moe": True}}))
+    assert opts_on.rollout_fp8_moe is True and opts_on.rollout_expert_parallel is True
+
+    # Explicit rollout_fp8_moe=False leaves rollout_expert_parallel untouched.
+    opts_off = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(engine_kwargs={"tpu": {"rollout_expert_parallel": True, "rollout_fp8_moe": False}})
+    )
+    assert opts_off.rollout_expert_parallel is True and opts_off.rollout_fp8_moe is False
+
+    # Conflicting rollout_fp8_moe=True + rollout_expert_parallel=False fails loudly.
+    with pytest.raises(ValueError, match="rollout_fp8_moe=True conflicts with rollout_expert_parallel=False"):
+        tpu_options.get_tpu_engine_options(
+            SimpleNamespace(engine_kwargs={"tpu": {"rollout_expert_parallel": False, "rollout_fp8_moe": True}})
+        )

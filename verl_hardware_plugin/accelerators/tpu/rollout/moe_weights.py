@@ -35,8 +35,11 @@ from verl_hardware_plugin.accelerators.tpu.device_api import tpu_synchronize
 #   of the contracting dim (``requant_shapes``). Written by requantizing the received bf16 (``write_requantized``).
 MOE_LAYOUT_TPU = "tpu_transposed_padded"
 MOE_LAYOUT_VLLM = "vllm"
-MOE_LAYOUT_TPU_EP = "tpu_expert_parallel"  # vllm-torchtpu zero-copy EP layout (see qwen3_5_layout.EP_EXPERT_TENSORS)
+MOE_LAYOUT_TPU_EP = "tpu_expert_parallel"  # vllm-torchtpu zero-copy EP layout (EP_EXPERT_TENSORS)
+MOE_LAYOUT_TPU_EP_QUANT = "tpu_expert_parallel_quantized"  # trainer-quantized zero-copy EP + wire scales
+MOE_LAYOUT_TPU_EP_FP8 = MOE_LAYOUT_TPU_EP_QUANT
 MOE_LAYOUT_TPU_FP8 = "tpu_transposed_padded_fp8"
+FP8_MOE_DTYPE = torch.float8_e4m3fn
 MOE_LAYOUTS = {
     "VllmUnquantizedFusedMoEMethod": MOE_LAYOUT_TPU,
     "UnquantizedFusedMoEMethod": MOE_LAYOUT_VLLM,
@@ -551,3 +554,344 @@ def write_experts(
         return
     write_w13(model_sd[w13_key], gate, up, layout, check_padding, check=check, name=w13_key)
     write_w2(model_sd[w2_key], down, layout, check_padding, check=check, name=w2_key)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Zero-copy expert-parallel wire layout (bf16 or trainer-quantized, shared across Qwen3.5 and Qwen3 MoE).
+# ---------------------------------------------------------------------------------------------------------------
+
+
+# TODO(tpu): Remove ``rollout_expert_parallel`` / ``EP_EXPERT_TENSORS`` / ``ep_zero_copy_targets`` once tpu-sync stages
+# received weights in host DRAM, linearizes/transposes on host, and H2Ds directly into vLLM weights. Standard expert
+# stacks already install directly under vLLM expert parallelism (``plan.expert_parallel`` shards them on dim 0); this
+# transposed wire layout exists only to avoid the HBM staging copy on large MoEs such as Qwen3.5-397B-A17B.
+class EPExpertTensor(NamedTuple):
+    """An expert stack sent in vLLM's expert-parallel runtime layout (``engine_kwargs.tpu.rollout_expert_parallel``)."""
+
+    hf: str  # suffix of Qwen3.5's fused HF tensor
+    ep: str  # suffix of the tpu-sync weight tensor (received zero-copy into ``leaf``)
+    scale: str  # suffix of the tpu-sync FP32 scale tensor [E, K_blocks, N] when trainer-quantized
+    leaf: str  # vLLM's expert weight parameter
+    scale_leaf: str  # vLLM's expert scale parameter [E_r, K_blocks, 1, N]
+    kind: str  # "w13" or "w2"
+
+
+EP_W13 = EPExpertTensor(
+    ".mlp.experts.gate_up_proj",
+    ".mlp.experts.w13_ep",
+    ".mlp.experts.w13_scale_ep",
+    "w13_weight",
+    "w13_weight_scale_inv",
+    "w13",
+)
+EP_W2 = EPExpertTensor(
+    ".mlp.experts.down_proj",
+    ".mlp.experts.w2_ep",
+    ".mlp.experts.w2_scale_ep",
+    "w2_weight",
+    "w2_weight_scale_inv",
+    "w2",
+)
+EP_EXPERT_TENSORS: tuple[EPExpertTensor, ...] = (EP_W13, EP_W2)
+EP_EXPERT_BLOCK_SUFFIXES: tuple[str, ...] = tuple(t.ep for t in EP_EXPERT_TENSORS)
+EP_FP8_SCALE_SUFFIXES: tuple[str, ...] = tuple(t.scale for t in EP_EXPERT_TENSORS)
+
+
+@dataclasses.dataclass(frozen=True)
+class ExpertWireQuant:
+    """Trainer-side MoE wire quantization format, discovered from the rollout's ``describe_vllm_params``."""
+
+    quant_dtype: torch.dtype = FP8_MOE_DTYPE
+    block_size: Optional[int] = None  # None: one scale per output channel
+    activation: str = "silu"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "quant_dtype": str(self.quant_dtype),
+            "block_size": self.block_size,
+            "activation": self.activation,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ExpertWireQuant:
+        dtype = getattr(torch, str(d["quant_dtype"]).removeprefix("torch."), None)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"unknown quantized expert dtype {d['quant_dtype']!r}")
+        block_size = int(d["block_size"]) if d.get("block_size") else None
+        activation = str(d.get("activation") or "silu").lower()
+        return cls(dtype, block_size, activation)
+
+    @classmethod
+    def from_description(cls, description: Optional[dict[str, Any]]) -> Optional[ExpertWireQuant]:
+        """The format a rollout's ``describe_vllm_params`` reported, or ``None`` if its experts are not quantized."""
+        moe_quant = (description or {}).get("moe_quant")
+        return cls.from_dict(moe_quant) if isinstance(moe_quant, dict) and "quant_dtype" in moe_quant else None
+
+
+def describe_moe_quant(vllm_model: Any) -> Optional[dict[str, Any]]:
+    """Rollout side: ``ExpertWireQuant.to_dict()`` of the live vLLM MoE layers when all use a planned quantized MoE
+    method (``MOE_QUANTIZED_LAYOUTS``), else ``None``."""
+    modules = list(vllm_model.named_modules()) if hasattr(vllm_model, "named_modules") else []
+    moe_modules = [m for _, m in modules if hasattr(m, "w13_weight") and hasattr(m, "quant_method")]
+    layouts = {MOE_LAYOUTS.get(type(m.quant_method).__name__) for m in moe_modules}
+    if not moe_modules or len(layouts) != 1 or not layouts <= MOE_QUANTIZED_LAYOUTS:
+        return None
+    activations = {_module_activation(m) for m in moe_modules}
+    if len(activations) != 1:
+        return None
+    activation = activations.pop()
+    loaded, _ = _load_vllm_torchtpu_fp8()
+    if loaded is not None:
+        try:
+            _, quant_dtype, block_size = loaded[1]("[tpu-sync]: describing the rollout's quantized MoE")
+            return ExpertWireQuant(quant_dtype, int(block_size) if block_size else None, activation).to_dict()
+        except Exception:
+            return None
+    # Fallback when vllm-torchtpu is not importable (e.g. CPU tests): inspect the live quantized weights and scales.
+    w13 = _local(moe_modules[0].w13_weight)
+    s13 = getattr(moe_modules[0], "w13_weight_scale_inv", None)
+    if not isinstance(s13, torch.Tensor) or w13.dtype == torch.bfloat16:
+        return None
+    s13 = _local(s13)
+    n_blocks = int(s13.shape[1]) if s13.ndim == 4 else 1
+    block_size = int(w13.shape[1]) // n_blocks if n_blocks > 1 else None
+    return ExpertWireQuant(w13.dtype, block_size, activation).to_dict()
+
+
+def quantize_expert_stack(weight: torch.Tensor, quant: ExpertWireQuant) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(q, scale)`` of ``weight`` [..., N, K] quantized over its last (contracting) dimension in format ``quant``.
+
+    Matches vllm-torchtpu's ``quantize_tensor(w, quant_dtype, axis=-1, block_size)`` bit for bit (explicit float32
+    reciprocal multiply for tie-point stability, exact zeros for all-zero blocks, half-to-even rounding for integer
+    dtypes), without importing vLLM on the trainer. ``q`` is [..., N, K] in ``quant.quant_dtype``; ``scale`` is
+    float32 [..., K / block_size (1 per channel), N].
+    """
+    dtype = quant.quant_dtype
+    is_float = torch.empty((), dtype=dtype).is_floating_point()
+    info: Any = torch.finfo(dtype) if is_float else torch.iinfo(dtype)
+    w = weight.to(torch.float32)
+    k = w.shape[-1]
+    block = quant.block_size or k
+    if k % block:
+        raise ValueError(f"tpu-sync: contracting dimension {k} is not divisible by block_size={block}")
+    blocked = w.reshape(*w.shape[:-1], k // block, block)
+    dtype_max_recip = torch.tensor(1.0 / float(info.max), dtype=torch.float32, device=w.device)
+    scale = blocked.abs().amax(dim=-1, keepdim=True) * dtype_max_recip
+    scale_inv = torch.where(scale == 0, torch.zeros_like(scale), 1.0 / scale)
+    q = torch.clamp(blocked * scale_inv, min=float(info.min), max=float(info.max))
+    if not is_float:
+        q = torch.round(q)
+    q = q.reshape_as(w).to(dtype)
+    return q, scale.squeeze(-1).transpose(-2, -1).contiguous()
+
+
+def _pad_expert_for_gmm(w: torch.Tensor, kind: str, activation: str) -> torch.Tensor:
+    """vllm-torchtpu's ``_quantize_and_format_single_moe_weight`` pre-quantization alignment to 128."""
+    if activation == "swigluoai" and kind == "w13":
+        w = torch.cat([w[:, ::2, :], w[:, 1::2, :]], dim=1)
+    if kind == "w13":
+        half = w.shape[1] // 2
+        aligned = _aligned(half)
+        if aligned != half:
+            pad = w.new_zeros(w.shape[0], aligned - half, w.shape[2])
+            w = torch.cat([w[:, :half, :], pad, w[:, half:, :], pad], dim=1)
+    elif kind == "w2":
+        inter = w.shape[2]
+        aligned = _aligned(inter)
+        if aligned != inter:
+            w = torch.cat([w, w.new_zeros(w.shape[0], w.shape[1], aligned - inter)], dim=2)
+    else:
+        raise ValueError(f"unknown expert tensor kind {kind!r}")
+    return w
+
+
+def format_ep_expert_weight(
+    weight: torch.Tensor,
+    kind: str,
+    quant: Optional[ExpertWireQuant] = None,
+    chunk_bytes: int = _DEFAULT_REQUANT_CHUNK_BYTES,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Trainer side: formats ``weight`` (``kind="w13"`` [E, 2I, H] or ``"w2"`` [E, H, I]) for zero-copy EP export.
+
+    Without ``quant``, returns ``(weight.transpose(1, 2).contiguous(), None)``. With ``quant``, pads to vllm-torchtpu's
+    128-multiple GMM layout and quantizes a few experts at a time (capping float32 temporaries at ``chunk_bytes``),
+    returning ``(q_gmm, scale)`` where ``q_gmm`` is [E, H, 2A] / [E, A, H] in ``quant.quant_dtype`` and ``scale`` is
+    float32 [E, K / block_size (1 per channel), N].
+    """
+    if quant is None:
+        return weight.transpose(-2, -1).contiguous(), None
+    num_experts = int(weight.shape[0])
+    per_expert = max(1, int(weight[0].numel()) * 4)
+    per_chunk = max(1, chunk_bytes // per_expert)
+    weights, scales = [], []
+    for start in range(0, num_experts, per_chunk):
+        end = min(start + per_chunk, num_experts)
+        padded = _pad_expert_for_gmm(weight[start:end].to(torch.float32), kind, quant.activation)
+        q, scale = quantize_expert_stack(padded, quant)
+        del padded
+        q_gmm = q.transpose(1, 2).contiguous()
+        if per_chunk < num_experts and q_gmm.device.type == "tpu":
+            tpu_synchronize([q_gmm, scale])
+        weights.append(q_gmm)
+        scales.append(scale)
+    if len(weights) == 1:
+        return weights[0], scales[0]
+    return torch.cat(weights, dim=0), torch.cat(scales, dim=0)
+
+
+def plan_ep_moe_layers(
+    moe_modules: list[tuple[str, Any]],
+    global_shapes: dict[str, list[int]],
+    expert_blocks: set[str] | list[str],
+    num_experts: int,
+    moe_intermediate_size: int,
+    tp_size: int,
+    tp_rank: int,
+    *,
+    allow_quantized: bool = True,
+) -> tuple[Optional[MoeLayerPlan], str]:
+    """Rollout side: validates the zero-copy expert-parallel wire layout against ``moe_modules`` up front."""
+    if not moe_modules:
+        return None, "vLLM MoE layouts not found"
+    wire_quant = any(n.endswith(EP_FP8_SCALE_SUFFIXES) for n in global_shapes)
+    for block in sorted(expert_blocks):
+        req = EP_EXPERT_BLOCK_SUFFIXES + (EP_FP8_SCALE_SUFFIXES if wire_quant else ())
+        missing = [sfx for sfx in req if block + sfx not in global_shapes]
+        if missing:
+            return None, f"{block} lacks {missing}"
+    if wire_quant and not allow_quantized:
+        return None, (
+            "the direct install of quantized experts is off (engine_kwargs.tpu-sync.direct_install_quantized_moe=False)"
+        )
+    for mod_name, m in moe_modules:
+        qm = m.quant_method
+        method = type(qm).__name__
+        layout = MOE_LAYOUTS.get(method)
+        if not bool(moe_attr(m, "use_ep", False)):
+            return None, "the trainer sent the expert-parallel layout but vLLM does not use expert parallelism"
+        if getattr(qm, "_fused_moe_decode_op", None) is not None or getattr(qm, "_moe_tp_decode_op", None) is not None:
+            return None, f"vLLM's {mod_name} armed a fused shared+routed decode kernel (stages shared-expert buffers)"
+        if wire_quant and layout not in MOE_QUANTIZED_LAYOUTS:
+            return None, (
+                f"the trainer sent quantized experts (rollout_fp8_moe) but vLLM's MoE is {method}, not a supported "
+                "quantized MoE method (set QUANTIZE_ON_LOAD_PREFIXES=experts on the rollout)"
+            )
+        if not wire_quant and method != "VllmUnquantizedFusedMoEMethod":
+            hint = (
+                " (set engine_kwargs.tpu.rollout_fp8_moe=True or enable describe_vllm_params auto-discovery)"
+                if layout in MOE_QUANTIZED_LAYOUTS
+                else ""
+            )
+            return None, f"expert-parallel direct install needs vllm-torchtpu's unquantized MoE, not {method}{hint}"
+        ep_mode, why = moe_parallel_mode(m, num_experts, moe_intermediate_size, tp_size, tp_rank)
+        if ep_mode is None:
+            return None, f"vLLM's {mod_name}: {why}"
+        if wire_quant:
+            for ep in EP_EXPERT_TENSORS:
+                sample_w = next((sh for n, sh in global_shapes.items() if n.endswith(ep.ep)), None)
+                sample_s = next((sh for n, sh in global_shapes.items() if n.endswith(ep.scale)), None)
+                if sample_w is None or sample_s is None or len(sample_s) != 3:
+                    return None, f"missing or invalid {ep.ep} / {ep.scale} in global_shapes"
+                if sample_w[0] % tp_size or sample_s[0] % tp_size:
+                    return None, f"{ep.ep} {sample_w} dim 0 does not split over TP={tp_size}"
+                expected_w = (sample_w[0] // tp_size, *sample_w[1:])
+                expected_s = (sample_s[0] // tp_size, sample_s[1], 1, sample_s[2])
+                live_w = getattr(m, ep.leaf, None)
+                live_s = getattr(m, ep.scale_leaf, None)
+                if not isinstance(live_w, torch.Tensor) or not isinstance(live_s, torch.Tensor):
+                    return None, f"vLLM's {mod_name} lacks {ep.leaf} / {ep.scale_leaf}"
+                live_w, live_s = _local(live_w), _local(live_s)
+                if tuple(live_w.shape) != expected_w or live_w.dtype == torch.bfloat16:
+                    return None, (
+                        f"vLLM's {mod_name}.{ep.leaf} is {tuple(live_w.shape)} {live_w.dtype}, "
+                        f"expected quantized {expected_w}"
+                    )
+                if tuple(live_s.shape) != expected_s or live_s.dtype != torch.float32:
+                    return None, (
+                        f"vLLM's {mod_name}.{ep.scale_leaf} is {tuple(live_s.shape)} {live_s.dtype}, "
+                        f"wire scale gives {expected_s} torch.float32"
+                    )
+    return MoeLayerPlan(MOE_LAYOUT_TPU_EP_QUANT if wire_quant else MOE_LAYOUT_TPU_EP, True, None), ""
+
+
+def ep_zero_copy_targets(
+    moe_layout: Optional[str],
+    tp_size: int,
+    expert_keys: dict[tuple[str, str], str],
+    model_sd: dict[str, torch.Tensor],
+    find_model_key: Callable[[str], Optional[str]],
+    global_shapes: dict[str, list[int]],
+) -> dict[str, torch.Tensor]:
+    """Rollout side: ``{wire_name: vLLM weight}`` for zero-copy expert-parallel layouts."""
+    if moe_layout not in (MOE_LAYOUT_TPU_EP, MOE_LAYOUT_TPU_EP_QUANT):
+        return {}
+    quantized = moe_layout == MOE_LAYOUT_TPU_EP_QUANT
+    targets: dict[str, torch.Tensor] = {}
+    for name, shape in global_shapes.items():
+        ep = next((t for t in EP_EXPERT_TENSORS if name.endswith(t.ep)), None)
+        if ep is None:
+            continue
+        prefix = name[: -len(ep.ep)] + ".mlp.experts"
+        weight = _local(model_sd[expert_param(model_sd, find_model_key, prefix, ep.leaf, expert_keys)])
+        expected = (shape[0] // tp_size, *shape[1:])
+        bad_dtype = (weight.dtype == torch.bfloat16) if quantized else (weight.dtype != torch.bfloat16)
+        if tuple(weight.shape) != expected or bad_dtype or not weight.is_contiguous():
+            want_dtype = "quantized (non-bfloat16)" if quantized else "bfloat16"
+            raise RuntimeError(
+                f"{_ERROR_PREFIX}: vLLM's {prefix}.{ep.leaf} is {tuple(weight.shape)} {weight.dtype} "
+                f"(contiguous={weight.is_contiguous()}); the expert-parallel layout needs {expected}, {want_dtype}, "
+                "contiguous"
+            )
+        targets[name] = weight
+    return targets
+
+
+def ep_sharding_rule(name: str, global_shape: list[int], tp_size: int) -> Optional[tuple[list[str], list[int]]]:
+    """Dim-0 TP sharding rule for ``EP_EXPERT_TENSORS`` weights and scales, else ``None``."""
+    if not name.endswith(EP_EXPERT_BLOCK_SUFFIXES + EP_FP8_SCALE_SUFFIXES):
+        return None
+    if global_shape[0] % tp_size:
+        raise RuntimeError(f"{_ERROR_PREFIX}: {name} {global_shape} dim 0 does not split over {tp_size}")
+    spec = ["tp"] + [""] * (len(global_shape) - 1)
+    local = [global_shape[0] // tp_size, *global_shape[1:]]
+    return spec, local
+
+
+def write_wire_scale(target: torch.Tensor, src: torch.Tensor, name: str, check: Optional[ParityCheckFn] = None) -> None:
+    """Copies a received 3-D scale [E_r, K / block, N] into vLLM's live 4-D ``w*_weight_scale_inv``."""
+    target = _local(target)
+    expected = (src.shape[0], src.shape[1], 1, src.shape[2]) if src.ndim == 3 else None
+    if (
+        expected is None
+        or tuple(target.shape) != expected
+        or target.dtype != torch.float32
+        or src.dtype != torch.float32
+    ):
+        raise RuntimeError(
+            f"{_ERROR_PREFIX}: vLLM's {name} is {tuple(target.shape)} {target.dtype}, received "
+            f"{tuple(src.shape)} {src.dtype} (expected vLLM's {expected} torch.float32)"
+        )
+    formatted = src.unsqueeze(2)
+    if check is not None:
+        check(name, target, formatted)
+    target.copy_(formatted)
+
+
+def write_ep_scales(
+    staging: dict[str, torch.Tensor],
+    model_sd: dict[str, torch.Tensor],
+    find_model_key: Callable[[str], Optional[str]],
+    expert_keys: dict[tuple[str, str], str],
+    check: Optional[ParityCheckFn] = None,
+) -> set[str]:
+    """Installs every ``EP_EXPERT_TENSORS`` scale in ``staging`` and returns the staging names consumed."""
+    consumed: set[str] = set()
+    for name in list(staging):
+        ep = next((t for t in EP_EXPERT_TENSORS if name.endswith(t.scale)), None)
+        if ep is None:
+            continue
+        prefix = name[: -len(ep.scale)] + ".mlp.experts"
+        key = expert_param(model_sd, find_model_key, prefix, ep.scale_leaf, expert_keys)
+        write_wire_scale(model_sd[key], staging[name], key, check=check)
+        consumed.add(name)
+    return consumed

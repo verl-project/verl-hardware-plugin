@@ -23,6 +23,12 @@ from torch.distributed.tensor.placement_types import _StridedShard
 
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_name
+from verl_hardware_plugin.accelerators.tpu.rollout.moe_weights import (
+    EP_EXPERT_TENSORS,
+    FP8_MOE_DTYPE,
+    ExpertWireQuant,
+    format_ep_expert_weight,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -187,14 +193,45 @@ class TrainerWeights:
         device: Any,
         local_transform: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
         expert_stack_wire: Optional[Callable[[list[tuple[str, tuple]], tuple[int, ...]], Optional[str]]] = None,
+        *,
+        rollout_expert_parallel: bool = False,
+        rollout_fp8_moe: Optional[bool] = None,
     ) -> None:
+        if rollout_fp8_moe is True and rollout_expert_parallel is False:
+            rollout_expert_parallel = True
         self._dense_chunks = iter([dense]) if isinstance(dense, dict) else iter(dense)
         self._local_transform = local_transform
         self._expert_stacks = expert_stacks
         self._expert_stack_wire = expert_stack_wire
         self._device = device
+        self._rollout_ep = bool(rollout_expert_parallel)
+        self._rollout_fp8_moe = rollout_fp8_moe
+        self._moe_wire_quant: Optional[ExpertWireQuant] = (
+            ExpertWireQuant(FP8_MOE_DTYPE, None) if rollout_fp8_moe is True else None
+        )
         self._iter: Optional[Iterator[tuple[str, torch.Tensor]]] = None
         self._exported = False
+
+    @property
+    def needs_moe_quant_probe(self) -> bool:
+        """Whether ``send_weights`` should consult the rollout's ``describe_vllm_params`` for MoE quantization."""
+        return bool(getattr(self, "_rollout_ep", False)) and getattr(self, "_rollout_fp8_moe", None) is not False
+
+    def configure_moe_wire(self, description: Optional[dict[str, Any]]) -> None:
+        """Resolves the trainer-side MoE wire quantization format from the rollout's ``describe_vllm_params``."""
+        if not self._rollout_ep or self._rollout_fp8_moe is False:
+            self._moe_wire_quant = None
+            return
+        reported = ExpertWireQuant.from_description(description)
+        if self._rollout_fp8_moe is True:
+            if description and "params" in description and reported is None:
+                raise RuntimeError(
+                    "tpu-sync: rollout_fp8_moe=True on the trainer, but the rollout's vLLM MoE layers are not "
+                    "quantized (set QUANTIZE_ON_LOAD_PREFIXES=experts on the rollout)"
+                )
+            self._moe_wire_quant = reported or ExpertWireQuant(FP8_MOE_DTYPE, None)
+        else:
+            self._moe_wire_quant = reported
 
     def __iter__(self) -> TrainerWeights:
         return self
@@ -208,11 +245,48 @@ class TrainerWeights:
         """Yields ``(hf_name, tensor, shard)``; see the class docstring."""
         return self._export(local=True)
 
+    def _materialize_for_ep(
+        self, name: str, param: Any, counts: dict[str, int]
+    ) -> tuple[torch.Tensor, Optional[tuple[int, int]]]:
+        """Resolves ``param`` to a plain tensor (rank-local when dim-0 sharded, else gathered in bf16) + shard."""
+        if not isinstance(param, DTensor):
+            counts["replicated"] += 1
+            return param.to(self._device, non_blocking=True), None
+        shard = fsdp_dim0_shard(param)
+        if shard is not None:
+            counts["local"] += 1
+            return param.to_local().to(self._device, non_blocking=True), shard
+        kind = "replicated" if _is_replicated(param) else "gathered"
+        counts[kind] += 1
+        if kind == "gathered":
+            logger.info(
+                f"{name}: all-gathered before EP export (mesh ndim={param.device_mesh.ndim}, "
+                f"placements={param.placements}, shape={tuple(param.shape)}, local={tuple(param.to_local().shape)})"
+            )
+        return param.to(self._device, dtype=torch.bfloat16, non_blocking=True).full_tensor(), None
+
+    def _export_ep_tensor(
+        self, prefix: str, ep: Any, raw: torch.Tensor, shard: Optional[tuple[int, int]]
+    ) -> Iterator[tuple[str, torch.Tensor, Optional[tuple[int, int]]]]:
+        quant = self._moe_wire_quant
+        base = raw if quant is not None else raw.to(torch.bfloat16)
+        formatted, scale = format_ep_expert_weight(base, ep.kind, quant)
+        del base
+        yield prefix + ep.ep, formatted, shard
+        if scale is not None:
+            yield prefix + ep.scale, scale, shard
+
     def _dense_items(self, local: bool = False) -> Iterator[tuple[str, Any, int]]:
         """Pops ``(hf_name, param, number of names of param in its dict)`` from the dense dicts, one dict at a time."""
         for chunk in self._dense_chunks:
+            if local and self._rollout_ep:
+                for ep in EP_EXPERT_TENSORS:
+                    for name in [n for n in chunk if n.endswith(ep.hf)]:
+                        chunk[f"__ep__:{name}"] = (ep, chunk.pop(name))
             if local and self._local_transform is not None:
+                ep_stashed = {k: chunk.pop(k) for k in [k for k in chunk if k.startswith("__ep__:")]}
                 chunk = self._local_transform(chunk)
+                chunk.update(ep_stashed)
             names_per_param = Counter(id(p) for p in chunk.values())
             for name in list(chunk.keys()):
                 param = chunk.pop(name)
@@ -228,6 +302,15 @@ class TrainerWeights:
         exported: dict[int, tuple[torch.Tensor, Optional[tuple[int, int]], Any]] = {}
         counts = {"local": 0, "replicated": 0, "gathered": 0}
         for name, param, num_names in self._dense_items(local):
+            if local and name.startswith("__ep__:"):
+                orig_name = name.removeprefix("__ep__:")
+                ep, raw_param = param
+                prefix = orig_name[: -len(ep.hf)]
+                plain, shard = self._materialize_for_ep(orig_name, raw_param, counts)
+                del raw_param, param
+                yield from self._export_ep_tensor(prefix, ep, plain, shard)
+                del plain
+                continue
             pid = id(param)
             if pid in exported:
                 tensor, shard, _ = exported[pid]
@@ -245,11 +328,35 @@ class TrainerWeights:
         # expert. Note that torchtitan's TPU SimpleFSDP shards expert weights on dim 1 once the FSDP degree exceeds the
         # expert count (torchtitan 73ebc5f2, for Qwen3-235B); such a block holds a slice of every expert, not whole
         # experts, so fsdp_dim0_shard does not recognize it and it is gathered.
+        ep_stack_groups: dict[str, dict[str, tuple[torch.Tensor, Optional[tuple[int, int]]]]] = {}
         while self._expert_stacks:
             stack, slots = self._expert_stacks.pop(0)
             wire = None
             if local and self._expert_stack_wire is not None:
                 wire = self._expert_stack_wire(slots, tuple(int(d) for d in stack.shape))
+            if (
+                wire is not None
+                and self._rollout_ep
+                and wire.endswith((".gate_proj.weight", ".up_proj.weight", ".down_proj.weight"))
+            ):
+                layer_prefix, _, tail = wire.partition(".mlp.experts.")
+                proj = tail.removesuffix(".weight")
+                plain, shard = self._materialize_for_ep(wire, stack, counts)
+                del stack
+                grp = ep_stack_groups.setdefault(layer_prefix, {})
+                grp[proj] = (plain, shard)
+                if {"gate_proj", "up_proj", "down_proj"} <= set(grp):
+                    (gate, gs), (up, us), (down, ds) = grp["gate_proj"], grp["up_proj"], grp["down_proj"]
+                    del ep_stack_groups[layer_prefix]
+                    if gs != us:
+                        raise RuntimeError(f"tpu-sync: {layer_prefix} gate_proj shard {gs} != up_proj shard {us}")
+                    gate_up = torch.cat([gate, up], dim=1)
+                    del gate, up
+                    yield from self._export_ep_tensor(layer_prefix, EP_EXPERT_TENSORS[0], gate_up, gs)
+                    del gate_up
+                    yield from self._export_ep_tensor(layer_prefix, EP_EXPERT_TENSORS[1], down, ds)
+                    del down
+                continue
             if wire is not None:
                 tensor, shard, kind = self._export_tensor(wire, stack, local=True)
                 counts[kind] += 1
@@ -283,20 +390,27 @@ class TrainerWeights:
         ``shard`` its ``(num_shards, shard_index)``); every other sharded layout is gathered (``"gathered"``, logged);
         a replicated or plain tensor is sent full (``"replicated"``). Without ``local``, everything is gathered.
         """
+        keep_dtype = local and getattr(param, "_tpu_sync_keep_dtype", False)
+        wire_dtype = param.dtype if keep_dtype else torch.bfloat16
         if not isinstance(param, DTensor):
-            converted = param.to(torch.bfloat16, non_blocking=True)
+            if getattr(param, "_tpu_sync_owned", False) and param.dtype == wire_dtype:
+                return param.to(self._device, non_blocking=True), None, "replicated"
+            converted = param.to(self._device, dtype=wire_dtype, non_blocking=True)
             return _owned(converted, aliases_param=converted is param), None, "replicated"
         shard = fsdp_dim0_shard(param) if local else None
         if shard is not None:
             local_block = param.to_local()
-            if getattr(param, "_tpu_sync_owned", False) and local_block.dtype == torch.bfloat16:
+            if getattr(param, "_tpu_sync_owned", False) and local_block.dtype == wire_dtype:
                 return local_block.to(self._device, non_blocking=True), shard, "local"
-            return _bf16_on(local_block, self._device), shard, "local"
+            if wire_dtype == torch.bfloat16:
+                return _bf16_on(local_block, self._device), shard, "local"
+            out = local_block.to(self._device, dtype=wire_dtype, non_blocking=True)
+            return _owned(out, aliases_param=out is local_block), shard, "local"
         kind = "replicated" if _is_replicated(param) else "gathered"
         if local and kind == "gathered":
             logger.info(
                 f"{name}: all-gathered for the weight sync (mesh ndim={param.device_mesh.ndim}, "
                 f"placements={param.placements}, shape={tuple(param.shape)}, local={tuple(param.to_local().shape)})"
             )
-        converted = param.to(self._device, dtype=torch.bfloat16, non_blocking=True)
+        converted = param.to(self._device, dtype=wire_dtype, non_blocking=True)
         return _owned(converted.full_tensor(), aliases_param=converted is param), None, kind

@@ -2569,3 +2569,92 @@ def test_quantized_dense_weights_fall_back_to_loaders_and_copy_into_rejects_fp8(
     plain_model.model.norm.weight = nn.Parameter(torch.zeros(HIDDEN, dtype=torch.float8_e4m3fn), requires_grad=False)
     with pytest.raises(RuntimeError, match="cannot copy unscaled .* into quantized"):
         direct_sampler.install_tpu_sync_weights()
+
+
+def test_update_tpu_sync_weights_auto_discovers_rollout_fp8_moe_zero_copy(fake_tpu_sync, worker_ext):
+    """End-to-end FP8 zero-copy EP sync: ``describe_vllm_params`` reports the rollout's FP8 MoE format, trainer
+    auto-quantizes the expert stacks, ``global_dtypes`` sizes the rollout's FP32 scale staging buffers, and the FP8
+    weights land zero-copy in ``w13_weight`` / ``w2_weight`` while ``install`` writes ``w*_weight_scale_inv``."""
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+    from verl_hardware_plugin.accelerators.tpu.rollout import qwen3_moe_layout
+
+    class VllmFp8MoEMethodTPU:
+        _tpu_activation_str = "silu"
+
+    tp = 2
+    trainer_ranks = 2
+    raw = _moe_trainer_weights(seed=3)
+
+    def make_fp8_model(rank):
+        m = _FakeQwen3MoeVllmModel(tp, rank, use_ep=True)
+        exp = m.model.layers[0].mlp.experts
+        local = MOE_E // tp
+        exp.quant_method = VllmFp8MoEMethodTPU()
+        exp.w13_weight = nn.Parameter(torch.zeros(local, HIDDEN, 2 * MOE_PAD, dtype=torch.float8_e4m3fn), False)
+        exp.w2_weight = nn.Parameter(torch.zeros(local, MOE_PAD, HIDDEN, dtype=torch.float8_e4m3fn), False)
+        exp.w13_weight_scale_inv = nn.Parameter(torch.zeros(local, 1, 1, 2 * MOE_PAD, dtype=torch.float32), False)
+        exp.w2_weight_scale_inv = nn.Parameter(torch.zeros(local, 1, 1, HIDDEN, dtype=torch.float32), False)
+        m.expert_params_mapping = [("w13_weight", "gate_proj", "w1")]  # triggers auto fallback of receive_into_vllm
+        return m
+
+    models = [make_fp8_model(rank) for rank in range(tp)]
+    samplers = [_make_moe_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+
+    def make_trainer_weights(rank):
+        per_rank = MOE_E // trainer_ranks
+        sl = slice(rank * per_rank, (rank + 1) * per_rank)
+        dense = {k: v.clone() for k, v in raw.items() if ".experts." not in k}
+        stacks = []
+        for proj in MOE_PROJS:
+            full_s = raw[f"{MOE_EXPERTS}.{proj}.weight"]
+            from torch.distributed.tensor import DTensor, Shard
+            from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+
+            class _M:
+                ndim = 1
+                device_type = "cpu"
+
+                def size(self, d=0):
+                    return trainer_ranks
+
+                def get_coordinate(self):
+                    return [rank]
+
+            dt = DTensor(
+                full_s[sl].clone(),
+                DTensorSpec(_M(), (Shard(0),), tensor_meta=TensorMeta(full_s.shape, full_s.stride(), full_s.dtype)),  # type: ignore[arg-type]
+                requires_grad=False,
+            )
+            slots = [(f"{MOE_EXPERTS}.{e}.{proj}.weight", tuple(full_s.shape[1:])) for e in range(MOE_E)]
+            stacks.append((dt, slots))
+        return TrainerWeights(
+            dense,
+            stacks,
+            "cpu",
+            expert_stack_wire=qwen3_moe_layout.expert_stack_wire_name,
+            rollout_expert_parallel=True,  # rollout_fp8_moe left None -> auto-discovered from describe_vllm_params!
+        )
+
+    w13_ptrs = [m.model.layers[0].mlp.experts.w13_weight.data_ptr() for m in models]
+    manager, _ = _make_manager(
+        [_trainer_engine(rank) for rank in range(trainer_ranks)],
+        make_trainer_weights,
+        samplers,
+        [],
+    )
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+
+    for rank, (sampler, model) in enumerate(zip(samplers, models, strict=True)):
+        exp = model.model.layers[0].mlp.experts
+        # Zero-copy: live FP8 buffer pointer unchanged, staging points straight to w13_weight, scale staging is FP32.
+        assert exp.w13_weight.data_ptr() == w13_ptrs[rank]
+        assert sampler._tpu_sync_staging[f"{MOE_EXPERTS}.w13_ep"].data_ptr() == w13_ptrs[rank]
+        assert sampler._tpu_sync_staging[f"{MOE_EXPERTS}.w13_scale_ep"].dtype == torch.float32
+        # Dequantized weights closely reconstruct this rank's bf16 experts.
+        sl = slice(rank * (MOE_E // tp), (rank + 1) * (MOE_E // tp))
+        gate = raw[f"{MOE_EXPERTS}.gate_proj.weight"][sl]
+        inter = gate.shape[1]
+        deq_gate = exp.w13_weight[..., :inter].float().transpose(1, 2) * exp.w13_weight_scale_inv[
+            :, 0, :, :inter
+        ].transpose(1, 2)
+        torch.testing.assert_close(deq_gate, gate.float(), atol=0.2, rtol=0.1)
