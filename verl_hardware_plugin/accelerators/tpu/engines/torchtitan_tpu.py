@@ -39,7 +39,6 @@ import re
 import shutil
 from collections.abc import Collection, Iterable, Mapping
 from contextlib import nullcontext
-from functools import partial
 from typing import Any, Callable, Iterator, Optional
 
 import torch
@@ -73,13 +72,13 @@ from verl.workers.engine.utils import (
     postprocess_batch_func,
     prepare_micro_batches,
 )
-from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import no_padding_2_padding
 from verl_hardware_plugin.accelerators.tpu.engines import graph_trainer_mode, tpu_model_kernels, tpu_ragged_ep
 from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
+    align_micro_batch_num_seqs,
     align_micro_batch_shapes_across_ranks,
     apply_fp32_logits_tpu,
     apply_tpu_precision_patches,
@@ -112,7 +111,12 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     unwrap_metadata,
 )
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
-from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import prepare_tpu_loss_inputs
+from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import (
+    device_loss_scalars,
+    loss_rows_can_be_padded,
+    ppo_loss_config,
+    prepare_tpu_loss_inputs,
+)
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 
@@ -120,9 +124,9 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-@functools.lru_cache(maxsize=32)
 def _headtail_restore_indices_cpu(seq_len: int, cp_size: int) -> torch.Tensor:
-    """CPU-cached restore permutation for ``_HeadTailLoadBalancer`` (avoids 64k ``argsort`` on TPU)."""
+    """The restore permutation of torch's ``_HeadTailLoadBalancer``, built on CPU (its ``argsort`` over a 64k-token
+    sequence is slow on TPU). The engine keeps one device copy per shape (``_cp_restore_indices``)."""
     return _HeadTailLoadBalancer(seq_len, cp_size, "cpu")._generate_indices(restore=True)[0].to(torch.int64)
 
 
@@ -912,15 +916,9 @@ def _add_rollout_consistency_metrics(
         "actor/ppo_k3_token_mean",
         "actor/logprob_gap_abs_token_mean",
     )
-    if (
-        isinstance(loss_function, partial)
-        and loss_function.func is ppo_loss
-        and any(name not in metrics for name in names)
-    ):
-        config = loss_function.keywords.get("config")
-        if config is None and loss_function.args:
-            config = loss_function.args[0]
-        if config is not None and config.global_batch_info.get("batch_num_tokens") is not None:
+    config = ppo_loss_config(loss_function)
+    if config is not None and any(name not in metrics for name in names):
+        if config.global_batch_info.get("batch_num_tokens") is not None:
             mode = config.policy_loss.get("loss_mode", "vanilla")
             correction = config.policy_loss.get("rollout_correction") or {}
             # Rejection sampling and other losses use a different token denominator.
@@ -986,6 +984,8 @@ class TorchTitanTPUEngine(BaseEngine):
         self.engine_config = engine_config
         self.optimizer_config = optimizer_config
         self.checkpoint_config = checkpoint_config
+        # Device copies of the head-tail CP restore permutation, per (seq_len, cp, device): see _cp_restore_indices.
+        self._cp_restore_idx_cache: dict[tuple[int, int, torch.device], torch.Tensor] = {}
 
         (
             self._use_splash_attention,
@@ -1438,20 +1438,21 @@ class TorchTitanTPUEngine(BaseEngine):
             raise NotImplementedError(f"context_parallel_load_balancer={load_balancer_type!r} is not supported")
         gathered = ContextParallelGather.apply(tensor, self.get_context_parallel_group())
         if load_balancer_type == "headtail":
-            cache = getattr(self, "_cp_restore_idx_cache", None)
-            if cache is None:
-                cache = {}
-                self._cp_restore_idx_cache = cache
-            key = (int(seq_len), int(self.parallel_dims.cp), gathered.device)
-            restore_idx = cache.get(key)
-            if restore_idx is None:
-                restore_idx = _headtail_restore_indices_cpu(int(seq_len), int(self.parallel_dims.cp)).to(
-                    device=gathered.device
-                )
-                tpu_synchronize(restore_idx, wait=False)
-                cache[key] = restore_idx
-            gathered = gathered.index_select(0, restore_idx)
+            gathered = gathered.index_select(0, self._cp_restore_indices(seq_len, gathered.device))
         return gathered
+
+    def _cp_restore_indices(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """The head-tail restore permutation for ``seq_len`` tokens on ``device``, built once per shape.
+
+        Built on CPU and copied to the device like the other CPU-built index tensors of a micro-batch (e.g. the labels
+        in ``prepare_model_inputs``), without a stream cut, so the first micro-batch of a shape fuses like the others.
+        """
+        key = (int(seq_len), int(self.parallel_dims.cp), device)
+        restore_idx = self._cp_restore_idx_cache.get(key)
+        if restore_idx is None:
+            restore_idx = _headtail_restore_indices_cpu(int(seq_len), int(self.parallel_dims.cp)).to(device=device)
+            self._cp_restore_idx_cache[key] = restore_idx
+        return restore_idx
 
     def _build_dp_gloo_group(self):
         """Build a host-side Gloo ProcessGroup per data-parallel slice when model parallelism is active.
@@ -1615,6 +1616,9 @@ class TorchTitanTPUEngine(BaseEngine):
         )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens)
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+        # Once per mini-batch, before the micro-batch loop (and its deferred eager-mode region): the per-step loss
+        # scalars as 0-D device tensors, so the loss programs do not bake them in as constants.
+        loss_scalars = device_loss_scalars(data, get_device_id) if loss_function is not None else {}
 
         micro_batches, indices = prepare_micro_batches(
             data=data,
@@ -1625,6 +1629,9 @@ class TorchTitanTPUEngine(BaseEngine):
         static_len = int(tpu_options.static_micro_batch_len or 0)
         static_response_len = int(tpu_options.static_max_response_len or 0)
         slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)
+        # Pad the PPO loss rows to a common bucket only for losses that provably ignore fully masked rows.
+        bucket_rows = tpu_options.loss_row_bucketing is not False and loss_rows_can_be_padded(loss_function)
+        static_num_seqs = int(tpu_options.static_micro_batch_num_seqs or 0)
         if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len or slot_len:
             align_micro_batch_shapes_across_ranks(
                 micro_batches,
@@ -1632,7 +1639,11 @@ class TorchTitanTPUEngine(BaseEngine):
                 static_len=static_len,
                 static_response_len=static_response_len,
                 gdn_row_slot_len=slot_len,
+                num_seqs_bucketing=bucket_rows,
+                static_num_seqs=static_num_seqs,
             )
+        elif bucket_rows:
+            align_micro_batch_num_seqs(micro_batches, static_num_seqs=static_num_seqs)
 
         if "kda" in getattr(self, "_tpu_kernels", ()) and not getattr(self, "_gdn_row_slot_len", 0):
             # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
@@ -1644,7 +1655,9 @@ class TorchTitanTPUEngine(BaseEngine):
                 logger.info("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)
 
         if graph_mode:
-            return self._graph_trainer_forward_backward(data, micro_batches, indices, loss_function, batch_num_tokens)
+            return self._graph_trainer_forward_backward(
+                data, micro_batches, indices, loss_function, batch_num_tokens, loss_scalars
+            )
 
         output_lst = []
         ctx = torch.no_grad() if forward_only else nullcontext()
@@ -1670,7 +1683,7 @@ class TorchTitanTPUEngine(BaseEngine):
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                     loss, output = self.forward_step(
-                        micro_batch, loss_function=loss_function, forward_only=forward_only
+                        micro_batch, loss_function=loss_function, forward_only=forward_only, loss_scalars=loss_scalars
                     )
                     if not forward_only:
                         with spmd_no_typecheck_context():
@@ -1693,6 +1706,7 @@ class TorchTitanTPUEngine(BaseEngine):
         indices: Any,
         loss_function: Callable,
         batch_num_tokens: Any,
+        loss_scalars: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> dict[str, Any]:
         """``trainer_mode=graph_trainer``: the mini-batch's micro-batch through TorchTitan's traced training step.
 
@@ -1719,12 +1733,19 @@ class TorchTitanTPUEngine(BaseEngine):
         with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode):
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 output_lst.append(
-                    self._graph_trainer_micro_batch(micro_batch, micro_batch_idx, loss_function, batch_num_tokens)
+                    self._graph_trainer_micro_batch(
+                        micro_batch, micro_batch_idx, loss_function, batch_num_tokens, loss_scalars
+                    )
                 )
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def _graph_trainer_micro_batch(
-        self, micro_batch: TensorDict, micro_batch_idx: int, loss_function: Callable, batch_num_tokens: Any
+        self,
+        micro_batch: TensorDict,
+        micro_batch_idx: int,
+        loss_function: Callable,
+        batch_num_tokens: Any,
+        loss_scalars: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> dict[str, Any]:
         """One micro-batch of ``_graph_trainer_forward_backward``: the traced step, then verl's loss and metrics."""
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
@@ -1749,7 +1770,10 @@ class TorchTitanTPUEngine(BaseEngine):
             advantages.to(device),
             loss_mask.to(device),
         )
-        global_valid_tokens = torch.tensor(float(batch_num_tokens), dtype=torch.float32, device=device)
+        # The same 0-D tensor as the eager loss (device_loss_scalars), else built here (not on TPU, e.g. CPU tests).
+        global_valid_tokens = (loss_scalars or {}).get("batch_num_tokens")
+        if global_valid_tokens is None or global_valid_tokens.device != device:
+            global_valid_tokens = torch.tensor(float(batch_num_tokens), dtype=torch.float32, device=device)
         input_dict = {"input": input_ids, "labels": labels, "positions": extra_inputs["positions"]}
         # bf16 autocast as in the eager engine; it must be active while the step is traced (step 1), which records the
         # casts into the graph.
@@ -1771,7 +1795,7 @@ class TorchTitanTPUEngine(BaseEngine):
             model_output = {
                 "log_probs": _to_jagged(log_probs, micro_batch["input_ids"].offsets(), output_args["orig_seq_len"])
             }
-            loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
+            loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch, loss_scalars)
             loss, metrics = loss_function(
                 model_output=loss_model_output, data=loss_data, dp_group=self.get_data_parallel_group()
             )
@@ -1835,7 +1859,13 @@ class TorchTitanTPUEngine(BaseEngine):
             pred = pred.full_tensor()
         return pred
 
-    def forward_step(self, micro_batch: TensorDict, loss_function: Callable, forward_only: bool):
+    def forward_step(
+        self,
+        micro_batch: TensorDict,
+        loss_function: Callable,
+        forward_only: bool,
+        loss_scalars: Optional[Mapping[str, torch.Tensor]] = None,
+    ):
         raise NotImplementedError("forward_step must be implemented in subclass")
 
     def optimizer_zero_grad(self):
@@ -2719,8 +2749,17 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
         return model_output
 
-    def forward_step(self, micro_batch: TensorDict, loss_function: Callable, forward_only: bool):
-        """Run one micro-batch forward step without eagerly transferring the full CPU TensorDict to TPU."""
+    def forward_step(
+        self,
+        micro_batch: TensorDict,
+        loss_function: Callable,
+        forward_only: bool,
+        loss_scalars: Optional[Mapping[str, torch.Tensor]] = None,
+    ):
+        """Run one micro-batch forward step without eagerly transferring the full CPU TensorDict to TPU.
+
+        ``loss_scalars``: the mini-batch's ``device_loss_scalars``, passed on to ``prepare_tpu_loss_inputs``.
+        """
         device_name = get_device_name()
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
@@ -2738,7 +2777,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                 )
 
                 if loss_function is not None:
-                    loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
+                    loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch, loss_scalars)
                     loss, metrics = loss_function(
                         model_output=loss_model_output,
                         data=loss_data,

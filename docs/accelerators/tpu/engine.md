@@ -8,7 +8,8 @@ TPU options of the TorchTitan engine go in its config, under `engine_kwargs.tpu`
 per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 `+actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.use_simple_fsdp=False`. Supported keys:
 `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`,
-`tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`,
+`tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `static_max_response_len`,
+`loss_row_bucketing`, `static_micro_batch_num_seqs`, `splash_max_block_size`,
 `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `trainer_mode`, `graph_trainer`, `model_kernels`,
 `ep_capacity_factor`, `qwen3_pallas_experts`, `moe_paired_gemm` and
 `context_parallel_strategy` (see `TPUEngineOptions` in `options.py`); an unknown key is an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
@@ -46,6 +47,8 @@ Performance options for long packed micro-batches (the Qwen3-30B-A3B recipe sets
 |---|---|
 | `splash_max_block_size: 1024` | Largest Splash attention block (torchtitan's default 512). Splash's grid grows as `(tokens / block)^2`; 1024 cut `update_actor` by 17% at 24k tokens per chip on v5p |
 | `static_micro_batch_len: <tokens>` | Pads every packed micro-batch to at least this length (e.g. the `use_dynamic_bsz` token budget), so the trainer compiles one shape instead of recompiling when the packed length reaches a new bucket (`static_max_response_len` does the same for the response length) |
+| `loss_row_bucketing: false` | Turns off PPO loss row bucketing (on by default). With it, the PPO loss inputs of every micro-batch are padded with fully masked rows to `tpu_padded_num_seqs`: the most sequences in any micro-batch of the mini-batch on any rank, rounded up to a power of two (the same sequence-count buckets as the Tokamax GatedDeltaNet document budget). The loss then does not recompile whenever `use_dynamic_bsz` changes the number of sequences per micro-batch. Only applied with verl's `ppo_loss` and a policy loss whose loss, gradients and metrics ignore fully masked rows (`vanilla`, `gspo`, `sapo`, `gpg`, `clip_cov`, `kl_cov`, `dro`, `cispo`, `dppo_tv`, `dppo_kl`, any `loss_agg_mode`); `geo_mean` (row mean), `bypass_mode` (its `rollout_corr/*` metrics average over rows) and custom `register_policy_loss` losses keep the exact row count |
+| `static_micro_batch_num_seqs: <sequences>` | With row bucketing, pad the PPO loss inputs to at least this many rows (e.g. the most sequences a micro-batch can hold), so the loss keeps one row shape |
 | `moe_paired_grouped_mm: true` | Qwen3 MoE: torchtitan's paired W1/W3 Pallas grouped matmul (shares the routed-token loads) |
 | `moe_native_weight_layout: true` | Qwen3 MoE: kernel-native `(E, K, N)` expert weights; `state_dict()` / `load_state_dict()` keep the canonical layout and names, so the HF load and the tpu-sync expert export are unchanged |
 | `mixed_precision_reduce: bfloat16` | bf16 FSDP gradient reduce-scatter instead of fp32 (half the traffic; a performance A/B option) |

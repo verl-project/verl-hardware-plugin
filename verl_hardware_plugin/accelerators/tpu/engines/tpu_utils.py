@@ -39,7 +39,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import TorchtitanEngineConfig
 from verl_hardware_plugin.accelerators.tpu.device_api import tpu_synchronize
-from verl_hardware_plugin.accelerators.tpu.engines.tpu_model_kernels import has_64mib_scoped_vmem
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_model_kernels import bucket_num_sequences, has_64mib_scoped_vmem
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 
 logger = logging.getLogger(__name__)
@@ -960,6 +960,8 @@ def align_micro_batch_shapes_across_ranks(
     static_len: int = 0,
     static_response_len: int = 0,
     gdn_row_slot_len: int = 0,
+    num_seqs_bucketing: bool = False,
+    static_num_seqs: int = 0,
 ) -> None:
     """Make every rank pad micro-batch ``i`` to the same packed length and response-length bucket.
 
@@ -975,6 +977,9 @@ def align_micro_batch_shapes_across_ranks(
     set, each micro-batch also pads to at least ``num_sequences * gdn_row_slot_len`` (rounded to a multiple of
     ``lcm(bucket_size, gdn_row_slot_len)``) so ``log_prob_micro_batch_size_per_gpu > ppo_micro_batch_size_per_gpu``
     allocates one ``gdn_row_slot_len`` row per sequence without overflowing :func:`row_slot_permutation`.
+
+    With ``num_seqs_bucketing``, the same all-reduce also gives every micro-batch a common ``tpu_padded_num_seqs``
+    (see :func:`align_micro_batch_num_seqs`).
     """
     step = bucket_size if bucket_size is not None and bucket_size > 0 else get_tpu_seq_bucket_size()
     slot_len = int(gdn_row_slot_len or 0)
@@ -1003,6 +1008,8 @@ def align_micro_batch_shapes_across_ranks(
                 tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", static_padded)
             if static_resp_padded:
                 tu.assign_non_tensor_data(mb, "tpu_max_response_len", static_resp_padded)
+        if num_seqs_bucketing:
+            _assign_padded_num_seqs(micro_batches, _max_num_seqs(micro_batches), static_num_seqs)
         return
     lens: list[int] = []
     for mb in micro_batches:
@@ -1013,6 +1020,8 @@ def align_micro_batch_shapes_across_ranks(
             int(resp.offsets().diff().max().item()) if resp is not None and getattr(resp, "is_nested", False) else 0
         )
         lens += [_mb_seq_padded(mb, int(n_tokens)), bucket_length(max_resp, step) if max_resp else 0]
+    if num_seqs_bucketing:
+        lens.append(_max_num_seqs(micro_batches))
     lens_tensor = torch.tensor(lens, dtype=torch.int64)
     torch.distributed.all_reduce(lens_tensor, op=torch.distributed.ReduceOp.MAX)
     resolved_lens = lens_tensor.tolist()
@@ -1020,6 +1029,37 @@ def align_micro_batch_shapes_across_ranks(
         tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", max(int(resolved_lens[2 * i]), static_padded))
         resp_len = int(resolved_lens[2 * i + 1])
         tu.assign_non_tensor_data(mb, "tpu_max_response_len", max(resp_len, static_resp_padded) if resp_len else 0)
+    if num_seqs_bucketing:
+        _assign_padded_num_seqs(micro_batches, int(resolved_lens[-1]), static_num_seqs)
+
+
+def _max_num_seqs(micro_batches: list[TensorDict]) -> int:
+    return max((int(mb.batch_size[0]) for mb in micro_batches), default=0)
+
+
+def _assign_padded_num_seqs(micro_batches: list[TensorDict], max_num_seqs: int, static_num_seqs: int) -> None:
+    padded = max(bucket_num_sequences(max_num_seqs), int(static_num_seqs or 0))
+    for mb in micro_batches:
+        tu.assign_non_tensor_data(mb, "tpu_padded_num_seqs", padded)
+
+
+def align_micro_batch_num_seqs(micro_batches: list[TensorDict], static_num_seqs: int = 0) -> None:
+    """Give every micro-batch of a mini-batch the same ``tpu_padded_num_seqs``, on every rank.
+
+    ``tpu_padded_num_seqs`` is the row count that ``prepare_tpu_loss_inputs`` pads the PPO loss inputs up to with
+    fully masked rows: the largest number of sequences in any micro-batch on any rank (one CPU all-reduce(MAX)),
+    rounded up to its sequence-count bucket (``bucket_num_sequences``, a power of two), and at least
+    ``static_num_seqs`` (``engine_kwargs.tpu.static_micro_batch_num_seqs``). With ``use_dynamic_bsz`` the number of
+    sequences per micro-batch varies; the loss programs then see at most one row shape per bucket instead of one per
+    sequence count. :func:`align_micro_batch_shapes_across_ranks` (``num_seqs_bucketing=True``) does the same within
+    its own all-reduce.
+    """
+    max_num_seqs = _max_num_seqs(micro_batches)
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        reduced = torch.tensor([max_num_seqs], dtype=torch.int64)
+        torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.MAX)
+        max_num_seqs = int(reduced.item())
+    _assign_padded_num_seqs(micro_batches, max_num_seqs, static_num_seqs)
 
 
 def _wrap_routed_experts_on_edp_mesh(model: nn.Module, *, parallel_dims: Any, training: Any) -> None:
