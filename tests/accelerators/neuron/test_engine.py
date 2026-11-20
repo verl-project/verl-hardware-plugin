@@ -32,7 +32,7 @@ def test_forward_preserves_loss_autograd_and_row_boundaries(monkeypatch):
         return logits
 
     engine = SimpleNamespace(
-        engine_config=SimpleNamespace(max_seq_len=8),
+        engine_config=SimpleNamespace(max_seq_len=8, log_prob_chunk_size=0),
         trainer=SimpleNamespace(device="cpu"),
         model_forward_step=forward,
         get_data_parallel_group=lambda: None,
@@ -81,6 +81,80 @@ def test_native_overrides_restore_after_failure():
     assert qwen3.model_registry is original_registry
     assert titan_impl.Trainer.init_distributed is original_init
     assert titan_impl.CheckpointManager is original_checkpointer
+
+
+class _Container(torch.optim.Optimizer):
+    """Like TorchTitan's OptimizersContainer: empty own state, real state in the inner optimizers."""
+
+    def __init__(self, optimizer):
+        self.optimizers = [optimizer]
+        torch.optim.Optimizer.__init__(self, [p for g in optimizer.param_groups for p in g["params"]], {})
+
+    def step(self, closure=None):
+        for optimizer in self.optimizers:
+            optimizer.step()
+
+
+def _offload_engine(offload):
+    from verl_hardware_plugin.accelerators.neuron.engines.torchtitan_neuron import TorchTitanNeuronEngineWithLMHead
+
+    engine = object.__new__(TorchTitanNeuronEngineWithLMHead)
+    module = torch.nn.Linear(4, 2)
+    module(torch.ones(3, 4)).sum().backward()
+    engine.module = [module]
+    engine.optimizer = _Container(torch.optim.Adam(module.parameters()))
+    engine.engine_config = SimpleNamespace(optimizer_offload=offload, forward_only=False)
+    engine.config = SimpleNamespace(training=SimpleNamespace(max_norm=1.0))
+    engine.trainer = SimpleNamespace(device=torch.device("cpu"))
+    return engine
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_optimizer_offload_moves_moments_only_around_the_step(monkeypatch, offload):
+    from verl.utils import fsdp_utils
+    from verl.workers.engine.torchtitan.transformer_impl import TorchTitanEngineWithLMHead
+    from verl_hardware_plugin.accelerators.neuron.engines.torchtitan_neuron import TorchTitanNeuronEngineWithLMHead
+
+    events = []
+    engine = _offload_engine(offload)
+    inner = engine.optimizer.optimizers[0]
+    step = engine.optimizer.step
+    monkeypatch.setattr(engine.optimizer, "step", lambda: (events.append("step"), step())[1])
+    monkeypatch.setattr(
+        fsdp_utils, "load_fsdp_optimizer", lambda optimizer, device: events.append(("load", optimizer is inner))
+    )
+    monkeypatch.setattr(
+        fsdp_utils,
+        "offload_fsdp_optimizer",
+        lambda optimizer: events.append(("offload", optimizer is inner, bool(optimizer.state))),
+    )
+    TorchTitanNeuronEngineWithLMHead.optimizer_step(engine)
+    assert events == ([("load", True), "step", ("offload", True, True)] if offload else ["step"])
+    assert not engine.optimizer.state and inner.state
+
+    calls = []
+    monkeypatch.setattr(TorchTitanEngineWithLMHead, "to", lambda self, **kwargs: calls.append(kwargs))
+    TorchTitanNeuronEngineWithLMHead.to(engine, "neuron", model=False, optimizer=True, grad=False)
+    assert calls == [{"device": "neuron", "model": False, "optimizer": not offload, "grad": False}]
+
+
+def test_native_overrides_select_sequence_parallel_and_unfused_qkv():
+    from torchtitan.models import qwen3
+    from torchtitan.models.common.attention import FusedQKVLinear, QKVLinear
+
+    from verl_hardware_plugin.accelerators.neuron.engines.torchtitan_neuron import titan_impl
+
+    original_layers = qwen3._build_qwen3_layers
+    hf_config = SimpleNamespace(tie_word_embeddings=False)
+    with native_config_overrides(hf_config, sequence_parallel=True, fuse_qkv=False):
+        assert titan_impl.ParallelismConfig().enable_sequence_parallel
+        layers = qwen3.model_registry("0.6B", attn_backend="sdpa").model.layers
+        assert all(isinstance(layer.attention.qkv_linear, QKVLinear.Config) for layer in layers)
+    assert qwen3._build_qwen3_layers is original_layers
+    with native_config_overrides(hf_config):
+        assert not titan_impl.ParallelismConfig().enable_sequence_parallel
+        layers = qwen3.model_registry("0.6B", attn_backend="sdpa").model.layers
+        assert all(isinstance(layer.attention.qkv_linear, FusedQKVLinear.Config) for layer in layers)
 
 
 def test_forward_does_not_gather_vocabulary_logits():

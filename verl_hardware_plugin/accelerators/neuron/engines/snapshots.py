@@ -41,7 +41,7 @@ def restore_model_parts(model_parts, snapshots):
             saved, spec = snapshot[name]
             current_spec = parameter._spec if isinstance(parameter, DTensor) else None
             if current_spec != spec:
-                raise ValueError(f"Policy snapshot sharding changed for {name}")
+                raise ValueError(f"Policy snapshot sharding changed for {name}: saved {spec}, now {current_spec}")
             local = parameter.to_local() if isinstance(parameter, DTensor) else parameter
             if local.shape != saved.shape or local.dtype != saved.dtype:
                 raise ValueError(f"Policy snapshot shape or dtype changed for {name}")

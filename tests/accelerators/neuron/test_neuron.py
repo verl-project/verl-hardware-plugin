@@ -145,7 +145,6 @@ def test_only_cuda_checkpoint_import_is_blocked(monkeypatch):
         {"spmd_backend": "spmd_types"},
         {"use_remove_padding": True},
         {"param_offload": True},
-        {"optimizer_offload": True},
         {"max_seq_len": 513},
         {"dtype": "float16"},
     ],
@@ -153,6 +152,10 @@ def test_only_cuda_checkpoint_import_is_blocked(monkeypatch):
 def test_config_rejects_unsupported_settings(overrides):
     with pytest.raises(ValueError):
         NeuronTorchtitanEngineConfig(**overrides)
+
+
+def test_config_accepts_optimizer_offload():
+    assert NeuronTorchtitanEngineConfig(optimizer_offload=True).optimizer_offload
 
 
 def test_config_defaults():

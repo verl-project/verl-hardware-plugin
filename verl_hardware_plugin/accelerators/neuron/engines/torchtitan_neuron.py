@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from contextlib import contextmanager
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from shutil import rmtree
 from tempfile import gettempdir
@@ -30,6 +32,43 @@ from .config import NeuronTorchtitanEngineConfig
 from .tensor_parallel import token_statistics
 
 _actor_engine: TorchTitanNeuronEngineWithLMHead | None = None
+logger = logging.getLogger(__name__)
+
+# When set, each rank records its allocation history and dumps a memory snapshot here on a device error.
+MEMORY_SNAPSHOT_DIR = "VERL_NEURON_MEMORY_SNAPSHOT_DIR"
+
+
+def record_memory_history():
+    if os.environ.get(MEMORY_SNAPSHOT_DIR):
+        torch.neuron._record_memory_history("all", context="alloc", max_entries=200_000)
+
+
+def dump_memory_snapshot(tag):
+    directory = os.environ.get(MEMORY_SNAPSHOT_DIR)
+    if not directory:
+        return None
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    path = Path(directory) / f"rank{rank:03d}_{tag}.pickle"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        torch.neuron._dump_snapshot(str(path))
+    except Exception:  # the snapshot must not hide the error that triggered it
+        logger.exception("Could not write the Neuron memory snapshot %s", path)
+        return None
+    logger.warning("Wrote the Neuron memory snapshot %s", path)
+    return path
+
+
+def snapshot_memory_on_error(forward_step):
+    @wraps(forward_step)
+    def wrapper(engine, micro_batch, loss_function, forward_only):
+        try:
+            return forward_step(engine, micro_batch, loss_function, forward_only)
+        except RuntimeError:
+            dump_memory_snapshot("forward_only" if forward_only else "train")
+            raise
+
+    return wrapper
 
 
 def actor_engine() -> TorchTitanNeuronEngineWithLMHead:
@@ -39,11 +78,18 @@ def actor_engine() -> TorchTitanNeuronEngineWithLMHead:
 
 
 @contextmanager
-def native_config_overrides(hf_config, optimizer_config=None, parallel_dims=None):
+def native_config_overrides(
+    hf_config, optimizer_config=None, parallel_dims=None, *, sequence_parallel=False, fuse_qkv=True
+):
     """Scope Neuron defaults to construction of this worker's TorchTitan trainer."""
     from torchtitan.models import qwen3
 
     original_registry = qwen3.model_registry
+    original_layers = qwen3._build_qwen3_layers
+
+    def build_layers(*args, **kwargs):
+        kwargs["fuse_qkv"] = fuse_qkv  # the Qwen3 flavors hard-code fuse_qkv=True
+        return original_layers(*args, **kwargs)
 
     def model_registry(*args, **kwargs):
         spec = original_registry(*args, **kwargs)
@@ -63,9 +109,14 @@ def native_config_overrides(hf_config, optimizer_config=None, parallel_dims=None
     overrides = [
         (titan_impl, "CheckpointManager", NeuronCheckpointManager),
         (titan_impl, "CompileConfig", partial(titan_impl.CompileConfig, backend="neuron")),
-        (titan_impl, "ParallelismConfig", partial(titan_impl.ParallelismConfig, enable_sequence_parallel=False)),
+        (
+            titan_impl,
+            "ParallelismConfig",
+            partial(titan_impl.ParallelismConfig, enable_sequence_parallel=sequence_parallel),
+        ),
         (titan_impl, "TrainingConfig", make_training_config),
         (qwen3, "model_registry", model_registry),
+        (qwen3, "_build_qwen3_layers", build_layers),
         (
             titan_impl.OptimizersContainer,
             "Config",
@@ -115,11 +166,19 @@ class TorchTitanNeuronEngineWithLMHead(TorchTitanEngineWithLMHead):
                 "expert_parallel_size",
                 "pipeline_parallel_size",
                 "spmd_backend",
+                "enable_sequence_parallel",
+                "fuse_qkv",
             )
             if any(getattr(engine_config, name) != getattr(_actor_engine.engine_config, name) for name in dimensions):
                 raise ValueError("A colocated Trainium reference must use the actor's parallel dimensions")
             parallel_dims = _actor_engine.parallel_dims
-        with native_config_overrides(model_config.hf_config, optimizer_config, parallel_dims):
+        with native_config_overrides(
+            model_config.hf_config,
+            optimizer_config,
+            parallel_dims,
+            sequence_parallel=engine_config.enable_sequence_parallel,
+            fuse_qkv=engine_config.fuse_qkv,
+        ):
             super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
         from .snapshots import install_snapshot_handlers
 
@@ -158,12 +217,14 @@ class TorchTitanNeuronEngineWithLMHead(TorchTitanEngineWithLMHead):
         for state in self.checkpointer.states.values():
             if hasattr(state, "cached_state_dict"):
                 state.cached_state_dict = {}
+        record_memory_history()
 
     def model_forward_step(self, *, inputs, extra_inputs=None, extra_kwargs=None):
         if len(self.module) != 1:
             raise ValueError("Trainium requires a single non-pipelined model part")
         return self.module[0](inputs, **(extra_inputs or {}), **(extra_kwargs or {}))
 
+    @snapshot_memory_on_error
     def forward_step(self, micro_batch, loss_function, forward_only):
         pad_token_id = int(tu.get_non_tensor_data(micro_batch, "pad_token_id", 0))
         inputs, positions, labels, offsets = padded_inputs(
@@ -181,7 +242,9 @@ class TorchTitanNeuronEngineWithLMHead(TorchTitanEngineWithLMHead):
                 if temperature.ndim == 1:
                     temperature = temperature[:, None, None]
             calculate_entropy = tu.get_non_tensor_data(micro_batch, "calculate_entropy", False)
-            log_probs, entropy = token_statistics(logits, labels, temperature, calculate_entropy)
+            log_probs, entropy = token_statistics(
+                logits, labels, temperature, calculate_entropy, self.engine_config.log_prob_chunk_size
+            )
             model_output = {"log_probs": host_jagged(log_probs, offsets)}
             if calculate_entropy:
                 model_output["entropy"] = host_jagged(entropy, offsets)
@@ -261,17 +324,48 @@ class TorchTitanNeuronEngineWithLMHead(TorchTitanEngineWithLMHead):
             raise RuntimeError(f"No complete TorchTitan checkpoint in {local_path}")
         torch.distributed.barrier()
 
+    def to(self, device, model=True, optimizer=True, grad=True):
+        # With optimizer offload, only optimizer_step loads the optimizer state, not the train-mode context.
+        super().to(device=device, model=model, optimizer=optimizer and not self._offload_optimizer(), grad=grad)
+
+    def _offload_optimizer(self):
+        return bool(self.engine_config.optimizer_offload) and not self.engine_config.forward_only
+
     def optimizer_step(self):
         from torchtitan.distributed import utils
 
-        norm = utils.clip_grad_norm_(
-            [parameter for module in self.module for parameter in module.parameters()],
-            self.config.training.max_norm,
-            foreach=False,
-            pp_mesh=None,
-            ep_enabled=False,
-        )
-        if not torch.isfinite(norm).item():
+        from verl.utils.fsdp_utils import load_fsdp_optimizer, offload_fsdp_optimizer
+
+        try:
+            norm = utils.clip_grad_norm_(
+                [parameter for module in self.module for parameter in module.parameters()],
+                self.config.training.max_norm,
+                foreach=False,
+                pp_mesh=None,
+                ep_enabled=False,
+            )
+            # First host sync after backward: asynchronous device errors from backward surface here.
+            finite = torch.isfinite(norm).item()
+        except RuntimeError:
+            dump_memory_snapshot("backward")
+            raise
+        if not finite:
             raise FloatingPointError("Trainium actor gradient norm is not finite")
-        self.optimizer.step()
-        return norm.item()
+        offload = self._offload_optimizer()
+        # The state lives in the inner optimizers; OptimizersContainer's own state is empty.
+        optimizers = list(getattr(self.optimizer, "optimizers", [self.optimizer]))
+        try:
+            if offload:
+                for optimizer in optimizers:
+                    load_fsdp_optimizer(optimizer, self.trainer.device)
+            self.optimizer.step()
+            if offload:
+                for optimizer in optimizers:
+                    offload_fsdp_optimizer(optimizer)
+                if hasattr(torch, "neuron"):
+                    torch.neuron.synchronize()  # the host copies are non-blocking
+                    torch.neuron.empty_cache()
+            return norm.item()
+        except RuntimeError:
+            dump_memory_snapshot("optimizer_step")
+            raise

@@ -17,6 +17,11 @@ from verl_hardware_plugin.accelerators.neuron.engines.tensor_parallel import tok
 
 
 def _check_token_statistics(mesh, device):
+    for chunk_size, chunks in ((0, 1), (2, 3)):
+        _check_token_statistics_chunked(mesh, device, chunk_size, chunks)
+
+
+def _check_token_statistics_chunked(mesh, device, chunk_size, chunks):
     from torchtitan.components.loss import _LossParallelCrossEntropy
 
     rank, world_size = mesh.get_local_rank(), mesh.size()
@@ -35,8 +40,10 @@ def _check_token_statistics(mesh, device):
                     DTensor, "full_tensor", side_effect=AssertionError("Token statistics must not gather logits")
                 ),
             ):
-                log_probs, entropy = token_statistics(sharded, labels.to(device), device_temperature, calculate_entropy)
-                assert titan_loss.call_count == 1
+                log_probs, entropy = token_statistics(
+                    sharded, labels.to(device), device_temperature, calculate_entropy, chunk_size
+                )
+                assert titan_loss.call_count == chunks
                 # Match the engine's differentiable host loss boundary.
                 log_probs = log_probs.cpu()
                 entropy = entropy.cpu() if entropy is not None else None

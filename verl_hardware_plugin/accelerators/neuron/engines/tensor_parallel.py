@@ -6,6 +6,7 @@
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
+from torch.utils.checkpoint import checkpoint
 
 from .compat import vocabulary_parallel_log_probs
 
@@ -34,8 +35,11 @@ class _VocabularyEntropy(torch.autograd.Function):
         return -probabilities * centered * entropy_grad.unsqueeze(-1), None
 
 
-def token_statistics(logits, labels, temperature, calculate_entropy=False):
-    """Return replicated token log probabilities and optional entropy, with local gradients."""
+def token_statistics(logits, labels, temperature, calculate_entropy=False, chunk_size=0):
+    """Return replicated token log probabilities and optional entropy, with local gradients.
+
+    With chunk_size > 0, the FP32 log-softmax runs per sequence chunk and is recomputed in backward.
+    """
     if isinstance(logits, DTensor):
         mesh = logits.device_mesh
         if (
@@ -46,11 +50,37 @@ def token_statistics(logits, labels, temperature, calculate_entropy=False):
             raise ValueError(f"Expected vocabulary-sharded logits on a TP mesh, got {logits.placements}")
         if logits.shape[-1] % mesh.size():
             raise ValueError("Trainium requires vocabulary size divisible by tensor parallel size")
-        local_logits = logits.to_local().float() / temperature
+        local = logits.to_local()
         group = mesh.get_group()
-        log_probs = vocabulary_parallel_log_probs(local_logits, labels, group, logits.shape[-1])
-        entropy = _VocabularyEntropy.apply(local_logits, group) if calculate_entropy else None
-        return log_probs, entropy
+        if local.ndim == 3 and 0 < chunk_size < local.shape[1]:
+            pieces = [
+                (local[:, start : start + chunk_size], labels[:, start : start + chunk_size])
+                for start in range(0, local.shape[1], chunk_size)
+            ]
+        else:
+            pieces = [(local, labels)]
+
+        def chunk_statistics(piece, piece_labels):
+            piece = piece.float() / temperature
+            log_probs = vocabulary_parallel_log_probs(piece, piece_labels, group, logits.shape[-1])
+            if calculate_entropy:
+                return log_probs, _VocabularyEntropy.apply(piece, group)
+            return (log_probs,)
+
+        recompute = len(pieces) > 1 and torch.is_grad_enabled() and local.requires_grad
+        log_probs, entropy = [], []
+        for piece, piece_labels in pieces:
+            if recompute:
+                result = checkpoint(chunk_statistics, piece, piece_labels, use_reentrant=False)
+            else:
+                result = chunk_statistics(piece, piece_labels)
+            log_probs.append(result[0])
+            if calculate_entropy:
+                entropy.append(result[1])
+        log_probs = torch.cat(log_probs, dim=1) if len(pieces) > 1 else log_probs[0]
+        if not calculate_entropy:
+            return log_probs, None
+        return log_probs, torch.cat(entropy, dim=1) if len(pieces) > 1 else entropy[0]
     normalized = torch.log_softmax(logits.float() / temperature, dim=-1)
     log_probs = normalized.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
     entropy = -(normalized.exp() * normalized).sum(-1) if calculate_entropy else None
