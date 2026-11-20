@@ -175,11 +175,21 @@ class TPUEngineOptions:
             unset preserves its default and FP32 master parameters.
         fp32_logits: Preserve FP32 LM-head accumulators with BF16 operands; ``False`` requests BF16 logits.
             Either explicit value disables the automatic fused-linear-loss default so this head is used.
-        rollout_expert_parallel: Export Qwen3.5 MoE experts in vLLM's expert-parallel layout so the rollout
-            receives them straight into its expert weights with no HBM staging copy (default: ``False``, see
-            ``rollout/qwen3_5_layout.py``). Temporary for large MoEs whose expert shard cannot afford a second HBM
-            staging copy alongside weights + KV cache (e.g. Qwen3.5-397B-A17B); remove once ``tpu-sync`` stages on
-            host DRAM and H2Ds directly into vLLM weights (the default ``False`` path already supports vLLM EP).
+        rollout_expert_parallel: Export MoE experts in vLLM's expert-parallel layout so the rollout receives
+            them straight into its expert weights with no HBM staging copy (default: ``False``, see
+            ``rollout/moe_weights.py``; supported by Qwen3.5 and Qwen3 MoE). Temporary for large MoEs whose expert
+            shard cannot afford a second HBM staging copy alongside weights + KV cache (e.g. Qwen3.5-397B-A17B); remove
+            once ``tpu-sync`` stages on host DRAM and H2Ds directly into vLLM weights (the default ``False`` path
+            already supports vLLM EP).
+        rollout_fp8_moe: Trainer-side expert quantization for ``rollout_expert_parallel`` when the rollout runs
+            vllm-torchtpu's quantized MoE (e.g. ``QUANTIZE_ON_LOAD_PREFIXES=experts`` with
+            ``VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=QUANTIZE_ON_LOAD_PREFIXES``). Unset (default): when
+            ``rollout_expert_parallel=True`` and the rollout reports quantized MoE via ``describe_vllm_params``, the
+            trainer automatically quantizes each expert stack in the rollout's ``(quant_dtype, block_size)`` format and
+            sends quantized weights (received zero-copy into ``w13_weight`` / ``w2_weight``) plus FP32 scales (copied
+            into ``w*_weight_scale_inv``), halving expert wire bytes and avoiding a bf16 staging copy. ``True`` forces
+            trainer-side quantization (and implies ``rollout_expert_parallel=True`` when unset); ``False`` disables
+            trainer-side quantization.
         param_dtype: Storage dtype of the trained parameters, their gradients and (with the default AdamW) the
             optimizer states: ``float32`` (default) or ``bfloat16``. ``bfloat16`` halves the parameter and gradient
             memory (pure bf16 training, no fp32 master), e.g. for models whose fp32 training state does not fit.
@@ -256,6 +266,7 @@ class TPUEngineOptions:
     mixed_precision_param: Optional[str] = None
     fp32_logits: Optional[bool] = None
     rollout_expert_parallel: Optional[bool] = None
+    rollout_fp8_moe: Optional[bool] = None
     param_dtype: Optional[str] = None
     optimizer_host_offload: Optional[bool] = None
     fp32_master: Optional[bool] = None
@@ -292,6 +303,7 @@ _ENGINE_KINDS: dict[str, Any] = {
     "mixed_precision_param": str,
     "fp32_logits": bool,
     "rollout_expert_parallel": bool,
+    "rollout_fp8_moe": bool,
     "param_dtype": str,
     "optimizer_host_offload": bool,
     "fp32_master": bool,
@@ -377,6 +389,14 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
         )
     if values.get("fp32_master") and values.get("param_dtype") != "bfloat16":
         raise ValueError(f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.fp32_master needs param_dtype=bfloat16")
+    if values.get("rollout_fp8_moe") is True:
+        if values.get("rollout_expert_parallel") is False:
+            raise ValueError(
+                f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.rollout_fp8_moe=True conflicts with "
+                "rollout_expert_parallel=False"
+            )
+        if values.get("rollout_expert_parallel") is None:
+            values["rollout_expert_parallel"] = True
     if values.get("ep_dispatcher") is not None:
         ep_disp = values["ep_dispatcher"].strip().lower()
         if ep_disp not in ("auto", "ragged", "static"):

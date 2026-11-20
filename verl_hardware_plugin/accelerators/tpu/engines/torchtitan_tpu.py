@@ -969,9 +969,12 @@ class TorchTitanTPUEngine(BaseEngine):
         from torchtitan.distributed.activation_checkpoint import FullAC
 
         try:
-            from torchtitan.experiments.tpu.activation_checkpoint import TPUSelectiveAC
+            from torchtitan.experiments.tpu.components.activation_checkpoint import TPUSelectiveAC
         except ImportError:
-            from torchtitan.distributed.activation_checkpoint import SelectiveAC as TPUSelectiveAC
+            try:
+                from torchtitan.experiments.tpu.activation_checkpoint import TPUSelectiveAC
+            except ImportError:
+                from torchtitan.distributed.activation_checkpoint import SelectiveAC as TPUSelectiveAC
         from torchtitan.trainer import Trainer
 
         super().__init__()
@@ -1385,12 +1388,21 @@ class TorchTitanTPUEngine(BaseEngine):
         ``engine_kwargs.tpu.context_parallel_strategy`` so verl keeps CP as a config option.
         """
         from torchtitan.config.transform import ContextParallelTransform, transform_model_config_
-        from torchtitan.experiments.tpu.cp_attention import (
-            install_tpu_cp_patches,
-            tpu_cp_inner_attention,
-            tpu_cp_load_balancer,
-            validate_tpu_context_parallel,
-        )
+
+        try:
+            from torchtitan.experiments.tpu.distributed.cp_attention import (
+                install_tpu_cp_patches,
+                tpu_cp_inner_attention,
+                tpu_cp_load_balancer,
+                validate_tpu_context_parallel,
+            )
+        except ImportError:
+            from torchtitan.experiments.tpu.cp_attention import (
+                install_tpu_cp_patches,
+                tpu_cp_inner_attention,
+                tpu_cp_load_balancer,
+                validate_tpu_context_parallel,
+            )
 
         strategy = get_tpu_engine_options(self.engine_config).context_parallel_strategy or "all_gather"
         if strategy == "all_gather" and not self._use_splash_attention:
@@ -1646,7 +1658,10 @@ class TorchTitanTPUEngine(BaseEngine):
         )
 
         if getattr(self, "_gdn_row_slot_len", 0):
-            from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+            try:
+                from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
+            except ImportError:
+                from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 
             row_ctx = set_unflatten_seq_len(self._gdn_row_slot_len)
         else:
@@ -2388,10 +2403,7 @@ class TorchTitanTPUEngine(BaseEngine):
             from verl_hardware_plugin.accelerators.tpu.rollout.qwen3_5_layout import make_tpu_sync_local_layout
 
             hf_config = self.model_config.hf_config
-            local_transform = make_tpu_sync_local_layout(
-                getattr(hf_config, "text_config", None) or hf_config,
-                expert_parallel=bool(self._tpu_options.rollout_expert_parallel),
-            )
+            local_transform = make_tpu_sync_local_layout(getattr(hf_config, "text_config", None) or hf_config)
         elif getattr(self, "_torchtitan_name", None) == "qwen3":
             # Qwen3 MoE: tpu-sync sends each expert stack as one 3-D tensor, so that FSDP shards of whole experts are
             # sent without a gather and the rollout installs its slices straight into vLLM's w13 / w2
@@ -2408,6 +2420,8 @@ class TorchTitanTPUEngine(BaseEngine):
                 get_device_id(),
                 local_transform=local_transform,
                 expert_stack_wire=expert_stack_wire,
+                rollout_expert_parallel=bool(self._tpu_options.rollout_expert_parallel),
+                rollout_fp8_moe=self._tpu_options.rollout_fp8_moe,
             ),
             None,
         )

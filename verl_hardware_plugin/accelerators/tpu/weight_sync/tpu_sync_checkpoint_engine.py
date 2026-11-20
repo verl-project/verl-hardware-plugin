@@ -305,6 +305,8 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         self._effective_receive_into_vllm: Optional[bool] = False if self.receive_into_vllm == "off" else None
         self._vllm_params: Optional[dict[str, VllmParam]] = None
         self._vllm_tp_size: Optional[int] = None
+        self._cached_vllm_params: Optional[dict[str, Any]] = None
+        self._vllm_params_fetched: bool = False
         if torch.distributed.is_initialized():
             self.rank = torch.distributed.get_rank()
         else:
@@ -342,6 +344,14 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         if self._registry is None:
             self._registry = get_tpu_sync_rendezvous()
         return self._registry
+
+    async def _get_published_vllm_params(self) -> Optional[dict[str, Any]]:
+        """Fetches and caches the rollout's ``describe_vllm_params`` payload from the rendezvous once."""
+        if not self._vllm_params_fetched:
+            if hasattr(self.registry, "get_vllm_params"):
+                self._cached_vllm_params = await self.registry.get_vllm_params.remote()
+            self._vllm_params_fetched = True
+        return self._cached_vllm_params
 
     def prepare(self) -> dict:
         return {}
@@ -396,6 +406,9 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
 
         # Materialize weights in a single pass and filter tied embeddings
         if isinstance(weights, TrainerWeights):
+            if weights.needs_moe_quant_probe:
+                published_vllm = await self._get_published_vllm_params()
+                weights.configure_moe_wire(published_vllm)
             exported = list(weights.local_shards())
             shard_info = {name: shard for name, _, shard in exported if shard is not None}
             named_weights = [(name, tensor) for name, tensor, _ in exported]
@@ -508,8 +521,8 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         """
         auto = self.receive_into_vllm == "auto"
         if self._vllm_params is None:
-            published = await self.registry.get_vllm_params.remote()
-            if not published:
+            published = await self._get_published_vllm_params()
+            if not published or published.get("dense_receive_disabled") or "params" not in published:
                 if auto:
                     self._effective_receive_into_vllm = False
                     return None
@@ -573,11 +586,19 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         # TODO(tpu): Move global_shapes registration to a one-time setup step during initialization
         # (e.g., in prepare or build_process_group/model_init) instead of per weight-sync step,
         # since tensor shapes are static across training iterations and only need to be communicated once.
+        global_shapes = {name: full_shape(name, p) for name, p in valid_weights}
+        global_dtypes = {name: str(p.dtype) for name, p in valid_weights if p.dtype != torch.bfloat16}
         try:
-            global_shapes = {name: full_shape(name, p) for name, p in valid_weights}
             await self.registry.set_global_shapes.remote(global_shapes)
         except Exception as e:
             logger.warning(f"Could not record global shapes in the tpu-sync rendezvous: {e}")
+        if global_dtypes:
+            await self.registry.set_global_dtypes.remote(global_dtypes)
+        elif hasattr(self.registry, "set_global_dtypes"):
+            try:
+                await self.registry.set_global_dtypes.remote({})
+            except Exception as e:
+                logger.warning(f"Could not clear global dtypes in the tpu-sync rendezvous: {e}")
 
         # Build variable metadata protos for each dynamic tensor. Every variable carries its full shape:
         # - a local FSDP shard is block `shard_index` of `num_shards` blocks along its shard dim (dim 0; dim 1 for
@@ -885,27 +906,59 @@ async def update_tpu_sync_weights(manager: Any, global_steps: Optional[int] = No
             await asyncio.to_thread(ray.get, refs)
         manager._tpu_sync_stage_d2h = stage_d2h
 
-    # 0. With receive_into_vllm ("auto" or "on"), the trainer exports in vLLM's layout when supported, so it needs
-    #    the rollout's parameter description (shapes, dtypes, which weights vllm-torchtpu transposed) before its
-    #    first export. Every rank of every replica holds the same shapes, so one worker's description serves all.
-    if options.receive_into_vllm != "off" and not getattr(manager, "_tpu_sync_vllm_params_checked", False):
-        described = await manager.replicas[0].server_handle.collective_rpc.remote(method="describe_vllm_params")
-        description = next((d for d in (described or []) if isinstance(d, dict) and "params" in d), None)
+    # 0. Query the rollout's parameter description once before the first trainer export:
+    #    - With receive_into_vllm ("auto" or "on"), the trainer exports dense weights in vLLM's layout when supported.
+    #    - Even when receive_into_vllm is "off", ``moe_quant`` / ``moe_quant_ineligible_reason`` let ``TrainerWeights``
+    #      auto-discover (or fail fast on) trainer-side MoE quantization without activating dense receive_into_vllm.
+    if manager.replicas and not getattr(manager, "_tpu_sync_vllm_params_checked", False):
+        try:
+            described = await manager.replicas[0].server_handle.collective_rpc.remote(method="describe_vllm_params")
+        except Exception:
+            if options.receive_into_vllm != "off":
+                raise
+            described = None
+        worker_descs = [d for d in (described or []) if isinstance(d, dict) and "params" in d]
+        description = dict(worker_descs[0]) if worker_descs else None
         manager._tpu_sync_vllm_params_checked = True
         if description is None:
             if options.receive_into_vllm == "on":
                 raise RuntimeError("receive_into_vllm: the rollout workers returned no vLLM parameter description")
-            logger.info(
-                "tpu-sync: receive_into_vllm=auto falling back to rollout staging buffers "
-                "(rollout returned no vLLM parameter description)"
-            )
+            if options.receive_into_vllm == "auto":
+                logger.info(
+                    "tpu-sync: receive_into_vllm=auto falling back to rollout staging buffers "
+                    "(rollout returned no vLLM parameter description)"
+                )
         else:
+            if len(worker_descs) > 1:
+                moe_quants = [d.get("moe_quant") for d in worker_descs]
+                if any(mq is None for mq in moe_quants) or any(mq != moe_quants[0] for mq in moe_quants[1:]):
+                    description.pop("moe_quant", None)
+                    reason = next(
+                        (
+                            d["moe_quant_ineligible_reason"]
+                            for d in worker_descs
+                            if d.get("moe_quant_ineligible_reason")
+                        ),
+                        None,
+                    )
+                    if reason is not None or any(mq is not None for mq in moe_quants):
+                        description["moe_quant_ineligible_reason"] = (
+                            reason or "rollout TP ranks disagreed on MoE quantization metadata"
+                        )
+            if not getattr(options, "direct_install_quantized_moe", True):
+                description.pop("moe_quant", None)
+                description["moe_quant_ineligible_reason"] = "engine_kwargs.tpu-sync.direct_install_quantized_moe=False"
+            num_params = len(description["params"])
+            if options.receive_into_vllm == "off":
+                description.pop("params", None)
+                description["dense_receive_disabled"] = True
             await manager._tpu_sync_rendezvous.set_vllm_params.remote(description)
             manager._tpu_sync_vllm_params_published = True
-            logger.info(
-                f"tpu-sync: published {len(description['params'])} vLLM parameters (TP={description['tp_size']}) for "
-                "the trainer's export in vLLM's layout"
-            )
+            if options.receive_into_vllm != "off":
+                logger.info(
+                    f"tpu-sync: published {num_params} vLLM parameters (TP={description['tp_size']}) for "
+                    "the trainer's export in vLLM's layout"
+                )
 
     # 1. Every trainer rank binds its tensors to its synchronizer, registers them with the controller and records
     #    the global shapes (and, with stage_d2h, copies them to host memory and unbinds them). ray.get blocks until
@@ -1013,9 +1066,16 @@ async def _finish_tpu_sync(
     t_init_sampler_start = time.perf_counter()
     # vLLM's workers are not Ray processes, so the driver hands them what the trainer published in step 1.
     global_shapes = await manager._tpu_sync_rendezvous.get_global_shapes.remote()
-    # Only passed when off, so rollout workers of other engines keep their signature.
+    global_dtypes = (
+        await manager._tpu_sync_rendezvous.get_global_dtypes.remote()
+        if hasattr(manager._tpu_sync_rendezvous, "get_global_dtypes")
+        else {}
+    )
+    # Optional kwargs are only passed when needed, so rollout workers of other engines keep their signature.
     direct_quantized = getattr(options, "direct_install_quantized_moe", True)
-    extra_init_kwargs = {} if direct_quantized else {"direct_install_quantized_moe": False}
+    extra_init_kwargs: dict[str, Any] = {} if direct_quantized else {"direct_install_quantized_moe": False}
+    if global_dtypes:
+        extra_init_kwargs["global_dtypes"] = global_dtypes
     await asyncio.gather(
         *[
             replica.server_handle.collective_rpc.remote(
