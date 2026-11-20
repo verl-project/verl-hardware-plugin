@@ -36,8 +36,10 @@ Everything else (attention q/k/v/o with the replicated KV heads, the shared expe
 the dense path's rules in ``tpu_sync_worker_extension``.
 
 The layouts above are those of vLLM 0.29's Qwen3.5 (non-interleaved ``in_proj_qkvz`` / ``in_proj_ba``) and of
-vllm-torchtpu's unquantized MoE method. ``plan_direct_install`` checks them on the live vLLM model and falls back to
-vLLM's loaders for anything else (other models, quantized or expert-parallel MoE, a replicated ``in_proj_ba``, ...).
+vllm-torchtpu's MoE methods (``moe_weights.MOE_LAYOUTS``: unquantized, or FP8 experts requantized on the rollout from
+the received bf16 slices). Under vLLM expert parallelism over the TP group each rank receives whole experts (dim 0)
+instead. ``plan_direct_install`` checks all of this on the live vLLM model and falls back to vLLM's loaders for
+anything else (other models, unknown MoE methods or placements, a replicated ``in_proj_ba``, ...).
 """
 
 from __future__ import annotations
@@ -48,16 +50,20 @@ from typing import Any, Callable, Iterator, NamedTuple, Optional
 
 import torch
 
-from verl_hardware_plugin.accelerators.tpu.rollout.direct_install import DirectInstallLayout
+from verl_hardware_plugin.accelerators.tpu.rollout.direct_install import (
+    DirectInstallLayout,
+    non_moe_quantized_reason,
+)
 from verl_hardware_plugin.accelerators.tpu.rollout.moe_weights import (
     MOE_LAYOUT_TPU_EP,
-    MOE_LAYOUTS,
+    MOE_QUANTIZED_LAYOUTS,
+    MoeRequant,
     ParityCheckFn,
     expert_param,
     moe_attr,
     moe_parallel_mode,
-    write_w2,
-    write_w13,
+    plan_moe_layers,
+    write_experts,
 )
 
 # HF model types of the Qwen3.5 text models this module installs.
@@ -193,7 +199,9 @@ class DirectInstallPlan:
     dims: Qwen3_5Dims
     tp_rank: int
     tp_size: int
-    moe_layout: Optional[str]  # MOE_LAYOUT_TPU / MOE_LAYOUT_VLLM / MOE_LAYOUT_TPU_EP, None without experts
+    # One of ``moe_weights.MOE_LAYOUTS``' values (e.g. MOE_LAYOUT_TPU, MOE_LAYOUT_TPU_FP8) or MOE_LAYOUT_TPU_EP; None
+    # without experts.
+    moe_layout: Optional[str]
     # True when vLLM runs expert parallelism over the whole TP group (whole experts per rank, dim-0 sharded); False
     # when vLLM TP-slices every expert's intermediate dimension.
     expert_parallel: bool = False
@@ -201,6 +209,8 @@ class DirectInstallPlan:
     # resolved expert parameter keys (``(prefix, leaf) -> key``), which do not change between syncs.
     padding_checked: bool = False
     expert_keys: dict[tuple[str, str], str] = field(default_factory=dict)
+    # The rollout's quantized expert format for ``moe_weights.MOE_QUANTIZED_LAYOUTS`` (resolved once by the plan).
+    moe_requant: Optional[MoeRequant] = None
 
 
 def make_tpu_sync_local_layout(
@@ -281,14 +291,21 @@ def refuse_split_tensors(weights: Iterator[tuple[str, torch.Tensor]]) -> Iterato
 
 
 def plan_direct_install(
-    vllm_model: Any, global_shapes: dict[str, list[int]], hf_text_config: Any, tp_size: int, worker_rank: int
+    vllm_model: Any,
+    global_shapes: dict[str, list[int]],
+    hf_text_config: Any,
+    tp_size: int,
+    worker_rank: int,
+    allow_quantized_moe: bool = True,
 ) -> tuple[Optional[DirectInstallPlan], str]:
     """``(plan, "")`` if this module can install into ``vllm_model`` directly, else ``(None, reason)``.
 
     Checks, on the live vLLM model rather than by name: a Qwen3.5 text config; the trainer's split tensor layout
     with the config's sizes; GatedDeltaNet heads and expert intermediate size that split evenly over the TP ranks;
-    one fused, non-interleaved, TP-sharded ``in_proj_qkvz`` / ``in_proj_ba`` per received GatedDeltaNet layer; a
-    known unquantized MoE method without expert parallelism; and that this worker's rank is its TP rank (tpu-sync
+    one fused, non-interleaved, TP-sharded ``in_proj_qkvz`` / ``in_proj_ba`` per received GatedDeltaNet layer; MoE
+    layers of one known method and parallel mode (``moe_weights.plan_moe_layers``: TP-sliced experts or expert
+    parallelism over the whole TP group; for a quantized method, also its requantizer and every live weight and scale;
+    ``allow_quantized_moe=False`` refuses quantized experts); and that this worker's rank is its TP rank (tpu-sync
     registers it at that position of the ``[1, tp]`` mesh).
     """
     model_type = getattr(hf_text_config, "model_type", None)
@@ -348,12 +365,21 @@ def plan_direct_install(
     if tp_rank != worker_rank:
         return None, f"worker rank {worker_rank} is not its TP rank {tp_rank}"
 
+    moe_modules = [(n, m) for n, m in modules if hasattr(m, "w13_weight") and hasattr(m, "quant_method")]
+    quant_why = non_moe_quantized_reason(vllm_model, moe_modules if expert_blocks else ())
+    if quant_why:
+        return None, quant_why
+
     moe_layout = None
     expert_parallel = False
+    moe_requant = None
     if expert_blocks:
-        expert_counts = {
-            int(shape[0]) for name, shape in global_shapes.items() if name.endswith(expert_suffixes) and len(shape) == 3
-        }
+        non_3d = sorted(
+            name for name, shape in global_shapes.items() if name.endswith(expert_suffixes) and len(shape) != 3
+        )
+        if non_3d:
+            return None, f"expected 3-D expert tensors, got {non_3d[0]} {list(global_shapes[non_3d[0]])}"
+        expert_counts = {int(shape[0]) for name, shape in global_shapes.items() if name.endswith(expert_suffixes)}
         if len(expert_counts) != 1:
             return None, f"inconsistent expert counts in wire shapes: {sorted(expert_counts)}"
         wire_experts = expert_counts.pop()
@@ -362,41 +388,64 @@ def plan_direct_install(
         num_experts = dims.num_experts or wire_experts
         if not dims.moe_intermediate_size:
             return None, "incomplete Qwen3.5 MoE config: missing moe_intermediate_size"
+        if not moe_modules:
+            return None, "vLLM MoE layouts not found"
+        if len(moe_modules) != len(expert_blocks):
+            return (
+                None,
+                f"vLLM has {len(moe_modules)} fused-MoE layers, the trainer sent {len(expert_blocks)} MoE blocks",
+            )
 
-        layouts: set[str] = set()
-        modes: set[bool] = set()
-        for mod_name, m in modules:
-            if not (hasattr(m, "w13_weight") and hasattr(m, "quant_method")):
-                continue
-            use_ep = bool(moe_attr(m, "use_ep", False))
-            method = type(m.quant_method).__name__
-            if wire_ep:
-                if not use_ep:
+        if wire_ep:
+            for mod_name, m in moe_modules:
+                method = type(m.quant_method).__name__
+                if not bool(moe_attr(m, "use_ep", False)):
                     return None, "the trainer sent the expert-parallel layout but vLLM does not use expert parallelism"
                 if method != "VllmUnquantizedFusedMoEMethod":
                     return None, f"expert-parallel direct install needs vllm-torchtpu's unquantized MoE, not {method}"
                 ep_mode, why = moe_parallel_mode(m, num_experts, dims.moe_intermediate_size, tp_size, tp_rank)
                 if ep_mode is None:
                     return None, f"vLLM's {mod_name}: {why}"
-                layouts.add(MOE_LAYOUT_TPU_EP)
-                modes.add(True)
-                continue
-            if method not in MOE_LAYOUTS:
-                return None, f"unsupported vLLM MoE method {method} (quantized?)"
-            ep_mode, why = moe_parallel_mode(m, num_experts, dims.moe_intermediate_size, tp_size, tp_rank)
-            if ep_mode is None:
-                return None, f"vLLM's {mod_name}: {why}"
-            layouts.add(MOE_LAYOUTS[method])
-            modes.add(use_ep if tp_size == 1 else ep_mode)
-        if len(layouts) != 1:
-            return None, f"vLLM MoE layouts {sorted(layouts) or 'not found'}"
-        if len(modes) != 1:
-            return None, "vLLM's MoE layers mix expert parallelism and TP-sliced experts"
-        moe_layout = layouts.pop()
-        expert_parallel = modes.pop()
+            moe_layout, expert_parallel = MOE_LAYOUT_TPU_EP, True
+        else:
+            cfg_hidden = getattr(hf_text_config, "hidden_size", None)
+            hidden = (
+                int(cfg_hidden)
+                if cfg_hidden
+                else next(int(s[-1]) for n, s in sorted(global_shapes.items()) if n.endswith(".mlp.experts.gate_proj"))
+            )
+            moe_plan, why = plan_moe_layers(
+                moe_modules,
+                num_experts,
+                dims.moe_intermediate_size,
+                hidden,
+                tp_size,
+                tp_rank,
+                allow_quantized=allow_quantized_moe,
+                use_ep_at_tp1=True,
+            )
+            if moe_plan is None:
+                return None, why
+            expected_expert_shapes = {
+                ".mlp.experts.gate_proj": [num_experts, dims.moe_intermediate_size, hidden],
+                ".mlp.experts.up_proj": [num_experts, dims.moe_intermediate_size, hidden],
+                ".mlp.experts.down_proj": [num_experts, hidden, dims.moe_intermediate_size],
+            }
+            for layer in sorted(expert_blocks):
+                for suffix, exp_shape in expected_expert_shapes.items():
+                    t_name = layer + suffix
+                    if list(global_shapes[t_name]) != exp_shape:
+                        return None, (
+                            f"{t_name} is {list(global_shapes[t_name])}, the config gives {exp_shape} "
+                            f"(moe_intermediate_size={dims.moe_intermediate_size})"
+                        )
+            moe_layout, expert_parallel, moe_requant = moe_plan
     elif dims.moe_intermediate_size and dims.moe_intermediate_size % tp_size:
         return None, f"moe_intermediate_size {dims.moe_intermediate_size} does not split over TP={tp_size}"
-    return DirectInstallPlan(dims, tp_rank, tp_size, moe_layout, expert_parallel=expert_parallel), ""
+    return (
+        DirectInstallPlan(dims, tp_rank, tp_size, moe_layout, expert_parallel=expert_parallel, moe_requant=moe_requant),
+        "",
+    )
 
 
 def zero_copy_targets(
@@ -466,7 +515,8 @@ def install(
 
     ``copy_into(vllm_key, tensor)`` copies a tensor in vLLM's checkpoint ([n_out, n_in]) layout, transposing it
     for the weights that vllm-torchtpu keeps as [n_in, n_out]. ``check``, if given, is called on every expert
-    weight region before it is overwritten (the exact parity check; ``copy_into`` runs it for the rest). Updates
+    weight region before it is overwritten (the exact parity check; ``copy_into`` runs it for the rest; quantized
+    experts compare the requantized weights and scales, see ``moe_weights.write_requantized``). Updates
     ``plan.padding_checked`` and ``plan.expert_keys`` (see ``DirectInstallPlan``).
     """
     consumed: set[str] = set()
@@ -517,16 +567,48 @@ def install(
         if plan.moe_layout is None:
             raise RuntimeError(f"{_ERROR_PREFIX}: received experts but planned no MoE layout")
         prefix = m.group(1)
-        gate, up, down = staging[name], staging[f"{prefix}.up_proj"], staging[f"{prefix}.down_proj"]
-        w13_key, w2_key = (
-            expert_param(model_sd, find_model_key, prefix, leaf, plan.expert_keys)
-            for leaf in ("w13_weight", "w2_weight")
+        pieces = (name, f"{prefix}.up_proj", f"{prefix}.down_proj")
+        missing = [p for p in pieces if p not in staging]
+        if missing:
+            raise RuntimeError(f"{_ERROR_PREFIX}: {prefix} lacks {missing}")
+        gate, up, down = (staging[p] for p in pieces)
+        if gate.ndim != 3:
+            raise RuntimeError(f"{_ERROR_PREFIX}: {name} is {tuple(gate.shape)}, expected a 3-D expert stack")
+        local_experts = (
+            (dims.num_experts // tp_size if plan.expert_parallel else dims.num_experts)
+            if dims.num_experts is not None
+            else gate.shape[0]
         )
-        check_padding = not plan.padding_checked
-        write_w13(model_sd[w13_key], gate, up, plan.moe_layout, check_padding, check=check, name=w13_key)
-        write_w2(model_sd[w2_key], down, plan.moe_layout, check_padding, check=check, name=w2_key)
-        consumed.update({name, f"{prefix}.up_proj", f"{prefix}.down_proj"})
-    plan.padding_checked = True
+        local_inter = (
+            (dims.moe_intermediate_size if plan.expert_parallel else dims.moe_intermediate_size // tp_size)
+            if dims.moe_intermediate_size is not None
+            else gate.shape[1]
+        )
+        hidden = gate.shape[2]
+        expected_shapes = (
+            (local_experts, local_inter, hidden),
+            (local_experts, local_inter, hidden),
+            (local_experts, hidden, local_inter),
+        )
+        for piece, t, exp_shape in zip(pieces, (gate, up, down), expected_shapes, strict=True):
+            if tuple(t.shape) != exp_shape:
+                raise RuntimeError(f"{_ERROR_PREFIX}: {piece} is {tuple(t.shape)} on this rank, expected {exp_shape}")
+        write_experts(
+            model_sd,
+            find_model_key,
+            prefix,
+            gate,
+            up,
+            down,
+            layout=plan.moe_layout,
+            expert_keys=plan.expert_keys,
+            check_padding=not plan.padding_checked,
+            requant=plan.moe_requant,
+            check=check,
+        )
+        consumed.update(pieces)
+    # Requantized experts are written whole (fresh zero padding), so no padding is checked for them.
+    plan.padding_checked = plan.moe_layout not in MOE_QUANTIZED_LAYOUTS
     return consumed
 
 

@@ -74,6 +74,11 @@ for this backend):
   - from all trainer and rollout hosts to the tpu-sync controller, which runs in the driver process;
   - from the trainer hosts to the rollout hosts. Every trainer and rollout worker listens on a port the
     OS assigns and registers it with the controller, so no fixed port range needs to be open.
+- The weights travel over the hosts' data NICs. tpu-sync treats every NIC with jumbo frames (MTU above 1500)
+  as a data NIC, listens on all of them, and each worker registers one of them with the controller, the
+  workers of a host taking the NICs in turn. A host without such a NIC uses its default IP, as do the control
+  messages. On Cloud TPU v6e hosts with two extra 200 Gbps NICs (`ct6e-standard-4t`), this sends the weights
+  over both instead of the default NIC.
 
 ## Configuration
 
@@ -88,10 +93,12 @@ actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 | Option (`engine_kwargs.tpu-sync.*`) | Default | Description |
 |-------------------------------------|---------|-------------|
 | `parallelism` | `8` | Parallel transfer streams per worker. |
+| `group_size` | `16` | Number of consecutive tensors the tpu-sync controller plans and schedules as one stage of the transfer (`1` makes every tensor its own stage). |
 | `verify_parity` | `off` | Weight-sync check: `off`, `norm`, `exact` or `all` (`True` means `norm`). See [Parity checks](#parity-checks). A failed check stops the run. Meant for bring-up and after changing sharding or upgrading tpu-sync. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The deprecated environment variable `VERL_TPU_SYNC_RELEASE_BUFFERS` still overrides the option on the trainer workers and logs a deprecation warning. |
 | `tie_word_embeddings` | unset | Whether `lm_head` is tied to the input embedding, so it need not be sent. Set, the trainer does not send `lm_head.weight`, and every rollout worker copies its embedding into its LM head after the install. Each sync checks that copy: `lm_head` must have been copied from the embedding, or share its tensor, and be bitwise equal to it (with `verify_parity=exact` or `all`, the step-0 sync also requires the checkpoint's `lm_head` to equal the embedding); otherwise the sync fails before generation resumes. The check needs a direct [install mode](#rollout-install): with `vllm loaders`, a sync with the option set fails. The option cannot be combined with `receive_into_vllm=True`, which receives straight into vLLM's parameters and never fills `lm_head` from the embedding: the two together are rejected when the options are parsed, before any weights are sent. With a direct install, the driver logs one `[TPU-SYNC TIED LM_HEAD ...]` line per rollout worker and sync, also with the option unset. Unset sends `lm_head`, which is correct for tied and untied models alike. |
 | `return_after_d2h` | `True` | Return to the trainer as soon as its ranks have copied their weights to host memory and freed the device buffers, and finish the sync (transfer, pause, install, resume) in the background while training goes on. The next sync waits for it first and raises its error, if any. Applies from the second sync on (tpu-sync keeps the weights bound across the first transfer to a rollout topology) and needs a `tpu-sync-torch` whose `WeightSynchronizer.d2h()` returns a future; otherwise the sync runs to the end as before. See [Returning after the D2H](#returning-after-the-d2h). |
+| `direct_install_quantized_moe` | `True` | Install quantized rollout MoE experts (e.g. `vllm-torchtpu`'s FP8 MoE with `QUANTIZE_ON_LOAD_PREFIXES=experts`) directly: each rollout rank requantizes its received bf16 expert slices with the rollout's own quantizer and writes the live weights and scales in place. Set to `False` to install quantized experts through vLLM's checkpoint loaders instead (much slower, e.g. for debugging). |
 
 ## Rollout install
 
@@ -99,15 +106,15 @@ Each rollout worker picks an install mode on the first sync, logged as `install 
 
 | Mode | Models | How |
 |------|--------|-----|
-| `direct` | Dense models (Qwen3, Llama) | Each rank receives its TP shard and copies it into vLLM's (fused, possibly transposed) parameters. |
-| `qwen3_5 direct` | Qwen3.5 | As `direct`, plus the GatedDeltaNet and expert layouts of `rollout/qwen3_5_layout.py` (experts sliced on their intermediate dimension). |
-| `qwen3_moe direct` | Qwen3 MoE (e.g. Qwen3-30B-A3B), with vLLM expert parallelism over the whole TP group (`enable_expert_parallel`, EP size = TP size) or without it | Each rank receives one block of each 3-D expert stack: with EP its own whole experts (dim 0), without EP its slice of every expert's intermediate dimension (as Qwen3.5); it writes them into vLLM's `w13_weight` / `w2_weight`. The router is received whole (`rollout/qwen3_moe_layout.py`). |
-| `vllm loaders` | Any other hybrid or MoE model or layout (e.g. quantized experts, EP that does not cover the TP group) | Every rank all-gathers every tensor and runs vLLM's own checkpoint loaders. Correct, but slow; the log says why no direct install was possible. |
+| `direct` | Unquantized dense models (Qwen3, Llama) | Each rank receives its TP shard and copies it into vLLM's (fused, possibly transposed) parameters. |
+| `qwen3_5 direct` | Qwen3.5 (dense or MoE, with EP over the TP group or TP-sliced experts; unquantized or `vllm-torchtpu` FP8 routed experts when non-expert layers stay unquantized) | As `direct`, plus the GatedDeltaNet and expert layouts of `rollout/qwen3_5_layout.py` (FP8 routed experts are requantized from each rank's received bf16 slice). |
+| `qwen3_moe direct` | Qwen3 MoE (e.g. Qwen3-30B-A3B), with vLLM expert parallelism over the whole TP group (`enable_expert_parallel`, EP size = TP size) or without it; unquantized or `vllm-torchtpu` FP8 routed experts when non-expert layers stay unquantized | Each rank receives one block of each 3-D expert stack: with EP its own whole experts (dim 0), without EP its slice of every expert's intermediate dimension (as Qwen3.5); it writes (or requantizes) them into vLLM's `w13_weight` / `w2_weight` (and scales). The router is received whole (`rollout/qwen3_moe_layout.py`). |
+| `vllm loaders` | Any other hybrid or MoE model or layout (e.g. quantized non-expert layers, unsupported quantized MoE methods, or EP that does not cover the TP group) | Every rank all-gathers every tensor and runs vLLM's own checkpoint loaders. Correct, but slow; the log says why no direct install was possible. |
 
 The model-specific direct modes are the entries of `rollout/direct_install.py`, tried in order; the first whose
 checks pass on the live vLLM model is used. To add one, write `rollout/<model>_layout.py` with a
-`DirectInstallLayout` and add it to that table; the worker extension stays unchanged. The expert writers for vLLM's
-fused-MoE weights are shared in `rollout/moe_weights.py`.
+`DirectInstallLayout` and add it to that table; the worker extension stays unchanged. The expert planners and writers
+for vLLM's fused-MoE weights are shared in `rollout/moe_weights.py`.
 
 ## Parity checks
 
@@ -128,8 +135,10 @@ extra compare per tensor, once. The driver logs one line per replica:
 
 followed, on a mismatch, by one line per mismatched tensor and rank. It covers every tensor installed directly into
 vLLM's parameters, including each written region of the experts' `w13_weight` (`[gate]` / `[up]`) and `w2_weight`
-for Qwen3.5 and Qwen3 MoE. Models installed through vLLM's weight loaders cannot be checked bit for bit (the loaders
-re-shard the tensors themselves); the check logs `not run` and fails, so use `verify_parity=norm` for them.
+for Qwen3.5 and Qwen3 MoE (and, for FP8 routed experts quantized on load from bf16 via `QUANTIZE_ON_LOAD_PREFIXES=experts`,
+the requantized weights and scales reported as `<key>[requantized]`). Models installed through vLLM's weight loaders
+cannot be checked bit for bit (the loaders re-shard the tensors themselves); the check logs `not run` and fails, so use
+`verify_parity=norm` for them.
 
 An enabled check that fails raises `TPUSyncParityError` on the driver, which stops the run. It fails on a mismatch
 (including `unresolved` tensors in the `exact` check), and also when it cannot collect what it needs: trainer ranks

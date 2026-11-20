@@ -146,28 +146,56 @@ def test_tpu_sync_options_are_parsed_and_typed():
     assert get_tpu_sync_options(None) == TPUSyncOptions()
     assert get_tpu_sync_options({}) == TPUSyncOptions(
         parallelism=8,
+        group_size=16,
         verify_parity="off",
         release_buffers_after_sync=True,
         tie_word_embeddings=None,
         return_after_d2h=True,
+        receive_into_vllm="auto",
+        direct_install_quantized_moe=True,
     )
     # Command-line overrides may arrive as strings.
     options = get_tpu_sync_options(
         {
             "parallelism": "4",
+            "group_size": "128",
             "verify_parity": "true",
             "release_buffers_after_sync": "0",
             "tie_word_embeddings": 1,
             "return_after_d2h": "false",
+            "receive_into_vllm": "false",
+            "direct_install_quantized_moe": "false",
         }
     )
     assert options == TPUSyncOptions(
         parallelism=4,
+        group_size=128,
         verify_parity="norm",
         release_buffers_after_sync=False,
         tie_word_embeddings=True,
         return_after_d2h=False,
+        receive_into_vllm="off",
+        direct_install_quantized_moe=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "auto"),
+        ("auto", "auto"),
+        (" AUTO ", "auto"),
+        (True, "on"),
+        ("true", "on"),
+        ("on", "on"),
+        (False, "off"),
+        ("false", "off"),
+        ("off", "off"),
+    ],
+)
+def test_tpu_sync_receive_into_vllm_modes(value, expected):
+    options = get_tpu_sync_options({} if value is None else {"receive_into_vllm": value})
+    assert options.receive_into_vllm == expected
 
 
 @pytest.mark.parametrize(
@@ -188,7 +216,9 @@ def test_tpu_sync_verify_parity_modes(value, mode, norms, exact):
     assert (options.verify_parity, options.verify_norms, options.verify_exact) == (mode, norms, exact)
 
 
-@pytest.mark.parametrize("kwargs", [{"paralelism": 4}, {"parallelism": 0}, {"verify_parity": "maybe"}])
+@pytest.mark.parametrize(
+    "kwargs", [{"paralelism": 4}, {"parallelism": 0}, {"group_size": 0}, {"verify_parity": "maybe"}]
+)
 def test_tpu_sync_options_reject_unknown_keys_and_bad_values(kwargs):
     with pytest.raises(ValueError, match="engine_kwargs.tpu-sync"):
         get_tpu_sync_options(kwargs)

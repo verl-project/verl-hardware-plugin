@@ -59,7 +59,7 @@ def test_custom_table():
     def layout(name, plan):
         return direct_install.DirectInstallLayout(
             name=name,
-            plan=lambda *args: (plan, "" if plan else f"{name} refused"),
+            plan=lambda *args, **kwargs: (plan, "" if plan else f"{name} refused"),
             sharding_rule=lambda *args: None,
             install=lambda *args: (set(), set()),
         )

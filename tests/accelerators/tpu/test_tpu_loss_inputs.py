@@ -3,9 +3,13 @@
 
 """Unit tests (CPU) for the adapter between the TPU engine's outputs and verl's SFT / PPO losses."""
 
+import os
+
 import pytest
 import torch
 from tensordict import TensorDict
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_leaves
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -53,8 +57,11 @@ def test_prepare_tpu_loss_inputs_matches_unmodified_sft_loss():
     assert torch.allclose(padded_log_probs.grad, expected_grad)
 
 
-def _ppo_micro_batch(lengths, max_response_len=None, seed=0):
-    """Packed PPO micro-batch as `TorchTitanTPUEngineWithLMHead` builds it: nested prompts/responses on CPU."""
+def _ppo_micro_batch(lengths, max_response_len=None, seed=0, response_masks=None):
+    """Packed PPO micro-batch as `TorchTitanTPUEngineWithLMHead` builds it: nested prompts/responses on CPU.
+
+    ``response_masks`` (one list per row) marks the valid response tokens; all valid by default.
+    """
     gen = torch.Generator().manual_seed(seed)
 
     def nested(rows):
@@ -67,7 +74,11 @@ def _ppo_micro_batch(lengths, max_response_len=None, seed=0):
             "prompts": nested([torch.randint(0, 100, (p,), generator=gen) for p in prompt_lens]),
             "responses": nested([torch.randint(0, 100, (r,), generator=gen) for r in response_lens]),
             "input_ids": nested([torch.randint(0, 100, (p + r,), generator=gen) for p, r in lengths]),
-            "response_mask": nested([torch.ones(r, dtype=torch.int64) for r in response_lens]),
+            "response_mask": nested(
+                [torch.ones(r, dtype=torch.int64) for r in response_lens]
+                if response_masks is None
+                else [torch.tensor(m, dtype=torch.int64) for m in response_masks]
+            ),
             "old_log_probs": nested([-torch.rand(r, generator=gen) for r in response_lens]),
             "advantages": nested([torch.randn(r, generator=gen) for r in response_lens]),
             "ref_log_prob": nested([-torch.rand(r, generator=gen) for r in response_lens]),
@@ -97,6 +108,11 @@ def _ppo_model_output(lengths, padded_len, with_entropy, seed=0):
     return model_output, leaves, cu_seqlens
 
 
+def _metric_value(metric):
+    """A loss metric's value: verl ``Metric`` objects aggregate, plain numbers pass through."""
+    return metric.aggregate() if hasattr(metric, "aggregate") else float(metric)
+
+
 def _ppo_config():
     return ActorConfig(
         strategy="fsdp",
@@ -109,9 +125,20 @@ def _ppo_config():
     )
 
 
-@pytest.mark.parametrize("lengths", [[(5, 7)], [(3, 2), (6, 9), (4, 1)]])
+# Same buckets (response bucket 16, packed bucket 48), different mask contents and numbers of valid tokens.
+_MASK_CASES = [
+    ([(3, 2), (6, 9), (4, 1)], None),
+    ([(3, 2), (6, 9), (4, 1)], [[1, 0], [1, 1, 0, 1, 0, 1, 1, 0, 1], [1]]),
+    ([(3, 2), (6, 9), (4, 1)], [[0, 1], [0, 0, 0, 0, 0, 0, 0, 0, 1], [1]]),
+    ([(5, 7), (9, 11)], [[0, 0, 1, 0, 0, 0, 1], [1] * 11]),
+]
+
+
+@pytest.mark.parametrize(
+    "lengths,response_masks", [([(5, 7)], None), ([(3, 2), (6, 9), (4, 1)], None), *_MASK_CASES[1:]]
+)
 @pytest.mark.parametrize("with_entropy", [False, True])
-def test_prepare_tpu_loss_inputs_ppo_matches_unmodified_ppo_loss(lengths, with_entropy):
+def test_prepare_tpu_loss_inputs_ppo_matches_unmodified_ppo_loss(lengths, response_masks, with_entropy):
     padded_len = bucket_length(sum(p + r for p, r in lengths), 16)
     response_bucket = bucket_length(max(r for _, r in lengths), 16)
 
@@ -121,14 +148,16 @@ def test_prepare_tpu_loss_inputs_ppo_matches_unmodified_ppo_loss(lengths, with_e
     reference_output = {
         key: torch.nested.nested_tensor_from_jagged(leaf[:total], cu_seqlens) for key, leaf in leaves.items()
     }
-    ref_loss, ref_metrics = ppo_loss(_ppo_config(), reference_output, _ppo_micro_batch(lengths))
+    ref_loss, ref_metrics = ppo_loss(
+        _ppo_config(), reference_output, _ppo_micro_batch(lengths, response_masks=response_masks)
+    )
     ref_loss.backward()
     ref_grads = {key: leaf.grad.clone() for key, leaf in leaves.items()}
     for leaf in leaves.values():
         leaf.grad = None
 
     # TPU adapter: bucket-padded outputs, static layout, same unmodified core loss.
-    micro_batch = _ppo_micro_batch(lengths, max_response_len=response_bucket)
+    micro_batch = _ppo_micro_batch(lengths, max_response_len=response_bucket, response_masks=response_masks)
     loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
     loss, metrics = ppo_loss(_ppo_config(), loss_model_output, loss_data)
     loss.backward()
@@ -137,6 +166,8 @@ def test_prepare_tpu_loss_inputs_ppo_matches_unmodified_ppo_loss(lengths, with_e
     for key, leaf in leaves.items():
         torch.testing.assert_close(leaf.grad, ref_grads[key], rtol=0, atol=1e-7)
     assert set(metrics) == set(ref_metrics)
+    for key, ref_metric in ref_metrics.items():
+        assert _metric_value(metrics[key]) == pytest.approx(_metric_value(ref_metric), rel=1e-6, abs=1e-7), key
     # The source micro-batch keeps its real sequence metadata.
     assert micro_batch["responses"].offsets().diff().tolist() == [r for _, r in lengths]
 
@@ -168,3 +199,76 @@ def test_prepare_tpu_loss_inputs_ppo_falls_back_to_trimmed_outputs():
     loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, _ppo_micro_batch(lengths, 16))
     assert loss_model_output["log_probs"].values().shape == torch.Size([int(cu_seqlens[-1])])
     assert loss_data["responses"].offsets().diff().tolist() == [2, 5]
+
+
+class _DataDependentShapeGuard(TorchDispatchMode):
+    """Fails on ops whose output shape depends on tensor values: boolean-mask indexing, dynamic ``nonzero`` and
+    ``masked_select``. On TPU every new output size compiles new programs, once per micro-batch when the size follows
+    its valid tokens (verl-project/verl#8663). Integer indexing and gather keep static shapes and stay allowed."""
+
+    _DYNAMIC_OUTPUT = {torch.ops.aten.nonzero.default, torch.ops.aten.masked_select.default}
+    _INDEXING = {
+        torch.ops.aten.index.Tensor,
+        torch.ops.aten.index_put.default,
+        torch.ops.aten.index_put_.default,
+        torch.ops.aten._index_put_impl_.default,
+    }
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func in self._DYNAMIC_OUTPUT:
+            raise AssertionError(f"data-dependent output shape in the TPU loss path: {func}")
+        if func in self._INDEXING:
+            indices = args[1] if len(args) > 1 else kwargs.get("indices", ())
+            if any(isinstance(i, torch.Tensor) and i.dtype in (torch.bool, torch.uint8) for i in indices or ()):
+                raise AssertionError(f"boolean-mask indexing in the TPU loss path: {func}")
+        return func(*args, **kwargs)
+
+
+class _DenseShapeRecorder(TorchDispatchMode):
+    """Records each op and the shapes of the dense (non-nested) tensors it returns."""
+
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        shapes = tuple(tuple(t.shape) for t in tree_leaves(out) if isinstance(t, torch.Tensor) and not t.is_nested)
+        self.records.append((str(func), shapes))
+        return out
+
+
+def _tpu_ppo_loss_inputs(lengths, response_masks):
+    model_output, _, _ = _ppo_model_output(lengths, padded_len=48, with_entropy=True)
+    micro_batch = _ppo_micro_batch(lengths, max_response_len=16, response_masks=response_masks)
+    return prepare_tpu_loss_inputs(model_output, micro_batch)
+
+
+@pytest.mark.parametrize("lengths,response_masks", _MASK_CASES)
+def test_ppo_loss_on_tpu_inputs_has_no_data_dependent_shapes(lengths, response_masks):
+    loss_model_output, loss_data = _tpu_ppo_loss_inputs(lengths, response_masks)
+    with _DataDependentShapeGuard():
+        ppo_loss(_ppo_config(), loss_model_output, loss_data)
+
+
+def test_ppo_loss_shapes_on_tpu_inputs_do_not_depend_on_mask_contents():
+    """Same buckets, different mask contents and valid-token counts: every dense intermediate keeps its shape."""
+    traces = []
+    for lengths, response_masks in _MASK_CASES[:3]:
+        loss_model_output, loss_data = _tpu_ppo_loss_inputs(lengths, response_masks)
+        with _DenseShapeRecorder() as recorder:
+            ppo_loss(_ppo_config(), loss_model_output, loss_data)
+        traces.append(recorder.records)
+    assert traces[0] == traces[1] == traces[2]
+
+
+def test_core_under_test_emits_the_expected_loss_metrics():
+    """The core-SHA CI job names metrics in TPU_LOSS_EXPECT_METRICS so the checks above provably run them."""
+    expected = [m for m in os.environ.get("TPU_LOSS_EXPECT_METRICS", "").split(",") if m]
+    if not expected:
+        pytest.skip("TPU_LOSS_EXPECT_METRICS is not set (the core-SHA CI job sets it)")
+    loss_model_output, loss_data = _tpu_ppo_loss_inputs(*_MASK_CASES[1])
+    _, metrics = ppo_loss(_ppo_config(), loss_model_output, loss_data)
+    missing = [m for m in expected if m not in metrics]
+    assert not missing, f"the verl core under test does not emit {missing}"
