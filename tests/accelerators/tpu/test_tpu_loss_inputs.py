@@ -368,15 +368,19 @@ def test_geo_mean_rows_are_not_padded_because_pad_rows_rescale_it():
     assert padded_pg_loss == pytest.approx(ref_pg_loss * 3 / 4, rel=1e-5)
 
 
-@pytest.mark.parametrize("rollout_is", [None, "sequence"])
+@pytest.mark.parametrize("rollout_is", [None, "token", "sequence"])
 def test_bypass_mode_rows_are_not_padded_because_rollout_metrics_count_pad_rows(rollout_is):
-    """bypass_mode's rollout-correction metrics (e.g. ``rollout_corr/training_ppl``) average over every row."""
+    """bypass_mode's sequence-level rollout-correction metrics average over every row."""
     config = _loss_mode_config("bypass_mode", "token-mean", rollout_is=rollout_is)
     assert not loss_inputs.loss_rows_can_be_padded(functools.partial(ppo_loss, config=config))
-    ref_metrics = _run_ppo_loss(config, 0)[2]
-    padded_metrics = _run_ppo_loss(config, 4)[2]  # if the engine padded its rows
-    name = "rollout_corr/training_ppl"
-    assert _metric_value(padded_metrics[name]) != pytest.approx(_metric_value(ref_metrics[name]), rel=1e-6)
+    if rollout_is is not None:
+        # ``rollout_corr/rollout_is_seq_mean`` averages ``seq_mean_weights`` across all batch rows (including zeroed
+        # pad rows) in both released verl and pinned main; ``rollout_corr/training_ppl`` also did so prior to
+        # ``_valid_row_mean`` in newer verl main.
+        ref_metrics = _run_ppo_loss(config, 0)[2]
+        padded_metrics = _run_ppo_loss(config, 4)[2]  # if the engine padded its rows
+        name = "rollout_corr/rollout_is_seq_mean"
+        assert _metric_value(padded_metrics[name]) == pytest.approx(_metric_value(ref_metrics[name]) * 3 / 4, rel=1e-5)
 
 
 def test_loss_rows_can_be_padded_only_for_known_row_invariant_ppo_losses():
