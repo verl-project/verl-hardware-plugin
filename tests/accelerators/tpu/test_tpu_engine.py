@@ -1012,7 +1012,7 @@ def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
     from torch.distributed.fsdp import FSDPModule
 
     from verl.workers.engine.base import BaseEngine
-    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu, tpu_utils
+    from verl_hardware_plugin.accelerators.tpu.engines import gdn_slot_schedule, torchtitan_tpu, tpu_utils
     from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
         derive_torchtitan_name_and_flavor,
         enable_fsdp_gradient_division,
@@ -1023,7 +1023,7 @@ def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
 
     # Nothing in the engine imports core verl's GPU TorchTitan engine, and torchtitan is only imported inside
     # functions, so the plugin registers on machines without torchtitan.
-    for module in (torchtitan_tpu, tpu_utils):
+    for module in (torchtitan_tpu, tpu_utils, gdn_slot_schedule):
         tree = ast.parse(open(module.__file__).read())
         assert not any(n.startswith("verl.workers.engine.torchtitan") for n in _imported_modules(ast.walk(tree)))
         assert not any(n.startswith("torchtitan") for n in _imported_modules(tree.body))
@@ -1884,6 +1884,8 @@ def test_enable_context_parallel_all_gather_requires_splash():
             "torchtitan.config.transform": fake_transform,
             "torchtitan.experiments": SimpleNamespace(),
             "torchtitan.experiments.tpu": SimpleNamespace(cp_attention=fake_cp_attention),
+            "torchtitan.experiments.tpu.distributed": None,
+            "torchtitan.experiments.tpu.distributed.cp_attention": None,
             "torchtitan.experiments.tpu.cp_attention": fake_cp_attention,
         },
     ):

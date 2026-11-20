@@ -367,3 +367,60 @@ def test_context_parallel_strategy_and_gdn_option_validation():
     ):
         with pytest.raises(ValueError, match="context_parallel_size > 1"):
             resolve_tpu_torchtitan_options(_cfg(tpu_dict, context_parallel_size=1, use_torch_compile=False))
+
+
+def test_cp_gdn_slot_and_static_logprob_options():
+    opts = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(
+            engine_kwargs={
+                "tpu": {
+                    "cp_full_positions": "true",
+                    "gdn_auto_row_slot_len": "32768",
+                    "fuse_gdn_projections": True,
+                    "sort_micro_batches_by_slot": "1",
+                    "static_log_prob_micro_batch_len": 65536,
+                }
+            }
+        )
+    )
+    assert opts.cp_full_positions is True
+    assert opts.gdn_auto_row_slot_len == 32768
+    assert opts.fuse_gdn_projections is True
+    assert opts.sort_micro_batches_by_slot is True
+    assert opts.static_log_prob_micro_batch_len == 65536
+
+    with pytest.raises(ValueError, match="Invalid TPU engine option gdn_auto_row_slot_len"):
+        tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"gdn_auto_row_slot_len": 0}}))
+
+    with pytest.raises(ValueError, match="Invalid TPU engine option static_log_prob_micro_batch_len"):
+        tpu_options.get_tpu_engine_options(
+            SimpleNamespace(engine_kwargs={"tpu": {"static_log_prob_micro_batch_len": -4}})
+        )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        tpu_options.get_tpu_engine_options(
+            SimpleNamespace(engine_kwargs={"tpu": {"gdn_auto_row_slot_len": 16384, "gdn_row_slot_len": 16384}})
+        )
+
+    for bad_static_cfg in (
+        {"gdn_auto_row_slot_len": 32768, "static_micro_batch_len": 16384},
+        {"gdn_auto_row_slot_len": 32768, "static_micro_batch_len": 49152},
+        {"gdn_auto_row_slot_len": 32768, "static_log_prob_micro_batch_len": 16384},
+        {"gdn_auto_row_slot_len": 32768, "static_log_prob_micro_batch_len": 40000},
+    ):
+        with pytest.raises(ValueError, match="divisible by gdn_auto_row_slot_len"):
+            tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": bad_static_cfg}))
+
+    valid_static = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(
+            engine_kwargs={
+                "tpu": {
+                    "gdn_auto_row_slot_len": 32768,
+                    "static_micro_batch_len": 32768,
+                    "static_log_prob_micro_batch_len": 98304,
+                }
+            }
+        )
+    )
+    assert valid_static.static_micro_batch_len == 32768
+    assert valid_static.static_log_prob_micro_batch_len == 98304

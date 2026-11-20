@@ -577,6 +577,7 @@ _DYNAMO_CACHE_TARGETS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("torchtitan.experiments.tpu.qwen3_5.tokamax_gated_delta", ("_tpu_generation", "_import_kda")),
     ("torchtitan.experiments.tpu.kernels.ragged_gather_tc", ("_tpu_generation",)),
     ("torchtitan.experiments.tpu.kernels.causal_conv1d", ("_tpu_generation",)),
+    ("torchtitan.experiments.tpu.kernels.pallas_vmem", ("tpu_generation",)),
 )
 
 

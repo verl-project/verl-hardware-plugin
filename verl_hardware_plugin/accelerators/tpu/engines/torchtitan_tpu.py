@@ -74,7 +74,12 @@ from verl.workers.engine.utils import (
     prepare_micro_batches,
 )
 from verl.workers.utils.padding import no_padding_2_padding
-from verl_hardware_plugin.accelerators.tpu.engines import graph_trainer_mode, tpu_model_kernels, tpu_ragged_ep
+from verl_hardware_plugin.accelerators.tpu.engines import (
+    gdn_slot_schedule,
+    graph_trainer_mode,
+    tpu_model_kernels,
+    tpu_ragged_ep,
+)
 from verl_hardware_plugin.accelerators.tpu.engines.cp_layer_transforms import (
     context_parallel_layer_transforms,
     module_available,
@@ -1340,10 +1345,46 @@ class TorchTitanTPUEngine(BaseEngine):
         if self._gdn_row_slot_len:
             if not self._use_fused_linear_cross_entropy:
                 raise ValueError("gdn_row_slot_len needs the fused log-prob path (use_fused_linear_cross_entropy)")
+            if parallelism.context_parallel_degree > 1:
+                raise ValueError(
+                    "gdn_row_slot_len is not supported with context parallelism; "
+                    "use gdn_auto_row_slot_len with context_parallel_strategy='ulysses'"
+                )
             # Each gdn_row_slot_len-token row holds one sequence, so the GatedDeltaNet needs no document resets.
             self.config.override.imports.append(
                 ("torchtitan.experiments.tpu.qwen3_5.gated_delta.gated_delta_document_resets", {"enabled": False})
             )
+        self._cp_full_positions = bool(tpu_options.cp_full_positions)
+        self._gdn_auto_row_slot_len = int(tpu_options.gdn_auto_row_slot_len or 0)
+        self._sort_micro_batches_by_slot = bool(tpu_options.sort_micro_batches_by_slot)
+        if self._gdn_auto_row_slot_len:
+            if not isinstance(self, TorchTitanTPUEngineWithLMHead) or not self._use_fused_linear_cross_entropy:
+                raise ValueError(
+                    "gdn_auto_row_slot_len requires TorchTitanTPUEngineWithLMHead with use_fused_linear_cross_entropy"
+                )
+            if self._graph_trainer_mode:
+                raise ValueError("gdn_auto_row_slot_len is not supported with trainer_mode='graph_trainer'")
+            if parallelism.tensor_parallel_degree > 1:
+                raise ValueError("gdn_auto_row_slot_len does not support tensor parallelism")
+            if parallelism.context_parallel_degree > 1 and parallelism.context_parallel_load_balancer is not None:
+                raise ValueError(
+                    "gdn_auto_row_slot_len under context parallelism requires contiguous token sharding "
+                    "(context_parallel_strategy='ulysses', load_balancer=None)"
+                )
+            seq_bucket_sz = get_tpu_seq_bucket_size(self.engine_config)
+            if not tpu_options.static_micro_batch_len and seq_bucket_sz % self._gdn_auto_row_slot_len != 0:
+                logger.warning(
+                    "gdn_auto_row_slot_len=%d is set without static_micro_batch_len and seq_bucket_size=%d is not "
+                    "divisible by gdn_auto_row_slot_len; micro-batches whose bucketed length is not a multiple of "
+                    "%d will fall back to single-doc or segmented execution.",
+                    self._gdn_auto_row_slot_len,
+                    seq_bucket_sz,
+                    self._gdn_auto_row_slot_len,
+                )
+        if tpu_options.fuse_gdn_projections:
+            if parallelism.tensor_parallel_degree > 1:
+                raise ValueError("fuse_gdn_projections does not support tensor parallelism")
+            gdn_slot_schedule.enable_fused_gdn_projections(self.config.model_spec.model)
         for override_import in tpu_model_kernels.override_imports(self._tpu_kernels):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
@@ -1363,6 +1404,11 @@ class TorchTitanTPUEngine(BaseEngine):
         # TorchTitan disables gradient division by default (for global token normalization),
         # but verl's loss function multiplies by dp_size to compensate for gradient averaging.
         model_parts = self.trainer.model_parts
+        gdn_slot_schedule.validate_model_cp_slot_support(
+            model_parts,
+            need_cp_full_positions=self._cp_full_positions and self.parallel_dims.cp_enabled,
+            need_document_resets_override=bool(self._gdn_auto_row_slot_len),
+        )
         if self.engine_config.data_parallel_shard_size > 1:
             dp_size = self.get_data_parallel_size()
             for model_part in model_parts:
@@ -1708,6 +1754,70 @@ class TorchTitanTPUEngine(BaseEngine):
         with timeline.span(span_name, group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()):
             return super().infer_batch(data, loss_function)
 
+    def _allow_auto_row_slot(self) -> bool:
+        """Whether dynamic per-micro-batch GDN row-slot scheduling (``gdn_auto_row_slot_len``) is active."""
+        auto_slot_len = int(getattr(self, "_gdn_auto_row_slot_len", 0) or 0)
+        slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)
+        if (
+            auto_slot_len <= 0
+            or slot_len > 0
+            or bool(getattr(self, "_graph_trainer_mode", False))
+            or not isinstance(self, TorchTitanTPUEngineWithLMHead)
+            or not bool(getattr(self, "_use_fused_linear_cross_entropy", False))
+            or bool(getattr(self.parallel_dims, "tp_enabled", False))
+        ):
+            return False
+        if bool(getattr(self.parallel_dims, "cp_enabled", False)):
+            parallelism = getattr(getattr(getattr(self, "trainer", None), "config", None), "parallelism", None)
+            if getattr(parallelism, "context_parallel_load_balancer", None) is not None:
+                return False
+        return True
+
+    def _effective_mb_slot_len(
+        self,
+        micro_batch: TensorDict,
+        *,
+        allow_auto_row_slot: bool,
+        forward_only: bool,
+        padded_seq_len: Optional[int] = None,
+    ) -> int:
+        """Resolved per-micro-batch GDN unflatten slot length, gated on ``allow_auto_row_slot`` and entropy mode."""
+        if not allow_auto_row_slot:
+            return 0
+        mb_slot_len = int(
+            tu.get_non_tensor_data(data=micro_batch, key=gdn_slot_schedule.MB_SLOT_LEN_KEY, default=0) or 0
+        )
+        if mb_slot_len <= 0:
+            return 0
+        use_rmpad = bool(
+            unwrap_metadata(tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True))
+        )
+        if not use_rmpad:
+            return 0
+        if padded_seq_len is None:
+            ids = micro_batch["input_ids"]
+            orig_len = int(ids.values().numel()) if getattr(ids, "is_nested", False) else int(ids.numel())
+            bucket_sz = get_tpu_seq_bucket_size(self.engine_config)
+            padded_seq_len = max(
+                bucket_length(orig_len, bucket_sz),
+                int(tu.get_non_tensor_data(data=micro_batch, key="tpu_padded_seq_len", default=0) or 0),
+            )
+        if padded_seq_len < mb_slot_len or padded_seq_len % mb_slot_len != 0:
+            return 0
+        ids = micro_batch["input_ids"]
+        if getattr(ids, "is_nested", False):
+            offs = ids.offsets()
+            n_seqs = int(offs.numel() - 1)
+            max_seq = int(offs.diff().max().item()) if n_seqs > 0 else 0
+            if n_seqs > padded_seq_len // mb_slot_len or max_seq > mb_slot_len:
+                return 0
+        calculate_entropy = bool(
+            unwrap_metadata(tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False))
+        )
+        if mb_slot_len < padded_seq_len and calculate_entropy and not forward_only:
+            return 0
+        return mb_slot_len
+
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only: bool = False):
         """Perform forward and optionally backward pass with host-side token counting and XLA graph break."""
         graph_mode = getattr(self, "_graph_trainer_mode", False)
@@ -1736,15 +1846,43 @@ class TorchTitanTPUEngine(BaseEngine):
         )
         tpu_options = get_tpu_engine_options(self.engine_config)
         static_len = int(tpu_options.static_micro_batch_len or 0)
+        if forward_only and tpu_options.static_log_prob_micro_batch_len:
+            static_len = int(tpu_options.static_log_prob_micro_batch_len)
         static_response_len = int(tpu_options.static_max_response_len or 0)
         slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)
         # Pad the PPO loss rows to a common bucket only for losses that provably ignore fully masked rows.
         bucket_rows = tpu_options.loss_row_bucketing is not False and loss_rows_can_be_padded(loss_function)
         static_num_seqs = int(tpu_options.static_micro_batch_num_seqs or 0)
-        if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len or slot_len:
+        auto_slot_len = int(getattr(self, "_gdn_auto_row_slot_len", 0) or 0)
+        bucket_sz = get_tpu_seq_bucket_size(self.engine_config)
+        allow_auto_row_slot = self._allow_auto_row_slot()
+        effective_forward_only = forward_only or not torch.is_grad_enabled()
+        if (
+            getattr(self, "_sort_micro_batches_by_slot", False)
+            and indices is not None
+            and len(micro_batches) > 1
+            and not slot_len
+        ):
+            micro_batches, indices = gdn_slot_schedule.sort_micro_batches_for_slots(
+                micro_batches,
+                indices,
+                auto_slot_len=auto_slot_len,
+                static_len=static_len,
+                bucket_size=bucket_sz,
+                forward_only=effective_forward_only,
+                allow_row_slot=allow_auto_row_slot,
+            )
+        if (
+            self._use_simple_fsdp
+            or self.parallel_dims.cp_enabled
+            or static_len
+            or static_response_len
+            or slot_len
+            or allow_auto_row_slot
+        ):
             align_micro_batch_shapes_across_ranks(
                 micro_batches,
-                bucket_size=get_tpu_seq_bucket_size(self.engine_config),
+                bucket_size=bucket_sz,
                 static_len=static_len,
                 static_response_len=static_response_len,
                 gdn_row_slot_len=slot_len,
@@ -1753,15 +1891,35 @@ class TorchTitanTPUEngine(BaseEngine):
             )
         elif bucket_rows:
             align_micro_batch_num_seqs(micro_batches, static_num_seqs=static_num_seqs)
+        if allow_auto_row_slot:
+            gdn_slot_schedule.plan_micro_batch_gdn_slots(
+                micro_batches,
+                auto_slot_len=auto_slot_len,
+                forward_only=effective_forward_only,
+                allow_row_slot=True,
+                allow_single_doc=True,
+            )
 
         if "kda" in getattr(self, "_tpu_kernels", ()) and not getattr(self, "_gdn_row_slot_len", 0):
-            # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
-            # micro-batch is one packed document, plus the bucket-padding tail; bucketed so that use_dynamic_bsz's
-            # varying sequence counts do not recompile the kernels (see packed_document_budget).
-            budget = tpu_model_kernels.packed_document_budget(max(int(mb.batch_size[0]) for mb in micro_batches))
-            updated = tpu_model_kernels.set_packed_document_budget(self.module, budget)
-            if updated:
-                logger.info("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)
+            # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): count only micro-batches that
+            # still run segmented, and synchronize the max document budget across all SPMD ranks.
+            segmented_mbs = [
+                mb
+                for mb in micro_batches
+                if self._effective_mb_slot_len(
+                    mb,
+                    allow_auto_row_slot=allow_auto_row_slot,
+                    forward_only=effective_forward_only,
+                )
+                == 0
+            ]
+            local_max_docs = max((gdn_slot_schedule.segmented_document_count(mb) for mb in segmented_mbs), default=0)
+            global_max_docs = gdn_slot_schedule.sync_max_segmented_documents(local_max_docs)
+            if global_max_docs > 0:
+                budget = tpu_model_kernels.packed_document_budget(global_max_docs)
+                updated = tpu_model_kernels.set_packed_document_budget(self.module, budget)
+                if updated:
+                    logger.info("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)
 
         if graph_mode:
             return self._graph_trainer_forward_backward(
@@ -1782,15 +1940,27 @@ class TorchTitanTPUEngine(BaseEngine):
             else nullcontext()
         )
 
-        if getattr(self, "_gdn_row_slot_len", 0):
-            set_unflatten_seq_len = _import_set_unflatten_seq_len()
-
-            row_ctx = set_unflatten_seq_len(self._gdn_row_slot_len)
-        else:
-            row_ctx = nullcontext()
+        row_ctx = (
+            gdn_slot_schedule.unflatten_seq_len_context(self._gdn_row_slot_len)
+            if getattr(self, "_gdn_row_slot_len", 0)
+            else nullcontext()
+        )
         with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), row_ctx:
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
-                with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
+                mb_slot_len = self._effective_mb_slot_len(
+                    micro_batch,
+                    allow_auto_row_slot=allow_auto_row_slot,
+                    forward_only=effective_forward_only,
+                )
+                mb_row_ctx: Any = (
+                    gdn_slot_schedule.unflatten_seq_len_context(mb_slot_len) if mb_slot_len > 0 else nullcontext()
+                )
+                with (
+                    self.trainer.train_context(),
+                    ctx,
+                    mb_row_ctx,
+                    torch.profiler.record_function(f"micro_batch{micro_batch_idx}"),
+                ):
                     loss, output = self.forward_step(
                         micro_batch, loss_function=loss_function, forward_only=forward_only, loss_scalars=loss_scalars
                     )
@@ -2610,12 +2780,23 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
             )
             output_args["orig_seq_len"] = orig_seq_len
             if getattr(self, "_gdn_row_slot_len", 0):
+                if self.parallel_dims.cp_enabled:
+                    raise ValueError(
+                        "gdn_row_slot_len is not supported with context parallelism; "
+                        "use gdn_auto_row_slot_len with context_parallel_strategy='ulysses'"
+                    )
                 # One sequence per GatedDeltaNet row; prepare_model_outputs restores the packed order.
                 slot_src, contig_src = row_slot_permutation(cu_seqlens, input_ids.shape[-1], self._gdn_row_slot_len)
                 slot_src = slot_src.to(input_ids.device)
                 input_ids, position_ids = input_ids[..., slot_src], position_ids[..., slot_src]
                 output_args["gdn_contig_src"] = contig_src.to(input_ids.device)
         else:
+            if self.parallel_dims.cp_enabled and getattr(self, "_cp_full_positions", False):
+                if multi_modal_inputs or position_ids.dim() > 2:
+                    raise ValueError(
+                        "cp_full_positions supports 1-D text position_ids only "
+                        "(got multimodal inputs or multi-dimensional MRoPE position_ids)"
+                    )
             pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
             batch_size = micro_batch.batch_size[0]
             max_seq_len = bucket_length(int(max(input_ids.offsets().diff())), bucket_size=bucket_size)
@@ -2643,9 +2824,49 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
             output_args["batch_size"] = batch_size
             output_args["max_seq_len"] = max_seq_len
 
-        output_args["padded_seq_len"] = int(input_ids.shape[-1])
+        padded_seq_len = int(input_ids.shape[-1])
+        output_args["padded_seq_len"] = padded_seq_len
         extra_kwargs: dict[str, Any] = {}
+        slot_src_cpu: Optional[torch.Tensor] = None
+        mb_slot_len = self._effective_mb_slot_len(
+            micro_batch,
+            allow_auto_row_slot=self._allow_auto_row_slot(),
+            forward_only=not torch.is_grad_enabled(),
+            padded_seq_len=padded_seq_len,
+        )
+        if mb_slot_len > 0 and use_remove_padding:
+            if mb_slot_len < padded_seq_len:
+                input_ids, position_ids, labels, slot_src_cpu, contig_src_dev = (
+                    gdn_slot_schedule.permute_packed_for_row_slots(
+                        cu_seqlens, padded_seq_len, mb_slot_len, input_ids, position_ids, labels
+                    )
+                )
+                output_args[gdn_slot_schedule.POST_GATHER_CONTIG_SRC_KEY] = contig_src_dev
+            extra_kwargs["gated_delta_document_resets"] = False
+
+        cp_full_pos_dev: Optional[torch.Tensor] = None
         if self.parallel_dims.cp_enabled:
+            if getattr(self, "_gdn_row_slot_len", 0):
+                raise ValueError(
+                    "gdn_row_slot_len is not supported with context parallelism; "
+                    "use gdn_auto_row_slot_len with context_parallel_strategy='ulysses'"
+                )
+            if getattr(self, "_cp_full_positions", False):
+                if use_remove_padding:
+                    full_pos_cpu = gdn_slot_schedule.build_cp_full_positions(
+                        micro_batch, padded_seq_len, unsegmented=mb_slot_len > 0, slot_src_cpu=slot_src_cpu
+                    )
+                    if position_ids.ndim <= 2 and int(position_ids.numel()) == int(full_pos_cpu.numel()):
+                        cp_full_pos_dev = position_ids.reshape(-1).contiguous()
+                    else:
+                        cp_full_pos_dev = full_pos_cpu.to(device=input_ids.device, non_blocking=True).contiguous()
+                else:
+                    if multi_modal_inputs or position_ids.ndim != 1 or int(position_ids.numel()) != padded_seq_len:
+                        raise ValueError(
+                            "cp_full_positions supports 1-D text position_ids only "
+                            "(got multimodal inputs or multi-dimensional MRoPE position_ids)"
+                        )
+                    cp_full_pos_dev = position_ids.contiguous()
             cp_batch: dict[str, Any] = {"input": input_ids, "positions": position_ids}
             if use_remove_padding:
                 cp_batch["labels"] = labels
@@ -2666,6 +2887,8 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
         # Rows restart at position 0, so attention derives document (and row) boundaries from the positions.
         extra_inputs = {"positions": position_ids, **multi_modal_inputs}
+        if cp_full_pos_dev is not None:
+            extra_inputs["cp_full_positions"] = cp_full_pos_dev
         extra_inputs = {
             k: v if not isinstance(v, torch.Tensor) or v.is_contiguous() else v.contiguous()
             for k, v in extra_inputs.items()
@@ -2674,13 +2897,21 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         input_ids = input_ids.contiguous()
 
         if getattr(self.trainer.config.parallelism, "spmd_backend", None) == "spmd_types":
+            import spmd_types as spmd
             from torchtitan.distributed.spmd_types import annotate_input_spmd_types
-            from torchtitan.models.common.decoder_sharding import decoder_input_sharding
+            from torchtitan.models.common.decoder_sharding import CP, DP, TP, SpmdType, decoder_input_sharding
 
+            sharding = dict(decoder_input_sharding())
             spmd_inputs: dict[str, Any] = {"input": input_ids, "positions": extra_inputs["positions"]}
             if use_remove_padding:
                 spmd_inputs["labels"] = labels
-            annotate_input_spmd_types(self.parallel_dims, spmd_inputs, decoder_input_sharding())
+            if "cp_full_positions" in extra_inputs:
+                spmd_inputs["cp_full_positions"] = extra_inputs["cp_full_positions"]
+                sharding["cp_full_positions"] = SpmdType(
+                    {DP: spmd.V, CP: spmd.R, TP: spmd.R},
+                    partition_spec=spmd.PartitionSpec(DP),
+                )
+            annotate_input_spmd_types(self.parallel_dims, spmd_inputs, sharding)
 
         return input_ids, extra_inputs, extra_kwargs, output_args
 
@@ -2759,18 +2990,27 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                         vocab_size=int(lm_head_weight_t.shape[1]),
                     ),
                 )
+                post_gather_src = output_args.get(gdn_slot_schedule.POST_GATHER_CONTIG_SRC_KEY)
                 if calculate_entropy and not torch.is_grad_enabled():
                     # Entropy without gradient (old log-probs): one chunk of logits at a time, never all of them.
                     entropy_rmpad = chunked_entropy_from_hidden_tpu(hidden_rmpad, lm_head_weight_t, temperature)
+                    gathered_entropy = self._maybe_gather_context_parallel(entropy_rmpad, output_args)
+                    if post_gather_src is not None:
+                        gathered_entropy = gathered_entropy.index_select(0, post_gather_src)
                     model_output["entropy"] = _to_jagged(
-                        self._maybe_gather_context_parallel(entropy_rmpad, output_args),
+                        gathered_entropy,
                         cu_seqlens,
                         output_args.get("orig_seq_len"),
                     )
                 if not calculate_entropy or not torch.is_grad_enabled():
                     fused_log_probs = self._maybe_gather_context_parallel(fused_log_probs, output_args)
+                    if post_gather_src is not None:
+                        fused_log_probs = fused_log_probs.index_select(0, post_gather_src)
                     model_output["log_probs"] = _to_jagged(fused_log_probs, cu_seqlens, output_args.get("orig_seq_len"))
                     return model_output
+            assert gdn_slot_schedule.POST_GATHER_CONTIG_SRC_KEY not in output_args, (
+                "CP row-slot permutation must not enter the differentiated-entropy logits path"
+            )
             # A differentiated entropy (entropy loss) needs the logits. The log-probs still come from the fused kernel,
             # so the reference, old-log-prob and update passes all compute them the same way (an on-policy PPO ratio
             # is exactly 1).
