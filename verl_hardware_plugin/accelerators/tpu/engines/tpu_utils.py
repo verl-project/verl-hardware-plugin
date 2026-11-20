@@ -202,6 +202,8 @@ def tpu_precision_compiler_context():
 # nested tensor returned from ``prepare_model_outputs``, so loss functions can
 # consume the fixed-shape device tensor directly without XLA recompilation.
 TPU_PADDED_VALUES_ATTR = "_tpu_padded_values"
+# Non-tensor key of a micro-batch: the number of rows of its PPO loss inputs (``losses/loss_inputs.py``).
+TPU_PADDED_NUM_SEQS_KEY = "tpu_padded_num_seqs"
 
 _DEFAULT_TPU_SEQ_BUCKET_SIZE = 256
 

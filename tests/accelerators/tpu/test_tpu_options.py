@@ -283,3 +283,15 @@ def test_ac_save_splash_and_routing_option():
         SimpleNamespace(engine_kwargs={"tpu": {"ac_save_splash_and_routing": False}})
     )
     assert opts_off.ac_save_splash_and_routing is False
+
+
+def test_static_micro_batch_seqs_option():
+    assert get_tpu_engine_options(_cfg()).static_micro_batch_seqs is None
+    # Command-line overrides may arrive as strings.
+    assert get_tpu_engine_options(_cfg({"static_micro_batch_seqs": "64"})).static_micro_batch_seqs == 64
+    assert get_tpu_engine_options(_cfg({"static_micro_batch_seqs": 64})) == TPUEngineOptions(static_micro_batch_seqs=64)
+    for bad in (0, -1, True, "x"):
+        with pytest.raises(ValueError, match="Invalid TPU engine option static_micro_batch_seqs"):
+            get_tpu_engine_options(_cfg({"static_micro_batch_seqs": bad}))
+    with pytest.raises(ValueError, match="Unknown TPU engine option"):
+        get_tpu_engine_options(_cfg({"static_micro_batch_seq": 64}))

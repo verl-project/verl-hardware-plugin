@@ -78,6 +78,7 @@ from verl.workers.utils.padding import no_padding_2_padding
 from verl_hardware_plugin.accelerators.tpu.engines import graph_trainer_mode, tpu_model_kernels, tpu_ragged_ep
 from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+    TPU_PADDED_NUM_SEQS_KEY,
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
     align_micro_batch_shapes_across_ranks,
@@ -112,7 +113,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     unwrap_metadata,
 )
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
-from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import prepare_tpu_loss_inputs
+from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import ROW_PADDING_LOSS_MODES, prepare_tpu_loss_inputs
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
 from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 
@@ -1609,6 +1610,7 @@ class TorchTitanTPUEngine(BaseEngine):
         tpu_options = get_tpu_engine_options(self.engine_config)
         static_len = int(tpu_options.static_micro_batch_len or 0)
         static_response_len = int(tpu_options.static_max_response_len or 0)
+        static_seqs = int(tpu_options.static_micro_batch_seqs or 0)
         slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)
         if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len or slot_len:
             align_micro_batch_shapes_across_ranks(
@@ -1619,11 +1621,24 @@ class TorchTitanTPUEngine(BaseEngine):
                 gdn_row_slot_len=slot_len,
             )
 
-        if "kda" in getattr(self, "_tpu_kernels", ()) and not getattr(self, "_gdn_row_slot_len", 0):
+        uses_document_budget = "kda" in getattr(self, "_tpu_kernels", ()) and not slot_len
+        if static_seqs:
+            pads_loss_rows = self._pads_loss_rows(loss_function)
+            if pads_loss_rows:
+                for micro_batch in micro_batches:
+                    tu.assign_non_tensor_data(micro_batch, TPU_PADDED_NUM_SEQS_KEY, static_seqs)
+            if pads_loss_rows or uses_document_budget:
+                self._warn_above_static_micro_batch_seqs(
+                    micro_batches, static_seqs, pads_loss_rows, uses_document_budget
+                )
+
+        if uses_document_budget:
             # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
             # micro-batch is one packed document, plus the bucket-padding tail; bucketed so that use_dynamic_bsz's
-            # varying sequence counts do not recompile the kernels (see packed_document_budget).
-            budget = tpu_model_kernels.packed_document_budget(max(int(mb.batch_size[0]) for mb in micro_batches))
+            # varying sequence counts do not recompile the kernels (see packed_document_budget), and sized for at
+            # least static_micro_batch_seqs sequences, so it stays constant while no micro-batch has more.
+            num_seqs = max(int(mb.batch_size[0]) for mb in micro_batches)
+            budget = tpu_model_kernels.packed_document_budget(max(num_seqs, static_seqs))
             updated = tpu_model_kernels.set_packed_document_budget(self.module, budget)
             if updated:
                 logger.info("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)
@@ -1670,6 +1685,52 @@ class TorchTitanTPUEngine(BaseEngine):
                 output_lst.append(output)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+
+    def _pads_loss_rows(self, loss_function: Optional[Callable]) -> bool:
+        """Whether ``static_micro_batch_seqs`` pads the loss rows of ``loss_function``.
+
+        Only verl's ``ppo_loss`` gets padding rows (the padded loss inputs hold its fields only), and only with a
+        policy loss mode in ``ROW_PADDING_LOSS_MODES``. Any other mode, e.g. ``geo_mean``, which averages over
+        every row, keeps the exact rows, with one warning per mode.
+        """
+        if not (isinstance(loss_function, partial) and loss_function.func is ppo_loss):
+            return False
+        config = loss_function.keywords.get("config")
+        if config is None and loss_function.args:
+            config = loss_function.args[0]
+        loss_mode = config.policy_loss.get("loss_mode", "vanilla") if config is not None else None
+        if loss_mode in ROW_PADDING_LOSS_MODES:
+            return True
+        warned = self.__dict__.setdefault("_static_micro_batch_seqs_warned_modes", set())
+        if loss_mode not in warned:
+            warned.add(loss_mode)
+            logger.warning(
+                "static_micro_batch_seqs: policy loss mode %r is not one whose loss ignores empty rows (geo_mean "
+                "averages over every row), so its PPO loss inputs keep their exact rows.",
+                loss_mode,
+            )
+        return False
+
+    def _warn_above_static_micro_batch_seqs(
+        self, micro_batches: list[TensorDict], static_seqs: int, pads_loss_rows: bool, uses_document_budget: bool
+    ) -> None:
+        """Logs each new sequence count above ``static_micro_batch_seqs`` once, and which shapes follow it."""
+        warned = self.__dict__.setdefault("_static_micro_batch_seqs_warned", set())
+        counts = sorted({int(mb.batch_size[0]) for mb in micro_batches if int(mb.batch_size[0]) > static_seqs} - warned)
+        if counts:
+            warned.update(counts)
+            effects = []
+            if pads_loss_rows:
+                effects.append("their PPO loss inputs keep their own row count")
+            if uses_document_budget:
+                effects.append("the Tokamax GatedDeltaNet document budget grows with them")
+            logger.warning(
+                "static_micro_batch_seqs=%d is below the %s sequences of some micro-batches: %s, so shapes can "
+                "change again and compile new programs. Raise static_micro_batch_seqs to cover them.",
+                static_seqs,
+                counts,
+                " and ".join(effects),
+            )
 
     def _graph_trainer_forward_backward(
         self,

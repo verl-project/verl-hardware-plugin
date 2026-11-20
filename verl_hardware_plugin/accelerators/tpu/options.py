@@ -214,6 +214,13 @@ class TPUEngineOptions:
             instead of one per length bucket it meets (default: unset, off).
         static_max_response_len: Pad every micro-batch's response-length bucket to at least this many tokens (e.g.
             ``max_response_length``), so response-shaped tensors also keep one shape (default: unset, off).
+        static_micro_batch_seqs: Pad the PPO loss inputs of every micro-batch to at least this many rows (sequences),
+            so their shapes do not depend on how many sequences ``use_dynamic_bsz`` puts in a micro-batch (default:
+            unset, off). The extra rows are empty sequences (all-zero response mask, log-probs and advantages), so the
+            loss, its gradients and the token-mean normalization do not change. With Tokamax's GatedDeltaNet kernels
+            it is also the floor of their packed-document budget. A micro-batch with more sequences keeps its own
+            row count. Only verl's ``ppo_loss`` gets padded rows, and only with a policy loss mode that ignores
+            empty rows (``ROW_PADDING_LOSS_MODES``: not ``geo_mean``); other losses keep the exact rows.
         splash_max_block_size: Largest Splash attention block size, a power of two >= 128 (default: ``512``,
             torchtitan's). Long packed micro-batches run faster with ``1024``.
         mixed_precision_reduce: dtype of the FSDP gradient reduce-scatter, ``float32`` (default, torchtitan's) or
@@ -264,6 +271,7 @@ class TPUEngineOptions:
     ac_save_splash_and_routing: Optional[bool] = None
     static_micro_batch_len: Optional[int] = None
     static_max_response_len: Optional[int] = None
+    static_micro_batch_seqs: Optional[int] = None
     splash_max_block_size: Optional[int] = None
     mixed_precision_reduce: Optional[str] = None
     moe_paired_grouped_mm: Optional[bool] = None
@@ -300,6 +308,7 @@ _ENGINE_KINDS: dict[str, Any] = {
     "ac_save_splash_and_routing": bool,
     "static_micro_batch_len": int,
     "static_max_response_len": int,
+    "static_micro_batch_seqs": int,
     "splash_max_block_size": int,
     "mixed_precision_reduce": str,
     "moe_paired_grouped_mm": bool,

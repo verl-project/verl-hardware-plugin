@@ -17,9 +17,23 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
+from tensordict.tensorclass import NonTensorData
 
 from verl.utils import tensordict_utils as tu
-from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import TPU_PADDED_VALUES_ATTR, unwrap_metadata
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+    TPU_PADDED_NUM_SEQS_KEY,
+    TPU_PADDED_VALUES_ATTR,
+    unwrap_metadata,
+)
+
+# Policy loss modes of verl (``actor.policy_loss.loss_mode``) that reduce over the response mask only (``agg_loss``,
+# masked means): empty loss rows change neither their loss, its gradients nor its masked metrics. Bypass mode's
+# per-sequence diagnostics that reduce over every row also count the empty rows, so they can change (listed in
+# docs/accelerators/tpu/engine.md). ``geo_mean`` averages its per-sequence losses over every row (``torch.mean``), so
+# empty rows would scale its loss; it keeps the exact rows, like any mode not listed here.
+ROW_PADDING_LOSS_MODES = frozenset(
+    {"bypass_mode", "cispo", "clip_cov", "dppo_kl", "dppo_tv", "dro", "gpg", "gspo", "kl_cov", "sapo", "vanilla"}
+)
 
 
 class _TPUPaddedJaggedProxy:
@@ -80,18 +94,45 @@ def _copy_tensordict_without_device(td: TensorDict) -> TensorDict:
     return out
 
 
+def _scalar_metadata_tensordict(td: TensorDict, num_rows: int) -> TensorDict:
+    """A TensorDict with no device and ``num_rows`` rows that holds only the scalar host metadata of ``td``.
+
+    Scalar metadata are ``dp_size``, ``batch_num_tokens``, ``global_batch_size``, ...; the per-sequence entries of
+    ``td`` are left out, as they do not have ``num_rows`` rows.
+    """
+    out = TensorDict({}, batch_size=[num_rows])
+    for key, value in td.items():
+        if isinstance(value, NonTensorData):
+            tu.assign_non_tensor_data(out, key, value.data)
+    return out
+
+
+def _loss_num_rows(micro_batch: TensorDict) -> int:
+    """Rows of the PPO loss inputs: the batch size, padded to at least ``tpu_padded_num_seqs`` when it is set.
+
+    A micro-batch with more sequences than ``tpu_padded_num_seqs`` keeps its own row count.
+    """
+    batch_size = int(micro_batch.batch_size[0])
+    num_rows = int(unwrap_metadata(tu.get_non_tensor_data(micro_batch, TPU_PADDED_NUM_SEQS_KEY, 0)) or 0)
+    return max(batch_size, num_rows)
+
+
 def _response_gather_index(
-    micro_batch: TensorDict, response_width: int, padded_len: int
+    micro_batch: TensorDict, response_width: int, padded_len: int, num_rows: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build, on CPU, the index/mask that gather every response's per-token outputs from a packed sequence.
 
     Mirrors verl's ``no_padding_2_padding`` convention: response token ``r`` of sequence ``i`` is predicted at packed
     position ``seq_end_i - resp_len_i - 1 + r``. Returns ``index`` (int64) and ``valid`` (bool), both shaped
-    ``[batch_size, response_width]``; padded slots point at position 0 and are masked out.
+    ``[num_rows, response_width]`` (``num_rows`` defaults to the batch size); padded slots, and every slot of the
+    rows past the batch size, point at position 0 and are masked out.
     """
     prompt_lens = micro_batch["prompts"].offsets().diff().cpu()
     response_lens = micro_batch["responses"].offsets().diff().cpu()
     starts = ((prompt_lens + response_lens).cumsum(dim=0) - response_lens - 1).to(torch.int64)
+    if num_rows is not None and num_rows > response_lens.shape[0]:
+        extra = num_rows - response_lens.shape[0]
+        starts, response_lens = F.pad(starts, (0, extra)), F.pad(response_lens, (0, extra))
     cols = torch.arange(response_width, dtype=torch.int64).unsqueeze(0)
     valid = cols < response_lens.unsqueeze(1)
     index = torch.where(valid, starts.unsqueeze(1) + cols, torch.zeros_like(cols)).clamp(0, max(0, padded_len - 1))
@@ -122,6 +163,12 @@ def prepare_tpu_loss_inputs(model_output: dict[str, Any], micro_batch: TensorDic
     shapes that depend on the sequence-length bucket, the micro-batch size and the response-length bucket. Trimming
     the outputs to the exact token count instead would make every micro-batch with new lengths compile new XLA
     programs (forward loss and the fused LM-head backward) for the whole run.
+
+    With ``engine_kwargs.tpu.static_micro_batch_seqs``, the engine gives every micro-batch of verl's ``ppo_loss``
+    ``tpu_padded_num_seqs`` (for a policy loss mode in ``ROW_PADDING_LOSS_MODES``): its PPO loss inputs get at least
+    that many rows, so their shapes do not depend on the number of sequences in the micro-batch either. The extra
+    rows are empty sequences (zero response mask, log-probs and advantages), which leave the loss, its gradients and
+    the token-mean normalization unchanged.
     """
     log_prob = model_output.get("log_probs")
     tpu_padded_log_prob = getattr(log_prob, TPU_PADDED_VALUES_ATTR, None)
@@ -129,9 +176,6 @@ def prepare_tpu_loss_inputs(model_output: dict[str, Any], micro_batch: TensorDic
         return model_output, micro_batch
 
     if "old_log_probs" in micro_batch and "advantages" in micro_batch:
-        # Preserve host sequence metadata while moving response fields independently
-        # of the source TensorDict's device setting.
-        loss_data = _copy_tensordict_without_device(micro_batch)
         responses = micro_batch["responses"]
         if micro_batch["prompts"].is_nested:
             # The bucketed width from pad_packed_inputs_for_tpu, the common width across ranks, or the real one.
@@ -149,11 +193,6 @@ def prepare_tpu_loss_inputs(model_output: dict[str, Any], micro_batch: TensorDic
         if micro_batch["prompts"].is_nested:
             # Legacy batches can retain response fields wider than the packed response bucket.
             response_width = max(response_width, *(tensor.shape[1] for tensor in padded_fields.values()))
-            tu.assign_non_tensor_data(loss_data, "max_response_len", response_width)
-        for key, tensor in padded_fields.items():
-            if tensor.shape[1] > response_width:
-                raise ValueError(f"{key} exceeds max_response_len ({tensor.shape[1]} > {response_width})")
-            loss_data[key] = F.pad(tensor, (0, response_width - tensor.shape[1])).to(tpu_padded_log_prob.device)
 
         loss_model_output = dict(model_output)
         padded_keys = [
@@ -168,30 +207,46 @@ def prepare_tpu_loss_inputs(model_output: dict[str, Any], micro_batch: TensorDic
                 getattr(value, "is_nested", False) and key not in padded_keys for key, value in model_output.items()
             )
         )
+        batch_size = int(micro_batch.batch_size[0])
+        num_rows = _loss_num_rows(micro_batch) if static_layout else batch_size
+        if num_rows > batch_size:
+            loss_data = _scalar_metadata_tensordict(micro_batch, num_rows)
+        else:
+            # Preserve host sequence metadata while moving response fields independently
+            # of the source TensorDict's device setting.
+            loss_data = _copy_tensordict_without_device(micro_batch)
+        if micro_batch["prompts"].is_nested:
+            tu.assign_non_tensor_data(loss_data, "max_response_len", response_width)
+        for key, tensor in padded_fields.items():
+            if tensor.shape[1] > response_width:
+                raise ValueError(f"{key} exceeds max_response_len ({tensor.shape[1]} > {response_width})")
+            # Responses padded to `response_width`, plus all-zero rows up to `num_rows`.
+            tensor = F.pad(tensor, (0, response_width - tensor.shape[1], 0, num_rows - batch_size))
+            loss_data[key] = tensor.to(tpu_padded_log_prob.device)
+
         if static_layout:
-            batch_size = int(micro_batch.batch_size[0])
             segment = response_width + 1
             index_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
             layout = torch.nested.nested_tensor_from_jagged(
-                torch.zeros(batch_size * segment), torch.arange(batch_size + 1, dtype=torch.int64) * segment
+                torch.zeros(num_rows * segment), torch.arange(num_rows + 1, dtype=torch.int64) * segment
             )
             for key in padded_keys:
                 padded_values = getattr(model_output[key], TPU_PADDED_VALUES_ATTR)
                 padded_len = int(padded_values.shape[0])
                 if padded_len not in index_cache:
-                    index_cache[padded_len] = _response_gather_index(micro_batch, response_width, padded_len)
+                    index_cache[padded_len] = _response_gather_index(micro_batch, response_width, padded_len, num_rows)
                 index, valid = index_cache[padded_len]
                 loss_model_output[key] = _TPUPaddedJaggedProxy(
                     _gather_responses_static_layout(padded_values, index, valid), layout
                 )
             # Matching sequence metadata for the static layout: prompt length 1 and response length
             # `response_width` for every row, so the per-row slices of `no_padding_2_padding` are static too.
-            offsets = torch.arange(batch_size + 1, dtype=torch.int64)
+            offsets = torch.arange(num_rows + 1, dtype=torch.int64)
             loss_data["prompts"] = torch.nested.nested_tensor_from_jagged(
-                torch.zeros(batch_size, dtype=torch.int64), offsets
+                torch.zeros(num_rows, dtype=torch.int64), offsets
             )
             loss_data["responses"] = torch.nested.nested_tensor_from_jagged(
-                torch.zeros(batch_size * response_width, dtype=torch.int64), offsets * response_width
+                torch.zeros(num_rows * response_width, dtype=torch.int64), offsets * response_width
             )
         else:
             for key in padded_keys:

@@ -3,20 +3,29 @@
 
 """Unit tests (CPU) for the adapter between the TPU engine's outputs and verl's SFT / PPO losses."""
 
+import math
 import os
 
 import pytest
 import torch
 from tensordict import TensorDict
 from torch.utils._python_dispatch import TorchDispatchMode
-from torch.utils._pytree import tree_leaves
+from torch.utils._pytree import tree_flatten, tree_leaves
+from torch.utils.weak import WeakTensorKeyDictionary
 
+from verl.trainer.config.algorithm import RolloutCorrectionConfig
+from verl.trainer.ppo.core_algos import POLICY_LOSS_REGISTRY
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.workers.config import ActorConfig
+from verl.workers.config.actor import PolicyLossConfig
 from verl.workers.utils.losses import ppo_loss, sft_loss
-from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import TPU_PADDED_VALUES_ATTR, bucket_length
-from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import prepare_tpu_loss_inputs
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+    TPU_PADDED_NUM_SEQS_KEY,
+    TPU_PADDED_VALUES_ATTR,
+    bucket_length,
+)
+from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import ROW_PADDING_LOSS_MODES, prepare_tpu_loss_inputs
 
 
 def test_prepare_tpu_loss_inputs_matches_unmodified_sft_loss():
@@ -272,3 +281,424 @@ def test_core_under_test_emits_the_expected_loss_metrics():
     _, metrics = ppo_loss(_ppo_config(), loss_model_output, loss_data)
     missing = [m for m in expected if m not in metrics]
     assert not missing, f"the verl core under test does not emit {missing}"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# static_micro_batch_seqs: PPO loss inputs padded to at least N rows (``tpu_padded_num_seqs``), verl's unmodified loss
+# ---------------------------------------------------------------------------------------------------------------------
+
+LENGTHS = [(5, 7), (3, 2), (6, 9), (4, 1), (7, 13)]  # (prompt, response) tokens of the packed sequences
+
+
+def _rows_case(lengths, padded_len, seed=0, dp_size=2, zero_mask_row=None, seq_ratios=None):
+    """A packed PPO micro-batch and its bucket-padded device leaves (log-probs, entropy).
+
+    The response log-probs stay within 0.4 of the old ones, so the PPO ratios vary around 1 and some are clipped.
+    ``seq_ratios`` shifts the token log-ratios of sequence ``i`` so that they sum to ``log(seq_ratios[i])``, which
+    makes ``seq_ratios[i]`` its IS ratio with ``rollout_is="sequence"`` in bypass mode. With ``dp_size > 1`` the
+    micro-batch carries global token / sequence counts, as verl sets them under data parallelism; with
+    ``dp_size == 1`` the loss normalizes by the micro-batch's own counts.
+    """
+    gen = torch.Generator().manual_seed(seed)
+
+    def nested(rows):
+        return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+    masks = [torch.ones(r, dtype=torch.int64) for _, r in lengths]
+    if zero_mask_row is not None:
+        masks[zero_mask_row] = torch.zeros_like(masks[zero_mask_row])
+    old_log_probs = [-0.5 - torch.rand(r, generator=gen) for _, r in lengths]
+    micro_batch = TensorDict(
+        {
+            "prompts": nested([torch.randint(0, 100, (p,), generator=gen) for p, _ in lengths]),
+            "responses": nested([torch.randint(0, 100, (r,), generator=gen) for _, r in lengths]),
+            "input_ids": nested([torch.randint(0, 100, (p + r,), generator=gen) for p, r in lengths]),
+            "response_mask": nested(masks),
+            "old_log_probs": nested(old_log_probs),
+            "advantages": nested([torch.randn(r, generator=gen) for _, r in lengths]),
+            "ref_log_prob": nested([-0.5 - torch.rand(r, generator=gen) for _, r in lengths]),
+        },
+        batch_size=[len(lengths)],
+    )
+    num_tokens = sum(int(mask.sum()) for mask in masks)
+    if dp_size > 1:
+        tu.assign_non_tensor(micro_batch, dp_size=dp_size, batch_num_tokens=3 * num_tokens, global_batch_size=48)
+    else:
+        tu.assign_non_tensor(micro_batch, dp_size=1, batch_num_tokens=None, global_batch_size=None)
+
+    log_probs = -0.5 - torch.rand(padded_len, generator=gen)
+    offset = 0
+    for i, ((p, r), old) in enumerate(zip(lengths, old_log_probs, strict=True)):
+        log_ratio = 0.8 * (torch.rand(r, generator=gen) - 0.5)
+        if seq_ratios is not None:
+            log_ratio += math.log(seq_ratios[i]) / r - log_ratio.mean()
+        log_probs[offset + p - 1 : offset + p - 1 + r] = old + log_ratio
+        offset += p + r
+    leaves = {"log_probs": log_probs, "entropy": torch.rand(padded_len, generator=gen)}
+    for leaf in leaves.values():
+        leaf.requires_grad_(True)
+    cu_seqlens = torch.tensor([0] + [p + r for p, r in lengths]).cumsum(0)
+    return micro_batch, leaves, cu_seqlens
+
+
+def _rows_model_output(leaves, cu_seqlens):
+    """The engine's model outputs: trimmed host views that carry their bucket-padded device leaves."""
+    total = int(cu_seqlens[-1])
+    model_output = {}
+    for key, leaf in leaves.items():
+        nested = torch.nested.nested_tensor_from_jagged(leaf.detach()[:total].clone(), cu_seqlens)
+        setattr(nested, TPU_PADDED_VALUES_ATTR, leaf)
+        model_output[key] = nested
+    return model_output
+
+
+def _rows_loss_inputs(micro_batch, model_output, num_rows=0, width=None):
+    """``prepare_tpu_loss_inputs`` as the engine calls it, optionally with ``tpu_padded_num_seqs`` (N) set."""
+    response_lens = micro_batch["responses"].offsets().diff()
+    tu.assign_non_tensor_data(micro_batch, "max_response_len", bucket_length(int(response_lens.max()), 16))
+    if width:
+        tu.assign_non_tensor_data(micro_batch, "tpu_max_response_len", width)
+    if num_rows:
+        tu.assign_non_tensor_data(micro_batch, TPU_PADDED_NUM_SEQS_KEY, num_rows)
+    return prepare_tpu_loss_inputs(model_output, micro_batch)
+
+
+def _plain_metrics(metrics):
+    out = {}
+    for key, value in metrics.items():
+        if hasattr(value, "aggregate"):
+            value = value.aggregate()
+        out[key] = float(value.item() if hasattr(value, "item") else value)
+    return out
+
+
+def _run_rows(config, lengths=LENGTHS, padded_len=96, *, num_rows=0, width=None, exact=False, **case_kwargs):
+    """Loss, gradients of the device leaves, metrics and loss inputs of one micro-batch."""
+    micro_batch, leaves, cu_seqlens = _rows_case(lengths, padded_len, **case_kwargs)
+    if exact:  # verl's own path on exact (unbucketed) packed outputs, as on GPU
+        total = int(cu_seqlens[-1])
+        loss_output = {k: torch.nested.nested_tensor_from_jagged(v[:total], cu_seqlens) for k, v in leaves.items()}
+        loss_data = micro_batch
+    else:
+        loss_output, loss_data = _rows_loss_inputs(micro_batch, _rows_model_output(leaves, cu_seqlens), num_rows, width)
+    loss, metrics = ppo_loss(config, loss_output, loss_data)
+    loss.backward()
+    grads = {key: leaf.grad.detach().clone() for key, leaf in leaves.items()}
+    return loss.detach(), grads, _plain_metrics(metrics), loss_output, loss_data
+
+
+def _rows_config(loss_agg_mode="token-mean", **kwargs):
+    return ActorConfig(
+        strategy="fsdp",
+        rollout_n=8,
+        ppo_micro_batch_size_per_gpu=4,
+        loss_agg_mode=loss_agg_mode,
+        use_kl_loss=True,
+        kl_loss_coef=0.001,
+        entropy_coeff=0.01,
+        **kwargs,
+    )
+
+
+def _bypass_config(
+    rollout_is="token", rollout_is_batch_normalize=False, rollout_rs=None, rs_threshold=None, loss_type="ppo_clip"
+):
+    """Rollout correction in bypass mode, by default with token-level IS weights, as common for TPU rollouts."""
+    correction = RolloutCorrectionConfig(
+        rollout_is=rollout_is,
+        rollout_is_threshold=3.0,
+        rollout_is_batch_normalize=rollout_is_batch_normalize,
+        rollout_rs=rollout_rs,
+        rollout_rs_threshold=rs_threshold,
+        bypass_mode=True,
+        loss_type=loss_type,
+    )
+    return ActorConfig(
+        strategy="fsdp",
+        rollout_n=16,
+        ppo_micro_batch_size_per_gpu=4,
+        loss_agg_mode="token-mean",
+        use_kl_loss=False,
+        entropy_coeff=0.0,
+        clip_ratio=0.2,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        clip_ratio_c=1.0e9,
+        policy_loss=PolicyLossConfig(loss_mode="bypass_mode", rollout_correction=correction),
+    )
+
+
+def _loss_mode_config(loss_mode):
+    """An actor config for verl's policy loss ``loss_mode``, with the settings that some modes require."""
+    if loss_mode == "bypass_mode":
+        return _bypass_config()
+    extra = {"dro_beta": 0.1} if loss_mode == "dro" else {}
+    return _rows_config(clip_ratio_c=3.0, policy_loss=PolicyLossConfig(loss_mode=loss_mode, **extra))
+
+
+# Metrics that reduce over every loss row, so the padding rows count too (docs/accelerators/tpu/engine.md): the
+# sequence-level IS statistics and the rejection-sampling fraction of bypass mode, and verl 0.9.1's perplexity and
+# chi-square metrics.
+PADDING_SENSITIVE_METRICS = (
+    "rollout_corr/rollout_is_seq_",
+    "rollout_corr/rollout_rs_seq_masked_fraction",
+    "rollout_corr/chi2_seq",
+)
+# With rollout_is="sequence", verl's compute_is_metrics also reduces over every loss row. With s_i the sum of
+# log_prob - old_log_prob over the response tokens of row i (its sequence log-ratio), it logs rollout_is_max =
+# exp(max s_i) (capped at exp(20)), rollout_is_min = exp(min s_i), and the fractions of rows with
+# s_i > log(rollout_is_threshold) (rollout_is_ratio_fraction_high) and s_i < log(rollout_is_threshold_lower)
+# (rollout_is_ratio_fraction_low; 1 / rollout_is_threshold by default). A padding row has s_i = 0, the ratio 1.
+SEQUENCE_IS_PADDING_SENSITIVE_METRICS = (
+    "rollout_corr/rollout_is_max",
+    "rollout_corr/rollout_is_min",
+    "rollout_corr/rollout_is_ratio_fraction_high",
+    "rollout_corr/rollout_is_ratio_fraction_low",
+)
+
+
+def _padding_sensitive(key, rollout_is=None):
+    """Whether the padding rows can change metric ``key``; ``rollout_is`` is the IS level of bypass mode."""
+    if rollout_is == "sequence" and key in SEQUENCE_IS_PADDING_SENSITIVE_METRICS:
+        return True
+    return key.startswith(PADDING_SENSITIVE_METRICS) or (key.startswith("rollout_corr/") and "ppl" in key)
+
+
+def _assert_same_loss(a, b, metric_keys=None):
+    torch.testing.assert_close(a[0], b[0], rtol=1e-6, atol=1e-6)
+    assert set(a[1]) == set(b[1])
+    for key in a[1]:
+        torch.testing.assert_close(a[1][key], b[1][key], rtol=0, atol=1e-7)
+    assert set(a[2]) == set(b[2])
+    for key in a[2] if metric_keys is None else metric_keys:
+        assert math.isclose(a[2][key], b[2][key], rel_tol=1e-5, abs_tol=1e-6), (key, a[2][key], b[2][key])
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize(
+    "loss_agg_mode, kwargs",
+    [
+        ("token-mean", {}),
+        ("token-sum", {}),
+        ("seq-mean-token-sum", {}),
+        ("seq-mean-token-mean", {}),
+        ("seq-mean-token-sum-norm", {"loss_scale_factor": 64}),
+    ],
+)
+def test_static_micro_batch_seqs_rows_give_the_same_loss_gradients_and_metrics(loss_agg_mode, kwargs, dp_size):
+    """Empty padding rows (N=12 for 5 sequences, with a wider response bucket) change nothing the loss computes."""
+    config = _rows_config(loss_agg_mode, **kwargs)
+    reference = _run_rows(config, dp_size=dp_size)
+    padded = _run_rows(config, num_rows=12, width=32, dp_size=dp_size)
+    assert padded[4]["response_mask"].shape == (12, 32)
+    _assert_same_loss(reference, padded)
+    assert padded[2]["actor/pg_clipfrac"] > 0  # the clipped branch of the PPO loss is exercised
+    _assert_same_loss(_run_rows(config, exact=True, dp_size=dp_size), padded)
+
+
+@pytest.mark.parametrize(
+    "correction",
+    [
+        {},
+        {"rollout_is": "sequence", "rollout_is_batch_normalize": True},
+        {"rollout_is": None, "rollout_rs": "token_k1", "rs_threshold": "0.9_1.1"},
+        {"rollout_rs": "seq_max_k2", "rs_threshold": 0.05},
+        {"rollout_is": "sequence", "rollout_is_batch_normalize": True, "loss_type": "reinforce"},
+    ],
+    ids=["token-is", "sequence-is", "token-rs", "token-is-sequence-rs", "sequence-is-reinforce"],
+)
+def test_static_micro_batch_seqs_rows_with_rollout_correction(correction):
+    """Bypass-mode rollout correction: the same loss and gradients; only the listed diagnostics may differ.
+
+    Per-sequence rollout-correction statistics that reduce over every loss row also count the padding rows: the
+    sequence-level IS statistics, with ``rollout_is="sequence"`` also the largest and smallest sequence IS ratio and
+    the fractions of sequences outside the IS thresholds (exact cases in the next test), the fraction of sequences
+    with rejected tokens, and in verl 0.9.1 also the off-policy perplexity and chi-square metrics. The loss, the
+    gradients and the other metrics are unchanged, also with ``loss_type="reinforce"``, where the IS weights scale
+    the loss itself.
+    """
+    reference = _run_rows(_bypass_config(**correction))
+    padded = _run_rows(_bypass_config(**correction), num_rows=12, width=32)
+    assert any(key.startswith("rollout_corr/") for key in padded[2])
+    rollout_is = correction.get("rollout_is", "token")
+    metric_keys = [key for key in reference[2] if not _padding_sensitive(key, rollout_is)]
+    _assert_same_loss(reference, padded, metric_keys=metric_keys)
+
+
+@pytest.mark.parametrize("loss_type", ["ppo_clip", "reinforce"])
+@pytest.mark.parametrize(
+    "seq_ratios, two_rows, four_rows",
+    [
+        ([4.0, 0.1], (4.0, 0.1, 0.5, 0.5), (4.0, 0.1, 0.25, 0.25)),  # one ratio above 3, one below 1/3
+        ([2.0, 4.0], (4.0, 2.0, 0.5, 0.0), (4.0, 1.0, 0.25, 0.0)),  # all above 1: the minimum becomes 1
+        ([0.1, 0.2], (0.2, 0.1, 0.0, 1.0), (1.0, 0.1, 0.0, 0.5)),  # all below 1: the maximum becomes 1
+    ],
+    ids=["out-of-bounds", "above-1", "below-1"],
+)
+def test_static_micro_batch_seqs_rows_change_the_sequence_is_max_min_and_fractions(
+    seq_ratios, two_rows, four_rows, loss_type
+):
+    """With rollout_is="sequence", padding rows (ratio 1) change these diagnostics, but not the loss or gradients.
+
+    Two sequences with the sequence IS ratios ``seq_ratios``, without and with padding to 4 rows. ``two_rows`` and
+    ``four_rows`` are (rollout_is_max, rollout_is_min, rollout_is_ratio_fraction_high, rollout_is_ratio_fraction_low)
+    for rollout_is_threshold=3 and the default rollout_is_threshold_lower=1/3.
+    """
+    config = _bypass_config(rollout_is="sequence", loss_type=loss_type)
+    lengths = [(5, 7), (6, 9)]
+    exact = _run_rows(config, lengths, 32, exact=True, seq_ratios=seq_ratios)  # verl on the exact rows, as on GPU
+    reference = _run_rows(config, lengths, 32, seq_ratios=seq_ratios)
+    padded = _run_rows(config, lengths, 32, num_rows=4, seq_ratios=seq_ratios)
+    assert padded[4]["response_mask"].shape == (4, 16)
+    for run, expected in ((exact, two_rows), (reference, two_rows), (padded, four_rows)):
+        values = tuple(run[2][key] for key in SEQUENCE_IS_PADDING_SENSITIVE_METRICS)
+        assert values == pytest.approx(expected, rel=1e-5, abs=1e-6)
+    _assert_same_loss(exact, reference)
+    metric_keys = [key for key in reference[2] if not _padding_sensitive(key, "sequence")]
+    _assert_same_loss(reference, padded, metric_keys=metric_keys)
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("loss_mode", sorted(POLICY_LOSS_REGISTRY))
+def test_static_micro_batch_seqs_rows_for_every_policy_loss_mode(loss_mode, dp_size):
+    """Padding rows leave every mode in ``ROW_PADDING_LOSS_MODES`` unchanged, but would change geo_mean's loss.
+
+    geo_mean averages its per-sequence losses over every row, so padding rows scale its loss and gradients; the
+    engine keeps its exact rows (test_tpu_engine.py). verl modes not in the list are skipped: the engine does not
+    pad them either.
+    """
+    if loss_mode not in ROW_PADDING_LOSS_MODES and loss_mode != "geo_mean":
+        pytest.skip(f"{loss_mode} is not in ROW_PADDING_LOSS_MODES: the engine keeps its exact rows")
+    torch.manual_seed(0)  # clip_cov picks a random subset of its tokens
+    reference = _run_rows(_loss_mode_config(loss_mode), dp_size=dp_size)
+    torch.manual_seed(0)
+    padded = _run_rows(_loss_mode_config(loss_mode), num_rows=12, width=32, dp_size=dp_size)
+    if loss_mode == "geo_mean":
+        assert not math.isclose(reference[0].item(), padded[0].item(), rel_tol=1e-3)
+        return
+    _assert_same_loss(reference, padded, metric_keys=[key for key in reference[2] if not _padding_sensitive(key)])
+
+
+def test_static_micro_batch_seqs_shapes_do_not_depend_on_the_sequence_count():
+    a = _run_rows(_rows_config(), [(5, 7), (9, 11)], 64, num_rows=8, width=32, seed=1)
+    b = _run_rows(_rows_config(), [(12, 16), (3, 2), (4, 4), (2, 30), (6, 1)], 96, num_rows=8, width=32, seed=2)
+    for key in ("log_probs", "entropy"):
+        assert a[3][key].values().shape == b[3][key].values().shape == torch.Size([8 * (32 + 1)])
+    for key in ("response_mask", "old_log_probs", "advantages", "ref_log_prob"):
+        assert tuple(a[4][key].shape) == tuple(b[4][key].shape) == (8, 32)
+    for key in ("prompts", "responses"):
+        assert a[4][key].offsets().tolist() == b[4][key].offsets().tolist()
+    assert tu.get_non_tensor_data(a[4], "max_response_len", None) == 32
+    assert tu.get_non_tensor_data(a[4], "dp_size", None) == 2  # scalar metadata kept
+    assert "input_ids" not in a[4].keys()  # per-sequence entries left out
+
+
+class _DeviceOpTrace(TorchDispatchMode):
+    """Records the ops on (CPU stand-ins for) device tensors, with their input and output shapes.
+
+    A tensor is a device tensor if the test marks it, or if an op with a device input produced it; ops on host tensors
+    only (e.g. the gather indices that ``prepare_tpu_loss_inputs`` builds on CPU) are not recorded. Ops whose output
+    size depends on tensor values (boolean-mask indexing, ``nonzero``), and every op computed from such an output, go
+    to ``data_dependent`` instead of ``static``.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.device = WeakTensorKeyDictionary()  # device tensor -> derived from a data-dependent size
+        self.static = []
+        self.data_dependent = []
+
+    def mark(self, *tensors):
+        for tensor in tensors:
+            self.device[tensor] = False
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        inputs = [t for t in tree_flatten((args, kwargs))[0] if isinstance(t, torch.Tensor)]
+        if not any(t in self.device for t in inputs):
+            return out
+        name = str(func)
+        dependent = any(self.device.get(t, False) for t in inputs)
+        dependent |= name.startswith(("aten.nonzero.", "aten.masked_select."))
+        dependent |= name.startswith("aten.index.") and any(t.dtype == torch.bool for t in inputs[1:])
+        outputs = [t for t in tree_flatten(out)[0] if isinstance(t, torch.Tensor)]
+        for tensor in outputs:
+            self.device[tensor] = dependent
+        record = (name, [tuple(t.shape) for t in inputs], [tuple(t.shape) for t in outputs])
+        (self.data_dependent if dependent else self.static).append(record)
+        return out
+
+
+def _trace_loss_and_backward(config, lengths, num_rows, seed):
+    """Device-op trace of prepare_tpu_loss_inputs + verl's ppo_loss + backward for one micro-batch."""
+    micro_batch, leaves, cu_seqlens = _rows_case(lengths, padded_len=96, seed=seed)
+    model_output = _rows_model_output(leaves, cu_seqlens)
+    with _DeviceOpTrace() as trace:
+        trace.mark(*leaves.values())
+        loss_output, loss_data = _rows_loss_inputs(micro_batch, model_output, num_rows, width=32)
+        # The PPO fields are built on the host and moved to the device (a no-op on CPU): mark them as device tensors.
+        trace.mark(*(loss_data[key] for key in ("response_mask", "old_log_probs", "advantages", "ref_log_prob")))
+        loss, _ = ppo_loss(config, loss_output, loss_data)
+        loss.backward()
+    return trace
+
+
+def test_static_micro_batch_seqs_device_ops_do_not_depend_on_the_sequence_count():
+    """Micro-batches with different sequence and valid-token counts give the same device ops and shapes with N set.
+
+    This covers the forward loss, its metrics and the backward. An op whose output size depends on tensor values
+    (verl versions whose ppo_loss counts ``actor/old_logprobs_mismatch_count`` with a boolean mask have one) cannot be
+    made static by row padding. The test compares such ops by name only, and every other device op, of the forward
+    and of the backward, by name and shapes.
+    """
+    config = _rows_config()
+    a = _trace_loss_and_backward(config, [(5, 7), (9, 11), (4, 3)], num_rows=8, seed=1)
+    b = _trace_loss_and_backward(config, [(12, 16), (3, 2), (4, 4), (2, 30), (6, 1)], num_rows=8, seed=2)
+    assert len(a.static) > 50  # the trace sees the loss, the metrics and the backward
+    assert a.static == b.static
+    assert [record[0] for record in a.data_dependent] == [record[0] for record in b.data_dependent]
+    # Without N, the row count of the loss inputs follows the sequence count.
+    a = _trace_loss_and_backward(config, [(5, 7), (9, 11), (4, 3)], num_rows=0, seed=1)
+    b = _trace_loss_and_backward(config, [(12, 16), (3, 2), (4, 4), (2, 30), (6, 1)], num_rows=0, seed=2)
+    assert a.static != b.static
+
+
+def test_static_micro_batch_seqs_below_the_sequence_count_keeps_the_rows():
+    """N below the sequence count keeps the exact rows; N equal to it changes nothing."""
+    reference = _run_rows(_rows_config())
+    for num_rows in (3, len(LENGTHS)):
+        result = _run_rows(_rows_config(), num_rows=num_rows)
+        assert result[4]["response_mask"].shape[0] == len(LENGTHS)
+        _assert_same_loss(reference, result)
+
+
+def test_static_micro_batch_seqs_pads_around_a_sequence_without_valid_tokens():
+    """A real sequence whose response mask is all zero is padded like any other, with the same loss and gradients."""
+    reference = _run_rows(_rows_config(), zero_mask_row=1)
+    padded = _run_rows(_rows_config(), num_rows=12, width=32, zero_mask_row=1)
+    assert padded[4]["response_mask"].shape == (12, 32)
+    _assert_same_loss(reference, padded)
+
+
+def test_static_micro_batch_seqs_leaves_sft_and_trimmed_outputs_alone():
+    """Only the static PPO layout reads ``tpu_padded_num_seqs``: SFT and the trimmed fallback keep their inputs."""
+    padded_log_probs = torch.tensor([-1.0, -2.0, -3.0, -4.0, -5.0, -100.0, -200.0, -300.0], requires_grad=True)
+    cu_seqlens = torch.tensor([0, 3, 5])
+    nested_log_probs = torch.nested.nested_tensor_from_jagged(padded_log_probs.detach()[:5], cu_seqlens)
+    setattr(nested_log_probs, TPU_PADDED_VALUES_ATTR, padded_log_probs)
+    loss_mask = torch.nested.nested_tensor([torch.tensor([0, 1, 1]), torch.tensor([0, 1])], layout=torch.jagged)
+    micro_batch = TensorDict({"loss_mask": loss_mask}, batch_size=[2])
+    tu.assign_non_tensor(micro_batch, pad_mode=DatasetPadMode.NO_PADDING, dp_size=2, batch_num_tokens=6)
+    tu.assign_non_tensor_data(micro_batch, TPU_PADDED_NUM_SEQS_KEY, 8)
+    loss_model_output, loss_data = prepare_tpu_loss_inputs({"log_probs": nested_log_probs}, micro_batch)
+    loss, _ = sft_loss(config=None, model_output=loss_model_output, data=loss_data)
+    assert loss.item() == pytest.approx(7.0 / 3.0)
+
+    # A packed output without its bucket-padded device tensor: the trimmed path, exact rows.
+    lengths = [(3, 2), (4, 5)]
+    model_output, _, cu_seqlens = _ppo_model_output(lengths, padded_len=32, with_entropy=False)
+    model_output["values"] = torch.nested.nested_tensor_from_jagged(torch.zeros(int(cu_seqlens[-1])), cu_seqlens)
+    micro_batch = _ppo_micro_batch(lengths, 16)
+    tu.assign_non_tensor_data(micro_batch, TPU_PADDED_NUM_SEQS_KEY, 8)
+    _, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
+    assert loss_data["response_mask"].shape[0] == len(lengths)
