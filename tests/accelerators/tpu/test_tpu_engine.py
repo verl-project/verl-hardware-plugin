@@ -1904,7 +1904,7 @@ def test_enable_context_parallel_all_gather_requires_splash():
                 assert parallelism.spmd_backend == "spmd_types"
 
 
-def test_headtail_restore_indices_cpu_matches_load_balancer_and_is_cached():
+def test_headtail_restore_indices_cpu_matches_load_balancer():
     from torch.distributed.tensor.experimental._context_parallel._load_balancer import _HeadTailLoadBalancer
 
     from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import _headtail_restore_indices_cpu
@@ -1914,36 +1914,171 @@ def test_headtail_restore_indices_cpu_matches_load_balancer_and_is_cached():
         restore = _headtail_restore_indices_cpu(seq_len, cp)
         assert restore.dtype == torch.int64 and restore.device.type == "cpu"
         assert torch.equal(restore, expected.to(torch.int64))
-        assert _headtail_restore_indices_cpu(seq_len, cp) is restore
         # Restoring the head-tail shard order gives back the original token order.
         shard_order = _HeadTailLoadBalancer(seq_len, cp, "cpu")._generate_indices(restore=False)[0]
         tokens = torch.arange(seq_len)
         assert torch.equal(tokens[shard_order].index_select(0, restore), tokens)
 
 
-def test_gather_context_parallel_headtail_uses_cached_restore_indices():
+def test_gather_context_parallel_headtail_restores_order_with_one_index_tensor_per_shape():
     from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
     from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
 
-    seq_len, cp = 16, 2
-    engine = SimpleNamespace(
-        trainer=SimpleNamespace(
-            config=SimpleNamespace(parallelism=SimpleNamespace(context_parallel_load_balancer="headtail"))
-        ),
-        parallel_dims=SimpleNamespace(cp=cp),
-        get_context_parallel_group=lambda: None,
+    cp = 2
+    engine = object.__new__(TorchTitanTPUEngine)
+    engine.trainer = SimpleNamespace(
+        config=SimpleNamespace(parallelism=SimpleNamespace(context_parallel_load_balancer="headtail"))
     )
-    shard_order = torchtitan_tpu._HeadTailLoadBalancer(seq_len, cp, "cpu")._generate_indices(restore=False)[0]
-    gathered = torch.arange(seq_len)[shard_order].float()
+    engine.parallel_dims = SimpleNamespace(cp=cp)
+    engine.get_context_parallel_group = lambda: None
+    engine._cp_restore_idx_cache = {}
+
+    def gather(seq_len):
+        shard_order = torchtitan_tpu._HeadTailLoadBalancer(seq_len, cp, "cpu")._generate_indices(restore=False)[0]
+        return engine._gather_context_parallel(torch.arange(seq_len)[shard_order].float(), seq_len)
+
+    with mock.patch.object(torchtitan_tpu.ContextParallelGather, "apply", side_effect=lambda t, g: t):
+        assert torch.equal(gather(16), torch.arange(16).float())
+        first = engine._cp_restore_idx_cache[(16, cp, torch.device("cpu"))]
+        assert torch.equal(gather(16), torch.arange(16).float())
+        assert engine._cp_restore_idx_cache[(16, cp, torch.device("cpu"))] is first  # reused, not rebuilt
+        assert torch.equal(gather(32), torch.arange(32).float())
+    assert set(engine._cp_restore_idx_cache) == {(16, cp, torch.device("cpu")), (32, cp, torch.device("cpu"))}
+
+
+def test_bucket_num_sequences_and_packed_document_budget():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels
+
+    assert [tpu_model_kernels.bucket_num_sequences(n) for n in (0, 1, 2, 3, 4, 5, 8, 9)] == [1, 1, 2, 4, 4, 8, 8, 16]
+    # Unchanged document budget: one per sequence plus the padding tail, a power of two, at least the minimum.
+    minimum = tpu_model_kernels.MIN_PACKED_DOCUMENT_BUDGET
+    assert tpu_model_kernels.packed_document_budget(3) == minimum
+    assert tpu_model_kernels.packed_document_budget(minimum) == 2 * minimum
+    assert tpu_model_kernels.packed_document_budget(2 * minimum - 1) == 2 * minimum
+
+
+def _rows_mb(num_seqs):
+    ids = torch.nested.as_nested_tensor([torch.zeros(5, dtype=torch.int64)] * num_seqs, layout=torch.jagged)
+    return TensorDict({"input_ids": ids, "responses": ids}, batch_size=[num_seqs])
+
+
+def test_align_micro_batch_shapes_num_seqs_bucketing():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+
+    def padded_rows(mbs):
+        return [tu.get_non_tensor_data(m, "tpu_padded_num_seqs", None) for m in mbs]
+
+    # Off by default: no row target.
+    mbs = [_rows_mb(3), _rows_mb(2)]
+    tpu_utils.align_micro_batch_shapes_across_ranks(mbs, bucket_size=16)
+    assert padded_rows(mbs) == [None, None]
+    # Single process: the mini-batch's largest micro-batch, bucketed, for every micro-batch; at least the static rows.
+    tpu_utils.align_micro_batch_shapes_across_ranks(mbs, bucket_size=16, num_seqs_bucketing=True)
+    assert padded_rows(mbs) == [4, 4]
+    tpu_utils.align_micro_batch_shapes_across_ranks(mbs, bucket_size=16, num_seqs_bucketing=True, static_num_seqs=6)
+    assert padded_rows(mbs) == [6, 6]
+
+    # Several ranks: the row count joins the same all-reduce(MAX) as the lengths (one extra trailing entry).
+    reduced = []
+
+    def fake_all_reduce(tensor, op=None):
+        reduced.append(tensor.tolist())
+        other_rank = torch.zeros_like(tensor)
+        other_rank[-1] = 5  # another rank's micro-batch holds 5 sequences
+        tensor.copy_(torch.maximum(tensor, other_rank))
+
     with (
-        mock.patch.object(torchtitan_tpu.ContextParallelGather, "apply", side_effect=lambda t, g: t),
-        mock.patch.object(torchtitan_tpu, "tpu_synchronize") as sync,
+        mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+        mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+        mock.patch.object(torch.distributed, "all_reduce", side_effect=fake_all_reduce),
     ):
-        out1 = TorchTitanTPUEngine._gather_context_parallel(engine, gathered, seq_len)
-        out2 = TorchTitanTPUEngine._gather_context_parallel(engine, gathered, seq_len)
-    assert torch.equal(out1, torch.arange(seq_len).float()) and torch.equal(out2, out1)
-    assert sync.call_count == 1  # the device copy of the indices is made once per (seq_len, cp, device)
-    assert len(engine._cp_restore_idx_cache) == 1
+        mbs = [_rows_mb(3), _rows_mb(2)]
+        tpu_utils.align_micro_batch_shapes_across_ranks(mbs, bucket_size=16, num_seqs_bucketing=True)
+        assert len(reduced) == 1 and len(reduced[0]) == 2 * len(mbs) + 1 and reduced[0][-1] == 3
+        assert padded_rows(mbs) == [8, 8]
+        mbs = [_rows_mb(3), _rows_mb(2)]
+        tpu_utils.align_micro_batch_num_seqs(mbs, static_num_seqs=0)
+        assert reduced[-1] == [3] and padded_rows(mbs) == [8, 8]
+
+
+class _RecordingEngine:
+    """Records what ``forward_backward_batch`` hands each micro-batch's ``forward_step``."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, micro_batch, loss_function, forward_only, loss_scalars=None):
+        self.calls.append(
+            (
+                int(micro_batch.batch_size[0]),
+                tu.get_non_tensor_data(micro_batch, "tpu_padded_num_seqs", None),
+                loss_scalars,
+            )
+        )
+        return torch.tensor(0.0), {"loss": 0.0, "metrics": {}, "model_output": {}}
+
+
+def _fwd_bwd_engine(tpu_kwargs, *, simple_fsdp=False):
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngineWithLMHead
+
+    engine = object.__new__(TorchTitanTPUEngineWithLMHead)
+    engine.engine_config = SimpleNamespace(
+        tensor_parallel_size=1, context_parallel_size=1, engine_kwargs={"tpu": tpu_kwargs}, seq_bucket_size=None
+    )
+    engine.get_data_parallel_group = lambda: None
+    engine.get_data_parallel_size = lambda: 1
+    engine._use_simple_fsdp = simple_fsdp
+    engine.parallel_dims = SimpleNamespace(cp_enabled=False)
+    engine._tpu_kernels = frozenset()
+    engine._tpu_eager_mode = None
+    engine.trainer = SimpleNamespace(train_context=nullcontext)
+    engine.forward_step = _RecordingEngine()
+    return engine
+
+
+@pytest.mark.parametrize("simple_fsdp", [False, True])
+@pytest.mark.parametrize(
+    "loss_mode,tpu_kwargs,on_tpu,expected_rows",
+    [
+        ("vanilla", {}, True, 4),  # default on TPU: bucketed rows and a 0-D device batch_num_tokens
+        ("vanilla", {"static_micro_batch_num_seqs": 6}, True, 6),
+        ("vanilla", {"loss_row_bucketing": False}, True, None),  # opt-out
+        ("geo_mean", {}, True, None),  # pad rows would rescale geo_mean
+        ("vanilla", {}, False, 4),  # off TPU: rows still bucketed, batch_num_tokens stays a host number
+    ],
+)
+def test_forward_backward_batch_row_bucketing_and_loss_scalars(
+    simple_fsdp, loss_mode, tpu_kwargs, on_tpu, expected_rows
+):
+    from verl.workers.config import ActorConfig
+    from verl.workers.config.actor import PolicyLossConfig
+    from verl.workers.utils.losses import ppo_loss
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+    from verl_hardware_plugin.accelerators.tpu.losses import loss_inputs
+
+    config = ActorConfig(
+        strategy="fsdp", rollout_n=1, ppo_micro_batch_size_per_gpu=4, policy_loss=PolicyLossConfig(loss_mode=loss_mode)
+    )
+    loss_fn = functools.partial(ppo_loss, config=config)
+    data = TensorDict({"loss_mask": torch.ones(5, 4, dtype=torch.int64)}, batch_size=[5])
+    micro_batches = [_rows_mb(3), _rows_mb(2)]
+    engine = _fwd_bwd_engine(tpu_kwargs, simple_fsdp=simple_fsdp)
+    with (
+        mock.patch.object(torchtitan_tpu, "prepare_micro_batches", return_value=(micro_batches, None)),
+        mock.patch.object(torchtitan_tpu, "postprocess_batch_func", side_effect=lambda output_lst, **kw: output_lst),
+        mock.patch.object(torchtitan_tpu, "get_device_id", return_value=torch.device("cpu")),
+        mock.patch.object(loss_inputs, "accelerator_is_tpu", return_value=on_tpu),
+    ):
+        engine.forward_backward_batch(data, loss_fn, forward_only=True)
+    calls = engine.forward_step.calls
+    assert [(rows, padded) for rows, padded, _ in calls] == [(3, expected_rows), (2, expected_rows)]
+    scalars = calls[0][2]
+    assert all(call[2] is scalars for call in calls)  # computed once per mini-batch
+    if on_tpu:
+        assert set(scalars) == {"batch_num_tokens"}
+        assert scalars["batch_num_tokens"].shape == torch.Size([]) and float(scalars["batch_num_tokens"]) == 20.0
+    else:
+        assert scalars == {}
 
 
 def test_cp_attention_owner_dispatches_to_inner_attention_cp_shard():
