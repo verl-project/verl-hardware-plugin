@@ -229,6 +229,44 @@ def test_tpu_sync_receive_into_vllm_modes(value, expected):
 
 
 @pytest.mark.parametrize(
+    ("value", "untied", "tied"),
+    [
+        (None, "auto", "off"),
+        ("auto", "auto", "off"),
+        (" AUTO ", "auto", "off"),
+        ("off", "off", "off"),
+        (False, "off", "off"),
+        ("false", "off", "off"),
+        ("on", "on", None),
+        (True, "on", None),
+        ("true", "on", None),
+    ],
+)
+def test_tpu_sync_receive_into_vllm_with_tie_word_embeddings(caplog, value, untied, tied):
+    """With tie_word_embeddings, only on (True) is refused: auto resolves to off, logged once, and off stays off.
+
+    receive_into_vllm never fills lm_head from the embedding. tie_word_embeddings=False changes nothing.
+    """
+    kwargs = {} if value is None else {"receive_into_vllm": value}
+    assert get_tpu_sync_options({**kwargs, "tie_word_embeddings": False}).receive_into_vllm == untied
+    if tied is None:
+        with pytest.raises(ValueError, match=r"receive_into_vllm=on \(True\) cannot be combined with tie_word_embed"):
+            get_tpu_sync_options({**kwargs, "tie_word_embeddings": True})
+        return
+    with caplog.at_level(logging.INFO, logger=tpu_options.__name__):
+        for _ in range(2):  # the driver parses the options at every sync
+            options = get_tpu_sync_options({**kwargs, "tie_word_embeddings": "true"})
+            assert (options.receive_into_vllm, options.tie_word_embeddings) == (tied, True)
+    fallback = [r.getMessage() for r in caplog.records if "receive_into_vllm=auto falling back" in r.getMessage()]
+    if untied == "auto":
+        assert len(fallback) == 1
+        assert "tie_word_embeddings is set" in fallback[0]
+        assert fallback[0].startswith("checkpoint_engine.engine_kwargs.tpu-sync: ")
+    else:
+        assert fallback == []
+
+
+@pytest.mark.parametrize(
     ("value", "mode", "norms", "exact"),
     [
         (None, "off", False, False),
