@@ -49,7 +49,10 @@ from typing import Any, Callable, Iterator, NamedTuple, Optional
 
 import torch
 
-from verl_hardware_plugin.accelerators.tpu.rollout.direct_install import DirectInstallLayout
+from verl_hardware_plugin.accelerators.tpu.rollout.direct_install import (
+    DirectInstallLayout,
+    non_moe_quantized_reason,
+)
 from verl_hardware_plugin.accelerators.tpu.rollout.moe_weights import (
     MOE_QUANTIZED_LAYOUTS,
     MoeRequant,
@@ -226,6 +229,9 @@ def plan_direct_install(
     moe_modules = [(n, m) for n, m in modules if hasattr(m, "w13_weight") and hasattr(m, "quant_method")]
     if len(moe_modules) != len(blocks):
         return None, f"vLLM has {len(moe_modules)} fused-MoE layers, the trainer sent {len(blocks)} MoE blocks"
+    quant_why = non_moe_quantized_reason(vllm_model, moe_modules)
+    if quant_why:
+        return None, quant_why
     moe_plan, why = plan_moe_layers(
         moe_modules,
         dims.num_experts,

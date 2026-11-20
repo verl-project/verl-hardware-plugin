@@ -16,10 +16,21 @@ adapters to the signatures below) and add it to ``direct_install_layouts()``.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, NamedTuple, Optional
 
 import torch
+
+# Unscaled floating-point parameter dtypes that ``copy_into`` may write directly; quantized dtypes (FP8, int8, FP4)
+# carry separate scale tensors and would be silently corrupted by an unscaled ``copy_``.
+UNQUANTIZED_PARAM_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+_UNQUANTIZED_LINEAR_METHODS = (
+    "UnquantizedLinearMethod",
+    "VllmUnquantizedLinearMethod",
+    "UnquantizedEmbeddingMethod",
+)
+_QUANTIZED_WEIGHT_ATTRS = ("weight_scale", "weight_scale_inv", "weight_packed", "qweight")
 
 # ``(sharding_spec, local_shape)`` of a tensor on one TP rank, e.g. ``(["tp", ""], [rows // tp, cols])``.
 ShardingRule = tuple[list[str], list[int]]
@@ -112,4 +123,42 @@ def loader_error(
         error = layout.loader_error(global_shapes, hf_text_config) if layout.loader_error is not None else ""
         if error:
             return error
+    return ""
+
+
+def non_moe_quantized_reason(vllm_model: Any, moe_modules: Sequence[tuple[str, Any]] = ()) -> str:
+    """Why ``vllm_model``'s non-expert layers cannot be written by ``copy_into`` (quantized), or ``""``.
+
+    ``copy_into`` copies unscaled bf16 slices straight into ``model_sd[key]``: on a quantized linear or embedding
+    parameter (e.g. ``VllmFp8LinearMethodTPU``'s ``float8_e4m3fn`` ``weight`` paired with ``weight_scale``) PyTorch's
+    ``copy_`` silently casts the unscaled values and leaves the old scale in place.
+    """
+    modules = list(vllm_model.named_modules()) if hasattr(vllm_model, "named_modules") else []
+    moe_objs = [m for _, m in moe_modules] or [
+        m for _, m in modules if hasattr(m, "w13_weight") and hasattr(m, "quant_method")
+    ]
+    moe_ids = {id(m) for m in moe_objs}
+    moe_param_ids = {id(p) for m in moe_objs if isinstance(m, torch.nn.Module) for p in m.parameters()}
+    for name, m in modules:
+        if id(m) in moe_ids:
+            continue
+        qm = getattr(m, "quant_method", None)
+        if qm is not None and hasattr(m, "weight") and type(qm).__name__ not in _UNQUANTIZED_LINEAR_METHODS:
+            return f"vLLM's non-expert {name or type(m).__name__} uses quantized method {type(qm).__name__}"
+        for attr in _QUANTIZED_WEIGHT_ATTRS:
+            if isinstance(getattr(m, attr, None), torch.Tensor):
+                return f"vLLM's non-expert {name or type(m).__name__} has {attr}"
+    named_params = (
+        vllm_model.named_parameters()
+        if hasattr(vllm_model, "named_parameters")
+        else vllm_model.state_dict().items()
+        if hasattr(vllm_model, "state_dict")
+        else ()
+    )
+    for key, param in named_params:
+        if id(param) in moe_param_ids or ".experts." in f".{key}.":
+            continue
+        local = param.to_local() if hasattr(param, "to_local") else param
+        if isinstance(local, torch.Tensor) and local.dtype not in UNQUANTIZED_PARAM_DTYPES:
+            return f"vLLM's non-expert parameter {key} has quantized dtype {local.dtype}"
     return ""

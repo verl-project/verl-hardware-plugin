@@ -695,11 +695,96 @@ def test_plan_fp8_moe(fake_vllm_torchtpu_fp8):
     fake_vllm_torchtpu_fp8.block_size = 2  # blockwise scales: [E, H / 2, 1, 2A] and [E, A / 2, 1, H]
     assert "w13_weight_scale_inv is (3, 1, 1, 256)" in reason()
     assert plan(_Fp8Experts(E, INTER // 2, HID, block_size=2))[0].moe_requant.block_size == 2
+    for bad_bs in (0, -2, (128, 128), True):
+        fake_vllm_torchtpu_fp8.block_size = bad_bs
+        assert "not a positive int" in reason()
     fake_vllm_torchtpu_fp8.block_size = None
+    # Non-persistent scale buffer (excluded from state_dict) is caught at plan time, not mid-install.
+    non_persistent = _Fp8Experts(E, INTER // 2, HID)
+    s2 = non_persistent.w2_weight_scale_inv.detach().clone()
+    del non_persistent.w2_weight_scale_inv
+    non_persistent.register_buffer("w2_weight_scale_inv", s2, persistent=False)
+    assert "has no w2_weight_scale_inv" in reason(non_persistent)
+    # swigluoai on _tpu_activation_str, expert w2_bias, and armed fused decode kernels are refused at plan time.
+    assert "swigluoai" in reason(_Fp8Experts(E, INTER // 2, HID, method=VllmFp8MoEMethodTPU("swigluoai")))
+    assert "bias" in reason(_Fp8Experts(E, INTER // 2, HID, w2_bias=torch.zeros(HID)))
+    armed = VllmFp8MoEMethodTPU()
+    armed._fused_moe_decode_op = object()
+    assert "fused shared+routed decode kernel" in reason(_Fp8Experts(E, INTER // 2, HID, method=armed))
+    # Current vllm-torchtpu main exposes envs.TPU_MOE_REQUANT_CHUNK_BYTES instead of _REQUANT_CHUNK_BYTES.
+    fake_vllm_torchtpu_fp8.envs = SimpleNamespace(TPU_MOE_REQUANT_CHUNK_BYTES=256 * 1024)
+    assert plan()[0].moe_requant.chunk_bytes == 256 * 1024
+    fake_vllm_torchtpu_fp8.envs = SimpleNamespace(TPU_MOE_REQUANT_CHUNK_BYTES=0)
+    assert "must be positive" in reason()
+    del fake_vllm_torchtpu_fp8.envs
     fake_vllm_torchtpu_fp8._quantize_and_format_single_moe_weight = lambda w, *, name, dtype: None  # renamed kwargs
     assert "unexpected signature" in reason()
     del fake_vllm_torchtpu_fp8._quantize_and_format_single_moe_weight
     assert "lacks _quantize_and_format_single_moe_weight" in reason()
+
+
+def test_plan_refuses_quantized_non_expert_layers_and_mismatched_expert_blocks(fake_vllm_torchtpu_fp8):
+    """Direct install requires non-expert weights to stay unquantized (copy_into writes unscaled bf16), and validates
+    both the MoE module count and per-block 3-D wire shapes on Qwen3.5."""
+    VllmUnquantizedLinearMethod = type("VllmUnquantizedLinearMethod", (), {})
+    UnquantizedEmbeddingMethod = type("UnquantizedEmbeddingMethod", (), {})
+    VllmFp8LinearMethodTPU = type("VllmFp8LinearMethodTPU", (), {})
+
+    # Unquantized linear / embedding methods on non-expert modules are accepted.
+    ok_model = _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID))
+    ok_model.gdn.in_proj_qkvz.quant_method = VllmUnquantizedLinearMethod()
+    ok_model.embed_tokens = torch.nn.Embedding(16, HID)
+    ok_model.embed_tokens.quant_method = UnquantizedEmbeddingMethod()
+    assert qwen3_5_layout.plan_direct_install(ok_model, SHAPES, CONFIG, 2, 0)[0] is not None
+
+    # Pre-quantized FP8 checkpoint / QUANTIZE_ON_LOAD_PREFIXES beyond experts: non-expert FP8 linears are refused.
+    fp8_linear_model = _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID))
+    fp8_linear_model.gdn.in_proj_qkvz.quant_method = VllmFp8LinearMethodTPU()
+    plan, why = qwen3_5_layout.plan_direct_install(fp8_linear_model, SHAPES, CONFIG, 2, 0)
+    assert plan is None and "VllmFp8LinearMethodTPU" in why
+
+    scaled_model = _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID))
+    scaled_model.shared_expert = torch.nn.Linear(HID, INTER)
+    scaled_model.shared_expert.register_parameter("weight_scale", torch.nn.Parameter(torch.ones(INTER)))
+    plan, why = qwen3_5_layout.plan_direct_install(scaled_model, SHAPES, CONFIG, 2, 0)
+    assert plan is None and "has weight_scale" in why
+
+    fp8_param_model = _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID))
+    fp8_param_model.gdn.in_proj_qkvz.weight = torch.nn.Parameter(
+        torch.zeros(2 * K + 2 * V, HID, dtype=FP8), requires_grad=False
+    )
+    plan, why = qwen3_5_layout.plan_direct_install(fp8_param_model, SHAPES, CONFIG, 2, 0)
+    assert plan is None and "quantized dtype" in why
+
+    # Mismatched MoE module count (e.g. an extra draft-model MoE layer) or bad 3-D expert wire shapes are refused.
+    extra_moe = _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID))
+    extra_moe.draft_experts = _Fp8Experts(E, INTER // 2, HID)
+    plan, why = qwen3_5_layout.plan_direct_install(extra_moe, SHAPES, CONFIG, 2, 0)
+    assert plan is None and "2 fused-MoE layers" in why
+
+    folded_shapes = {**SHAPES, f"{EXPERTS}.down_proj": [E * HID, INTER]}
+    plan, why = qwen3_5_layout.plan_direct_install(
+        _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID)), folded_shapes, CONFIG, 2, 0
+    )
+    assert plan is None and "3-D expert tensors" in why
+
+    transposed_down = {**SHAPES, f"{EXPERTS}.down_proj": [E, INTER, HID]}
+    plan, why = qwen3_5_layout.plan_direct_install(
+        _vllm_model(experts=_Fp8Experts(E, INTER // 2, HID)), transposed_down, CONFIG, 2, 0
+    )
+    assert plan is None and "the config gives" in why
+
+    # Rank-local shape check in install() rejects wrong TP slices before write_requantized pads them to 128.
+    experts = _Fp8Experts(E, INTER // 2, HID)
+    valid_model = _vllm_model(experts=experts)
+    valid_plan, _ = qwen3_5_layout.plan_direct_install(valid_model, SHAPES, CONFIG, 2, 0)
+    bad_staging = _received(_hf_tensors(torch.Generator().manual_seed(0)), 0, 2)
+    bad_staging[f"{EXPERTS}.gate_proj"] = torch.zeros(E, INTER, HID, dtype=torch.bfloat16)  # TP=1 slice on TP=2 plan
+    model_sd = _fp8_model_sd(experts, 0, 2)
+    with pytest.raises(RuntimeError, match="on this rank, expected"):
+        qwen3_5_layout.install(
+            bad_staging, model_sd, lambda k: k if k in model_sd else None, _copy_into(model_sd), valid_plan
+        )
 
 
 def test_plan_fp8_moe_without_vllm_torchtpu_falls_back():

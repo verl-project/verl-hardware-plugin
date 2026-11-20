@@ -50,7 +50,10 @@ from typing import Any, Callable, Iterator, NamedTuple, Optional
 
 import torch
 
-from verl_hardware_plugin.accelerators.tpu.rollout.direct_install import DirectInstallLayout
+from verl_hardware_plugin.accelerators.tpu.rollout.direct_install import (
+    DirectInstallLayout,
+    non_moe_quantized_reason,
+)
 from verl_hardware_plugin.accelerators.tpu.rollout.moe_weights import (
     MOE_LAYOUT_TPU_EP,
     MOE_QUANTIZED_LAYOUTS,
@@ -362,13 +365,21 @@ def plan_direct_install(
     if tp_rank != worker_rank:
         return None, f"worker rank {worker_rank} is not its TP rank {tp_rank}"
 
+    moe_modules = [(n, m) for n, m in modules if hasattr(m, "w13_weight") and hasattr(m, "quant_method")]
+    quant_why = non_moe_quantized_reason(vllm_model, moe_modules if expert_blocks else ())
+    if quant_why:
+        return None, quant_why
+
     moe_layout = None
     expert_parallel = False
     moe_requant = None
     if expert_blocks:
-        expert_counts = {
-            int(shape[0]) for name, shape in global_shapes.items() if name.endswith(expert_suffixes) and len(shape) == 3
-        }
+        non_3d = sorted(
+            name for name, shape in global_shapes.items() if name.endswith(expert_suffixes) and len(shape) != 3
+        )
+        if non_3d:
+            return None, f"expected 3-D expert tensors, got {non_3d[0]} {list(global_shapes[non_3d[0]])}"
+        expert_counts = {int(shape[0]) for name, shape in global_shapes.items() if name.endswith(expert_suffixes)}
         if len(expert_counts) != 1:
             return None, f"inconsistent expert counts in wire shapes: {sorted(expert_counts)}"
         wire_experts = expert_counts.pop()
@@ -377,8 +388,14 @@ def plan_direct_install(
         num_experts = dims.num_experts or wire_experts
         if not dims.moe_intermediate_size:
             return None, "incomplete Qwen3.5 MoE config: missing moe_intermediate_size"
+        if not moe_modules:
+            return None, "vLLM MoE layouts not found"
+        if len(moe_modules) != len(expert_blocks):
+            return (
+                None,
+                f"vLLM has {len(moe_modules)} fused-MoE layers, the trainer sent {len(expert_blocks)} MoE blocks",
+            )
 
-        moe_modules = [(n, m) for n, m in modules if hasattr(m, "w13_weight") and hasattr(m, "quant_method")]
         if wire_ep:
             for mod_name, m in moe_modules:
                 method = type(m.quant_method).__name__
@@ -389,11 +406,14 @@ def plan_direct_install(
                 ep_mode, why = moe_parallel_mode(m, num_experts, dims.moe_intermediate_size, tp_size, tp_rank)
                 if ep_mode is None:
                     return None, f"vLLM's {mod_name}: {why}"
-            if not moe_modules:
-                return None, "vLLM MoE layouts not found"
             moe_layout, expert_parallel = MOE_LAYOUT_TPU_EP, True
         else:
-            hidden = next(int(s[-1]) for n, s in global_shapes.items() if n.endswith(".mlp.experts.gate_proj"))
+            cfg_hidden = getattr(hf_text_config, "hidden_size", None)
+            hidden = (
+                int(cfg_hidden)
+                if cfg_hidden
+                else next(int(s[-1]) for n, s in sorted(global_shapes.items()) if n.endswith(".mlp.experts.gate_proj"))
+            )
             moe_plan, why = plan_moe_layers(
                 moe_modules,
                 num_experts,
@@ -406,6 +426,19 @@ def plan_direct_install(
             )
             if moe_plan is None:
                 return None, why
+            expected_expert_shapes = {
+                ".mlp.experts.gate_proj": [num_experts, dims.moe_intermediate_size, hidden],
+                ".mlp.experts.up_proj": [num_experts, dims.moe_intermediate_size, hidden],
+                ".mlp.experts.down_proj": [num_experts, hidden, dims.moe_intermediate_size],
+            }
+            for layer in sorted(expert_blocks):
+                for suffix, exp_shape in expected_expert_shapes.items():
+                    t_name = layer + suffix
+                    if list(global_shapes[t_name]) != exp_shape:
+                        return None, (
+                            f"{t_name} is {list(global_shapes[t_name])}, the config gives {exp_shape} "
+                            f"(moe_intermediate_size={dims.moe_intermediate_size})"
+                        )
             moe_layout, expert_parallel, moe_requant = moe_plan
     elif dims.moe_intermediate_size and dims.moe_intermediate_size % tp_size:
         return None, f"moe_intermediate_size {dims.moe_intermediate_size} does not split over TP={tp_size}"
@@ -534,20 +567,46 @@ def install(
         if plan.moe_layout is None:
             raise RuntimeError(f"{_ERROR_PREFIX}: received experts but planned no MoE layout")
         prefix = m.group(1)
+        pieces = (name, f"{prefix}.up_proj", f"{prefix}.down_proj")
+        missing = [p for p in pieces if p not in staging]
+        if missing:
+            raise RuntimeError(f"{_ERROR_PREFIX}: {prefix} lacks {missing}")
+        gate, up, down = (staging[p] for p in pieces)
+        if gate.ndim != 3:
+            raise RuntimeError(f"{_ERROR_PREFIX}: {name} is {tuple(gate.shape)}, expected a 3-D expert stack")
+        local_experts = (
+            (dims.num_experts // tp_size if plan.expert_parallel else dims.num_experts)
+            if dims.num_experts is not None
+            else gate.shape[0]
+        )
+        local_inter = (
+            (dims.moe_intermediate_size if plan.expert_parallel else dims.moe_intermediate_size // tp_size)
+            if dims.moe_intermediate_size is not None
+            else gate.shape[1]
+        )
+        hidden = gate.shape[2]
+        expected_shapes = (
+            (local_experts, local_inter, hidden),
+            (local_experts, local_inter, hidden),
+            (local_experts, hidden, local_inter),
+        )
+        for piece, t, exp_shape in zip(pieces, (gate, up, down), expected_shapes, strict=True):
+            if tuple(t.shape) != exp_shape:
+                raise RuntimeError(f"{_ERROR_PREFIX}: {piece} is {tuple(t.shape)} on this rank, expected {exp_shape}")
         write_experts(
             model_sd,
             find_model_key,
             prefix,
-            staging[name],
-            staging[f"{prefix}.up_proj"],
-            staging[f"{prefix}.down_proj"],
+            gate,
+            up,
+            down,
             layout=plan.moe_layout,
             expert_keys=plan.expert_keys,
             check_padding=not plan.padding_checked,
             requant=plan.moe_requant,
             check=check,
         )
-        consumed.update({name, f"{prefix}.up_proj", f"{prefix}.down_proj"})
+        consumed.update(pieces)
     # Requantized experts are written whole (fresh zero padding), so no padding is checked for them.
     plan.padding_checked = plan.moe_layout not in MOE_QUANTIZED_LAYOUTS
     return consumed

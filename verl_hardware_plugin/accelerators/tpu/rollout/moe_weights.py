@@ -29,10 +29,10 @@ from verl_hardware_plugin.accelerators.tpu.device_api import tpu_synchronize
 # * ``MOE_LAYOUT_TPU``: vllm-torchtpu's unquantized method, w13 [E, H, 2A] / w2 [E, A, H] (transposed; each w13 half
 #   and w2's rows padded with zeros to ``A``, the next multiple of 128);
 # * ``MOE_LAYOUT_VLLM``: vLLM's own unquantized method, [E, 2I, H] / [E, H, I];
-# * ``MOE_LAYOUT_TPU_FP8``: vllm-torchtpu's FP8 method (``QUANTIZE_ON_LOAD_PREFIXES=experts`` or an FP8 checkpoint):
-#   ``MOE_LAYOUT_TPU``'s layout in its ``MOE_REQUANTIZE_WEIGHT_DTYPE`` (FP8 e4m3 by default) plus
-#   ``w*_weight_scale_inv`` scales, per output channel or per ``MOE_REQUANTIZE_BLOCK_SIZE`` block of the contracting
-#   dimension (``requant_shapes``). Written by requantizing the received bf16 (``write_requantized``).
+# * ``MOE_LAYOUT_TPU_FP8``: vllm-torchtpu's FP8 method (``QUANTIZE_ON_LOAD_PREFIXES=experts``, or an FP8 checkpoint
+#   whose non-expert layers stay unquantized): ``MOE_LAYOUT_TPU``'s layout in ``MOE_REQUANTIZE_WEIGHT_DTYPE`` (FP8
+#   e4m3 by default) plus ``w*_weight_scale_inv`` scales, per output channel or per ``MOE_REQUANTIZE_BLOCK_SIZE`` block
+#   of the contracting dim (``requant_shapes``). Written by requantizing the received bf16 (``write_requantized``).
 MOE_LAYOUT_TPU = "tpu_transposed_padded"
 MOE_LAYOUT_VLLM = "vllm"
 MOE_LAYOUT_TPU_EP = "tpu_expert_parallel"  # vllm-torchtpu zero-copy EP layout (see qwen3_5_layout.EP_EXPERT_TENSORS)
@@ -58,6 +58,16 @@ def moe_attr(module: Any, name: str, default: Any) -> Any:
     return default if value is None else value
 
 
+def _module_activation(module: Any) -> str:
+    """The activation string vllm-torchtpu quantized (and runs) ``module``'s experts with."""
+    activation = getattr(getattr(module, "quant_method", None), "_tpu_activation_str", None)
+    if activation is not None:
+        return str(activation)
+    activation = moe_attr(module, "activation", "silu")
+    activation = getattr(activation, "value", activation)  # vLLM's MoEActivation enum
+    return str(activation).lower()
+
+
 def moe_parallel_mode(
     module: Any, num_experts: int, moe_intermediate_size: int, tp_size: int, tp_rank: int
 ) -> tuple[Optional[bool], str]:
@@ -71,8 +81,12 @@ def moe_parallel_mode(
     local_experts = int(moe_attr(module, "local_num_experts", 0) or 0)
     if global_experts and global_experts != num_experts:
         return None, f"{global_experts} experts, the config gives {num_experts}"
-    activation = str(moe_attr(module, "activation", "silu")).lower()
-    if "swigluoai" in activation or getattr(module, "w13_bias", None) is not None:
+    activation = _module_activation(module)
+    if (
+        "swigluoai" in activation.lower()
+        or getattr(module, "w13_bias", None) is not None
+        or getattr(module, "w2_bias", None) is not None
+    ):
         return None, f"activation {activation} / expert bias not supported"
     if tp_size == 1:
         return True, ""
@@ -283,17 +297,24 @@ def _load_vllm_torchtpu_fp8() -> tuple[Optional[tuple[Callable, Callable, int]],
         inspect.signature(get_config).bind("")
     except (TypeError, ValueError) as e:
         return None, f"vllm-torchtpu's FP8 MoE requantizer has an unexpected signature ({e})"
-    chunk_bytes = getattr(fp8, "_REQUANT_CHUNK_BYTES", _DEFAULT_REQUANT_CHUNK_BYTES)
-    return (quantize_and_format, get_config, int(chunk_bytes)), ""
-
-
-def _module_activation(module: Any) -> str:
-    """The activation string vllm-torchtpu quantized (and runs) ``module``'s experts with."""
-    activation = getattr(getattr(module, "quant_method", None), "_tpu_activation_str", None)
-    if activation is None:
-        activation = moe_attr(module, "activation", "silu")
-        activation = getattr(activation, "value", activation)  # vLLM's MoEActivation enum
-    return str(activation).lower()
+    raw_chunk_bytes: Any = None
+    try:
+        raw_chunk_bytes = getattr(getattr(fp8, "envs", None), "TPU_MOE_REQUANT_CHUNK_BYTES", None)
+    except Exception as e:
+        return None, f"vllm-torchtpu's TPU_MOE_REQUANT_CHUNK_BYTES is invalid ({e})"
+    if raw_chunk_bytes is None:
+        raw_chunk_bytes = getattr(fp8, "_REQUANT_CHUNK_BYTES", None)
+    if raw_chunk_bytes is None:
+        raw_chunk_bytes = _DEFAULT_REQUANT_CHUNK_BYTES
+    if isinstance(raw_chunk_bytes, bool):
+        return None, f"vllm-torchtpu's MoE requant chunk size {raw_chunk_bytes!r} is not a positive int"
+    try:
+        chunk_bytes = int(raw_chunk_bytes)
+    except (TypeError, ValueError) as e:
+        return None, f"vllm-torchtpu's MoE requant chunk size {raw_chunk_bytes!r} is invalid ({e})"
+    if chunk_bytes <= 0:
+        return None, f"vllm-torchtpu's MoE requant chunk size must be positive, got {chunk_bytes}"
+    return (quantize_and_format, get_config, chunk_bytes), ""
 
 
 def requant_shapes(
@@ -323,12 +344,14 @@ def _plan_vllm_torchtpu_fp8(
         _, quant_dtype, block_size = get_config("[tpu-sync direct install]: requantizing received MoE weights")
     except Exception as e:  # e.g. an unsupported MOE_REQUANTIZE_WEIGHT_DTYPE
         return None, f"vllm-torchtpu's MoE quantization config: {e}"
+    if not isinstance(quant_dtype, torch.dtype):
+        return None, f"vllm-torchtpu's MoE quantization dtype {quant_dtype!r} is not a torch.dtype"
+    if block_size is not None and (isinstance(block_size, bool) or not isinstance(block_size, int) or block_size <= 0):
+        return None, f"vllm-torchtpu's MOE_REQUANTIZE_BLOCK_SIZE={block_size!r} is not a positive int"
     activations = {_module_activation(m) for _, m in moe_modules}
     if len(activations) != 1:
         return None, f"vLLM's MoE layers use different activations {sorted(activations)}"
-    requant = MoeRequant(
-        quant_dtype, int(block_size) if block_size else None, activations.pop(), quantize_and_format, chunk_bytes
-    )
+    requant = MoeRequant(quant_dtype, block_size, activations.pop(), quantize_and_format, chunk_bytes)
     aligned = _aligned(local_inter)
     if requant.block_size and (hidden % requant.block_size or aligned % requant.block_size):
         return None, (
@@ -336,8 +359,9 @@ def _plan_vllm_torchtpu_fp8(
             f"(hidden {hidden}, padded intermediate {aligned})"
         )
     for name, m in moe_modules:
+        m_sd = m.state_dict() if isinstance(m, torch.nn.Module) else None
         for leaf, (shape, dtype) in requant_shapes(requant, local_experts, local_inter, hidden).items():
-            t = getattr(m, leaf, None)
+            t = m_sd.get(leaf) if m_sd is not None else getattr(m, leaf, None)
             if not isinstance(t, torch.Tensor):
                 return None, f"vLLM's {name} has no {leaf}"
             t = _local(t)
@@ -388,7 +412,8 @@ def plan_moe_layers(
     layouts: set[str] = set()
     modes: set[bool] = set()
     for name, m in moe_modules:
-        method = type(m.quant_method).__name__
+        qm = m.quant_method
+        method = type(qm).__name__
         layout = MOE_LAYOUTS.get(method)
         if layout is None:
             return None, f"unsupported vLLM MoE method {method} (quantized?)"
@@ -397,6 +422,8 @@ def plan_moe_layers(
                 f"vLLM MoE method {method}: the direct install of quantized experts is off "
                 "(engine_kwargs.tpu-sync.direct_install_quantized_moe=False)"
             )
+        if getattr(qm, "_fused_moe_decode_op", None) is not None or getattr(qm, "_moe_tp_decode_op", None) is not None:
+            return None, f"vLLM's {name} armed a fused shared+routed decode kernel (stages shared-expert buffers)"
         ep_mode, why = moe_parallel_mode(m, num_experts, moe_intermediate_size, tp_size, tp_rank)
         if ep_mode is None:
             return None, f"vLLM's {name}: {why}"

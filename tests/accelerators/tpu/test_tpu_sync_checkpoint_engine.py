@@ -2548,3 +2548,24 @@ def test_qwen3_moe_with_unsupported_expert_placement_falls_back_to_vllm_loaders(
         assert sorted(received) == sorted(expected)
         for name, tensor in expected.items():
             assert torch.equal(received[name], tensor), name
+
+
+def test_quantized_dense_weights_fall_back_to_loaders_and_copy_into_rejects_fp8(fake_tpu_sync, worker_ext, caplog):
+    """Dense models with quantized linears use vLLM's loaders at init; copy_into also refuses unscaled bf16 -> fp8."""
+    quant_model = _FakeVllmModel(2)
+    quant_model.model.layers[0].self_attn.qkv_proj.quant_method = type("VllmFp8LinearMethodTPU", (), {})()
+    sampler = _make_sampler(worker_ext, rank=0, tp=2, model=quant_model)
+    with caplog.at_level(logging.WARNING, logger=worker_ext.__name__):
+        assert sampler.init_tpu_sync_on_worker("10.0.0.2:7777", {"model.norm.weight": [HIDDEN]}) is True
+    assert sampler._tpu_sync_use_vllm_loaders is True
+    assert "VllmFp8LinearMethodTPU" in caplog.text
+
+    # Defense-in-depth: even if a parameter becomes FP8 after init, copy_into raises instead of casting unscaled bf16.
+    plain_model = _FakeVllmModel(1)
+    direct_sampler = _make_sampler(worker_ext, rank=0, tp=1, model=plain_model)
+    assert direct_sampler.init_tpu_sync_on_worker("10.0.0.2:7777", {"model.norm.weight": [HIDDEN]}) is True
+    assert direct_sampler._tpu_sync_use_vllm_loaders is False
+    direct_sampler._tpu_sync_ws.received = [torch.ones(HIDDEN, dtype=torch.bfloat16)]
+    plain_model.model.norm.weight = nn.Parameter(torch.zeros(HIDDEN, dtype=torch.float8_e4m3fn), requires_grad=False)
+    with pytest.raises(RuntimeError, match="cannot copy unscaled .* into quantized"):
+        direct_sampler.install_tpu_sync_weights()

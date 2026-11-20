@@ -388,6 +388,12 @@ def test_fp8_plan_refusals(fake_vllm_torchtpu_fp8):
     model = _fp8_vllm_model(2, 0, True)
     plan, why = qwen3_moe_layout.plan_direct_install(model, SHAPES, CONFIG, 2, 0, allow_quantized_moe=False)
     assert plan is None and "quantized experts is off" in why
+    # A pre-quantized FP8 checkpoint also quantizes dense linears (VllmFp8LinearMethodTPU): direct install refuses it
+    # rather than overwriting FP8 weights with unscaled bf16 via copy_into.
+    fp8_dense = _fp8_vllm_model(2, 0, True)
+    fp8_dense.model.layers[0].mlp.gate.quant_method = type("VllmFp8LinearMethodTPU", (), {})()
+    plan, why = qwen3_moe_layout.plan_direct_install(fp8_dense, SHAPES, CONFIG, 2, 0)
+    assert plan is None and "VllmFp8LinearMethodTPU" in why
     model.model.layers[1].mlp.experts.w2_weight.data = torch.zeros(E // 2, 128, HID + 1, dtype=FP8)
     plan, why = qwen3_moe_layout.plan_direct_install(model, SHAPES, CONFIG, 2, 0)
     assert plan is None and "model.layers.1.mlp.experts.w2_weight is (2, 128, 9)" in why
