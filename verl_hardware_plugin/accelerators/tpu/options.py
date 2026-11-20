@@ -218,11 +218,14 @@ class TPUEngineOptions:
             count (``tpu_padded_num_seqs``: the most sequences in any micro-batch of the mini-batch on any rank,
             rounded up to a power of two), so the loss programs do not recompile whenever ``use_dynamic_bsz`` changes
             the number of sequences per micro-batch (default: ``True``). Applied only with verl's ``ppo_loss`` and a
-            policy loss that ignores fully masked rows (``losses.loss_inputs.loss_rows_can_be_padded``); ``geo_mean``,
-            ``bypass_mode`` and custom ``register_policy_loss`` losses keep the exact row count. ``False`` turns it off.
+            policy loss that ignores fully masked rows (``losses.loss_inputs.loss_rows_can_be_padded``); ``geo_mean``
+            and custom ``register_policy_loss`` losses keep the exact row count, and so does ``bypass_mode`` unless
+            ``static_micro_batch_num_seqs`` is set. ``False`` turns it off.
         static_micro_batch_num_seqs: With ``loss_row_bucketing``, pad the PPO loss inputs to at least this many rows
             (e.g. the largest number of sequences a micro-batch can hold), so the loss keeps one row shape
-            (default: unset, the power-of-two bucket only).
+            (default: unset, the power-of-two bucket only). With it, ``bypass_mode`` gets padded rows too: its loss
+            and gradients do not change, but with verl 0.9.1 some of its ``rollout_corr/*`` diagnostics count the
+            padding rows (docs/accelerators/tpu/engine.md lists them).
         splash_max_block_size: Largest Splash attention block size, a power of two >= 128 (default: ``512``,
             torchtitan's). Long packed micro-batches run faster with ``1024``.
         mixed_precision_reduce: dtype of the FSDP gradient reduce-scatter, ``float32`` (default, torchtitan's) or

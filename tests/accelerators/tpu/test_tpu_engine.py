@@ -1773,6 +1773,38 @@ def test_forward_backward_batch_row_bucketing_and_loss_scalars(
         assert scalars == {}
 
 
+@pytest.mark.parametrize("simple_fsdp", [False, True])
+@pytest.mark.parametrize(
+    "loss_mode,tpu_kwargs,expected_rows",
+    [
+        ("bypass_mode", {}, None),  # the default keeps bypass_mode's exact rows
+        ("bypass_mode", {"static_micro_batch_num_seqs": 6}, 6),  # a static row count pads it too
+        ("bypass_mode", {"static_micro_batch_num_seqs": 6, "loss_row_bucketing": False}, None),  # opt-out
+        ("geo_mean", {"static_micro_batch_num_seqs": 6}, None),  # pad rows would rescale geo_mean
+    ],
+)
+def test_forward_backward_batch_pads_bypass_mode_rows_only_with_static_micro_batch_num_seqs(
+    simple_fsdp, loss_mode, tpu_kwargs, expected_rows
+):
+    from verl.workers.config import ActorConfig
+    from verl.workers.config.actor import PolicyLossConfig
+    from verl.workers.utils.losses import ppo_loss
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+
+    config = ActorConfig(
+        strategy="fsdp", rollout_n=1, ppo_micro_batch_size_per_gpu=4, policy_loss=PolicyLossConfig(loss_mode=loss_mode)
+    )
+    data = TensorDict({"loss_mask": torch.ones(5, 4, dtype=torch.int64)}, batch_size=[5])
+    engine = _fwd_bwd_engine(tpu_kwargs, simple_fsdp=simple_fsdp)
+    with (
+        mock.patch.object(torchtitan_tpu, "prepare_micro_batches", return_value=([_rows_mb(3), _rows_mb(2)], None)),
+        mock.patch.object(torchtitan_tpu, "postprocess_batch_func", side_effect=lambda output_lst, **kw: output_lst),
+    ):
+        engine.forward_backward_batch(data, functools.partial(ppo_loss, config=config), forward_only=True)
+    calls = engine.forward_step.calls
+    assert [(rows, padded) for rows, padded, _ in calls] == [(3, expected_rows), (2, expected_rows)]
+
+
 def test_cp_attention_owner_dispatches_to_inner_attention_cp_shard():
     from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
 

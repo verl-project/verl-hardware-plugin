@@ -1635,9 +1635,12 @@ class TorchTitanTPUEngine(BaseEngine):
         static_len = int(tpu_options.static_micro_batch_len or 0)
         static_response_len = int(tpu_options.static_max_response_len or 0)
         slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)
-        # Pad the PPO loss rows to a common bucket only for losses that provably ignore fully masked rows.
-        bucket_rows = tpu_options.loss_row_bucketing is not False and loss_rows_can_be_padded(loss_function)
         static_num_seqs = int(tpu_options.static_micro_batch_num_seqs or 0)
+        # Pad the PPO loss rows to a common bucket only for losses that provably ignore fully masked rows, and with
+        # static_micro_batch_num_seqs also for bypass_mode (see loss_rows_can_be_padded).
+        bucket_rows = tpu_options.loss_row_bucketing is not False and loss_rows_can_be_padded(
+            loss_function, static_num_seqs
+        )
         if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len or slot_len:
             align_micro_batch_shapes_across_ranks(
                 micro_batches,

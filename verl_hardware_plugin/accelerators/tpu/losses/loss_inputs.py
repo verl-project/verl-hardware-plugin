@@ -37,6 +37,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
 __all__ = [
     "DEVICE_LOSS_SCALAR_KEYS",
     "ROW_PADDING_INVARIANT_POLICY_LOSSES",
+    "ROW_PADDING_OPT_IN_POLICY_LOSSES",
     "ROW_PADDING_VARIANT_POLICY_LOSSES",
     "can_pad_tensordict_rows",
     "device_loss_scalars",
@@ -62,8 +63,13 @@ ROW_PADDING_INVARIANT_POLICY_LOSSES = frozenset(
 # Policy losses whose results count every row: ``geo_mean`` (``torch.mean`` of the per-sequence losses, so pad rows
 # rescale the loss and its gradients) and ``bypass_mode`` (its ``rollout_corr/*`` metrics, e.g. ``training_ppl``,
 # average over every row). They, and losses not listed above (e.g. custom ``register_policy_loss`` losses), keep the
-# exact number of rows.
+# exact number of rows, except the ``ROW_PADDING_OPT_IN_POLICY_LOSSES`` below with ``static_micro_batch_num_seqs``.
 ROW_PADDING_VARIANT_POLICY_LOSSES = frozenset({"geo_mean", "bypass_mode"})
+# Of those, the policy losses whose loss, gradients and masked metrics ignore fully masked rows, and only some
+# diagnostics count them: verl 0.9.1 counts the padding rows in some of ``bypass_mode``'s sequence-level
+# ``rollout_corr/*`` metrics, verl main does not (verl-project/verl#7785, #8628). Their rows are padded only when
+# ``static_micro_batch_num_seqs`` asks for a fixed row count (docs/accelerators/tpu/engine.md lists the metrics).
+ROW_PADDING_OPT_IN_POLICY_LOSSES = frozenset({"bypass_mode"})
 # ``agg_loss`` modes: masked sums, with the per-sequence modes dropping rows without valid tokens (``seq_mask``).
 _ROW_PADDING_INVARIANT_AGG_MODES = frozenset(
     {"token-mean", "token-sum", "seq-mean-token-sum", "seq-mean-token-sum-norm", "seq-mean-token-mean"}
@@ -228,18 +234,24 @@ def ppo_loss_config(loss_function: Any) -> Any:
     return config
 
 
-def loss_rows_can_be_padded(loss_function: Any) -> bool:
-    """Whether padding the PPO loss inputs with fully masked rows leaves ``loss_function``'s results unchanged.
+def loss_rows_can_be_padded(loss_function: Any, static_num_seqs: int = 0) -> bool:
+    """Whether the engine may pad the PPO loss inputs of ``loss_function`` with fully masked rows.
 
-    True only for verl's ``ppo_loss`` with a policy loss in ``ROW_PADDING_INVARIANT_POLICY_LOSSES`` and an
-    ``agg_loss`` mode. Any other loss (``geo_mean``, ``bypass_mode``, a custom ``register_policy_loss`` loss, a non-PPO
-    loss) keeps the exact number of rows.
+    True only for verl's ``ppo_loss`` with an ``agg_loss`` mode and a policy loss in
+    ``ROW_PADDING_INVARIANT_POLICY_LOSSES``, whose results these rows leave unchanged, or, with ``static_num_seqs``
+    (``engine_kwargs.tpu.static_micro_batch_num_seqs``), in ``ROW_PADDING_OPT_IN_POLICY_LOSSES`` (``bypass_mode``: the
+    same loss and gradients, but with verl 0.9.1 some of its diagnostics count the rows). Any other loss (``geo_mean``,
+    ``bypass_mode`` without ``static_num_seqs``, a custom ``register_policy_loss`` loss, a non-PPO loss) keeps the exact
+    number of rows.
     """
     config = ppo_loss_config(loss_function)
     if config is None or _cfg_get(config, "loss_agg_mode") not in _ROW_PADDING_INVARIANT_AGG_MODES:
         return False
     policy_loss = _cfg_get(config, "policy_loss")
-    return _cfg_get(policy_loss, "loss_mode", "vanilla") in ROW_PADDING_INVARIANT_POLICY_LOSSES
+    loss_mode = _cfg_get(policy_loss, "loss_mode", "vanilla")
+    if loss_mode in ROW_PADDING_INVARIANT_POLICY_LOSSES:
+        return True
+    return bool(static_num_seqs) and loss_mode in ROW_PADDING_OPT_IN_POLICY_LOSSES
 
 
 def device_loss_scalars(data: TensorDict, device: Any) -> dict[str, torch.Tensor]:
