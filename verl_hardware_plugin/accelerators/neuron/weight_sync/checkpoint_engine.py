@@ -3,10 +3,10 @@
 
 """NIXL-only checkpoint bridge for native TorchTitan and native vLLM-Neuron."""
 
+import gc
 import json
 import logging
 import os
-import socket
 import time
 from datetime import timedelta
 
@@ -25,7 +25,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 @CheckpointEngineRegistry.register("neuron_nixl")
 class NeuronNixlCheckpointEngine(CheckpointEngine):
-    def __init__(self, bucket_size, is_master=False, timeout_s=300, verify_weights=True, **kwargs):
+    def __init__(self, bucket_size, is_master=False, timeout_s=1800, verify_weights=True, **kwargs):
         from ..engines.torchtitan_neuron import actor_engine
 
         self.engine = actor_engine()
@@ -64,11 +64,14 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
                 checksums[name] = [host.sum().item(), host.abs().sum().item()]
         metadata["checksums"] = checksums
         if self.rank == 0:
-            if not hasattr(self, "port"):
-                with socket.socket() as listener:
-                    listener.bind(("127.0.0.1", 0))
-                    self.port = listener.getsockname()[1]
-            metadata.update(host=ray.util.get_node_ip_address(), port=self.port, timeout_s=self.timeout_s)
+            host = ray.util.get_node_ip_address()
+            if getattr(self, "master_store", None) is None:
+                # Bind port 0 and keep the store: probing a free port and reopening it races.
+                self.master_store = control_store(
+                    NixlTopology(host, 0, rollout_tp=1, replicas=1, timeout_s=self.timeout_s), master=True
+                )
+                self.port = self.master_store.port
+            metadata.update(host=host, port=self.port, timeout_s=self.timeout_s)
         return metadata
 
     @classmethod
@@ -107,7 +110,8 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
                 raise ValueError("NIXL topology cannot change during this run")
             return
         self.spec = spec
-        self.store = control_store(spec, master=self.rank == 0)
+        store = getattr(self, "master_store", None) if self.rank == 0 else None
+        self.store = store if store is not None else control_store(spec, master=self.rank == 0)
         for replica in range(spec.replicas):
             for rank in range(spec.rollout_tp):
                 if (replica * spec.rollout_tp + rank) % self.world_size != self.rank:
@@ -154,6 +158,11 @@ class NeuronNixlCheckpointEngine(CheckpointEngine):
                     len(buckets),
                     self.spec.replicas * self.spec.rollout_tp,
                 )
+        # Nothing else frees the export's cached memory before the next actor forward.
+        del buffer
+        gc.collect()
+        if hasattr(torch, "neuron"):
+            torch.neuron.empty_cache()
         logger.info(
             "neuron_nixl rank %d exported %d HF buckets at policy step %s for %d TP receivers",
             self.rank,

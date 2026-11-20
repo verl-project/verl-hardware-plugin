@@ -115,3 +115,12 @@ def test_fused_bias_layout_and_incomplete_qkv_are_rejected_or_mapped():
     del shapes[prefix + "v_proj.bias"]
     with pytest.raises(ValueError, match="Incomplete QKV"):
         plan_box(buckets[0], shapes, inventory, 0, 2)
+
+
+def test_whole_params_close_a_bucket_rather_than_split_a_weight_that_fits():
+    schedule = [("a", (4, 4), "bfloat16"), ("b", (4, 4), "bfloat16"), ("c", (8, 4), "bfloat16")]
+    buckets = plan_buckets(schedule, bucket_bytes=48)
+    layout = [[(entry.name, entry.numel) for entry in bucket.entries] for bucket in buckets]
+    assert layout == [[("a", 16)], [("b", 16), ("c", 8)], [("c", 24)]]
+    greedy = plan_buckets(schedule, bucket_bytes=48, whole_params=False)
+    assert [[(entry.name, entry.numel) for entry in bucket.entries] for bucket in greedy][0] == [("a", 16), ("b", 8)]

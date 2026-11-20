@@ -43,7 +43,10 @@ class BoxPlan:
     skipped: tuple
 
 
-def plan_buckets(schedule, itemsize=2, *, bucket_bytes):
+def plan_buckets(schedule, itemsize=2, *, bucket_bytes, whole_params=True):
+    """whole_params starts a new bucket rather than split a weight that fits in one, so pieces keep the
+    same shapes across layers. Senders and receivers must use the same setting.
+    """
     if itemsize != 2 or bucket_bytes < 2 or bucket_bytes % 2:
         raise ValueError("Weight synchronization requires even-sized BF16 buckets")
     capacity = bucket_bytes // itemsize
@@ -58,6 +61,9 @@ def plan_buckets(schedule, itemsize=2, *, bucket_bytes):
         if row_size > capacity:
             raise ValueError(f"One row of {name} exceeds the weight bucket size")
         offset = 0
+        if whole_params and used and capacity - used < prod(shape) <= capacity:
+            buckets.append(Bucket(capacity, tuple(entries)))
+            entries, used = [], 0
         while offset < prod(shape):
             length = min(capacity - used, prod(shape) - offset)
             length -= length % row_size
@@ -191,13 +197,27 @@ def _slices(box):
 
 
 def pack_box(slot, buffer, bucket, plan):
+    """torch-neuronx compiles one eager graph per storage offset, so pieces that need a graph (a
+    transpose or a column window) are first copied to a fresh tensor at offset 0.
+    """
     for piece in plan.pieces:
         entry = bucket.entries[piece.entry_index]
-        fragment = buffer[entry.offset : entry.offset + entry.numel].view(-1, *entry.shape[1:])
-        source = fragment[_slices(piece.src_box)]
+        width = prod(entry.shape[1:])
+        (first, last), columns = piece.src_box[0], piece.src_box[1:]
+        rows = buffer[entry.offset + first * width : entry.offset + last * width]
+        target = slot[piece.box_offset : piece.box_offset + piece.numel]
+        whole_rows = all(
+            start == 0 and end == extent for (start, end), extent in zip(columns, entry.shape[1:], strict=True)
+        )
+        if whole_rows and not piece.transposed:
+            target.copy_(rows)
+            continue
+        staged = rows.clone().view(last - first, *entry.shape[1:])
         if piece.transposed:
-            source = source.transpose(0, 1)
-        slot[piece.box_offset : piece.box_offset + piece.numel].copy_(source.reshape(-1))
+            ((start, end),) = columns
+            target.copy_(staged.t().contiguous()[start:end].reshape(-1))
+        else:
+            target.copy_(staged[(slice(None),) + _slices(columns)].reshape(-1))
 
 
 def apply_box(host_buffer, plan, tensors):
