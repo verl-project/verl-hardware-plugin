@@ -117,6 +117,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
 )
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
 from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import (
+    _cfg_get,
     device_loss_scalars,
     loss_rows_can_be_padded,
     ppo_loss_config,
@@ -1004,15 +1005,17 @@ def _add_rollout_consistency_metrics(
         "actor/logprob_gap_abs_token_mean",
     )
     config = ppo_loss_config(loss_function)
-    if config is not None and any(name not in metrics for name in names):
-        if config.global_batch_info.get("batch_num_tokens") is not None:
-            mode = config.policy_loss.get("loss_mode", "vanilla")
-            correction = config.policy_loss.get("rollout_correction") or {}
+    global_batch_info = _cfg_get(config, "global_batch_info")
+    if isinstance(global_batch_info, Mapping) and any(name not in metrics for name in names):
+        if global_batch_info.get("batch_num_tokens") is not None:
+            policy_loss = _cfg_get(config, "policy_loss")
+            mode = _cfg_get(policy_loss, "loss_mode", "vanilla")
+            correction = _cfg_get(policy_loss, "rollout_correction")
             # Rejection sampling and other losses use a different token denominator.
             if mode == "vanilla" or (
                 mode == "bypass_mode"
-                and correction.get("loss_type", "ppo_clip") == "ppo_clip"
-                and correction.get("rollout_rs") is None
+                and _cfg_get(correction, "loss_type", "ppo_clip") == "ppo_clip"
+                and _cfg_get(correction, "rollout_rs") is None
             ):
                 with torch.no_grad():
                     log_prob = no_padding_2_padding(loss_model_output["log_probs"], loss_data)
@@ -1027,7 +1030,7 @@ def _add_rollout_consistency_metrics(
                             name,
                             Metric(
                                 AggregationType.SUM,
-                                agg_loss(value, mask, "token-mean", **config.global_batch_info),
+                                agg_loss(value, mask, "token-mean", **global_batch_info),
                             ),
                         )
 
@@ -1547,13 +1550,16 @@ class TorchTitanTPUEngine(BaseEngine):
     def _cp_restore_indices(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """The head-tail restore permutation for ``seq_len`` tokens on ``device``, built once per shape.
 
-        Built on CPU and copied to the device like the other CPU-built index tensors of a micro-batch (e.g. the labels
-        in ``prepare_model_inputs``), without a stream cut, so the first micro-batch of a shape fuses like the others.
+        Built on CPU and copied to the device with ``non_blocking=True`` like the other CPU-built index tensors of a
+        micro-batch (e.g. the labels in ``prepare_model_inputs``), avoiding a blocking H2D stream cut after
+        ``ContextParallelGather`` on cache miss so the first micro-batch of a shape fuses like the others.
         """
         key = (int(seq_len), int(self.parallel_dims.cp), device)
         restore_idx = self._cp_restore_idx_cache.get(key)
         if restore_idx is None:
-            restore_idx = _headtail_restore_indices_cpu(int(seq_len), int(self.parallel_dims.cp)).to(device=device)
+            restore_idx = _headtail_restore_indices_cpu(int(seq_len), int(self.parallel_dims.cp)).to(
+                device=device, non_blocking=True
+            )
             self._cp_restore_idx_cache[key] = restore_idx
         return restore_idx
 
@@ -1873,10 +1879,16 @@ class TorchTitanTPUEngine(BaseEngine):
             advantages.to(device),
             loss_mask.to(device),
         )
-        # The same 0-D tensor as the eager loss (device_loss_scalars), else built here (not on TPU, e.g. CPU tests).
+        # The same 0-D tensor as the eager loss (device_loss_scalars), else built here (not on TPU, e.g. CPU tests),
+        # clamped to >= 1.0 when batch_num_tokens == 0 globally to match GraphPolicyLoss and avoid 0.0 / 0.0 = NaN.
         global_valid_tokens = (loss_scalars or {}).get("batch_num_tokens")
         if global_valid_tokens is None or global_valid_tokens.device != device:
-            global_valid_tokens = torch.tensor(float(batch_num_tokens), dtype=torch.float32, device=device)
+            global_valid_tokens = torch.tensor(max(float(batch_num_tokens), 1.0), dtype=torch.float32, device=device)
+        eager_scalars = (
+            loss_scalars
+            if loss_scalars and "batch_num_tokens" in loss_scalars
+            else {**(loss_scalars or {}), "batch_num_tokens": global_valid_tokens}
+        )
         input_dict = {"input": input_ids, "labels": labels, "positions": extra_inputs["positions"]}
         # bf16 autocast as in the eager engine; it must be active while the step is traced (step 1), which records the
         # casts into the graph.
@@ -1898,7 +1910,7 @@ class TorchTitanTPUEngine(BaseEngine):
             model_output = {
                 "log_probs": _to_jagged(log_probs, micro_batch["input_ids"].offsets(), output_args["orig_seq_len"])
             }
-            loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch, loss_scalars)
+            loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch, eager_scalars)
             loss, metrics = loss_function(
                 model_output=loss_model_output, data=loss_data, dp_group=self.get_data_parallel_group()
             )

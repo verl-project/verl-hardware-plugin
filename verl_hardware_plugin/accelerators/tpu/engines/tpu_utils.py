@@ -32,6 +32,7 @@ import torch.distributed
 import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict
+from tensordict.tensorclass import NonTensorData, NonTensorStack
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -1017,7 +1018,8 @@ def align_micro_batch_shapes_across_ranks(
             if static_resp_padded:
                 tu.assign_non_tensor_data(mb, "tpu_max_response_len", static_resp_padded)
         if num_seqs_bucketing:
-            _assign_padded_num_seqs(micro_batches, _max_num_seqs(micro_batches), static_num_seqs)
+            raw_num_seqs, local_unpaddable = _encode_num_seqs_for_all_reduce(micro_batches)
+            _resolve_padded_num_seqs(micro_batches, raw_num_seqs, static_num_seqs, local_unpaddable)
         return
     lens: list[int] = []
     for mb in micro_batches:
@@ -1028,8 +1030,10 @@ def align_micro_batch_shapes_across_ranks(
             int(resp.offsets().diff().max().item()) if resp is not None and getattr(resp, "is_nested", False) else 0
         )
         lens += [_mb_seq_padded(mb, int(n_tokens)), bucket_length(max_resp, step) if max_resp else 0]
+    local_unpaddable = None
     if num_seqs_bucketing:
-        lens.append(_max_num_seqs(micro_batches))
+        raw_num_seqs, local_unpaddable = _encode_num_seqs_for_all_reduce(micro_batches)
+        lens.append(raw_num_seqs)
     lens_tensor = torch.tensor(lens, dtype=torch.int64)
     torch.distributed.all_reduce(lens_tensor, op=torch.distributed.ReduceOp.MAX)
     resolved_lens = lens_tensor.tolist()
@@ -1038,11 +1042,66 @@ def align_micro_batch_shapes_across_ranks(
         resp_len = int(resolved_lens[2 * i + 1])
         tu.assign_non_tensor_data(mb, "tpu_max_response_len", max(resp_len, static_resp_padded) if resp_len else 0)
     if num_seqs_bucketing:
-        _assign_padded_num_seqs(micro_batches, int(resolved_lens[-1]), static_num_seqs)
+        _resolve_padded_num_seqs(micro_batches, int(resolved_lens[-1]), static_num_seqs, local_unpaddable)
+
+
+# Sentinel in the int64 MAX all-reduce indicating that at least one micro-batch on at least one rank has an entry whose
+# rows cannot be padded (so every rank disables row bucketing in lockstep).
+_UNPADDABLE_NUM_SEQS = 1 << 62
+_WARNED_UNPADDABLE: set[tuple[str, str]] = set()
+
+
+def can_pad_nested_tensor_rows(value: torch.Tensor) -> bool:
+    """Whether ``value`` is a contiguous jagged nested tensor whose outer dim 0 can be padded with empty rows."""
+    return (
+        value.layout == torch.jagged
+        and getattr(value, "_lengths", None) is None
+        and int(getattr(value, "_ragged_idx", 0)) >= 1
+    )
+
+
+def first_unpaddable_tensordict_entry(td: TensorDict, prefix: str = "") -> Optional[tuple[str, str]]:
+    """``(key_path, type_desc)`` of the first entry in ``td`` whose rows cannot be padded, else ``None``."""
+    if len(td.batch_size) == 0:
+        return (prefix.rstrip(".") or "<root>", "0-D TensorDict")
+    for key, value in td.items():
+        path = f"{prefix}{key}"
+        if isinstance(value, (NonTensorData, NonTensorStack)):
+            continue
+        if isinstance(value, TensorDict):
+            bad = first_unpaddable_tensordict_entry(value, prefix=f"{path}.")
+            if bad is not None:
+                return bad
+            continue
+        if isinstance(value, torch.Tensor) and value.is_nested:
+            if not can_pad_nested_tensor_rows(value):
+                return (path, f"nested Tensor (layout={value.layout})")
+            continue
+        if isinstance(value, torch.Tensor):
+            if value.ndim < 1:
+                return (path, "0-D Tensor")
+            continue
+        return (path, type(value).__name__)
+    return None
+
+
+def can_pad_tensordict_rows(td: TensorDict) -> bool:
+    """Whether every per-row entry of ``td`` can be row-padded by ``pad_tensordict_rows``."""
+    return first_unpaddable_tensordict_entry(td) is None
 
 
 def _max_num_seqs(micro_batches: list[TensorDict]) -> int:
     return max((int(mb.batch_size[0]) for mb in micro_batches), default=0)
+
+
+def _encode_num_seqs_for_all_reduce(
+    micro_batches: list[TensorDict],
+) -> tuple[int, Optional[tuple[str, str]]]:
+    for mb in micro_batches:
+        bad = first_unpaddable_tensordict_entry(mb)
+        if bad is not None:
+            return _UNPADDABLE_NUM_SEQS, bad
+    return _max_num_seqs(micro_batches), None
 
 
 def _assign_padded_num_seqs(micro_batches: list[TensorDict], max_num_seqs: int, static_num_seqs: int) -> None:
@@ -1051,23 +1110,47 @@ def _assign_padded_num_seqs(micro_batches: list[TensorDict], max_num_seqs: int, 
         tu.assign_non_tensor_data(mb, "tpu_padded_num_seqs", padded)
 
 
+def _resolve_padded_num_seqs(
+    micro_batches: list[TensorDict],
+    reduced_num_seqs: int,
+    static_num_seqs: int,
+    local_unpaddable: Optional[tuple[str, str]],
+) -> None:
+    if reduced_num_seqs >= _UNPADDABLE_NUM_SEQS:
+        warn_key = local_unpaddable or ("<remote_rank>", "unpaddable_micro_batch")
+        if warn_key not in _WARNED_UNPADDABLE:
+            _WARNED_UNPADDABLE.add(warn_key)
+            if local_unpaddable is not None:
+                logger.warning(
+                    "Disabling PPO loss row bucketing: micro-batch field %r (%s) cannot be row-padded",
+                    local_unpaddable[0],
+                    local_unpaddable[1],
+                )
+            else:
+                logger.warning("Disabling PPO loss row bucketing: another rank's micro-batch has an unpaddable field")
+        for mb in micro_batches:
+            mb.pop("tpu_padded_num_seqs", None)
+        return
+    _assign_padded_num_seqs(micro_batches, reduced_num_seqs, static_num_seqs)
+
+
 def align_micro_batch_num_seqs(micro_batches: list[TensorDict], static_num_seqs: int = 0) -> None:
     """Give every micro-batch of a mini-batch the same ``tpu_padded_num_seqs``, on every rank.
 
     ``tpu_padded_num_seqs`` is the row count that ``prepare_tpu_loss_inputs`` pads the PPO loss inputs up to with
     fully masked rows: the largest number of sequences in any micro-batch on any rank (one CPU all-reduce(MAX)),
     rounded up to its sequence-count bucket (``bucket_num_sequences``, a power of two), and at least
-    ``static_num_seqs`` (``engine_kwargs.tpu.static_micro_batch_num_seqs``). With ``use_dynamic_bsz`` the number of
-    sequences per micro-batch varies; the loss programs then see at most one row shape per bucket instead of one per
-    sequence count. :func:`align_micro_batch_shapes_across_ranks` (``num_seqs_bucketing=True``) does the same within
-    its own all-reduce.
+    ``static_num_seqs`` (``engine_kwargs.tpu.static_micro_batch_num_seqs``). If any micro-batch on any rank contains an
+    entry whose rows cannot be padded (:func:`can_pad_tensordict_rows`), every rank leaves ``tpu_padded_num_seqs``
+    unset so all ranks fall back to exact row counts together. :func:`align_micro_batch_shapes_across_ranks`
+    (``num_seqs_bucketing=True``) does the same within its own all-reduce.
     """
-    max_num_seqs = _max_num_seqs(micro_batches)
+    raw_num_seqs, local_unpaddable = _encode_num_seqs_for_all_reduce(micro_batches)
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-        reduced = torch.tensor([max_num_seqs], dtype=torch.int64)
+        reduced = torch.tensor([raw_num_seqs], dtype=torch.int64)
         torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.MAX)
-        max_num_seqs = int(reduced.item())
-    _assign_padded_num_seqs(micro_batches, max_num_seqs, static_num_seqs)
+        raw_num_seqs = int(reduced.item())
+    _resolve_padded_num_seqs(micro_batches, raw_num_seqs, static_num_seqs, local_unpaddable)
 
 
 def _wrap_routed_experts_on_edp_mesh(model: nn.Module, *, parallel_dims: Any, training: Any) -> None:
