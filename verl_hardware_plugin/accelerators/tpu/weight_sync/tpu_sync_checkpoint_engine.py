@@ -974,6 +974,9 @@ async def _finish_tpu_sync(
     t_init_sampler_start = time.perf_counter()
     # vLLM's workers are not Ray processes, so the driver hands them what the trainer published in step 1.
     global_shapes = await manager._tpu_sync_rendezvous.get_global_shapes.remote()
+    # Only passed when off, so rollout workers of other engines keep their signature.
+    direct_quantized = getattr(options, "direct_install_quantized_moe", True)
+    extra_init_kwargs = {} if direct_quantized else {"direct_install_quantized_moe": False}
     await asyncio.gather(
         *[
             replica.server_handle.collective_rpc.remote(
@@ -984,6 +987,7 @@ async def _finish_tpu_sync(
                     "parallelism": parallelism,
                     "job_name": _sampler_job_name(replica, replica_idx),
                     "receive_into_vllm": receive_into_vllm,
+                    **extra_init_kwargs,
                 },
             )
             for replica_idx, replica in enumerate(manager.replicas)

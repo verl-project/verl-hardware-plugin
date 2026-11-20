@@ -2172,6 +2172,26 @@ def test_sampler_init_registers_under_its_replica_job_name(fake_tpu_sync, worker
     assert registration.listener_address == f"10.0.0.1:{ws.listener_port}"
 
 
+@pytest.mark.parametrize("direct_quantized", [True, False])
+def test_sampler_init_passes_the_quantized_moe_opt_out_to_the_layout_plans(
+    fake_tpu_sync, worker_ext, monkeypatch, direct_quantized
+):
+    """engine_kwargs.tpu-sync.direct_install_quantized_moe reaches every layout's plan (False: loader fallback)."""
+    from verl_hardware_plugin.accelerators.tpu.rollout import direct_install
+
+    seen = []
+
+    def select_layout(*args, **kwargs):
+        seen.append(kwargs.get("allow_quantized_moe"))
+        return direct_install.LayoutSelection(None, None, [])
+
+    monkeypatch.setattr(direct_install, "select_layout", select_layout)
+    sampler = _make_sampler(worker_ext, rank=0, tp=2, model=_FakeVllmModel(2))
+    kwargs = {} if direct_quantized else {"direct_install_quantized_moe": False}
+    assert sampler.init_tpu_sync_on_worker("10.0.0.2:7777", {"model.norm.weight": [128]}, **kwargs) is True
+    assert seen == [direct_quantized]
+
+
 @pytest.mark.parametrize("address, shapes", [(None, {"model.norm.weight": [128]}), ("10.0.0.2:7777", {})])
 def test_sampler_init_requires_the_controller_address_and_shapes(fake_tpu_sync, worker_ext, address, shapes):
     sampler = _make_sampler(worker_ext, rank=0, tp=2, model=_FakeVllmModel(2))

@@ -23,8 +23,10 @@ import torch
 
 # ``(sharding_spec, local_shape)`` of a tensor on one TP rank, e.g. ``(["tp", ""], [rows // tp, cols])``.
 ShardingRule = tuple[list[str], list[int]]
-# ``(vllm_model, global_shapes, hf_text_config, tp_size, worker_rank) -> (plan, "")`` or ``(None, reason)``.
-PlanFn = Callable[[Any, dict[str, list[int]], Any, int, int], tuple[Optional[Any], str]]
+# ``(vllm_model, global_shapes, hf_text_config, tp_size, worker_rank, allow_quantized_moe=True) -> (plan, "")`` or
+# ``(None, reason)``. ``allow_quantized_moe=False`` (``engine_kwargs.tpu-sync.direct_install_quantized_moe``) refuses
+# quantized experts, so vLLM's loaders install them.
+PlanFn = Callable[..., tuple[Optional[Any], str]]
 # ``(staging, model_sd, find_model_key, copy_into, plan, check) -> staging names used``.
 # ``copy_into(vllm_key, tensor)`` copies a tensor in vLLM's checkpoint layout (and runs the parity check);
 # ``check``, if not None, is the exact parity check for regions written without ``copy_into``.
@@ -78,11 +80,14 @@ def select_layout(
     tp_size: int,
     worker_rank: int,
     layouts: Optional[tuple[DirectInstallLayout, ...]] = None,
+    allow_quantized_moe: bool = True,
 ) -> LayoutSelection:
     """The first of ``layouts`` (default ``direct_install_layouts()``) that can install into ``vllm_model``."""
     reasons: list[str] = []
     for layout in direct_install_layouts() if layouts is None else layouts:
-        plan, reason = layout.plan(vllm_model, global_shapes, hf_text_config, tp_size, worker_rank)
+        plan, reason = layout.plan(
+            vllm_model, global_shapes, hf_text_config, tp_size, worker_rank, allow_quantized_moe=allow_quantized_moe
+        )
         if plan is not None:
             return LayoutSelection(layout, plan, reasons)
         reasons.append(reason)
