@@ -255,6 +255,50 @@ def torchtitan_model_attn_backend(torchtitan_name: str, attn_type: str) -> str:
     return "sdpa" if torchtitan_name in _SDPA_ONLY_TORCHTITAN_MODELS else attn_type
 
 
+# Host staging helpers shared by the optimizer host offload (torchtitan_tpu.py) and activation_offload.py.
+
+
+def can_pin_memory() -> bool:
+    """Whether ``torch.empty(..., pin_memory=True)`` has an active accelerator host allocator."""
+    accel = getattr(torch, "accelerator", None)
+    if accel is not None and callable(getattr(accel, "is_available", None)):
+        try:
+            return bool(accel.is_available())
+        except Exception:
+            return False
+    return False
+
+
+def alloc_cpu_staging(shape: torch.Size | tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """Allocate a contiguous host staging buffer (pinned when an accelerator runtime is active)."""
+    if can_pin_memory():
+        try:
+            return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+        except RuntimeError:
+            pass
+    return torch.empty(shape, dtype=dtype, device="cpu")
+
+
+def record_tpu_event(is_tpu: bool) -> Any:
+    """Record and return a ``torch.tpu.Event`` on the active TPU stream, or ``None`` off-TPU."""
+    if not is_tpu:
+        return None
+    tpu_mod = getattr(torch, "tpu", None)
+    event_cls = getattr(tpu_mod, "Event", None)
+    if event_cls is None:
+        return None
+    ev = event_cls()
+    ev.record()
+    return ev
+
+
+def direct_d2h_source(tensor: torch.Tensor) -> torch.Tensor:
+    """Ensure ``tensor`` satisfies ``torch_tpu`` ``CanCopyStorageDirect`` (zero offset, contiguous, tight storage)."""
+    if not tensor.is_contiguous() or tensor.storage_offset() != 0 or tensor.untyped_storage().nbytes() != tensor.nbytes:
+        return tensor.contiguous()
+    return tensor
+
+
 def get_text_config(hf_config: Any) -> Any:
     """The language-model config of ``hf_config``: ``text_config`` for multimodal configs, else ``hf_config``."""
     text_config = getattr(hf_config, "text_config", None)

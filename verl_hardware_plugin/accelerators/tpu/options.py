@@ -237,6 +237,13 @@ class TPUEngineOptions:
         graph_trainer: Settings passed straight to TorchTitan's ``TpuGraphTrainerCompileConfig(**cfg)``
             (e.g. ``memory_policy``, ``save_regions``, ``fsdp_barrier_policy``, ``graph_split``).
             Ignored when ``trainer_mode`` is not ``graph_trainer``.
+        activation_offload_min_mb: With verl's ``actor_rollout_ref.model.enable_activation_offload=True`` (host
+            offload of the activations saved for backward, ``engines/activation_offload.py``, experimental): smallest
+            saved tensor, in MiB, that is offloaded (default: ``1.0``).
+        activation_offload_host_cache_gb: With activation offload: most free pinned host memory, in GiB, kept for
+            reuse between micro-batches (default: the buffers the last micro-batch used).
+        activation_offload_prefetch: With activation offload: host-to-device copies started ahead of the backward's
+            use (default: ``1``); each costs one offloaded tensor of extra HBM.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -272,6 +279,9 @@ class TPUEngineOptions:
     frozen_param_regex: Optional[str] = None
     trainer_mode: Optional[str] = None
     graph_trainer: Optional[dict[str, Any]] = None
+    activation_offload_min_mb: Optional[float] = None
+    activation_offload_host_cache_gb: Optional[float] = None
+    activation_offload_prefetch: Optional[int] = None
 
 
 _ENGINE_KINDS: dict[str, Any] = {
@@ -308,6 +318,9 @@ _ENGINE_KINDS: dict[str, Any] = {
     "frozen_param_regex": str,
     "trainer_mode": str,
     "graph_trainer": dict,
+    "activation_offload_min_mb": float,
+    "activation_offload_host_cache_gb": float,
+    "activation_offload_prefetch": int,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 

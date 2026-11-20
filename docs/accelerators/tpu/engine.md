@@ -10,7 +10,8 @@ per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`,
 `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`,
 `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `trainer_mode`, `graph_trainer`, `model_kernels`,
-`ep_capacity_factor`, `qwen3_pallas_experts`, `moe_paired_gemm` and
+`ep_capacity_factor`, `qwen3_pallas_experts`, `moe_paired_gemm`, `activation_offload_min_mb`,
+`activation_offload_host_cache_gb`, `activation_offload_prefetch` and
 `context_parallel_strategy` (see `TPUEngineOptions` in `options.py`); an unknown key is an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
 deprecated and log a warning.
 
@@ -52,6 +53,7 @@ Performance options for long packed micro-batches (the Qwen3-30B-A3B recipe sets
 | `gdn_row_slot_len: <max_model_len>` | Qwen3.5: every sequence of a packed micro-batch starts at a multiple of this length, so the GatedDeltaNet runs one sequence per row (torchtitan's `set_unflatten_seq_len`) instead of resetting at packed documents through Tokamax `segment_ids`. Needs `use_dynamic_bsz=False`, a fixed `ppo_micro_batch_size_per_gpu`, `static_micro_batch_len` = that size x `gdn_row_slot_len`, and the fused log-prob |
 | `trainer_mode: graph_trainer` | Actor only (bypass mode, KL loss off, `use_simple_fsdp=True`, `static_micro_batch_len` set): traces the micro-batch forward, fused LM-head log-prob, dual-clip PPO loss and backward once with TorchTitan's `TpuGraphTrainer` (`aot_fx_trace`) and compiles it as one PJRT executable instead of per-block `torch.compile` |
 | `graph_trainer: <dict>` | Optional compiler configuration passed straight to TorchTitan's `TpuGraphTrainerCompileConfig(**cfg)` (e.g. `memory_policy`, `save_regions`, `fsdp_barrier_policy`, `graph_split`); ignored when `trainer_mode` is not `graph_trainer` |
+| `actor_rollout_ref.model.enable_activation_offload=True` (verl's flag) | Experimental, eager-blocks trainer only: the activations the model forward saves for backward (activation-checkpoint block inputs, selective-AC saves such as the Splash `(out, lse)`) go to pinned host memory and come back in backward with a one-step prefetch (`engines/activation_offload.py`). Tune with `activation_offload_min_mb` (default 1), `activation_offload_host_cache_gb` (default: what the last micro-batch used) and `activation_offload_prefetch` (default 1). HBM savings and step-time cost are not yet measured on TPU |
 
 ## Verify
 

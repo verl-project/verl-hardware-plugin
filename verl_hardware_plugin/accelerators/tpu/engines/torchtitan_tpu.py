@@ -116,6 +116,9 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     tpu_synchronize,
     unwrap_metadata,
 )
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import alloc_cpu_staging as _alloc_cpu_staging
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import direct_d2h_source as _direct_d2h_source
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import record_tpu_event as _record_tpu_event
 from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
 from verl_hardware_plugin.accelerators.tpu.losses.loss_inputs import prepare_tpu_loss_inputs
 from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
@@ -236,40 +239,6 @@ def _param_mesh_key(param: torch.Tensor) -> int | None:
     return None if mesh is None else id(mesh)
 
 
-def _can_pin_memory() -> bool:
-    """Whether ``torch.empty(..., pin_memory=True)`` has an active accelerator host allocator."""
-    accel = getattr(torch, "accelerator", None)
-    if accel is not None and callable(getattr(accel, "is_available", None)):
-        try:
-            return bool(accel.is_available())
-        except Exception:
-            return False
-    return False
-
-
-def _alloc_cpu_staging(shape: torch.Size | tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-    """Allocate a contiguous host staging buffer (pinned when an accelerator runtime is active)."""
-    if _can_pin_memory():
-        try:
-            return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
-        except RuntimeError:
-            pass
-    return torch.empty(shape, dtype=dtype, device="cpu")
-
-
-def _record_tpu_event(is_tpu: bool) -> Any:
-    """Record and return a ``torch.tpu.Event`` on the active TPU stream, or ``None`` off-TPU."""
-    if not is_tpu:
-        return None
-    tpu_mod = getattr(torch, "tpu", None)
-    event_cls = getattr(tpu_mod, "Event", None)
-    if event_cls is None:
-        return None
-    ev = event_cls()
-    ev.record()
-    return ev
-
-
 def _wrap_local_like_param(local: torch.Tensor, like_param: torch.Tensor) -> torch.Tensor:
     """Wrap ``local`` in a ``DTensor`` view sharing ``local``'s storage when ``like_param`` is a ``DTensor``."""
     if isinstance(like_param, DTensor) and local.ndim > 0:
@@ -280,13 +249,6 @@ def _wrap_local_like_param(local: torch.Tensor, like_param: torch.Tensor) -> tor
         )
         return DTensor(local.view_as(local), spec, requires_grad=False)
     return local
-
-
-def _direct_d2h_source(tensor: torch.Tensor) -> torch.Tensor:
-    """Ensure ``tensor`` satisfies ``torch_tpu`` ``CanCopyStorageDirect`` (zero offset, contiguous, tight storage)."""
-    if not tensor.is_contiguous() or tensor.storage_offset() != 0 or tensor.untyped_storage().nbytes() != tensor.nbytes:
-        return tensor.contiguous()
-    return tensor
 
 
 @functools.lru_cache(maxsize=1)
@@ -949,6 +911,9 @@ def _add_rollout_consistency_metrics(
 class TorchTitanTPUEngine(BaseEngine):
     """Standalone TorchTitan engine for Google TPU with ``tpu_dist`` / PJRT SPMD execution."""
 
+    # Host offload of saved activations (model.enable_activation_offload), set up in initialize().
+    _activation_offload: Optional[activation_offload.HostActivationOffload] = None
+
     def __init__(
         self,
         model_config: HFModelConfig,
@@ -1018,6 +983,11 @@ class TorchTitanTPUEngine(BaseEngine):
             graph_trainer_mode.validate_graph_trainer_engine(
                 engine_config, tpu_options, use_simple_fsdp=self._use_simple_fsdp, tpu_kernels=self._tpu_kernels
             )
+            if getattr(model_config, "enable_activation_offload", False) and not engine_config.forward_only:
+                raise ValueError(
+                    "model.enable_activation_offload is not supported with trainer_mode=graph_trainer; its graph "
+                    "memory policy (engine_kwargs.tpu.graph_trainer) decides what is saved or offloaded."
+                )
         self._graph_policy_loss_spec: Optional[graph_trainer_mode.GraphPolicyLossSpec] = None
         self._graph_trainer_traced_len: Optional[int] = None
         registry_params = inspect.signature(model_module.model_registry).parameters
@@ -1503,6 +1473,7 @@ class TorchTitanTPUEngine(BaseEngine):
         """Initialize model/checkpointer and release unused optimizer state on forward-only reference workers."""
         self.module = self.trainer.model_parts
         self.checkpointer = self.trainer.checkpointer
+        self._activation_offload = self._build_activation_offload()
         _use_threaded_hf_reader(self.checkpointer)
         # load initial HF weights
         self.checkpointer.load()
@@ -1656,33 +1627,31 @@ class TorchTitanTPUEngine(BaseEngine):
             row_ctx = set_unflatten_seq_len(self._gdn_row_slot_len)
         else:
             row_ctx = nullcontext()
-        # VERL_TPU_ACTIVATION_OFFLOAD=1: saved-for-backward activations go to pinned host memory between a micro-batch's
-        # forward and backward (engines/activation_offload.py).
-        offload = None
-        if not forward_only and activation_offload.activation_offload_enabled():
-            offload = getattr(self, "_activation_offload", None)
-            if offload is None:
-                offload = activation_offload.HostActivationOffload(p for m in self.module for p in m.parameters())
-                self._activation_offload = offload
+        # model.enable_activation_offload: model_forward_step offloads the saved activations to host memory; each
+        # micro-batch's buffers are recycled once its backward is done (engines/activation_offload.py).
+        offload = None if forward_only else self._activation_offload
         with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), row_ctx:
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
-                    with offload.hooks() if offload is not None else nullcontext():
+                    micro_batch_done = False
+                    try:
                         loss, output = self.forward_step(
                             micro_batch, loss_function=loss_function, forward_only=forward_only
                         )
-                    if not forward_only:
-                        with spmd_no_typecheck_context():
-                            if self._simple_fsdp_loss_scale is not None:
-                                loss = loss * self._simple_fsdp_loss_scale
-                            tpu_synchronize(loss, wait=False)
-                            loss.backward()
+                        if not forward_only:
+                            with spmd_no_typecheck_context():
+                                if self._simple_fsdp_loss_scale is not None:
+                                    loss = loss * self._simple_fsdp_loss_scale
+                                tpu_synchronize(loss, wait=False)
+                                loss.backward()
+                                del loss
+                                tpu_synchronize(wait=True)
+                        else:
                             del loss
-                            tpu_synchronize(wait=True)
-                            if offload is not None:
-                                offload.end_micro_batch()
-                    else:
-                        del loss
+                        micro_batch_done = True
+                    finally:
+                        if offload is not None:
+                            offload.end_micro_batch(reuse_buffers=micro_batch_done)
                 output_lst.append(output)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
@@ -1829,12 +1798,44 @@ class TorchTitanTPUEngine(BaseEngine):
             )
         # Non-PP forward. train_context (SPMD mesh) is set by the caller.
         assert len(model_parts) == 1
-        pred = model_parts[0](inputs, **(extra_inputs or {}), **(extra_kwargs or {}))
+        # Activation offload covers the model forward of a training step only (not the loss, not no-grad passes).
+        offload = self._activation_offload
+        with offload.hooks() if offload is not None and torch.is_grad_enabled() else nullcontext():
+            pred = model_parts[0](inputs, **(extra_inputs or {}), **(extra_kwargs or {}))
         if isinstance(pred, tuple):
             return tuple(p.full_tensor() if isinstance(p, DTensor) else p for p in pred)
         if isinstance(pred, DTensor) and not return_dtensor:
             pred = pred.full_tensor()
         return pred
+
+    def _build_activation_offload(self) -> Optional[activation_offload.HostActivationOffload]:
+        """``HostActivationOffload`` when verl's ``model.enable_activation_offload`` is set on a training engine."""
+        if self.engine_config.forward_only or not getattr(self.model_config, "enable_activation_offload", False):
+            return None
+        device_name = get_device_name()
+        if device_name == "cpu":
+            logger.warning("model.enable_activation_offload ignored: the engine runs on CPU")
+            return None
+        options = self._tpu_options
+        min_mb = options.activation_offload_min_mb if options is not None else None
+        cache_gb = options.activation_offload_host_cache_gb if options is not None else None
+        prefetch = options.activation_offload_prefetch if options is not None else None
+        n_sac = activation_offload.route_sac_saves_through_hooks(self.module)
+        offload = activation_offload.HostActivationOffload(
+            lambda: (p for m in self.module for p in m.parameters()),
+            min_bytes=int((min_mb if min_mb is not None else activation_offload.DEFAULT_MIN_MB) * (1 << 20)),
+            host_cache_bytes=None if cache_gb is None else int(cache_gb * (1 << 30)),
+            prefetch=prefetch if prefetch is not None else activation_offload.DEFAULT_PREFETCH,
+            device_types=(device_name,),
+        )
+        logger.warning(
+            "Activation offload (experimental): saved activations >= %.1f MiB go to pinned host memory, "
+            "prefetch=%d, %d activation-checkpoint wrappers route selective-AC saves through it",
+            offload.min_bytes / (1 << 20),
+            offload.prefetch,
+            n_sac,
+        )
+        return offload
 
     def forward_step(self, micro_batch: TensorDict, loss_function: Callable, forward_only: bool):
         raise NotImplementedError("forward_step must be implemented in subclass")
@@ -2016,6 +2017,8 @@ class TorchTitanTPUEngine(BaseEngine):
                 if not self.engine_config.forward_only and optimizer and self.optimizer is not None:
                     load_fsdp_optimizer(self.optimizer, target_device)
             elif device == "cpu":
+                if self._activation_offload is not None:
+                    self._activation_offload.release()
                 if model:
                     for module in self.module:
                         move_tpu_params_(
