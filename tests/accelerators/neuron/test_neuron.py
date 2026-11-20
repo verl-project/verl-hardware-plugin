@@ -107,6 +107,37 @@ def test_worker_refuses_unassigned_cores(monkeypatch):
         prepare_worker_environment()
 
 
+def test_tp8_fsdp8_core_order_places_groups_on_supported_devices():
+    from verl_hardware_plugin.accelerators.neuron.runtime import actor_core
+
+    cores = [actor_core("tp8_fsdp8", rank) for rank in range(64)]
+    assert sorted(cores) == list(range(64))
+    device = [core // 4 for core in cores]
+    for group in range(8):
+        devices = sorted(set(device[8 * group : 8 * group + 8]))
+        assert len(devices) == 2 and devices[0] % 2 == 0 and devices[1] == devices[0] + 1
+    fsdp = {frozenset(device[tp::8]) for tp in range(8)}
+    assert fsdp == {frozenset({0, 3, 4, 7, 8, 11, 12, 15}), frozenset({1, 2, 5, 6, 9, 10, 13, 14})}
+    with pytest.raises(ValueError, match="Unknown"):
+        actor_core("tp4", 0)
+
+
+def test_worker_applies_core_order_only_on_full_nodes(monkeypatch):
+    import os
+
+    monkeypatch.setenv("VERL_NEURON_ACTOR_CORE_ORDER", "tp8_fsdp8")
+    monkeypatch.setenv("NEURON_RT_VISIBLE_CORES", "13")
+    monkeypatch.setenv("RANK", str(64 + 13))  # rank 13 of the second actor node
+    monkeypatch.setenv("RAY_LOCAL_WORLD_SIZE", "64")
+    prepare_worker_environment()
+    from verl_hardware_plugin.accelerators.neuron.runtime import actor_core
+
+    assert os.environ["NEURON_RT_VISIBLE_CORES"] == str(actor_core("tp8_fsdp8", 13))
+    monkeypatch.setenv("RAY_LOCAL_WORLD_SIZE", "8")
+    with pytest.raises(ValueError, match="all 64 cores"):
+        prepare_worker_environment()
+
+
 @pytest.mark.parametrize("visible,rank,expected", [("7", 0, 7), ("4-7", 2, 6), ("2,6", 1, 6)])
 def test_physical_core(visible, rank, expected):
     assert physical_core(visible, rank) == expected

@@ -144,6 +144,24 @@ def physical_core(visible, local_rank):
     return cores[local_rank]
 
 
+# Opt-in actor rank placement for TP=8 x FSDP=8 on a 64-core trn2 node. The default (rank r on core r)
+# puts each FSDP group on every other device, which the runtime cannot build collectives for.
+ACTOR_CORE_ORDER = "VERL_NEURON_ACTOR_CORE_ORDER"
+CORES_PER_NODE = 64
+_TP8_FSDP8_FIRST_DEVICES = (0, 3, 4, 7, 8, 11, 12, 15)
+
+
+def actor_core(order, node_rank):
+    if order != "tp8_fsdp8":
+        raise ValueError(f"Unknown {ACTOR_CORE_ORDER}: {order!r} (supported: tp8_fsdp8)")
+    if not 0 <= node_rank < CORES_PER_NODE:
+        raise ValueError(f"Node rank {node_rank} is outside a {CORES_PER_NODE}-core node")
+    group, tp_rank = divmod(node_rank, 8)
+    first = _TP8_FSDP8_FIRST_DEVICES[group]
+    device = first if tp_rank < 4 else first ^ 1
+    return device * 4 + tp_rank % 4
+
+
 def prepare_worker_environment():
     """Preserve Ray's physical allocation while selecting local device zero."""
     configure_environment()
@@ -151,6 +169,12 @@ def prepare_worker_environment():
         visible = os.environ.get("NEURON_RT_VISIBLE_CORES", "")
         if not visible:
             raise RuntimeError("Ray did not assign NeuronCores to this training worker")
+        order = os.environ.get(ACTOR_CORE_ORDER)
+        if order:
+            if int(os.environ["RAY_LOCAL_WORLD_SIZE"]) != CORES_PER_NODE:
+                raise ValueError(f"{ACTOR_CORE_ORDER} requires actor workers on all {CORES_PER_NODE} cores of a node")
+            node_rank = int(os.environ["RANK"]) % CORES_PER_NODE
+            os.environ["NEURON_RT_VISIBLE_CORES"] = str(actor_core(order, node_rank))
         os.environ["LOCAL_RANK"] = "0"
         os.environ["LOCAL_WORLD_SIZE"] = os.environ["RAY_LOCAL_WORLD_SIZE"]
 

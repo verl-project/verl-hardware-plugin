@@ -151,6 +151,10 @@ class TorchTitanNeuronEngineWithLMHead(TorchTitanEngineWithLMHead):
             raise ValueError("Trainium v1 supports dense Qwen3 only")
         if model_config.use_remove_padding:
             raise ValueError("Trainium causal SDPA requires model.use_remove_padding=false")
+        from ..runtime import ACTOR_CORE_ORDER
+
+        if os.environ.get(ACTOR_CORE_ORDER) == "tp8_fsdp8" and engine_config.tensor_parallel_size != 8:
+            raise ValueError(f"{ACTOR_CORE_ORDER}=tp8_fsdp8 places ranks for tensor_parallel_size=8 only")
         for field in ("num_attention_heads", "num_key_value_heads", "vocab_size", "intermediate_size"):
             if getattr(model_config.hf_config, field) % engine_config.tensor_parallel_size:
                 raise ValueError(f"Trainium requires {field} divisible by tensor_parallel_size")
