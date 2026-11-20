@@ -224,7 +224,19 @@ class TrainerWeights:
             return
         reported = ExpertWireQuant.from_description(description)
         if self._rollout_fp8_moe is True:
-            if description and "params" in description and reported is None:
+            has_rollout_desc = bool(
+                description
+                and (
+                    "params" in description or "tp_size" in description or "moe_quant_ineligible_reason" in description
+                )
+            )
+            if has_rollout_desc and reported is None:
+                ineligible = (description or {}).get("moe_quant_ineligible_reason")
+                if ineligible:
+                    raise RuntimeError(
+                        "tpu-sync: rollout_fp8_moe=True on the trainer, but the rollout cannot zero-copy quantized "
+                        f"MoE experts: {ineligible}"
+                    )
                 raise RuntimeError(
                     "tpu-sync: rollout_fp8_moe=True on the trainer, but the rollout's vLLM MoE layers are not "
                     "quantized (set QUANTIZE_ON_LOAD_PREFIXES=experts on the rollout)"
@@ -345,9 +357,13 @@ class TrainerWeights:
                 del stack
                 grp = ep_stack_groups.setdefault(layer_prefix, {})
                 grp[proj] = (plain, shard)
+                del plain
                 if {"gate_proj", "up_proj", "down_proj"} <= set(grp):
-                    (gate, gs), (up, us), (down, ds) = grp["gate_proj"], grp["up_proj"], grp["down_proj"]
                     del ep_stack_groups[layer_prefix]
+                    (gate, gs) = grp.pop("gate_proj")
+                    (up, us) = grp.pop("up_proj")
+                    (down, ds) = grp.pop("down_proj")
+                    del grp
                     if gs != us:
                         raise RuntimeError(f"tpu-sync: {layer_prefix} gate_proj shard {gs} != up_proj shard {us}")
                     gate_up = torch.cat([gate, up], dim=1)
@@ -375,6 +391,9 @@ class TrainerWeights:
             for e, (hf_name, _shape) in enumerate(slots):
                 yield hf_name, full[e].clone(), None
             del full
+        if ep_stack_groups:
+            incomplete = {k: sorted(v) for k, v in sorted(ep_stack_groups.items())}
+            raise RuntimeError(f"tpu-sync: incomplete MoE expert stack projections at export end: {incomplete}")
         if local:
             if get_device_name() == "tpu":
                 log_gpu_memory_usage("After the tpu-sync weight export", logger=logger)

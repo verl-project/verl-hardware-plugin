@@ -45,6 +45,7 @@ anything else (other models, unknown MoE methods or placements, a replicated ``i
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, NamedTuple, Optional
 
@@ -65,6 +66,7 @@ from verl_hardware_plugin.accelerators.tpu.rollout.moe_weights import (
     ExpertWireQuant,
     MoeRequant,
     ParityCheckFn,
+    ep_quant_loader_error,
     ep_zero_copy_targets,
     format_ep_expert_weight,
     plan_ep_moe_layers,
@@ -261,12 +263,14 @@ def make_tpu_sync_local_layout(
     return local_layout
 
 
-def refuse_split_tensors(weights: Iterator[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
+def refuse_split_tensors(
+    weights: Iterator[tuple[str, torch.Tensor]], *, rewrite_ep: bool = True
+) -> Iterator[tuple[str, torch.Tensor]]:
     """Undoes ``make_tpu_sync_local_layout`` for vLLM's checkpoint loaders: yields HF's fused tensors.
 
     Used when the rollout falls back to vLLM's loaders (``plan_direct_install`` returned no plan), which expect HF's
     ``in_proj_qkv`` / ``conv1d`` / stacked ``mlp.experts.gate_up_proj`` / ``down_proj`` (also undoes the
-    expert-parallel layout). A fused tensor is yielded once all of its
+    expert-parallel layout when ``rewrite_ep`` is True). A fused tensor is yielded once all of its
     pieces arrived (sorted names keep a layer's pieces together); other tensors pass through.
     """
     pending: dict[str, dict[str, torch.Tensor]] = {}
@@ -279,10 +283,11 @@ def refuse_split_tensors(weights: Iterator[tuple[str, torch.Tensor]]) -> Iterato
                 f"tpu-sync: cannot install trainer-quantized expert tensor {name} ({tensor.dtype}) via vLLM's "
                 "checkpoint loaders; inspect the rejected direct-install plan log above"
             )
-        ep = next((t for t in EP_EXPERT_TENSORS if name.endswith(t.ep)), None)
-        if ep is not None:
-            yield name[: -len(ep.ep)] + ep.hf, tensor.transpose(-2, -1)
-            continue
+        if rewrite_ep:
+            ep = next((t for t in EP_EXPERT_TENSORS if name.endswith(t.ep)), None)
+            if ep is not None:
+                yield name[: -len(ep.ep)] + ep.hf, tensor.transpose(-2, -1)
+                continue
         for split in SPLIT_TENSORS:
             piece = next((p for p in split.pieces if name.endswith(p)), None)
             if piece is None:
@@ -307,6 +312,7 @@ def plan_direct_install(
     tp_size: int,
     worker_rank: int,
     allow_quantized_moe: bool = True,
+    global_dtypes: Optional[Mapping[str, str]] = None,
 ) -> tuple[Optional[DirectInstallPlan], str]:
     """``(plan, "")`` if this module can install into ``vllm_model`` directly, else ``(None, reason)``.
 
@@ -420,6 +426,7 @@ def plan_direct_install(
                 tp_size,
                 tp_rank,
                 allow_quantized=allow_quantized_moe,
+                global_dtypes=global_dtypes,
             )
             if ep_plan is None:
                 return None, why
@@ -621,7 +628,18 @@ def _local(param: torch.Tensor) -> torch.Tensor:
 
 
 def _loader_weights(weights: Iterator[tuple[str, torch.Tensor]], hf_text_config: Any) -> Iterator:
-    return refuse_split_tensors(weights)
+    rewrite_ep = hf_text_config is None or getattr(hf_text_config, "model_type", None) in QWEN3_5_MODEL_TYPES
+    return refuse_split_tensors(weights, rewrite_ep=rewrite_ep)
+
+
+def _loader_error(
+    global_shapes: dict[str, list[int]],
+    hf_text_config: Any = None,
+    *,
+    global_dtypes: Optional[Mapping[str, str]] = None,
+) -> str:
+    del hf_text_config
+    return ep_quant_loader_error(global_shapes, global_dtypes)
 
 
 def _sharding_rule(name: str, global_shape: list[int], tp_size: int, plan: DirectInstallPlan) -> Optional[Any]:
@@ -636,4 +654,5 @@ LAYOUT = DirectInstallLayout(
     fused_targets=FUSED_TARGETS,
     zero_copy_targets=zero_copy_targets,
     loader_weights=_loader_weights,
+    loader_error=_loader_error,
 )

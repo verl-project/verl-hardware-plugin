@@ -406,8 +406,11 @@ EP_SHAPES = {
 
 
 def test_plan_expert_parallel():
-    def ep_model(tp, method=VllmUnquantizedFusedMoEMethod, use_ep=True):
+    def ep_model(tp, method=VllmUnquantizedFusedMoEMethod, use_ep=True, aligned_inter=INTER):
         exp = _Experts(method(), use_ep=use_ep)
+        local_e = max(1, E // tp)
+        exp.w13_weight = torch.nn.Parameter(torch.zeros(local_e, HID, 2 * aligned_inter, dtype=torch.bfloat16))
+        exp.w2_weight = torch.nn.Parameter(torch.zeros(local_e, aligned_inter, HID, dtype=torch.bfloat16))
         if use_ep:
             exp.ep_size, exp.ep_rank = tp, 0
         return _vllm_model(gdn=_GDN(tp_size=tp), experts=exp)
@@ -417,6 +420,23 @@ def test_plan_expert_parallel():
     # moe_intermediate_size need not split over the ranks under EP (the experts are not sliced).
     odd = SimpleNamespace(**{**vars(CONFIG), "moe_intermediate_size": 5})
     assert qwen3_5_layout.plan_direct_install(ep_model(1), EP_SHAPES, odd, 1, 0)[0] is not None
+    # Unaligned BF16 EP (live w13_weight padded to 128 while wire w13_ep is unpadded 2*INTER=8) is refused at plan time.
+    assert (
+        "w13_weight is (3, 6, 256)"
+        in qwen3_5_layout.plan_direct_install(ep_model(1, aligned_inter=128), EP_SHAPES, CONFIG, 1, 0)[1]
+    )
+    # Armed fused decode kernel and non-persistent weight buffer are refused at plan time.
+    armed_model = ep_model(1)
+    armed_model.experts.quant_method._moe_tp_decode_op = object()
+    assert (
+        "fused shared+routed decode kernel"
+        in qwen3_5_layout.plan_direct_install(armed_model, EP_SHAPES, CONFIG, 1, 0)[1]
+    )
+    non_pers = ep_model(1)
+    w2_buf = non_pers.experts.w2_weight.detach().clone()
+    del non_pers.experts.w2_weight
+    non_pers.experts.register_buffer("w2_weight", w2_buf, persistent=False)
+    assert "has no w2_weight" in qwen3_5_layout.plan_direct_install(non_pers, EP_SHAPES, CONFIG, 1, 0)[1]
     no_ep = ep_model(1, use_ep=False)
     assert "does not use expert parallelism" in qwen3_5_layout.plan_direct_install(no_ep, EP_SHAPES, CONFIG, 1, 0)[1]
     quant = ep_model(1, method=Fp8MoEMethod)
@@ -1121,7 +1141,105 @@ def test_trainer_weights_fp8_dtensor_shard0_and_shard1_and_auto_discovery(monkey
         256,
     )
 
-    # 3. rollout_fp8_moe=True fails loudly if the rollout reports unquantized MoE.
+    # 3. rollout_fp8_moe=True fails loudly if the rollout reports unquantized MoE or ineligible MoE.
     tw_mismatch = TrainerWeights({}, [], "cpu", rollout_expert_parallel=True, rollout_fp8_moe=True)
     with pytest.raises(RuntimeError, match="not quantized"):
         tw_mismatch.configure_moe_wire({"tp_size": 2, "params": {"w": {}}})
+    tw_inelig = TrainerWeights({}, [], "cpu", rollout_expert_parallel=True, rollout_fp8_moe=True)
+    with pytest.raises(RuntimeError, match="use_ep=False"):
+        tw_inelig.configure_moe_wire({"tp_size": 2, "moe_quant_ineligible_reason": "use_ep=False"})
+
+
+def test_describe_moe_quant_eligibility_and_global_dtypes_verification():
+    """``describe_moe_quant`` checks all zero-copy EP conditions; ``plan_direct_install`` verifies exact 1-byte wire
+    dtypes via ``global_dtypes``; ``loader_error`` rejects trainer-quantized wire tensors before staging."""
+    from verl_hardware_plugin.accelerators.tpu.rollout import direct_install
+
+    # 1. Valid EP FP8 (including blockwise CPU-fallback inference).
+    bs2_model = _vllm_model(
+        gdn=_GDN(tp_size=1), experts=_Fp8Experts(E, INTER, HID, block_size=2, use_ep=True, ep_size=1, ep_rank=0)
+    )
+    assert moe_weights.describe_moe_quant(bs2_model, tp_size=1) == {
+        "quant_dtype": "torch.float8_e4m3fn",
+        "block_size": 2,
+        "activation": "silu",
+    }
+
+    # 2. Ineligible rollout configurations return None from describe_moe_quant and explain why.
+    no_ep = _vllm_model(gdn=_GDN(tp_size=2), experts=_Fp8Experts(E, INTER // 2, HID, use_ep=False))
+    assert moe_weights.describe_moe_quant(no_ep, tp_size=2) is None
+    assert "use_ep=False" in (moe_weights.moe_quant_ineligible_reason(no_ep, tp_size=2) or "")
+
+    bad_ep_size = _vllm_model(
+        gdn=_GDN(tp_size=2), experts=_Fp8Experts(E, INTER, HID, use_ep=True, ep_size=1, ep_rank=0)
+    )
+    assert moe_weights.describe_moe_quant(bad_ep_size, tp_size=2) is None
+    assert "ep_size=1" in (moe_weights.moe_quant_ineligible_reason(bad_ep_size, tp_size=2) or "")
+
+    fp8_dense = _vllm_model(gdn=_GDN(tp_size=1), experts=_Fp8Experts(E, INTER, HID, use_ep=True, ep_size=1, ep_rank=0))
+    fp8_dense.gdn.in_proj_qkvz.quant_method = type("VllmFp8LinearMethodTPU", (), {})()
+    assert moe_weights.describe_moe_quant(fp8_dense, tp_size=1) is None
+    assert "VllmFp8LinearMethodTPU" in (moe_weights.moe_quant_ineligible_reason(fp8_dense, tp_size=1) or "")
+
+    swiglu_m = _vllm_model(
+        gdn=_GDN(tp_size=1),
+        experts=_Fp8Experts(E, INTER, HID, method=VllmFp8MoEMethodTPU("swigluoai"), use_ep=True, ep_size=1, ep_rank=0),
+    )
+    assert moe_weights.describe_moe_quant(swiglu_m, tp_size=1) is None
+    assert "swigluoai" in (moe_weights.moe_quant_ineligible_reason(swiglu_m, tp_size=1) or "")
+
+    armed_qm = VllmFp8MoEMethodTPU()
+    armed_qm._fused_moe_decode_op = object()
+    armed_m = _vllm_model(
+        gdn=_GDN(tp_size=1), experts=_Fp8Experts(E, INTER, HID, method=armed_qm, use_ep=True, ep_size=1, ep_rank=0)
+    )
+    assert moe_weights.describe_moe_quant(armed_m, tp_size=1) is None
+
+    bad_s13 = _vllm_model(gdn=_GDN(tp_size=1), experts=_Fp8Experts(E, INTER, HID, use_ep=True, ep_size=1, ep_rank=0))
+    bad_s13.experts.w13_weight_scale_inv = torch.nn.Parameter(
+        torch.zeros(E, 4, 1, 256), requires_grad=False
+    )  # 6 % 4 != 0
+    assert moe_weights.describe_moe_quant(bad_s13, tp_size=1) is None
+
+    # 3. Exact 1-byte wire dtype verification via global_dtypes (int8 vs float8_e4m3fn refused!).
+    full = _hf_tensors(torch.Generator().manual_seed(0))
+    sent = _fp8_sent(full)
+    shapes = {n: list(t.shape) for n, t in sent.items()}
+    dtypes_ok = {n: str(t.dtype) for n, t in sent.items() if t.dtype != torch.bfloat16}
+    valid_m = _vllm_model(gdn=_GDN(tp_size=1), experts=_Fp8Experts(E, INTER, HID, use_ep=True, ep_size=1, ep_rank=0))
+    sel_ok = direct_install.select_layout(valid_m, shapes, CONFIG, 1, 0, global_dtypes=dtypes_ok)
+    assert sel_ok.layout is qwen3_5_layout.LAYOUT
+
+    dtypes_int8 = {**dtypes_ok, f"{EXPERTS}.w13_ep": "torch.int8"}
+    sel_bad = direct_install.select_layout(valid_m, shapes, CONFIG, 1, 0, global_dtypes=dtypes_int8)
+    assert sel_bad.layout is None and any("torch.int8" in r for r in sel_bad.reasons)
+
+    dtypes_bad_scale = {**dtypes_ok, f"{EXPERTS}.w13_scale_ep": "torch.bfloat16"}
+    sel_bad_s = direct_install.select_layout(valid_m, shapes, CONFIG, 1, 0, global_dtypes=dtypes_bad_scale)
+    assert sel_bad_s.layout is None and any("torch.float32" in r for r in sel_bad_s.reasons)
+
+    # 4. loader_error fast-fails on quantized scale suffixes or quantized global_dtypes.
+    assert "cannot install trainer-quantized" in direct_install.loader_error(shapes, CONFIG)
+    assert "cannot install quantized wire tensor" in direct_install.loader_error(
+        EP_SHAPES, CONFIG, global_dtypes={f"{EXPERTS}.w13_ep": "torch.float8_e4m3fn"}
+    )
+
+
+def test_incomplete_ep_expert_stack_group_raises():
+    """Missing one of gate_proj / up_proj / down_proj in expert_stacks under rollout_expert_parallel raises."""
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+    from verl_hardware_plugin.accelerators.tpu.rollout import qwen3_moe_layout
+
+    gate = torch.randn(E, INTER, HID, dtype=torch.bfloat16)
+    up = torch.randn(E, INTER, HID, dtype=torch.bfloat16)
+    slots_g = [(f"{EXPERTS}.{e}.gate_proj.weight", (INTER, HID)) for e in range(E)]
+    slots_u = [(f"{EXPERTS}.{e}.up_proj.weight", (INTER, HID)) for e in range(E)]
+    tw = TrainerWeights(
+        {},
+        [(gate, slots_g), (up, slots_u)],
+        "cpu",
+        expert_stack_wire=qwen3_moe_layout.expert_stack_wire_name,
+        rollout_expert_parallel=True,
+    )
+    with pytest.raises(RuntimeError, match="incomplete MoE expert stack projections"):
+        list(tw.local_shards())

@@ -16,7 +16,8 @@ adapters to the signatures below) and add it to ``direct_install_layouts()``.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import inspect
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, NamedTuple, Optional
 
@@ -64,8 +65,9 @@ class DirectInstallLayout:
     # vLLM-loader fallback (no layout planned): ``(weights, hf_text_config) -> weights`` back in HF's checkpoint
     # layout, undoing how the trainer sends this model's tensors over tpu-sync.
     loader_weights: Optional[Callable[[WeightsIterator, Any], WeightsIterator]] = None
-    # vLLM-loader fallback: ``(global_shapes, hf_text_config) -> error`` ("" if ``loader_weights`` can undo them).
-    loader_error: Optional[Callable[[dict[str, list[int]], Any], str]] = None
+    # vLLM-loader fallback: ``(global_shapes, hf_text_config, *, global_dtypes=None) -> error`` ("" when
+    # ``loader_weights`` can undo them).
+    loader_error: Optional[Callable[..., str]] = None
 
 
 class LayoutSelection(NamedTuple):
@@ -74,6 +76,14 @@ class LayoutSelection(NamedTuple):
     layout: Optional[DirectInstallLayout]  # None: no layout plans (dense path or vLLM's loaders)
     plan: Any  # ``layout.plan``'s plan, passed to ``layout.install``
     reasons: list[str]  # why the layouts tried before ``layout`` (all of them if None) refused
+
+
+def _accepts_kwarg(fn: Callable[..., Any], kwarg: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return kwarg in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def direct_install_layouts() -> tuple[DirectInstallLayout, ...]:
@@ -92,12 +102,24 @@ def select_layout(
     worker_rank: int,
     layouts: Optional[tuple[DirectInstallLayout, ...]] = None,
     allow_quantized_moe: bool = True,
+    global_dtypes: Optional[Mapping[str, str]] = None,
 ) -> LayoutSelection:
     """The first of ``layouts`` (default ``direct_install_layouts()``) that can install into ``vllm_model``."""
     reasons: list[str] = []
     for layout in direct_install_layouts() if layouts is None else layouts:
+        extra = (
+            {"global_dtypes": global_dtypes}
+            if global_dtypes is not None and _accepts_kwarg(layout.plan, "global_dtypes")
+            else {}
+        )
         plan, reason = layout.plan(
-            vllm_model, global_shapes, hf_text_config, tp_size, worker_rank, allow_quantized_moe=allow_quantized_moe
+            vllm_model,
+            global_shapes,
+            hf_text_config,
+            tp_size,
+            worker_rank,
+            allow_quantized_moe=allow_quantized_moe,
+            **extra,
         )
         if plan is not None:
             return LayoutSelection(layout, plan, reasons)
@@ -116,11 +138,22 @@ def loader_weights(
 
 
 def loader_error(
-    global_shapes: dict[str, list[int]], hf_text_config: Any, layouts: Optional[tuple[DirectInstallLayout, ...]] = None
+    global_shapes: dict[str, list[int]],
+    hf_text_config: Any = None,
+    layouts: Optional[tuple[DirectInstallLayout, ...]] = None,
+    *,
+    global_dtypes: Optional[Mapping[str, str]] = None,
 ) -> str:
     """Why vLLM's loaders cannot take the trainer's tensors (the first layout's ``loader_error``), or ``""``."""
     for layout in direct_install_layouts() if layouts is None else layouts:
-        error = layout.loader_error(global_shapes, hf_text_config) if layout.loader_error is not None else ""
+        if layout.loader_error is None:
+            continue
+        extra = (
+            {"global_dtypes": global_dtypes}
+            if global_dtypes is not None and _accepts_kwarg(layout.loader_error, "global_dtypes")
+            else {}
+        )
+        error = layout.loader_error(global_shapes, hf_text_config, **extra)
         if error:
             return error
     return ""

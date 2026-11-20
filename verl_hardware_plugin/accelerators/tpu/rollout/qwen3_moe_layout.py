@@ -44,6 +44,7 @@ after ``split_expert_stacks`` restores HF's per-expert tensors.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, NamedTuple, Optional
 
@@ -56,11 +57,14 @@ from verl_hardware_plugin.accelerators.tpu.rollout.direct_install import (
 from verl_hardware_plugin.accelerators.tpu.rollout.moe_weights import (
     EP_EXPERT_BLOCK_SUFFIXES,
     EP_FP8_SCALE_SUFFIXES,
+    EP_W2,
+    EP_W13,
     MOE_LAYOUT_TPU_EP,
     MOE_LAYOUT_TPU_EP_QUANT,
     MOE_QUANTIZED_LAYOUTS,
     MoeRequant,
     ParityCheckFn,
+    ep_quant_loader_error,
     ep_sharding_rule,
     ep_zero_copy_targets,
     plan_ep_moe_layers,
@@ -180,7 +184,8 @@ def split_expert_stacks(weights: Iterator[tuple[str, torch.Tensor]]) -> Iterator
     """Undoes the trainer's stacking for vLLM's checkpoint loaders: yields one HF tensor per expert.
 
     Used when the rollout falls back to vLLM's loaders (``plan_direct_install`` returned no plan), which expect HF's
-    ``<prefix>.mlp.experts.<e>.<proj>.weight``. Other tensors (including Qwen3.5's expert pieces, which carry no
+    ``<prefix>.mlp.experts.<e>.<proj>.weight``. Also undoes unquantized ``rollout_expert_parallel`` stacks
+    (``w13_ep`` [E, H, 2I] / ``w2_ep`` [E, I, H]). Other tensors (including Qwen3.5's expert pieces, which carry no
     ``.weight`` suffix) pass through.
     """
     for name, tensor in weights:
@@ -192,6 +197,23 @@ def split_expert_stacks(weights: Iterator[tuple[str, torch.Tensor]]) -> Iterator
                 f"tpu-sync: cannot install trainer-quantized expert tensor {name} ({tensor.dtype}) via vLLM's "
                 "checkpoint loaders; inspect the rejected direct-install plan log above"
             )
+        if name.endswith(EP_W13.ep) and tensor.ndim == 3:
+            prefix = name[: -len(EP_W13.ep)] + ".mlp.experts"
+            t = tensor.transpose(-2, -1).contiguous()
+            if t.shape[1] % 2:
+                raise RuntimeError(f"tpu-sync: {name} {tuple(tensor.shape)} cannot split into gate_proj / up_proj")
+            half = t.shape[1] // 2
+            gate_stack, up_stack = t[:, :half, :], t[:, half:, :]
+            for e in range(t.shape[0]):
+                yield f"{prefix}.{e}.gate_proj.weight", gate_stack[e]
+                yield f"{prefix}.{e}.up_proj.weight", up_stack[e]
+            continue
+        if name.endswith(EP_W2.ep) and tensor.ndim == 3:
+            prefix = name[: -len(EP_W2.ep)] + ".mlp.experts"
+            t = tensor.transpose(-2, -1).contiguous()
+            for e in range(t.shape[0]):
+                yield f"{prefix}.{e}.down_proj.weight", t[e]
+            continue
         m = _WIRE_RE.match(name)
         if m is None or tensor.ndim != 3:
             yield name, tensor
@@ -208,6 +230,7 @@ def plan_direct_install(
     tp_size: int,
     worker_rank: int,
     allow_quantized_moe: bool = True,
+    global_dtypes: Optional[Mapping[str, str]] = None,
 ) -> tuple[Optional[DirectInstallPlan], str]:
     """``(plan, "")`` if this module can install the experts into ``vllm_model`` directly, else ``(None, reason)``.
 
@@ -267,6 +290,7 @@ def plan_direct_install(
             tp_size,
             worker_rank,
             allow_quantized=allow_quantized_moe,
+            global_dtypes=global_dtypes,
         )
     else:
         moe_plan, why = plan_moe_layers(
@@ -379,6 +403,16 @@ def _loader_weights(weights: Iterator[tuple[str, torch.Tensor]], hf_text_config:
     return split_expert_stacks(weights)
 
 
+def _loader_error(
+    global_shapes: dict[str, list[int]],
+    hf_text_config: Any = None,
+    *,
+    global_dtypes: Optional[Mapping[str, str]] = None,
+) -> str:
+    del hf_text_config
+    return ep_quant_loader_error(global_shapes, global_dtypes)
+
+
 def zero_copy_targets(
     plan: DirectInstallPlan,
     model_sd: dict[str, torch.Tensor],
@@ -397,4 +431,5 @@ LAYOUT = DirectInstallLayout(
     install=_install,
     zero_copy_targets=zero_copy_targets,
     loader_weights=_loader_weights,
+    loader_error=_loader_error,
 )

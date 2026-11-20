@@ -459,3 +459,38 @@ def test_qwen3_moe_trainer_quantized_ep_zero_copy():
                 q35._assert_bits_equal(
                     model_sd[f"{layer}.mlp.experts.{leaf}"], expected, f"rank {tp_rank} {layer} {leaf}"
                 )
+
+
+def test_qwen3_moe_bf16_ep_loader_fallback_splits_to_per_expert_weights():
+    """When Qwen3 MoE with ``rollout_expert_parallel=True`` (BF16 ``w13_ep`` / ``w2_ep``) falls back to vLLM's loaders,
+    ``direct_install.loader_weights`` preserves ``model_type='qwen3_moe'`` through ``qwen3_5_layout`` and splits both
+    stacks back into HF's per-expert ``<layer>.mlp.experts.<e>.{gate,up,down}_proj.weight`` tensors."""
+    from verl_hardware_plugin.accelerators.tpu.engines.weight_export import TrainerWeights
+    from verl_hardware_plugin.accelerators.tpu.rollout import direct_install
+
+    hf = {k: v.to(torch.bfloat16) for k, v in _hf_experts(torch.Generator().manual_seed(9)).items()}
+    stacked = _stacked(hf)
+    expert_stacks = []
+    for name, stack in sorted(stacked.items()):
+        if not name.endswith((".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")):
+            continue
+        prefix, proj = name.rsplit(".", 2)[0], name.split(".")[-2]
+        slots = [(f"{prefix}.{e}.{proj}.weight", tuple(stack.shape[1:])) for e in range(E)]
+        expert_stacks.append((stack, slots))
+    dense = {n: t for n, t in stacked.items() if n.endswith(qwen3_moe_layout.ROUTER_SUFFIX)}
+    tw = TrainerWeights(
+        dense,
+        expert_stacks,
+        "cpu",
+        expert_stack_wire=qwen3_moe_layout.expert_stack_wire_name,
+        rollout_expert_parallel=True,
+        rollout_fp8_moe=False,
+    )
+    sent = {n: t for n, t, _ in tw.local_shards()}
+    assert any(n.endswith(".mlp.experts.w13_ep") for n in sent)
+    assert direct_install.loader_error({n: list(t.shape) for n, t in sent.items()}, CONFIG) == ""
+
+    restored = dict(direct_install.loader_weights(iter(sorted(sent.items())), CONFIG))
+    assert set(restored) == set(hf)
+    for name, expected in hf.items():
+        assert torch.equal(restored[name], expected), name

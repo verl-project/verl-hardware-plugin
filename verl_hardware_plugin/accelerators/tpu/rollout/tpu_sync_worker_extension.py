@@ -280,6 +280,7 @@ class TPUSyncWorkerMixin:
             tp_size,
             rank_val,
             allow_quantized_moe=direct_install_quantized_moe,
+            global_dtypes=global_dtypes,
         )
         dense_quant_reason = direct_install.non_moe_quantized_reason(vllm_model) if layout is None else ""
         if dense_quant_reason:
@@ -292,9 +293,14 @@ class TPUSyncWorkerMixin:
         self._tpu_sync_use_vllm_loaders = use_vllm_loaders
         # The loaders need the trainer's tensors back in HF's layout (``DirectInstallLayout.loader_weights``).
         self._tpu_sync_hf_text_config = hf_text_config
-        loader_error = direct_install.loader_error(global_shapes_map, hf_text_config) if layout is None else ""
+        loader_error = (
+            direct_install.loader_error(global_shapes_map, hf_text_config, global_dtypes=global_dtypes)
+            if layout is None
+            else ""
+        )
         if loader_error:
-            raise RuntimeError(f"tpu-sync Sampler Rank {rank_val}: {loader_error}")
+            reasons_suffix = f" ({'; '.join(no_plan_reasons)})" if no_plan_reasons else ""
+            raise RuntimeError(f"tpu-sync Sampler Rank {rank_val}: {loader_error}{reasons_suffix}")
         install_mode = (
             f"{layout.name} direct" if layout is not None else "vllm loaders" if use_vllm_loaders else "direct"
         )
@@ -350,6 +356,12 @@ class TPUSyncWorkerMixin:
 
             # Allocate a local staging buffer with matching layout (the trainer sends bf16), or receive straight
             # into the rollout weight.
+            wire_dtype = torch.bfloat16
+            if global_dtypes and name in global_dtypes:
+                resolved_dtype = moe_weights.resolve_wire_dtype(global_dtypes[name])
+                if resolved_dtype is None:
+                    raise ValueError(f"tpu-sync: unknown wire dtype {global_dtypes[name]!r} for {name}")
+                wire_dtype = resolved_dtype
             t = zero_copy.get(name)
             if t is not None:
                 if list(t.shape) != list(shard.local_shape):
@@ -357,16 +369,19 @@ class TPUSyncWorkerMixin:
                         f"tpu-sync Sampler Rank {rank_val}: {name} slice {shard.local_shape} != rollout weight "
                         f"{list(t.shape)}"
                     )
+                if t.dtype != wire_dtype:
+                    raise RuntimeError(
+                        f"tpu-sync Sampler Rank {rank_val}: {name} wire dtype {wire_dtype} != rollout zero-copy "
+                        f"weight dtype {t.dtype}"
+                    )
             else:
+                if name.endswith(moe_weights.EP_FP8_SCALE_SUFFIXES) and wire_dtype != torch.float32:
+                    raise RuntimeError(
+                        f"tpu-sync Sampler Rank {rank_val}: {name} is an expert scale (expected torch.float32), "
+                        f"got staging dtype {wire_dtype} (missing global_dtypes?)"
+                    )
                 device = torch.device(tpu_sync_engine.TPU_SYNC_DEVICE)
-                staging_dtype = torch.bfloat16
-                if global_dtypes and name in global_dtypes:
-                    dtype_name = str(global_dtypes[name]).removeprefix("torch.")
-                    resolved_dtype = getattr(torch, dtype_name, None)
-                    if not isinstance(resolved_dtype, torch.dtype):
-                        raise ValueError(f"tpu-sync: unknown wire dtype {global_dtypes[name]!r} for {name}")
-                    staging_dtype = resolved_dtype
-                t = torch.empty(shard.local_shape, dtype=staging_dtype, device=device)
+                t = torch.empty(shard.local_shape, dtype=wire_dtype, device=device)
             staging_tensors[name] = t
             staging_sharded[name] = "tp" in shard.sharding_spec
             valid_params.append((name, t))
@@ -388,6 +403,7 @@ class TPUSyncWorkerMixin:
         self._tpu_sync_staging_sharded = staging_sharded
         self._sorted_vllm_params = valid_params
         self._tpu_sync_replicas = replicas
+        self._tpu_sync_zero_copy_names = frozenset(zero_copy)
         if zero_copy:
             logger.info(
                 f"tpu-sync Sampler Rank {rank_val}: {len(zero_copy)} tensors "
@@ -492,9 +508,15 @@ class TPUSyncWorkerMixin:
         result: dict[str, Any] = {"tp_size": tp_size, "params": params}
         if unsupported_reason:
             result["unsupported_reason"] = unsupported_reason
-        moe_quant = moe_weights.describe_moe_quant(vllm_model)
+        rank_attr = getattr(self, "rank", None)
+        tp_rank = int(rank_attr) if isinstance(rank_attr, int) else None
+        moe_quant = moe_weights.describe_moe_quant(vllm_model, tp_size=tp_size, tp_rank=tp_rank)
         if moe_quant is not None:
             result["moe_quant"] = moe_quant
+        else:
+            ineligible = moe_weights.moe_quant_ineligible_reason(vllm_model, tp_size=tp_size, tp_rank=tp_rank)
+            if ineligible:
+                result["moe_quant_ineligible_reason"] = ineligible
         return result
 
     def _init_receive_into_vllm(
@@ -569,6 +591,7 @@ class TPUSyncWorkerMixin:
         self._sorted_vllm_params = valid_params
         self._tpu_sync_replicas = replicas
         self._tpu_sync_bound_names = set(bound)
+        self._tpu_sync_zero_copy_names = frozenset()
         self._tpu_sync_layout = None
         self._tpu_sync_plan = None
         self._tpu_sync_use_vllm_loaders = False
@@ -622,6 +645,12 @@ class TPUSyncWorkerMixin:
             if exact_parity and bound_names
             else {}
         )
+        zero_copy_names: frozenset[str] = getattr(self, "_tpu_sync_zero_copy_names", frozenset())
+        zero_copy_before = (
+            {name: self._tpu_sync_staging[name].detach().to("cpu", copy=True) for name in sorted(zero_copy_names)}
+            if exact_parity and zero_copy_names
+            else {}
+        )
         t_h2d_start = time.perf_counter()
         # h2d() applies the skip_tiling plan the listener received with this transfer (see
         # init_tpu_sync_on_worker); nothing must override it here. With receive_into_vllm it writes vLLM's
@@ -670,6 +699,9 @@ class TPUSyncWorkerMixin:
         model_sd = vllm_model.state_dict() if hasattr(vllm_model, "state_dict") else vllm_model.model.state_dict()
         module_dict = dict(vllm_model.named_modules()) if hasattr(vllm_model, "named_modules") else {}
         parity = ExactParityCheck() if exact_parity else None
+        if parity is not None and zero_copy_before:
+            for name in sorted(zero_copy_before):
+                parity.check(name, zero_copy_before[name], self._tpu_sync_staging[name].detach().to("cpu", copy=True))
 
         def find_model_key(k: str) -> Optional[str]:
             resolved = resolve_model_key(k, model_sd)
