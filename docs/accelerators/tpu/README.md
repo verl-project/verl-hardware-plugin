@@ -117,8 +117,8 @@ replacement. verl's `TorchtitanEngineConfig` has no `engine_kwargs` field yet; t
 
 Process-wide settings that are not part of any verl config stay environment variables, set in the shell that
 runs the recipe; the platform forwards them to every worker: libtpu / XLA flags (`LIBTPU_INIT_ARGS`, `XLA_FLAGS`),
-`VERL_TPU_CHIPS_PER_HOST` (`options.tpu_chips_per_host_override`; the platform resolves the topology before any
-verl config exists), and `VERL_TPU_TIMELINE` ([RL Timeline & HBM Profiler](./timeline.md)).
+`TORCH_TPU_TOPOLOGY`, `VERL_TPU_CHIPS_PER_HOST` (`options.tpu_chips_per_host_override`; the platform resolves the
+topology before any verl config exists), and `VERL_TPU_TIMELINE` ([RL Timeline & HBM Profiler](./timeline.md)).
 
 Deprecated channels, still read for compatibility (each logs a one-time warning; an environment variable still
 overrides the config, as before):

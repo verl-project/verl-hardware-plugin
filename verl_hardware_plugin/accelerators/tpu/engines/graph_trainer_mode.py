@@ -38,6 +38,7 @@ import dataclasses
 import logging
 import math
 import os
+import sys
 from typing import Any, Callable
 
 import torch
@@ -297,7 +298,17 @@ def _packed_stream_as_one_row() -> Any:
     micro-batch is one row and the state resets only at document boundaries, as in the eager engine. The value is read
     while tracing, so the traced graph keeps it.
     """
-    from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+    for mod_name in (
+        "torchtitan.experiments.tpu.components.unflatten_shim",
+        "torchtitan.experiments.tpu.unflatten_shim",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "set_unflatten_seq_len"):
+            return mod.set_unflatten_seq_len(None)
+    try:
+        from torchtitan.experiments.tpu.components.unflatten_shim import set_unflatten_seq_len
+    except ImportError:
+        from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
 
     return set_unflatten_seq_len(None)
 

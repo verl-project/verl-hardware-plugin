@@ -19,7 +19,7 @@ import math
 import os
 import re
 from contextlib import contextmanager
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import ray
 import torch
@@ -58,7 +58,7 @@ _ensure_torch_tpu()  # Attempt at module load time so availability checks are fa
 # read: the libtpu / XLA compiler flags, and the plugin's own knobs (``VERL_TPU_*``, including ``VERL_TPU_SYNC_*``). Ray
 # workers start from the raylet's environment, not the driver's, so the platform names them in the job's
 # runtime_env for them to reach the trainer workers, the rollout servers and vLLM's engine workers.
-TPU_FORWARDED_ENV_VARS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS", "VERL_MOE_PAIRED_GEMM")
+TPU_FORWARDED_ENV_VARS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS", "VERL_MOE_PAIRED_GEMM", "TORCH_TPU_TOPOLOGY")
 TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_",)
 # Extra ``LIBTPU_INIT_ARGS`` / ``XLA_FLAGS`` appended only on ``RayWorkerGroup`` trainer/reference workers (never on
 # vLLM rollout servers), e.g. ``--xla_tpu_scoped_vmem_limit_kib=65472``, TorchTitan's MoE SparseCore collective-offload
@@ -173,7 +173,32 @@ def is_tpu_v7x(pod_type: str = "") -> bool:
 
 
 def _bounds(value: str) -> list[int]:
-    return [int(d) for d in value.replace("x", ",").split(",") if d]
+    text = value.strip().lower()
+    if not text:
+        return []
+    parts = text.replace("x", ",").split(",")
+    if any(not p.strip() for p in parts):
+        raise ValueError(f"invalid topology bounds {value!r}")
+    return [int(p.strip()) for p in parts]
+
+
+def _topology_override(environ: Mapping[str, str], expected_ndim: int, expected_count: int) -> str:
+    """Validated comma-separated ``TORCH_TPU_TOPOLOGY`` matching ``(expected_ndim, expected_count)``, else ``""``.
+
+    ``torch_tpu`` C++ splits ``TORCH_TPU_TOPOLOGY`` only on ``','``, so ``'x'``/``'X'`` inputs are normalized to commas.
+    """
+    override = environ.get("TORCH_TPU_TOPOLOGY", "").strip()
+    if not override:
+        return ""
+    try:
+        dims = _bounds(override)
+    except ValueError as e:
+        raise ValueError(f"Invalid TORCH_TPU_TOPOLOGY={override!r}: expected {expected_ndim} positive integers") from e
+    if any(d <= 0 for d in dims):
+        raise ValueError(f"Invalid TORCH_TPU_TOPOLOGY={override!r}: topology dimensions must be positive integers")
+    if len(dims) == expected_ndim and math.prod(dims) == expected_count:
+        return ",".join(map(str, dims))
+    return ""
 
 
 def gke_tpu_slice_topology(environ: Optional[Mapping[str, str]] = None) -> tuple[str, int]:
@@ -183,11 +208,12 @@ def gke_tpu_slice_topology(environ: Optional[Mapping[str, str]] = None) -> tuple
     (``TPU_TOPOLOGY`` names the same shape). Returns ``("", 0)`` outside a GKE TPU pod, e.g. on the Ray head.
     """
     environ = os.environ if environ is None else environ
-    host_bounds, chip_bounds = environ.get("TPU_HOST_BOUNDS", ""), environ.get("TPU_CHIPS_PER_HOST_BOUNDS", "")
+    host_bounds = environ.get("TPU_HOST_BOUNDS", "").strip()
+    chip_bounds = environ.get("TPU_CHIPS_PER_HOST_BOUNDS", "").strip()
     if not host_bounds or not chip_bounds:
         return "", 0
     hosts, chips = _bounds(host_bounds), _bounds(chip_bounds)
-    if len(hosts) != len(chips):
+    if len(hosts) != len(chips) or any(h <= 0 for h in hosts) or any(c <= 0 for c in chips):
         return "", 0
     return ",".join(str(h * c) for h, c in zip(hosts, chips, strict=True)), math.prod(hosts)
 
@@ -258,8 +284,40 @@ def ray_tpu_pool_chip_topology(
     if len({(label[keys[0]], label[keys[2]]) for label in labels}) > 1:
         logger.info("The pool's hosts belong to more than one TPU slice; the TPU 7x mesh comes from the table")
         return ""
-    worker_ids = [int(label["ray.io/tpu-worker-id"]) for label in labels]
-    topology = tpu_pool_chip_topology(worker_ids, labels[0]["ray.io/tpu-topology"], chips_per_host_bounds)
+    try:
+        worker_ids = [int(label["ray.io/tpu-worker-id"]) for label in labels]
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring non-integer Ray TPU worker id labels %s; the TPU 7x mesh comes from the table",
+            [label.get("ray.io/tpu-worker-id") for label in labels],
+        )
+        return ""
+    raw_slice_topology = labels[0]["ray.io/tpu-topology"]
+    try:
+        slice_chips, host_chips = _bounds(raw_slice_topology), _bounds(chips_per_host_bounds)
+    except ValueError:
+        logger.warning(
+            "Ignoring malformed Ray TPU topology label %r (chips_per_host_bounds=%r); "
+            "the TPU 7x mesh comes from the table",
+            raw_slice_topology,
+            chips_per_host_bounds,
+        )
+        return ""
+    if len(slice_chips) == len(host_chips) and all(
+        c > 0 and s % c == 0 for s, c in zip(slice_chips, host_chips, strict=True)
+    ):
+        host_grid = [s // c for s, c in zip(slice_chips, host_chips, strict=True)]
+        if math.prod(host_grid) < len(node_ips):
+            logger.warning(
+                "Ray TPU topology label %r holds only %d host(s), fewer than the pool's %d hosts (worker ids %s); "
+                "ignoring per-host topology labels so the TPU 7x mesh comes from the table",
+                raw_slice_topology,
+                math.prod(host_grid),
+                len(node_ips),
+                worker_ids,
+            )
+            return ""
+    topology = tpu_pool_chip_topology(worker_ids, raw_slice_topology, chips_per_host_bounds)
     if worker_ids != sorted(worker_ids):
         logger.warning(
             "The pool's hosts are not in slice order by rank (worker ids %s); libtpu numbers the processes of the "
@@ -275,37 +333,31 @@ def resolve_tpu_v7x_topology(
     num_nodes: int,
     environ: Optional[Mapping[str, str]] = None,
     pool_chip_topology: str = "",
+    pool_chip_topology_fn: Optional[Callable[[], str]] = None,
 ) -> str:
     """The 4-D ``x,y,z,cores`` mesh of ``num_devices`` TensorCore processes on ``num_nodes`` TPU 7x hosts.
 
-    ``TORCH_TPU_TOPOLOGY`` overrides. Otherwise, when the pool spans the slice the GKE webhook describes
-    (its chips times the cores per chip are the devices, its hosts are the nodes), the mesh is that slice
-    with the core axis appended, as torchtitan does. Else ``pool_chip_topology`` (the block of hosts the pool
-    holds, from ``ray_tpu_pool_chip_topology``) with the core axis. Only without either, e.g. outside Ray, does
-    the pool take the whole-host shape of ``TPU_V7X_TOPOLOGY_MAP``.
+    ``TORCH_TPU_TOPOLOGY`` overrides (normalized to comma-separated ``x,y,z,cores``). Otherwise, when the pool
+    spans the slice the GKE webhook describes (its chips times the cores per chip are the devices, its hosts are
+    the nodes), the mesh is that slice with the core axis appended, as torchtitan does. Else ``pool_chip_topology``
+    (or ``pool_chip_topology_fn()``, evaluated lazily so ``TORCH_TPU_TOPOLOGY`` and whole-slice webhook topologies
+    take precedence over ``ray_tpu_pool_chip_topology``) with the core axis. Only without either, e.g. outside Ray,
+    does the pool take the whole-host shape of ``TPU_V7X_TOPOLOGY_MAP``.
 
     Raises:
-        ValueError: if ``pool_chip_topology`` does not hold ``num_devices``, or nothing names a mesh for
-            ``num_devices``.
+        ValueError: if ``TORCH_TPU_TOPOLOGY`` is malformed, ``pool_chip_topology`` does not hold ``num_devices``, or
+            nothing names a mesh for ``num_devices``.
     """
     environ = os.environ if environ is None else environ
-    override = environ.get("TORCH_TPU_TOPOLOGY")
-    if override and math.prod(_bounds(override)) == num_devices:
+    override = _topology_override(environ, expected_ndim=4, expected_count=num_devices)
+    if override:
         return override
     slice_topology, slice_hosts = gke_tpu_slice_topology(environ)
-    if slice_topology:
-        slice_devices = math.prod(_bounds(slice_topology)) * TPU_V7X_CORES_PER_CHIP
-        if slice_devices == num_devices and slice_hosts == num_nodes:
-            return f"{slice_topology},{TPU_V7X_CORES_PER_CHIP}"
-        logger.info(
-            "The pool (%d devices on %d hosts) is part of the %s slice (%d devices on %d hosts); using the "
-            "built-in shape for its size",
-            num_devices,
-            num_nodes,
-            slice_topology,
-            slice_devices,
-            slice_hosts,
-        )
+    slice_devices = math.prod(_bounds(slice_topology)) * TPU_V7X_CORES_PER_CHIP if slice_topology else 0
+    if slice_topology and slice_devices == num_devices and slice_hosts == num_nodes:
+        return f"{slice_topology},{TPU_V7X_CORES_PER_CHIP}"
+    if not pool_chip_topology and pool_chip_topology_fn is not None:
+        pool_chip_topology = pool_chip_topology_fn()
     if pool_chip_topology:
         pool_devices = math.prod(_bounds(pool_chip_topology)) * TPU_V7X_CORES_PER_CHIP
         if pool_devices != num_devices:
@@ -318,6 +370,16 @@ def resolve_tpu_v7x_topology(
         if table and table != pool_topology:
             logger.info("Using the %s mesh of the pool's hosts rather than the table's %s", pool_topology, table)
         return pool_topology
+    if slice_topology:
+        logger.info(
+            "The pool (%d devices on %d hosts) is part of the %s slice (%d devices on %d hosts); using the "
+            "built-in shape for its size",
+            num_devices,
+            num_nodes,
+            slice_topology,
+            slice_devices,
+            slice_hosts,
+        )
     topology = TPU_V7X_TOPOLOGY_MAP.get(num_devices)
     if not topology:
         raise ValueError(
@@ -425,6 +487,7 @@ def resolve_tpu_topology_bounds(
     num_nodes: int,
     pod_type: str = "",
     pool_chip_topology: str = "",
+    pool_chip_topology_fn: Optional[Callable[[], str]] = None,
 ) -> tuple[str, str, str, str]:
     """Resolve ``(topology, host_bounds, chips_per_host_bounds, chips_per_host)`` for a TPU slice.
 
@@ -434,9 +497,9 @@ def resolve_tpu_topology_bounds(
     the chip count.
 
     On TPU 7x (``pod_type`` or ``TPU_ACCELERATOR_TYPE`` names it) ``total_chips`` counts TensorCore
-    devices, the topology is the 4-D mesh of ``resolve_tpu_v7x_topology`` (given ``pool_chip_topology``, the
-    block of chips the pool's hosts hold, when the caller knows it) and every process is its own cell of the mesh,
-    whatever the slice size.
+    devices, the topology is the 4-D mesh of ``resolve_tpu_v7x_topology`` (given ``pool_chip_topology`` or
+    ``pool_chip_topology_fn``, the block of chips the pool's hosts hold, when the caller knows it) and every
+    process is its own cell of the mesh, whatever the slice size.
 
     Raises:
         ValueError: if the topology cannot be determined. Guessing here is worse than failing:
@@ -446,12 +509,15 @@ def resolve_tpu_topology_bounds(
     chips_per_host = str(tpu_chips_per_host_override() or inferred_chips_per_host)
 
     if is_tpu_v7x(pod_type):
-        v7x_topology = resolve_tpu_v7x_topology(total_chips, num_nodes, pool_chip_topology=pool_chip_topology)
+        v7x_topology = resolve_tpu_v7x_topology(
+            total_chips,
+            num_nodes,
+            pool_chip_topology=pool_chip_topology,
+            pool_chip_topology_fn=pool_chip_topology_fn,
+        )
         return v7x_topology, v7x_topology, TPU_V7X_PROCESS_BOUNDS, chips_per_host
 
-    env_topology = os.environ.get("TORCH_TPU_TOPOLOGY", "")
-    if env_topology and math.prod(_bounds(env_topology)) != total_chips:
-        env_topology = ""
+    env_topology = _topology_override(os.environ, expected_ndim=3, expected_count=total_chips)
     topology = (
         env_topology or TPU_POD_TYPE_TOPOLOGY_MAP.get(pod_type.lower()) or DEFAULT_TPU_TOPOLOGY_MAP.get(total_chips)
     )
@@ -1008,16 +1074,17 @@ class PlatformTPU(PlatformBase):
             chips_per_host = str(tpu_chips_per_host_override() or max(1, world_size))
         else:
             # On TPU 7x a pool of whole hosts takes the block of hosts it holds in its slice, from the hosts' Ray
-            # labels (a single-device pool keeps the table's 1,1,1,1).
+            # labels (a single-device pool keeps the table's 1,1,1,1), evaluated lazily so TORCH_TPU_TOPOLOGY and
+            # whole-slice GKE webhook topologies win before ray_tpu_pool_chip_topology inspects host coordinates.
             whole_hosts = world_size == len(unique_hostnames) * TPU_V7X_DEVICES_PER_HOST
-            pool_chip_topology = (
-                ray_tpu_pool_chip_topology(unique_hostnames) if is_tpu_v7x(tpu_type) and whole_hosts else ""
+            pool_chip_topology_fn = (
+                (lambda: ray_tpu_pool_chip_topology(unique_hostnames)) if is_tpu_v7x(tpu_type) and whole_hosts else None
             )
             topology, _, _, chips_per_host = resolve_tpu_topology_bounds(
                 total_chips=world_size,
                 num_nodes=len(unique_hostnames),
                 pod_type=tpu_type,
-                pool_chip_topology=pool_chip_topology,
+                pool_chip_topology_fn=pool_chip_topology_fn,
             )
 
         return {

@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import importlib
 import inspect
 import math
+import sys
 from typing import Any, Optional
 
 import torch
@@ -36,16 +38,29 @@ try:
 except ImportError:
     _maybe_set_sparse_mesh = None  # type: ignore[assignment]
 
-try:
-    from torchtitan.experiments.tpu.token_dispatcher import (
-        scale_route_weights as _tt_scale_route_weights,
-    )
-    from torchtitan.experiments.tpu.token_dispatcher import (
-        stable_grouped_reduce as _tt_stable_grouped_reduce,
-    )
-except ImportError:
-    _tt_scale_route_weights = None  # type: ignore[assignment]
-    _tt_stable_grouped_reduce = None  # type: ignore[assignment]
+
+def _load_tt_token_dispatcher_helpers() -> tuple[Any, Any]:
+    """Load optional TorchTitan TPU ``(scale_route_weights, stable_grouped_reduce)`` across module layouts."""
+    for mod_name in (
+        "torchtitan.experiments.tpu.components.token_dispatcher",
+        "torchtitan.experiments.tpu.token_dispatcher",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None:
+            return getattr(mod, "scale_route_weights", None), getattr(mod, "stable_grouped_reduce", None)
+    for mod_name in (
+        "torchtitan.experiments.tpu.components.token_dispatcher",
+        "torchtitan.experiments.tpu.token_dispatcher",
+    ):
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:
+            continue
+        return getattr(mod, "scale_route_weights", None), getattr(mod, "stable_grouped_reduce", None)
+    return None, None
+
+
+_tt_scale_route_weights, _tt_stable_grouped_reduce = _load_tt_token_dispatcher_helpers()
 
 
 def has_tpu_ragged_all_to_all() -> bool:

@@ -553,6 +553,41 @@ def test_get_tpu_env_vars_derives_the_v7x_mesh_of_a_partial_slice_pool():
     assert env["TORCH_TPU_TOPOLOGY"] == "4,4,8,2"
 
 
+def test_get_tpu_env_vars_topology_override_and_lws_per_host_labels():
+    """TORCH_TPU_TOPOLOGY wins before probing L-shaped pools; per-host LWS 2x2x1 and non-int worker IDs fall back."""
+    platform = PlatformTPU()
+    pg = SimpleNamespace(id="pg-0")
+    l_shaped_nodes = _v7x_nodes([0, 1, 2, 4])
+    pg_table_4 = {"state": "CREATED", "bundles_to_node_id": {b: f"node-{b // 8}" for b in range(32)}}
+    for raw_override in ("2x2x4x2", "2X2X4X2", "2,2,4,2"):
+        with (
+            mock.patch("ray.is_initialized", return_value=True),
+            mock.patch("ray.nodes", return_value=l_shaped_nodes),
+            mock.patch("ray._private.state.state.placement_group_table", return_value=pg_table_4),
+            mock.patch.dict(os.environ, {**_env_without_webhook(), "TORCH_TPU_TOPOLOGY": raw_override}, clear=True),
+        ):
+            env = platform.get_tpu_env_vars(
+                rank=0, world_size=32, local_rank=0, local_world_size=8, name_prefix="ActorRolloutRefWorker", pgs=[pg]
+            )
+        assert env["TORCH_TPU_TOPOLOGY"] == "2,2,4,2"
+
+    # Per-host LWS label (2x2x1 on a multi-host pool) and non-integer worker-id fall back to "" instead of raising.
+    ips_4 = [f"10.0.0.{i}" for i in range(4)]
+    with mock.patch("ray.is_initialized", return_value=True):
+        with mock.patch("ray.nodes", return_value=_v7x_nodes([0, 0, 0, 0], topology="2x2x1")):
+            assert ray_tpu_pool_chip_topology(ips_4) == ""
+        with mock.patch("ray.nodes", return_value=_v7x_nodes(["host-a", "host-b", "host-c", "host-d"])):
+            assert ray_tpu_pool_chip_topology(ips_4) == ""
+
+    # Uppercase 'X' separator in webhook bounds is parsed case-insensitively.
+    with mock.patch.dict(
+        os.environ,
+        {**_env_without_webhook(), "TPU_HOST_BOUNDS": "1X1X2", "TPU_CHIPS_PER_HOST_BOUNDS": "2X2X1"},
+        clear=True,
+    ):
+        assert resolve_tpu_topology_bounds(total_chips=16, num_nodes=2, pod_type="tpu7x")[0] == "2,2,2,2"
+
+
 def test_tpu_mesh_env_applies_the_process_layout_on_tpu7x_only():
     env = _env_without_webhook()
     with mock.patch.dict(os.environ, env, clear=True):
@@ -864,8 +899,10 @@ def test_get_tpu_env_vars_rejects_a_rollout_replica_split_across_hosts():
 
 def _clear_forwarded_tpu_env(monkeypatch):
     """Unset the variables the platform forwards, so the test shell's own exports do not leak in."""
+    from verl_hardware_plugin.accelerators.tpu.platform_tpu import TPU_FORWARDED_ENV_VARS
+
     for name in list(os.environ):
-        if name in ("LIBTPU_INIT_ARGS", "XLA_FLAGS") or name.startswith("VERL_TPU_"):
+        if name in TPU_FORWARDED_ENV_VARS or name.startswith("VERL_TPU_"):
             monkeypatch.delenv(name)
 
 
@@ -880,6 +917,7 @@ def test_driver_tpu_env_is_forwarded_to_ray_workers(monkeypatch):
     flags = "--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_bf16_emission_mode=PROMOTE_F32"
     monkeypatch.setenv("LIBTPU_INIT_ARGS", flags)
     monkeypatch.setenv("XLA_FLAGS", "")  # empty: not forwarded, it would replace the workers' own value
+    monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "4,4,8,2")
     monkeypatch.setenv("VERL_TPU_EAGER_MODE", "DEFER_AND_FUSE")
     monkeypatch.setenv("VERL_TPU_SYNC_RELEASE_BUFFERS", "0")
     monkeypatch.setenv("VERL_LOGGING_LEVEL", "DEBUG")  # not a TPU knob: not forwarded
@@ -887,6 +925,7 @@ def test_driver_tpu_env_is_forwarded_to_ray_workers(monkeypatch):
     assert env_vars == {
         "VERL_PLATFORM": "tpu",
         "LIBTPU_INIT_ARGS": flags,
+        "TORCH_TPU_TOPOLOGY": "4,4,8,2",
         "VERL_TPU_EAGER_MODE": "DEFER_AND_FUSE",
         "VERL_TPU_SYNC_RELEASE_BUFFERS": "0",
     }
@@ -1780,18 +1819,19 @@ def test_enable_context_parallel_passes_gdn_options_to_the_transform():
         get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"context_parallel_gdn_reduce_dtype": "fp8"}}))
 
 
-@pytest.mark.parametrize(("strategy", "raises"), [("all_gather", True), ("ulysses", False)])
-def test_enable_context_parallel_rejects_gdn_row_slots_with_the_headtail_layout(strategy, raises):
-    """gdn_row_slot_len makes the CP GatedDeltaNet read the stream as rows, while the head-tail load balancer shards
-    it as one sequence: rejected under all_gather CP, allowed under Ulysses (contiguous shards)."""
+@pytest.mark.parametrize("strategy", ["all_gather", "ulysses"])
+def test_enable_context_parallel_rejects_gdn_row_slots(strategy):
+    """Static gdn_row_slot_len does not permute labels before cp_shard or post-gather-unpermute outputs under CP:
+    rejected for every context_parallel_strategy when context_parallel_size > 1."""
     layer_module = _fake_gdn_layer_module()
     modules = {_GDN_LAYER_MODULE: layer_module, _GDN_CP_MODULE: _fake_gdn_cp_module(with_options=False)}
     engine = _cp_engine(strategy, gdn_row_slot_len=4096)
     model = _model_with_layers(layer_module.GatedDeltaNet.Config, 1)
+    parallelism = _cp_parallelism()
     with mock.patch.dict(sys.modules, _fake_cp_modules([], layer_modules=modules)):
-        ctx = pytest.raises(ValueError, match="gdn_row_slot_len is not supported") if raises else nullcontext()
-        with ctx:
-            TorchTitanTPUEngine._enable_context_parallel(engine, _cp_parallelism(), model)
+        with pytest.raises(ValueError, match="gdn_row_slot_len is not supported"):
+            TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
+    assert parallelism.spmd_backend == "partial_dtensor"
 
 
 def test_cp_layer_module_available_does_not_hide_broken_imports(tmp_path, monkeypatch):
@@ -2732,12 +2772,22 @@ def test_torchtitan_head_compatibility_for_kda_multi_mesh_and_ep_simple_fsdp(mon
     from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu, tpu_model_kernels, tpu_utils
 
     # 1. PyPI tokamax==0.0.14 has ``tokamax`` without ``tokamax._src.ops.kda``: "auto" must not enable ``kda``.
+    #    Without TPU ``grouped_experts`` (non-TPU torchtitan build), "auto" must also omit ``moe`` so it stays runnable.
     fake_reg = SimpleNamespace(_use_tpu_moe_kernels=lambda _: None, TOKAMAX_GATED_DELTA_OVERRIDE="kda_override")
     monkeypatch.setattr(tpu_model_kernels, "_qwen3_5_config_registry", lambda: fake_reg)
     monkeypatch.setattr(
         tpu_model_kernels.importlib.util,
         "find_spec",
         lambda name: object() if name == "tokamax" else None,
+    )
+    monkeypatch.delitem(sys.modules, "torchtitan.experiments.tpu.components.grouped_experts", raising=False)
+    monkeypatch.delitem(sys.modules, "torchtitan.experiments.tpu.grouped_experts", raising=False)
+    assert tpu_model_kernels.resolve_tpu_model_kernels("qwen3_5", "auto") == frozenset({"lce"})
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torchtitan.experiments.tpu.components.grouped_experts",
+        SimpleNamespace(TpuGroupedExperts=object),
     )
     assert tpu_model_kernels.resolve_tpu_model_kernels("qwen3_5", "auto") == frozenset({"moe", "lce"})
     monkeypatch.setattr(
@@ -3963,3 +4013,72 @@ def test_align_micro_batch_shapes_gdn_row_slot_len_multi_seq():
     slotted = ids_pad[slot_src]
     restored = slotted[contig_src]
     assert torch.equal(restored[:orig_len], ids.values())
+
+
+def test_pr170_cp_layer_transforms_and_torchtitan_dual_layout(monkeypatch):
+    """Verify cp_layer_transforms guards and dual torchtitan HEAD (components/distributed) vs private-branch imports."""
+    from verl_hardware_plugin.accelerators.tpu.engines import (
+        cp_layer_transforms,
+        graph_trainer_mode,
+        torchtitan_tpu,
+        tpu_ragged_ep,
+        tpu_utils,
+    )
+    from verl_hardware_plugin.accelerators.tpu.options import TPUEngineOptions
+
+    # 1. Real loaded module (__spec__ is not None) missing the expected class raises RuntimeError, not silent skip.
+    broken_real_mod = SimpleNamespace(__spec__=object())
+    monkeypatch.setitem(sys.modules, _GDN_LAYER_MODULE, broken_real_mod)
+    with pytest.raises(RuntimeError, match=r"has no 'GatedDeltaNet\.Config'"):
+        cp_layer_transforms.context_parallel_layer_transforms(torch.nn.Module(), "cp_mesh", TPUEngineOptions())
+
+    # 2. Setting context_parallel_gdn_* on a model with 0 matching GDN layers raises ValueError.
+    layer_mod = _fake_gdn_layer_module()
+    layer_mod.__spec__ = object()
+    monkeypatch.setitem(sys.modules, _GDN_LAYER_MODULE, layer_mod)
+    with pytest.raises(ValueError, match=r"has 0 Qwen3\.5 GatedDeltaNet layers"):
+        cp_layer_transforms.context_parallel_layer_transforms(
+            _model_with_layers(layer_mod.GatedDeltaNet.Config, 0),
+            "cp_mesh",
+            TPUEngineOptions(context_parallel_gdn_strategy="all_to_all"),
+        )
+
+    # 3. Dual torchtitan module layout: HEAD (components.* / distributed.*) vs private branch (top-level).
+    class _KVAllGather:
+        pass
+
+    for cp_mod_name, other_cp_mod in (
+        ("torchtitan.experiments.tpu.distributed.cp_attention", "torchtitan.experiments.tpu.cp_attention"),
+        ("torchtitan.experiments.tpu.cp_attention", "torchtitan.experiments.tpu.distributed.cp_attention"),
+    ):
+        monkeypatch.delitem(sys.modules, other_cp_mod, raising=False)
+        fake_cp_mod = SimpleNamespace(
+            KVAllGatherCPInnerAttention=_KVAllGather,
+            install_tpu_cp_patches="patches",
+            tpu_cp_inner_attention="inner",
+            tpu_cp_load_balancer="lb",
+            validate_tpu_context_parallel="validate",
+        )
+        monkeypatch.setitem(sys.modules, cp_mod_name, fake_cp_mod)
+        assert torchtitan_tpu._import_tpu_cp_attention() is fake_cp_mod
+        assert tpu_utils._is_kv_all_gather_cp(_KVAllGather()) is True
+
+    set_unflatten_fn = mock.Mock(return_value=nullcontext())
+    monkeypatch.delitem(sys.modules, "torchtitan.experiments.tpu.unflatten_shim", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "torchtitan.experiments.tpu.components.unflatten_shim",
+        SimpleNamespace(set_unflatten_seq_len=set_unflatten_fn),
+    )
+    assert torchtitan_tpu._import_set_unflatten_seq_len() is set_unflatten_fn
+    with graph_trainer_mode._packed_stream_as_one_row():
+        pass
+    set_unflatten_fn.assert_called_once_with(None)
+
+    monkeypatch.delitem(sys.modules, "torchtitan.experiments.tpu.token_dispatcher", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "torchtitan.experiments.tpu.components.token_dispatcher",
+        SimpleNamespace(scale_route_weights="scale_fn", stable_grouped_reduce="reduce_fn"),
+    )
+    assert tpu_ragged_ep._load_tt_token_dispatcher_helpers() == ("scale_fn", "reduce_fn")

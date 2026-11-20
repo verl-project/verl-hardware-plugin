@@ -87,14 +87,24 @@ def _getattr_path(obj: Any, qualname: str) -> Any:
 
 
 def _loaded_attr(path: str) -> Optional[Any]:
-    """The object at ``path`` if its module is already imported, else None. Never imports anything."""
+    """The object at ``path`` if its module is already imported, else None. Never imports anything.
+
+    Raises:
+        RuntimeError: if ``path``'s module is a real imported module (``__spec__ is not None``) that lacks the
+            attribute, so a torchtitan rename fails loudly instead of silently skipping its CP transform.
+    """
     module_name, qualname = _split(path)
     module = sys.modules.get(module_name)
     if module is None:
         return None
     try:
         return _getattr_path(module, qualname)
-    except AttributeError:
+    except AttributeError as e:
+        if getattr(module, "__spec__", None) is not None:
+            raise RuntimeError(
+                f"Module {module_name!r} is imported, but has no {qualname!r} ({path!r}); "
+                "cannot verify whether the model requires its context-parallel transform."
+            ) from e
         return None
 
 
@@ -144,7 +154,17 @@ def _build_transform(spec: CPLayerTransform, load_balancer: Optional[str], optio
                 f"no {keyword!r} field. Upgrade torchtitan or unset the option."
             )
         kwargs[keyword] = value
-    return transform_cls(**kwargs)
+    transform = transform_cls(**kwargs)
+    if (
+        getattr(options, "context_parallel_gdn_reduce_dtype", None) is not None
+        and getattr(transform, "strategy", None) == "all_to_all"
+    ):
+        raise ValueError(
+            "engine_kwargs.tpu.context_parallel_gdn_reduce_dtype requires "
+            "context_parallel_gdn_strategy='allgather_reducescatter' "
+            "(under strategy='all_to_all', GatedDeltaNet CP runs all-to-all without reduce-scatter)."
+        )
+    return transform
 
 
 def context_parallel_layer_transforms(model: Any, load_balancer: Optional[str], options: Any = None) -> list[Any]:
@@ -158,16 +178,22 @@ def context_parallel_layer_transforms(model: Any, load_balancer: Optional[str], 
 
     Raises:
         RuntimeError: if the model contains a registered layer whose transform the installed torchtitan lacks.
-        ValueError: if an option is set that the installed transform does not accept.
+        ValueError: if an option is set for a layer the model lacks or that the installed transform does not accept.
     """
     transforms = []
     for spec in _REGISTRY:
         layer_config_cls = _loaded_attr(spec.layer_config)
-        if layer_config_cls is None:
-            continue  # its module is not imported, so the model cannot contain the layer
-        num_layers = sum(1 for _ in model.traverse(layer_config_cls))
+        num_layers = 0 if layer_config_cls is None else sum(1 for _ in model.traverse(layer_config_cls))
         if num_layers:
             transforms.append(_build_transform(spec, load_balancer, options, num_layers))
+            continue
+        for option in spec.option_fields:
+            value = getattr(options, option, None)
+            if value is not None:
+                raise ValueError(
+                    f"engine_kwargs.tpu.{option}={value!r} is set, but the model has 0 {spec.name} layers; "
+                    f"unset {option} for models without {spec.name} layers."
+                )
     return transforms
 
 
