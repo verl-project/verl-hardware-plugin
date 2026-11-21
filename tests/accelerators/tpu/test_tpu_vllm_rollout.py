@@ -413,6 +413,11 @@ def test_replica_gives_engines_on_one_host_disjoint_devices_and_ports(tpu_vllm, 
         assert all(21000 <= port < 22000 for port in ports)  # clear of Ray's worker ports and the ephemeral range
         assert seen_ports.isdisjoint(ports)
         seen_ports |= ports
+    engine_ids = [env[tpu_vllm.SUBHOST_ENGINE_ID_ENV] for env in envs]
+    assert all(engine_ids) and len(set(engine_ids)) == per_host
+    # A restarted engine reusing the same slot gets a fresh engine ID so StartSession coordination files never collide.
+    restarted = tpu_vllm.subhost_engine_env(slot=0, devices_per_engine=chips, replica_rank=0)
+    assert restarted[tpu_vllm.SUBHOST_ENGINE_ID_ENV] not in engine_ids
 
 
 def test_replica_rejects_more_engines_than_a_host_holds(tpu_vllm):

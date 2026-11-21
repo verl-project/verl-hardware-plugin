@@ -86,6 +86,11 @@ multi-host replicas launch as before.
   and ports. The first engine of a host claims it for its job (a shared `flock` on
   `/tmp/verl_tpu_subhost_rollout.lock`, held while the engine runs), and an engine of another job fails at startup.
   Give each job its own rollout hosts.
+- **Serialized `StartSession` init:** co-located sub-host engines serialize `TPUWorker.init_device` (the `tpu_dist`
+  / `tpunetd` `StartSession` handshake over `vbar.sock`) on `/tmp/verl_tpu_subhost_start_session.lock` so concurrent
+  `StartSession` calls on one host do not collide (`GRPC_ERROR error message: START_SESSION failed`). Model loading
+  and XLA compilation still run in parallel across engines. Whole-host (TP=8), TP=1, multi-host, and non-v7x
+  replicas are untouched; set `VERL_TPU_SUBHOST_SERIALIZE_START_SESSION=0` to opt out.
 
 ## Verify
 
