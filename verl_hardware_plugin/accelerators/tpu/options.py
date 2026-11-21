@@ -38,7 +38,7 @@ import dataclasses
 import logging
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,52 @@ def _apply_legacy_env(
 # ---------------------------------------------------------------------------------------------------------------
 
 
+class StaticMicroBatchLens:
+    """Parser for ``engine_kwargs.tpu.static_micro_batch_lens``.
+
+    Accepts a non-empty sequence of positive integers (e.g. ``[20480, 32768]`` or ``(20480, 32768)``) or a
+    comma-separated string of positive integers (e.g. ``"20480,32768"``) and returns a sorted, deduplicated
+    ``tuple[int, ...]``.
+    """
+
+    @classmethod
+    def parse(cls, value: Any) -> tuple[int, ...]:
+        if isinstance(value, str):
+            parts = [part.strip() for part in value.split(",")]
+            if not parts or any(not part for part in parts):
+                raise ValueError(
+                    f"static_micro_batch_lens must be a non-empty sequence of positive integers, got {value!r}"
+                )
+            raw_items: Sequence[Any] = parts
+        elif isinstance(value, Sequence) and not isinstance(value, bytes | bytearray):
+            if len(value) == 0:
+                raise ValueError(
+                    f"static_micro_batch_lens must be a non-empty sequence of positive integers, got {value!r}"
+                )
+            raw_items = value
+        else:
+            raise ValueError(
+                f"static_micro_batch_lens must be a non-empty sequence of positive integers, got {value!r}"
+            )
+        parsed: list[int] = []
+        for item in raw_items:
+            if isinstance(item, bool):
+                raise ValueError(f"static_micro_batch_lens entries must be positive integers, got {value!r}")
+            if isinstance(item, str):
+                stripped = item.strip()
+                if not stripped:
+                    raise ValueError(f"static_micro_batch_lens entries must be positive integers, got {value!r}")
+                n = int(stripped)
+            elif isinstance(item, int):
+                n = int(item)
+            else:
+                raise ValueError(f"static_micro_batch_lens entries must be positive integers, got {value!r}")
+            if n <= 0:
+                raise ValueError(f"static_micro_batch_lens entries must be positive integers, got {value!r}")
+            parsed.append(n)
+        return tuple(sorted(set(parsed)))
+
+
 @dataclasses.dataclass(frozen=True)
 class TPUEngineOptions:
     """TPU options of the TorchTitan engine. ``None`` means "use the default derived from the rest of the config".
@@ -234,8 +280,15 @@ class TPUEngineOptions:
             "attention.inner_attention")`` benchmark memory policy).
         static_micro_batch_len: Pad every packed micro-batch to at least this many tokens (rounded up to the
             sequence bucket), e.g. the ``use_dynamic_bsz`` token budget, so the trainer compiles one sequence shape
-            instead of one per length bucket it meets (default: unset, off). When ``gdn_auto_row_slot_len`` is set,
-            must be ``>= gdn_auto_row_slot_len`` and divisible by ``gdn_auto_row_slot_len``.
+            instead of one per length bucket it meets (default: unset, off). Mutually exclusive with
+            ``static_micro_batch_lens``. When ``gdn_auto_row_slot_len`` is set, must be ``>= gdn_auto_row_slot_len``
+            and divisible by ``gdn_auto_row_slot_len``.
+        static_micro_batch_lens: Sorted tuple of positive token tiers (e.g. ``[20480, 32768]`` or ``"20480,32768"``).
+            Each packed micro-batch snaps to the smallest tier ``>= resolved`` (each tier rounded up to the sequence
+            bucket), or keeps ``resolved`` when it exceeds the highest tier, avoiding the single-bucket overflow
+            cliff on multi-micro-batch spill steps while bounding XLA compilations to one shape per tier (default:
+            unset, off). Mutually exclusive with ``static_micro_batch_len``. When ``gdn_auto_row_slot_len`` is set,
+            every tier must be ``>= gdn_auto_row_slot_len`` and divisible by ``gdn_auto_row_slot_len``.
         static_max_response_len: Pad every micro-batch's response-length bucket to at least this many tokens (e.g.
             ``max_response_length``), so response-shaped tensors also keep one shape (default: unset, off).
         loss_row_bucketing: Pad the PPO loss inputs of every micro-batch with fully masked rows up to a common row
@@ -267,8 +320,8 @@ class TPUEngineOptions:
             micro-batches run segmented. Ranks agree via bitwise-AND all-reduce so SPMD collectives share one compiled
             shape. Mutually exclusive with ``gdn_row_slot_len``; requires ``use_fused_linear_cross_entropy``,
             ``tensor_parallel_size == 1``, contiguous CP layout (no ``headtail`` balancer), and any configured
-            ``static_micro_batch_len`` / ``static_log_prob_micro_batch_len`` to be ``>= gdn_auto_row_slot_len`` and
-            divisible by ``gdn_auto_row_slot_len``.
+            ``static_micro_batch_len`` / ``static_micro_batch_lens`` tier / ``static_log_prob_micro_batch_len`` to be
+            ``>= gdn_auto_row_slot_len`` and divisible by ``gdn_auto_row_slot_len``.
         fuse_gdn_projections: Set ``fuse_input_projections=True`` on every GatedDeltaNet config in ``model_spec.model``
             before build (``google-pytorch/torchtitan#216``), fusing the six bias-free input projections into one
             matmul (default: unset, off). Requires ``tensor_parallel_size == 1`` (``TP == 1``) and fails loudly if TP is
@@ -277,9 +330,9 @@ class TPUEngineOptions:
             using the shared slot classifier so micro-batches compiling to the same slot / segmentation program run
             back to back (default: unset, off).
         static_log_prob_micro_batch_len: Static packed micro-batch length in tokens for forward-only
-            (old / reference log-prob) passes, overriding ``static_micro_batch_len`` when ``forward_only=True``
-            (default: unset, off). When ``gdn_auto_row_slot_len`` is set, must be ``>= gdn_auto_row_slot_len`` and
-            divisible by ``gdn_auto_row_slot_len``.
+            (old / reference log-prob) passes, overriding ``static_micro_batch_len`` / ``static_micro_batch_lens`` when
+            ``forward_only=True`` (default: unset, off). When ``gdn_auto_row_slot_len`` is set, must be
+            ``>= gdn_auto_row_slot_len`` and divisible by ``gdn_auto_row_slot_len``.
         gdn_row_slot_len: Qwen3.5: start every sequence of a packed micro-batch at a multiple of this many tokens
             and run the GatedDeltaNet over rows of this length (one sequence per row) instead of restarting it at
             packed documents through Tokamax ``segment_ids`` (default: unset, off). Needs every sequence <= this
@@ -325,6 +378,7 @@ class TPUEngineOptions:
     ep_paired_grouped_mm: Optional[bool] = None
     ac_save_splash_and_routing: Optional[bool] = None
     static_micro_batch_len: Optional[int] = None
+    static_micro_batch_lens: Optional[tuple[int, ...]] = None
     static_max_response_len: Optional[int] = None
     loss_row_bucketing: Optional[bool] = None
     static_micro_batch_num_seqs: Optional[int] = None
@@ -343,6 +397,14 @@ class TPUEngineOptions:
     graph_trainer: Optional[dict[str, Any]] = None
 
     def __post_init__(self) -> None:
+        if self.static_micro_batch_lens is not None:
+            parsed_lens = StaticMicroBatchLens.parse(self.static_micro_batch_lens)
+            object.__setattr__(self, "static_micro_batch_lens", parsed_lens)
+        if self.static_micro_batch_len is not None and self.static_micro_batch_lens is not None:
+            raise ValueError(
+                f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.static_micro_batch_len and static_micro_batch_lens "
+                "are mutually exclusive"
+            )
         if self.static_micro_batch_num_seqs is not None and (
             isinstance(self.static_micro_batch_num_seqs, bool) or self.static_micro_batch_num_seqs < 1
         ):
@@ -380,6 +442,7 @@ _ENGINE_KINDS: dict[str, Any] = {
     "ep_paired_grouped_mm": bool,
     "ac_save_splash_and_routing": bool,
     "static_micro_batch_len": int,
+    "static_micro_batch_lens": StaticMicroBatchLens,
     "static_max_response_len": int,
     "loss_row_bucketing": bool,
     "static_micro_batch_num_seqs": int,
@@ -507,6 +570,11 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
             raise ValueError(
                 f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.{pos_int_key} must be >= 1, got {values[pos_int_key]!r}"
             )
+    if values.get("static_micro_batch_len") is not None and values.get("static_micro_batch_lens") is not None:
+        raise ValueError(
+            f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.static_micro_batch_len and static_micro_batch_lens "
+            "are mutually exclusive"
+        )
     if values.get("gdn_auto_row_slot_len") and values.get("gdn_row_slot_len"):
         raise ValueError(
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.gdn_auto_row_slot_len and gdn_row_slot_len are mutually exclusive"
@@ -519,6 +587,15 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
                 raise ValueError(
                     f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.{static_key} ({static_val}) must be >= "
                     f"gdn_auto_row_slot_len ({auto_slot_len}) and divisible by gdn_auto_row_slot_len"
+                )
+        static_lens = values.get("static_micro_batch_lens")
+        if static_lens is not None:
+            bad_tiers = [tier for tier in static_lens if tier < auto_slot_len or tier % auto_slot_len != 0]
+            if bad_tiers:
+                raise ValueError(
+                    f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.static_micro_batch_lens tier(s) {bad_tiers} "
+                    f"(from {list(static_lens)}) must each be >= gdn_auto_row_slot_len ({auto_slot_len}) "
+                    "and divisible by gdn_auto_row_slot_len"
                 )
     if values.get("ep_token_chunks") is not None and values["ep_token_chunks"] < 1:
         raise ValueError(

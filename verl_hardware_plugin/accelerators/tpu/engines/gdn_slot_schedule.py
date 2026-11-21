@@ -18,6 +18,7 @@ plugin-side monkeypatches are needed:
 from __future__ import annotations
 
 import inspect
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
@@ -27,7 +28,7 @@ from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 from verl.utils.model import extract_multi_modal_inputs
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
-    bucket_length,
+    resolve_static_micro_batch_len,
     row_slot_permutation,
     unwrap_metadata,
 )
@@ -284,6 +285,7 @@ def sort_micro_batches_for_slots(
     forward_only: bool,
     allow_row_slot: bool,
     allow_single_doc: bool = True,
+    static_lens: Optional[Sequence[int]] = None,
 ) -> tuple[list[TensorDict], list[Any]]:
     """Orders ``(micro_batches, indices)`` by ``(slot_category, -total_tokens, original_idx)``."""
     if len(micro_batches) <= 1:
@@ -294,7 +296,12 @@ def sort_micro_batches_for_slots(
         mb = micro_batches[idx]
         ids = mb["input_ids"]
         n_tok = int(ids.values().numel()) if getattr(ids, "is_nested", False) else int(ids.numel())
-        est_padded = bucket_length(max(n_tok, int(static_len or 0)), step)
+        est_padded = resolve_static_micro_batch_len(
+            n_tok,
+            step,
+            static_len=int(static_len or 0),
+            static_lens=static_lens,
+        )
         _, cat, total = classify_gdn_micro_batch(
             mb,
             auto_slot_len=auto_slot_len,
