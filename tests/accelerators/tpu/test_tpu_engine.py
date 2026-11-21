@@ -4054,6 +4054,169 @@ def test_align_micro_batch_shapes_static_len_and_response_len():
     assert padded(mbs, "tpu_max_response_len") == [8192, 8192]
 
 
+def test_align_micro_batch_shapes_multi_tier_static_lens():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+
+    def mb(n, resp=1000):
+        return TensorDict(
+            {
+                "input_ids": torch.nested.as_nested_tensor([torch.zeros(n, dtype=torch.int64)], layout=torch.jagged),
+                "responses": torch.nested.as_nested_tensor([torch.zeros(resp, dtype=torch.int64)], layout=torch.jagged),
+            },
+            batch_size=[1],
+        )
+
+    def padded(mbs, key):
+        return [tu.get_non_tensor_data(m, key, None) for m in mbs]
+
+    # Single-process: tier 0 covers <= 20480, tier 1 covers (20480, 32768], oversize keeps bucketed length.
+    mbs = [mb(17000), mb(20480), mb(20481), mb(32768), mb(35000)]
+    tpu_utils.align_micro_batch_shapes_across_ranks(mbs, bucket_size=2048, static_lens=(20480, 32768))
+    assert padded(mbs, "tpu_padded_seq_len") == [20480, 20480, 32768, 32768, 36864]
+
+    # Overflow cliff savings: 36,000 tokens split into 2 x 18,000 MBs pads to 2 x 20,480 = 40,960 instead of 65,536.
+    spill_dual = [mb(18000), mb(18000)]
+    spill_single = [mb(18000), mb(18000)]
+    tpu_utils.align_micro_batch_shapes_across_ranks(spill_dual, bucket_size=2048, static_lens=(20480, 32768))
+    tpu_utils.align_micro_batch_shapes_across_ranks(spill_single, bucket_size=2048, static_len=32768)
+    dual_total = sum(padded(spill_dual, "tpu_padded_seq_len"))
+    single_total = sum(padded(spill_single, "tpu_padded_seq_len"))
+    assert dual_total == 40960 and single_total == 65536
+    assert (single_total - dual_total) / single_total == pytest.approx(0.375)
+
+    # Single-tier static_lens=(32768,) matches static_len=32768 identically (sub-tier, exact, and overflow).
+    lengths = [12000, 32768, 35000]
+    mbs_single_val = [mb(n) for n in lengths]
+    mbs_single_tier = [mb(n) for n in lengths]
+    tpu_utils.align_micro_batch_shapes_across_ranks(mbs_single_val, bucket_size=2048, static_len=32768)
+    tpu_utils.align_micro_batch_shapes_across_ranks(mbs_single_tier, bucket_size=2048, static_lens=(32768,))
+    assert padded(mbs_single_tier, "tpu_padded_seq_len") == padded(mbs_single_val, "tpu_padded_seq_len")
+
+    # Multi-rank: all_reduce(MAX) runs first, then every rank snaps to the same tier (plus num_seqs_bucketing).
+    def fake_all_reduce_multi(tensor, op=None):
+        peer = torch.tensor([18432, 2048, 28672, 4096, 36864, 4096, 3], dtype=tensor.dtype)
+        tensor.copy_(torch.maximum(tensor, peer[: tensor.numel()]))
+
+    with (
+        mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+        mock.patch.object(torch.distributed, "get_world_size", return_value=4),
+        mock.patch.object(torch.distributed, "all_reduce", side_effect=fake_all_reduce_multi),
+    ):
+        mbs = [mb(17000, 1500), mb(19000, 2500), mb(35000, 3500)]
+        tpu_utils.align_micro_batch_shapes_across_ranks(
+            mbs,
+            bucket_size=2048,
+            static_lens=(20480, 32768),
+            num_seqs_bucketing=True,
+        )
+    assert padded(mbs, "tpu_padded_seq_len") == [20480, 32768, 36864]
+    assert padded(mbs, "tpu_padded_num_seqs") == [4, 4, 4]
+
+    # Single-tier multi-rank matches static_len identically.
+    with (
+        mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+        mock.patch.object(torch.distributed, "get_world_size", return_value=4),
+        mock.patch.object(torch.distributed, "all_reduce", side_effect=fake_all_reduce_multi),
+    ):
+        mbs_a = [mb(17000, 1500), mb(19000, 2500), mb(35000, 3500)]
+        mbs_b = [mb(17000, 1500), mb(19000, 2500), mb(35000, 3500)]
+        tpu_utils.align_micro_batch_shapes_across_ranks(mbs_a, bucket_size=2048, static_len=32768)
+        tpu_utils.align_micro_batch_shapes_across_ranks(mbs_b, bucket_size=2048, static_lens=(32768,))
+    assert padded(mbs_b, "tpu_padded_seq_len") == padded(mbs_a, "tpu_padded_seq_len") == [32768, 32768, 36864]
+
+    # Interaction with static gdn_row_slot_len: tiers round up to lcm(bucket_size, gdn_row_slot_len) and cover n_seqs.
+    mb1 = TensorDict(
+        {"input_ids": torch.nested.as_nested_tensor([torch.zeros(10000, dtype=torch.int64)], layout=torch.jagged)},
+        batch_size=[1],
+    )
+    mb2 = TensorDict(
+        {
+            "input_ids": torch.nested.as_nested_tensor(
+                [torch.zeros(10000, dtype=torch.int64), torch.zeros(10000, dtype=torch.int64)], layout=torch.jagged
+            )
+        },
+        batch_size=[2],
+    )
+    tpu_utils.align_micro_batch_shapes_across_ranks(
+        [mb1, mb2], bucket_size=2048, gdn_row_slot_len=16384, static_lens=(16384, 32768)
+    )
+    assert padded([mb1, mb2], "tpu_padded_seq_len") == [16384, 32768]
+
+
+def test_forward_backward_batch_static_micro_batch_lens_and_log_prob_override():
+    """``forward_backward_batch`` wires ``static_micro_batch_lens`` and lets ``static_log_prob_micro_batch_len``
+    override it when ``forward_only=True``."""
+    from contextlib import nullcontext
+
+    def _make_mb(n_tokens: int) -> TensorDict:
+        return TensorDict(
+            {
+                "input_ids": torch.nested.as_nested_tensor(
+                    [torch.zeros(n_tokens, dtype=torch.int64)], layout=torch.jagged
+                ),
+                "loss_mask": torch.ones((1, 4), dtype=torch.int64),
+            },
+            batch_size=[1],
+        )
+
+    def _run(tpu_kwargs: dict, *, forward_only: bool) -> list[int | None]:
+        eng = object.__new__(TorchTitanTPUEngine)
+        eng.parallel_dims = SimpleNamespace(tp_enabled=False, cp_enabled=False, pp_enabled=False)
+        eng.engine_config = SimpleNamespace(
+            tensor_parallel_size=1,
+            context_parallel_size=1,
+            data_parallel_shard_size=1,
+            data_parallel_replicate_size=1,
+            engine_kwargs={"tpu": tpu_kwargs},
+        )
+        eng.trainer = SimpleNamespace(train_context=nullcontext)
+        eng._graph_trainer_mode = False
+        eng._use_simple_fsdp = False
+        eng._simple_fsdp_loss_scale = None
+        eng._tpu_eager_mode = None
+        eng._gdn_row_slot_len = 0
+        eng._gdn_auto_row_slot_len = 0
+        eng._sort_micro_batches_by_slot = False
+        eng._tpu_kernels = frozenset()
+        eng.get_data_parallel_group = lambda: None
+        seen: list[int | None] = []
+
+        def _fake_step(mb: TensorDict, loss_function: object, forward_only: bool, **_kw: object):
+            seen.append(tu.get_non_tensor_data(mb, "tpu_padded_seq_len", None))
+            return torch.ones((), requires_grad=True), {"model_output": {}, "loss": 0.0, "metrics": {}}
+
+        eng.forward_step = _fake_step  # type: ignore[method-assign]
+        mbs = [_make_mb(17000), _make_mb(26000)]
+        data = TensorDict({"loss_mask": torch.ones((2, 4), dtype=torch.int64)}, batch_size=[2])
+        with (
+            mock.patch.object(torchtitan_tpu_mod, "prepare_micro_batches", return_value=(mbs, [[0], [1]])),
+            mock.patch.object(torchtitan_tpu_mod, "postprocess_batch_func", return_value={"ok": True}),
+            mock.patch.object(torchtitan_tpu_mod, "tpu_synchronize"),
+            mock.patch.object(torch.distributed, "is_initialized", return_value=False),
+        ):
+            eng.forward_backward_batch(data, loss_function=lambda **_kw: None, forward_only=forward_only)
+        return seen
+
+    import verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu as torchtitan_tpu_mod
+
+    tpu_cfg_both = {
+        "seq_bucket_size": 2048,
+        "static_micro_batch_lens": [20480, 32768],
+        "static_log_prob_micro_batch_len": 65536,
+    }
+    tpu_cfg_tiers = {
+        "seq_bucket_size": 2048,
+        "static_micro_batch_lens": [20480, 32768],
+    }
+
+    # Training pass uses multi-tier static_micro_batch_lens.
+    assert _run(tpu_cfg_both, forward_only=False) == [20480, 32768]
+    # Forward-only pass overrides static_micro_batch_lens when static_log_prob_micro_batch_len is set.
+    assert _run(tpu_cfg_both, forward_only=True) == [65536, 65536]
+    # Forward-only pass without static_log_prob_micro_batch_len retains static_micro_batch_lens.
+    assert _run(tpu_cfg_tiers, forward_only=True) == [20480, 32768]
+
+
 def _hf_export_tensors() -> dict[str, torch.Tensor]:
     generator = torch.Generator().manual_seed(0)
     return {
