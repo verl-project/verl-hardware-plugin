@@ -18,13 +18,23 @@ patch to span several hosts. Each remaining patch fills a gap in vLLM (v0.29.0 -
   with other engines (``tpu_vllm.subhost_engine_env``): per-worker MegaScale ports and libtpu log dir, and the
   GKE webhook's container-level TPU variables and ``TORCH_TPU_DEVICES_PER_HOST`` dropped. Upstream fix: a
   per-engine port base in vllm-torchtpu.
+* ``vllm_torchtpu.worker.tpu_worker.TPUWorker.init_device``, only in an engine that shares its TPU 7x host with
+  other engines: serialize the ``tpu_dist`` / ``tpunetd`` ``StartSession`` handshake across co-located engines on
+  the same host using a per-host ``fcntl.flock`` lockfile so concurrent ``StartSession`` calls over ``vbar.sock``
+  do not collide (``GRPC_ERROR error message: START_SESSION failed``). Each engine's TP workers still initialize
+  together, and the lock is released before model loading and XLA compilation. Upstream fix: concurrent
+  ``StartSession`` handling in ``tpunetd`` / ``torch_tpu``.
 """
 
+import contextlib
+import fcntl
 import importlib
 import logging
 import multiprocessing.process
 import os
 import sys
+import time
+import uuid
 
 import torch
 
@@ -254,12 +264,23 @@ def patch_vllm_for_tpu() -> None:
     _apply_tpu_precision_patches()
     if os.environ.get(SUBHOST_MEGASCALE_PORT_ENV):
         patch_tpu_worker_subhost_env()
+        if subhost_serialize_start_session_enabled():
+            patch_tpu_worker_subhost_start_session()
     _PATCHES_APPLIED = True
     logger.info("Successfully applied all TPU patches to vLLM and vllm-torchtpu.")
 
 
 # Set by tpu_vllm.subhost_engine_env on an engine that shares its host: the first port of the engine's MegaScale block.
 SUBHOST_MEGASCALE_PORT_ENV = "VERL_TPU_SUBHOST_MEGASCALE_PORT"
+# Unique per-launch identifier for one sub-host engine, shared across all of its TP worker processes.
+SUBHOST_ENGINE_ID_ENV = "VERL_TPU_SUBHOST_ENGINE_ID"
+# Enabled by default for co-located sub-host engines; set to "0" to opt out of host-wide StartSession serialization.
+SUBHOST_SERIALIZE_START_SESSION_ENV = "VERL_TPU_SUBHOST_SERIALIZE_START_SESSION"
+# Host-wide flock serializing tpunetd StartSession across co-located sub-host engines. Never unlinked so flock inode
+# identity stays shared across all processes on the host (matching tpu_vllm.SUBHOST_CLAIM_FILE).
+SUBHOST_START_SESSION_LOCK_FILE = "/tmp/verl_tpu_subhost_start_session.lock"
+_SUBHOST_INIT_WAIT_TIMEOUT_S = 120.0
+_SUBHOST_INIT_POLL_INTERVAL_S = 0.02
 # Variables that describe the whole pod or host, which every engine in the container would inherit: the GKE TPU
 # webhook's container-level variables (the second engine of a host then collides with the first on the pod's MegaScale
 # ports), and torch_tpu's TORCH_TPU_DEVICES_PER_HOST (e.g. exported for the trainer): torch_tpu sizes its node-local
@@ -316,6 +337,334 @@ def patch_tpu_worker_subhost_env() -> None:
     _configure_tpu_process_env._verl_subhost_env = True  # type: ignore[attr-defined]
     tpu_worker._configure_tpu_process_env = _configure_tpu_process_env
     logger.info("Applied the TPU patch for engines that share a host (MegaScale ports from %d).", megascale_port)
+
+
+def subhost_serialize_start_session_enabled() -> bool:
+    """Whether co-located sub-host engines serialize ``TPUWorker.init_device`` (default on for sub-host engines)."""
+    if not os.environ.get(SUBHOST_MEGASCALE_PORT_ENV):
+        return False
+    raw = os.environ.get(SUBHOST_SERIALIZE_START_SESSION_ENV, "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _file_nonempty(path: str) -> bool:
+    try:
+        return os.stat(path).st_size > 0
+    except OSError:
+        return False
+
+
+def _is_lock_held(path: str) -> bool:
+    """Return True if another open file description currently holds an exclusive ``flock`` on ``path``."""
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _wait_for_flock_release(path: str, deadline: float, poll_interval_s: float) -> bool:
+    """Wait until no other open file description holds ``LOCK_EX`` on ``path`` (or ``deadline`` passes)."""
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except FileNotFoundError:
+        return True
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(poll_interval_s)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return True
+    finally:
+        os.close(fd)
+
+
+def _write_atomic(path: str, payload: bytes) -> None:
+    tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex[:6]}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def _read_go_state(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+@contextlib.contextmanager
+def serialize_subhost_start_session(
+    *,
+    rank: int,
+    world_size: int,
+    engine_id: str,
+    lock_path: str = SUBHOST_START_SESSION_LOCK_FILE,
+    coordination_dir: str | None = None,
+    timeout_s: float = _SUBHOST_INIT_WAIT_TIMEOUT_S,
+    poll_interval_s: float = _SUBHOST_INIT_POLL_INTERVAL_S,
+):
+    """Serialize ``tpunetd`` ``StartSession`` across co-located sub-host engines on one TPU host.
+
+    All ``world_size`` TP workers of one engine must enter ``TPUWorker.init_device`` together because ``tpu_dist``
+    performs a multi-rank rendezvous and ``PRE_START_SESSION_BARRIER`` / ``POST_START_SESSION_BARRIER``. A naive
+    per-worker ``flock`` would deadlock sibling ranks of the same engine. Instead:
+
+    1. Sibling ranks ``1..world_size-1`` acquire a per-rank ``flock`` and signal arrival before waiting for rank 0.
+    2. Rank 0 waits for its siblings to arrive (so it never holds the host lock idle while workers spawn), acquires
+       ``LOCK_EX`` on ``lock_path``, and atomically publishes ``GO`` so all workers of this engine run ``init_device``
+       together.
+    3. On normal completion, rank 0 waits for every sibling's per-rank ``flock`` to drop before releasing ``lock_path``.
+       On exception or process crash, ``finally`` / kernel fd cleanup releases all locks immediately so peer engines
+       never stall.
+    """
+    if world_size <= 0 or not (0 <= rank < world_size):
+        raise ValueError(f"Expected 0 <= rank < world_size, got rank={rank}, world_size={world_size}")
+
+    lock_dir = os.path.dirname(lock_path)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
+
+    if world_size == 1:
+        single_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+        single_locked = False
+        try:
+            fcntl.flock(single_fd, fcntl.LOCK_EX)
+            single_locked = True
+            marker = f"{engine_id}:{os.getpid()}\n".encode()
+            os.pwrite(single_fd, marker, 0)
+            os.ftruncate(single_fd, len(marker))
+            yield
+        finally:
+            try:
+                if single_locked:
+                    try:
+                        os.ftruncate(single_fd, 0)
+                    except OSError:
+                        pass
+                    fcntl.flock(single_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(single_fd)
+        return
+
+    coord_dir = coordination_dir or lock_dir or "/tmp"
+    os.makedirs(coord_dir, exist_ok=True)
+    safe_id = "".join(c if (c.isalnum() or c in "._-") else "_" for c in engine_id)
+    prefix = os.path.join(coord_dir, f".verl_tpu_subhost_init_{safe_id}")
+    leader_path = f"{prefix}.leader"
+    go_path = f"{prefix}.go"
+
+    def rank_path(r: int) -> str:
+        return f"{prefix}.r{r}"
+
+    if rank > 0:
+        r_path = rank_path(rank)
+        rank_fd = os.open(r_path, os.O_RDWR | os.O_CREAT, 0o666)
+        rank_locked = False
+        try:
+            # Lock first, then write non-empty bytes: rank 0 checks st_size > 0 before probing the lock.
+            fcntl.flock(rank_fd, fcntl.LOCK_EX)
+            rank_locked = True
+            os.pwrite(rank_fd, f"{os.getpid()}\n".encode(), 0)
+
+            deadline = time.monotonic() + timeout_s
+            leader_seen = False
+            while time.monotonic() < deadline:
+                state = _read_go_state(go_path)
+                if state == "GO":
+                    break
+                if state == "ABORT":
+                    logger.warning(
+                        "Rank 0 of sub-host engine %s aborted before acquiring %s; rank %d proceeding.",
+                        engine_id,
+                        lock_path,
+                        rank,
+                    )
+                    break
+                if _file_nonempty(leader_path):
+                    leader_seen = True
+                if leader_seen and not _is_lock_held(leader_path):
+                    if _read_go_state(go_path) == "GO":
+                        break
+                    logger.warning(
+                        "Rank 0 of sub-host engine %s exited before signaling GO; rank %d proceeding.",
+                        engine_id,
+                        rank,
+                    )
+                    break
+                time.sleep(poll_interval_s)
+            else:
+                logger.warning(
+                    "Timed out after %.1fs waiting for rank 0 of sub-host engine %s to acquire %s; "
+                    "rank %d proceeding anyway.",
+                    timeout_s,
+                    engine_id,
+                    lock_path,
+                    rank,
+                )
+
+            yield
+        finally:
+            try:
+                if rank_locked:
+                    fcntl.flock(rank_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(rank_fd)
+        return
+
+    # rank == 0 (engine leader)
+    leader_fd = os.open(leader_path, os.O_RDWR | os.O_CREAT, 0o666)
+    leader_locked = False
+    host_fd: int | None = None
+    host_locked = False
+    signaled_go = False
+    succeeded = False
+    arrived_ranks: set[int] = set()
+    try:
+        fcntl.flock(leader_fd, fcntl.LOCK_EX)
+        leader_locked = True
+        os.pwrite(leader_fd, f"{os.getpid()}\n".encode(), 0)
+
+        deadline = time.monotonic() + timeout_s
+        while len(arrived_ranks) < world_size - 1 and time.monotonic() < deadline:
+            for r in range(1, world_size):
+                if r not in arrived_ranks:
+                    r_path = rank_path(r)
+                    if _file_nonempty(r_path) and _is_lock_held(r_path):
+                        arrived_ranks.add(r)
+            if len(arrived_ranks) < world_size - 1:
+                time.sleep(poll_interval_s)
+        if len(arrived_ranks) < world_size - 1:
+            logger.warning(
+                "Timed out after %.1fs waiting for sibling TPU workers of sub-host engine %s "
+                "(arrived=%s, world_size=%d); acquiring %s anyway.",
+                timeout_s,
+                engine_id,
+                sorted(arrived_ranks),
+                world_size,
+                lock_path,
+            )
+
+        host_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+        fcntl.flock(host_fd, fcntl.LOCK_EX)
+        host_locked = True
+        marker = f"{engine_id}:{os.getpid()}\n".encode()
+        os.pwrite(host_fd, marker, 0)
+        os.ftruncate(host_fd, len(marker))
+
+        _write_atomic(go_path, b"GO\n")
+        signaled_go = True
+
+        yield
+        succeeded = True
+    finally:
+        all_siblings_done = False
+        try:
+            if not signaled_go:
+                try:
+                    _write_atomic(go_path, b"ABORT\n")
+                except OSError:
+                    pass
+            elif succeeded:
+                exit_deadline = time.monotonic() + timeout_s
+                all_siblings_done = True
+                for r in range(1, world_size):
+                    r_path = rank_path(r)
+                    if r in arrived_ranks or _file_nonempty(r_path):
+                        if not _wait_for_flock_release(r_path, exit_deadline, poll_interval_s):
+                            all_siblings_done = False
+                            logger.warning(
+                                "Timed out waiting for sibling rank %d of sub-host engine %s to finish "
+                                "init_device; releasing %s.",
+                                r,
+                                engine_id,
+                                lock_path,
+                            )
+        finally:
+            if host_fd is not None:
+                try:
+                    if host_locked:
+                        try:
+                            os.ftruncate(host_fd, 0)
+                        except OSError:
+                            pass
+                        fcntl.flock(host_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(host_fd)
+            try:
+                if leader_locked:
+                    fcntl.flock(leader_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(leader_fd)
+            cleanup_paths = [leader_path]
+            if succeeded and all_siblings_done and len(arrived_ranks) == world_size - 1:
+                cleanup_paths.extend([go_path, *(rank_path(r) for r in range(1, world_size))])
+            for path in cleanup_paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
+def patch_tpu_worker_subhost_start_session() -> None:
+    """Serialize ``TPUWorker.init_device`` across co-located sub-host engines on the same TPU host.
+
+    Installed only when ``SUBHOST_MEGASCALE_PORT_ENV`` is set (sub-host engines where ``engines_per_host > 1``)
+    and ``SUBHOST_SERIALIZE_START_SESSION_ENV`` is not disabled. Whole-host (TP=8), TP=1, multi-host, and non-v7x
+    engines never install this wrapper.
+    """
+    if not subhost_serialize_start_session_enabled():
+        return
+    try:
+        import vllm_torchtpu.worker.tpu_worker as tpu_worker
+    except ImportError:
+        return
+    worker_cls = getattr(tpu_worker, "TPUWorker", None)
+    if worker_cls is None:
+        return
+    original = getattr(worker_cls, "init_device", None)
+    if original is None or getattr(original, "_verl_subhost_start_session", False):
+        return
+
+    def init_device(self, *args, **kwargs):
+        rank = int(getattr(self, "rank", 0))
+        pc = getattr(self, "parallel_config", None)
+        world_size = int(getattr(pc, "world_size", 1))
+        engine_id = (
+            os.environ.get(SUBHOST_ENGINE_ID_ENV)
+            or f"ppid{os.getppid()}_p{os.environ.get(SUBHOST_MEGASCALE_PORT_ENV, '0')}"
+        )
+        with serialize_subhost_start_session(
+            rank=rank,
+            world_size=world_size,
+            engine_id=engine_id,
+            lock_path=SUBHOST_START_SESSION_LOCK_FILE,
+        ):
+            return original(self, *args, **kwargs)
+
+    init_device._verl_subhost_start_session = True  # type: ignore[attr-defined]
+    worker_cls.init_device = init_device
+    logger.info(
+        "Applied TPU sub-host StartSession serialization patch to TPUWorker.init_device (lock=%s).",
+        SUBHOST_START_SESSION_LOCK_FILE,
+    )
 
 
 class PickleableProcessWrapper:

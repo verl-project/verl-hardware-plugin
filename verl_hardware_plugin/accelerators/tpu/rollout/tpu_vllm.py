@@ -45,6 +45,7 @@ from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
 )
 from verl_hardware_plugin.accelerators.tpu.profilers.tpu_vllm_timeline import vLLMServerTimelineMixin
 from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import (
+    SUBHOST_ENGINE_ID_ENV,
     SUBHOST_MEGASCALE_PORT_ENV,
     patch_vllm_for_tpu,
 )
@@ -233,8 +234,10 @@ def subhost_engine_env(slot: int, devices_per_engine: int, replica_rank: int) ->
         # pod, so every engine in the container would share it.
         "MEGASCALE_COORDINATOR_ADDRESS": f"127.0.0.1:{block}",
         SUBHOST_MEGASCALE_PORT_ENV: str(block),
-        # The server actor claims the host for this controller (see claim_host_for_subhost_engines).
+        # The server actor claims the host for this controller (see claim_host_for_subhost_engines), and this
+        # per-launch engine ID groups the engine's TP workers for StartSession serialization.
         SUBHOST_OWNER_ENV: _CONTROLLER_ID,
+        SUBHOST_ENGINE_ID_ENV: f"{_CONTROLLER_ID}:slot{slot}:r{replica_rank}:{uuid.uuid4().hex[:8]}",
         # Compile caches of their own: a cache keyed by the replica alone hands one TP size's executables to another
         # ("local device count is 0" when a TP=8 engine loaded TP=4 executables).
         "VLLM_CACHE_ROOT": f"/tmp/vllm_cache_tp{devices_per_engine}_r{replica_rank}",
