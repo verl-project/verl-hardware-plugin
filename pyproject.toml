@@ -19,6 +19,12 @@ dev = [
     "pytest>=8.2",  # importorskip(exc_type=...)
     "pyzmq",  # ROCm MoRI checkpoint engine tests
 ]
+# The in-process (colocated) TPU rollout's CPU tests (tests/accelerators/tpu/inproc/); without them the tests that
+# need them are skipped. They run vLLM on its CPU platform (VLLM_TARGET_DEVICE=cpu).
+inproc-test = [
+    "vllm==0.32.0",
+    "TransferQueue==0.1.11",  # verl's sync replay buffer (the batch-guard tests)
+]
 
 [project.entry-points."verl.plugins"]
 hardware = "verl_hardware_plugin"
