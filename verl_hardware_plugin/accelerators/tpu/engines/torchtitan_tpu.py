@@ -1372,7 +1372,11 @@ class TorchTitanTPUEngine(BaseEngine):
                     "(context_parallel_strategy='ulysses', load_balancer=None)"
                 )
             seq_bucket_sz = get_tpu_seq_bucket_size(self.engine_config)
-            if not tpu_options.static_micro_batch_len and seq_bucket_sz % self._gdn_auto_row_slot_len != 0:
+            if (
+                not tpu_options.static_micro_batch_len
+                and not tpu_options.static_micro_batch_lens
+                and seq_bucket_sz % self._gdn_auto_row_slot_len != 0
+            ):
                 logger.warning(
                     "gdn_auto_row_slot_len=%d is set without static_micro_batch_len and seq_bucket_size=%d is not "
                     "divisible by gdn_auto_row_slot_len; micro-batches whose bucketed length is not a multiple of "
@@ -1846,8 +1850,10 @@ class TorchTitanTPUEngine(BaseEngine):
         )
         tpu_options = get_tpu_engine_options(self.engine_config)
         static_len = int(tpu_options.static_micro_batch_len or 0)
+        static_lens = tpu_options.static_micro_batch_lens
         if forward_only and tpu_options.static_log_prob_micro_batch_len:
             static_len = int(tpu_options.static_log_prob_micro_batch_len)
+            static_lens = None
         static_response_len = int(tpu_options.static_max_response_len or 0)
         slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)
         # Pad the PPO loss rows to a common bucket only for losses that provably ignore fully masked rows.
@@ -1868,6 +1874,7 @@ class TorchTitanTPUEngine(BaseEngine):
                 indices,
                 auto_slot_len=auto_slot_len,
                 static_len=static_len,
+                static_lens=static_lens,
                 bucket_size=bucket_sz,
                 forward_only=effective_forward_only,
                 allow_row_slot=allow_auto_row_slot,
@@ -1876,6 +1883,7 @@ class TorchTitanTPUEngine(BaseEngine):
             self._use_simple_fsdp
             or self.parallel_dims.cp_enabled
             or static_len
+            or static_lens
             or static_response_len
             or slot_len
             or allow_auto_row_slot
@@ -1884,6 +1892,7 @@ class TorchTitanTPUEngine(BaseEngine):
                 micro_batches,
                 bucket_size=bucket_sz,
                 static_len=static_len,
+                static_lens=static_lens,
                 static_response_len=static_response_len,
                 gdn_row_slot_len=slot_len,
                 num_seqs_bucketing=bucket_rows,

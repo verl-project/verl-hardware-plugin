@@ -19,7 +19,7 @@ import logging
 import math
 import os
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from functools import cache
@@ -963,6 +963,29 @@ def compute_global_batch_num_tokens(data: TensorDict, dp_group: Any, tp_size: in
     return batch_num_tokens.item()
 
 
+def resolve_static_micro_batch_len(
+    length: int,
+    bucket_size: Optional[int] = None,
+    *,
+    static_len: int = 0,
+    static_lens: Optional[Sequence[int]] = None,
+) -> int:
+    """Resolve the padded token length for ``length`` given single- or multi-tier static lengths.
+
+    When ``static_lens`` is non-empty, rounds ``length`` and each positive tier up to ``bucket_size`` and snaps to
+    the smallest tier ``>= resolved`` (or keeps ``resolved`` when it exceeds every tier). Otherwise raises
+    ``resolved`` to at least ``bucket_length(static_len, bucket_size)`` when ``static_len > 0``.
+    """
+    step = bucket_size if bucket_size is not None and bucket_size > 0 else get_tpu_seq_bucket_size()
+    resolved = bucket_length(length, step)
+    tiers = tuple(sorted({bucket_length(int(x), step) for x in (static_lens or ()) if int(x) > 0}))
+    if tiers:
+        return next((tier for tier in tiers if tier >= resolved), resolved)
+    if static_len > 0:
+        return max(resolved, bucket_length(static_len, step))
+    return resolved
+
+
 def align_micro_batch_shapes_across_ranks(
     micro_batches: list[TensorDict],
     bucket_size: Optional[int] = None,
@@ -971,6 +994,7 @@ def align_micro_batch_shapes_across_ranks(
     gdn_row_slot_len: int = 0,
     num_seqs_bucketing: bool = False,
     static_num_seqs: int = 0,
+    static_lens: Optional[Sequence[int]] = None,
 ) -> None:
     """Make every rank pad micro-batch ``i`` to the same packed length and response-length bucket.
 
@@ -982,8 +1006,11 @@ def align_micro_batch_shapes_across_ranks(
 
     ``static_len`` / ``static_response_len`` (``engine_kwargs.tpu.static_micro_batch_len`` /
     ``static_max_response_len``) raise every packed / response length to at least that many tokens (rounded up to
-    the bucket), so the trainer compiles one shape instead of one per bucket it meets. When ``gdn_row_slot_len`` is
-    set, each micro-batch also pads to at least ``num_sequences * gdn_row_slot_len`` (rounded to a multiple of
+    the bucket), so the trainer compiles one shape instead of one per bucket it meets. When ``static_lens``
+    (``engine_kwargs.tpu.static_micro_batch_lens``) is non-empty, each micro-batch snaps to the smallest tier
+    ``>= resolved`` (each tier rounded up to the sequence step), or keeps ``resolved`` when it exceeds the highest
+    tier, taking precedence over single-tier ``static_len``. When ``gdn_row_slot_len`` is set, each micro-batch
+    also pads to at least ``num_sequences * gdn_row_slot_len`` (rounded to a multiple of
     ``lcm(bucket_size, gdn_row_slot_len)``) so ``log_prob_micro_batch_size_per_gpu > ppo_micro_batch_size_per_gpu``
     allocates one ``gdn_row_slot_len`` row per sequence without overflowing :func:`row_slot_permutation`.
 
@@ -993,8 +1020,14 @@ def align_micro_batch_shapes_across_ranks(
     step = bucket_size if bucket_size is not None and bucket_size > 0 else get_tpu_seq_bucket_size()
     slot_len = int(gdn_row_slot_len or 0)
     seq_step = math.lcm(step, slot_len) if slot_len > 0 else step
-    static_padded = bucket_length(static_len, seq_step) if static_len > 0 else 0
+    static_padded_lens = tuple(sorted({bucket_length(int(x), seq_step) for x in (static_lens or ()) if int(x) > 0}))
+    static_padded = 0 if static_padded_lens else (bucket_length(static_len, seq_step) if static_len > 0 else 0)
     static_resp_padded = bucket_length(static_response_len, step) if static_response_len > 0 else 0
+
+    def _snap_seq_len(resolved: int) -> int:
+        if static_padded_lens:
+            return next((tier for tier in static_padded_lens if tier >= resolved), resolved)
+        return max(resolved, static_padded)
 
     def _mb_seq_padded(mb: TensorDict, n_tokens: int) -> int:
         if slot_len <= 0:
@@ -1005,16 +1038,14 @@ def align_micro_batch_shapes_across_ranks(
             if getattr(ids, "is_nested", False)
             else (int(mb.batch_size[0]) if len(mb.batch_size) > 0 else 1)
         )
-        return bucket_length(max(n_tokens, static_len, max(n_seqs, 1) * slot_len), seq_step)
+        return bucket_length(max(n_tokens, max(n_seqs, 1) * slot_len), seq_step)
 
     if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
         for mb in micro_batches:
-            if slot_len > 0:
+            if slot_len > 0 or static_padded_lens or static_padded:
                 ids = mb["input_ids"]
                 n_tokens = ids.values().numel() if getattr(ids, "is_nested", False) else ids.numel()
-                tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", _mb_seq_padded(mb, int(n_tokens)))
-            elif static_padded:
-                tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", static_padded)
+                tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", _snap_seq_len(_mb_seq_padded(mb, int(n_tokens))))
             if static_resp_padded:
                 tu.assign_non_tensor_data(mb, "tpu_max_response_len", static_resp_padded)
         if num_seqs_bucketing:
@@ -1038,7 +1069,7 @@ def align_micro_batch_shapes_across_ranks(
     torch.distributed.all_reduce(lens_tensor, op=torch.distributed.ReduceOp.MAX)
     resolved_lens = lens_tensor.tolist()
     for i, mb in enumerate(micro_batches):
-        tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", max(int(resolved_lens[2 * i]), static_padded))
+        tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", _snap_seq_len(int(resolved_lens[2 * i])))
         resp_len = int(resolved_lens[2 * i + 1])
         tu.assign_non_tensor_data(mb, "tpu_max_response_len", max(resp_len, static_resp_padded) if resp_len else 0)
     if num_seqs_bucketing:
