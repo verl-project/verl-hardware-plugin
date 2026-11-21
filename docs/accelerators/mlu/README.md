@@ -48,7 +48,7 @@ docs/accelerators/mlu/
 | Device type | `mlu` |
 | Vendor identifier | `cambricon` |
 | Communication backend | `cncl` |
-| Device visibility env var | `MLU_VISIBLE_DEVICES` |
-| Ray resource name | `GPU` |
+| Device visibility env var | `CN_VISIBLE_DEVICES` |
+| Ray resource name | `MLU` |
 | IPC support | Yes |
 
