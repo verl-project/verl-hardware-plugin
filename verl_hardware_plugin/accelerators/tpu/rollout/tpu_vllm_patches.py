@@ -703,9 +703,9 @@ def serialize_subhost_start_session(
        workers spawn), acquires ``LOCK_EX`` on ``lock_path``, verifies all siblings are still waiting, and atomically
        publishes ``GO`` so all workers of this engine run ``init_device`` together.
     3. On normal completion, rank 0 waits for every sibling's per-rank ``flock`` to drop before releasing ``lock_path``.
-       If rank 0 dies before ``GO``, fails, or ``safety_timeout_s`` expires, rank 0 publishes ``ABORT`` (or kernel fd
-       cleanup drops the leader lock) and every rank of that engine raises rather than entering ``init_device``
-       unserialized.
+       If rank 0 raises before ``GO`` (including a missing peer or ``safety_timeout_s`` expiry), it publishes
+       ``ABORT``; if it is killed (``SIGKILL`` / ``os._exit``), the kernel releases its leader lock. Either way,
+       siblings notice within one ``poll_interval_s`` and raise rather than entering ``init_device`` unserialized.
     """
     if world_size <= 0 or not (0 <= rank < world_size):
         raise ValueError(f"Expected 0 <= rank < world_size, got rank={rank}, world_size={world_size}")
