@@ -90,7 +90,10 @@ multi-host replicas launch as before.
   / `tpunetd` `StartSession` handshake over `vbar.sock`) on `/tmp/verl_tpu_subhost_start_session.lock` so concurrent
   `StartSession` calls on one host do not collide (`GRPC_ERROR error message: START_SESSION failed`). Model loading
   and XLA compilation still run in parallel across engines. Whole-host (TP=8), TP=1, multi-host, and non-v7x
-  replicas are untouched; set `VERL_TPU_SUBHOST_SERIALIZE_START_SESSION=0` to opt out.
+  replicas are untouched. Serialization is fail-closed: if all workers of an engine do not reach the gate within
+  120 s, if rank 0 dies or fails before signaling `GO`, or if the 30-minute safety timeout expires while waiting for
+  the host lock or `GO`, the engine aborts and startup fails with an error instead of calling `StartSession`
+  unserialized. Set `VERL_TPU_SUBHOST_SERIALIZE_START_SESSION=0` to disable the serializer.
 
 ## Verify
 
