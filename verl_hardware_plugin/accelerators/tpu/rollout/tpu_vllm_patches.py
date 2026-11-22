@@ -533,7 +533,12 @@ SUBHOST_SERIALIZE_START_SESSION_ENV = "VERL_TPU_SUBHOST_SERIALIZE_START_SESSION"
 # Host-wide flock serializing tpunetd StartSession across co-located sub-host engines. Never unlinked so flock inode
 # identity stays shared across all processes on the host (matching tpu_vllm.SUBHOST_CLAIM_FILE).
 SUBHOST_START_SESSION_LOCK_FILE = "/tmp/verl_tpu_subhost_start_session.lock"
-_SUBHOST_INIT_WAIT_TIMEOUT_S = 120.0
+# How long same-engine workers wait for rank 0 / siblings to reach the init_device gate during spawn.
+# Once rank 0 holds its leader lock, siblings keep waiting as long as rank 0 is alive (bounded only by
+# _SUBHOST_INIT_SAFETY_TIMEOUT_S), never falling through unserialized.
+_SUBHOST_INIT_PEER_APPEAR_TIMEOUT_S = 120.0
+# Optional long safety bound shared by rank 0 and siblings (30 min); if exceeded, every rank aborts consistently.
+_SUBHOST_INIT_SAFETY_TIMEOUT_S = 1800.0
 _SUBHOST_INIT_POLL_INTERVAL_S = 0.02
 # Variables that describe the whole pod or host, which every engine in the container would inherit: the GKE TPU
 # webhook's container-level variables (the second engine of a host then collides with the first on the pod's MegaScale
@@ -625,23 +630,32 @@ def _is_lock_held(path: str) -> bool:
         os.close(fd)
 
 
-def _wait_for_flock_release(path: str, deadline: float, poll_interval_s: float) -> bool:
+def _acquire_flock(fd: int, deadline: float | None, poll_interval_s: float) -> bool:
+    """Acquire ``LOCK_EX`` on ``fd``, waiting indefinitely if ``deadline`` is ``None`` else until ``deadline``."""
+    if deadline is None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return True
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(poll_interval_s)
+
+
+def _wait_for_flock_release(path: str, deadline: float | None, poll_interval_s: float) -> bool:
     """Wait until no other open file description holds ``LOCK_EX`` on ``path`` (or ``deadline`` passes)."""
     try:
         fd = os.open(path, os.O_RDWR)
     except FileNotFoundError:
         return True
     try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    return False
-                time.sleep(poll_interval_s)
-            else:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                return True
+        if not _acquire_flock(fd, deadline, poll_interval_s):
+            return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
     finally:
         os.close(fd)
 
@@ -672,7 +686,8 @@ def serialize_subhost_start_session(
     engine_id: str,
     lock_path: str = SUBHOST_START_SESSION_LOCK_FILE,
     coordination_dir: str | None = None,
-    timeout_s: float = _SUBHOST_INIT_WAIT_TIMEOUT_S,
+    peer_appear_timeout_s: float = _SUBHOST_INIT_PEER_APPEAR_TIMEOUT_S,
+    safety_timeout_s: float | None = _SUBHOST_INIT_SAFETY_TIMEOUT_S,
     poll_interval_s: float = _SUBHOST_INIT_POLL_INTERVAL_S,
 ):
     """Serialize ``tpunetd`` ``StartSession`` across co-located sub-host engines on one TPU host.
@@ -682,12 +697,15 @@ def serialize_subhost_start_session(
     per-worker ``flock`` would deadlock sibling ranks of the same engine. Instead:
 
     1. Sibling ranks ``1..world_size-1`` acquire a per-rank ``flock`` and signal arrival before waiting for rank 0.
-    2. Rank 0 waits for its siblings to arrive (so it never holds the host lock idle while workers spawn), acquires
-       ``LOCK_EX`` on ``lock_path``, and atomically publishes ``GO`` so all workers of this engine run ``init_device``
-       together.
+       Once rank 0 has locked its leader file, siblings keep waiting for ``GO`` as long as rank 0's leader lock stays
+       held (bounded only by the optional long ``safety_timeout_s``), never falling through unserialized.
+    2. Rank 0 locks its leader file, waits for its siblings to arrive (so it never holds the host lock idle while
+       workers spawn), acquires ``LOCK_EX`` on ``lock_path``, verifies all siblings are still waiting, and atomically
+       publishes ``GO`` so all workers of this engine run ``init_device`` together.
     3. On normal completion, rank 0 waits for every sibling's per-rank ``flock`` to drop before releasing ``lock_path``.
-       On exception or process crash, ``finally`` / kernel fd cleanup releases all locks immediately so peer engines
-       never stall.
+       If rank 0 dies before ``GO``, fails, or ``safety_timeout_s`` expires, rank 0 publishes ``ABORT`` (or kernel fd
+       cleanup drops the leader lock) and every rank of that engine raises rather than entering ``init_device``
+       unserialized.
     """
     if world_size <= 0 or not (0 <= rank < world_size):
         raise ValueError(f"Expected 0 <= rank < world_size, got rank={rank}, world_size={world_size}")
@@ -696,11 +714,18 @@ def serialize_subhost_start_session(
     if lock_dir:
         os.makedirs(lock_dir, exist_ok=True)
 
+    now = time.monotonic()
+    safety_deadline = None if safety_timeout_s is None else now + safety_timeout_s
+
     if world_size == 1:
         single_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
         single_locked = False
         try:
-            fcntl.flock(single_fd, fcntl.LOCK_EX)
+            if not _acquire_flock(single_fd, safety_deadline, poll_interval_s):
+                raise TimeoutError(
+                    f"Timed out after {safety_timeout_s}s waiting to acquire host StartSession lock {lock_path} "
+                    f"for sub-host engine {engine_id}."
+                )
             single_locked = True
             marker = f"{engine_id}:{os.getpid()}\n".encode()
             os.pwrite(single_fd, marker, 0)
@@ -728,6 +753,10 @@ def serialize_subhost_start_session(
     def rank_path(r: int) -> str:
         return f"{prefix}.r{r}"
 
+    appear_deadline = now + peer_appear_timeout_s
+    if safety_deadline is not None:
+        appear_deadline = min(appear_deadline, safety_deadline)
+
     if rank > 0:
         r_path = rank_path(rank)
         rank_fd = os.open(r_path, os.O_RDWR | os.O_CREAT, 0o666)
@@ -738,41 +767,45 @@ def serialize_subhost_start_session(
             rank_locked = True
             os.pwrite(rank_fd, f"{os.getpid()}\n".encode(), 0)
 
-            deadline = time.monotonic() + timeout_s
             leader_seen = False
-            while time.monotonic() < deadline:
+            while True:
                 state = _read_go_state(go_path)
                 if state == "GO":
-                    break
-                if state == "ABORT":
-                    logger.warning(
-                        "Rank 0 of sub-host engine %s aborted before acquiring %s; rank %d proceeding.",
-                        engine_id,
-                        lock_path,
-                        rank,
+                    if _file_nonempty(leader_path) and _is_lock_held(leader_path):
+                        break
+                    raise RuntimeError(
+                        f"Rank 0 of sub-host engine {engine_id} exited after signaling GO before rank {rank} "
+                        "entered init_device; aborting to avoid unserialized StartSession."
                     )
-                    break
-                if _file_nonempty(leader_path):
+                if state == "ABORT":
+                    raise RuntimeError(
+                        f"Rank 0 of sub-host engine {engine_id} aborted before acquiring {lock_path}; "
+                        f"aborting rank {rank} to avoid unserialized StartSession."
+                    )
+                if not leader_seen and _file_nonempty(leader_path):
                     leader_seen = True
                 if leader_seen and not _is_lock_held(leader_path):
-                    if _read_go_state(go_path) == "GO":
-                        break
-                    logger.warning(
-                        "Rank 0 of sub-host engine %s exited before signaling GO; rank %d proceeding.",
-                        engine_id,
-                        rank,
+                    if _read_go_state(go_path) == "ABORT":
+                        raise RuntimeError(
+                            f"Rank 0 of sub-host engine {engine_id} aborted before acquiring {lock_path}; "
+                            f"aborting rank {rank} to avoid unserialized StartSession."
+                        )
+                    raise RuntimeError(
+                        f"Rank 0 of sub-host engine {engine_id} exited before signaling GO; "
+                        f"aborting rank {rank} to avoid unserialized StartSession."
                     )
-                    break
+                now = time.monotonic()
+                if not leader_seen and now >= appear_deadline:
+                    raise TimeoutError(
+                        f"Timed out after {peer_appear_timeout_s:.1f}s waiting for rank 0 of sub-host engine "
+                        f"{engine_id} to reach init_device gate; aborting rank {rank}."
+                    )
+                if safety_deadline is not None and now >= safety_deadline:
+                    raise TimeoutError(
+                        f"Timed out after {safety_timeout_s}s waiting for sub-host engine {engine_id} "
+                        f"to acquire {lock_path}; aborting rank {rank}."
+                    )
                 time.sleep(poll_interval_s)
-            else:
-                logger.warning(
-                    "Timed out after %.1fs waiting for rank 0 of sub-host engine %s to acquire %s; "
-                    "rank %d proceeding anyway.",
-                    timeout_s,
-                    engine_id,
-                    lock_path,
-                    rank,
-                )
 
             yield
         finally:
@@ -788,7 +821,6 @@ def serialize_subhost_start_session(
     leader_locked = False
     host_fd: int | None = None
     host_locked = False
-    signaled_go = False
     succeeded = False
     arrived_ranks: set[int] = set()
     try:
@@ -796,8 +828,7 @@ def serialize_subhost_start_session(
         leader_locked = True
         os.pwrite(leader_fd, f"{os.getpid()}\n".encode(), 0)
 
-        deadline = time.monotonic() + timeout_s
-        while len(arrived_ranks) < world_size - 1 and time.monotonic() < deadline:
+        while len(arrived_ranks) < world_size - 1 and time.monotonic() < appear_deadline:
             for r in range(1, world_size):
                 if r not in arrived_ranks:
                     r_path = rank_path(r)
@@ -806,44 +837,54 @@ def serialize_subhost_start_session(
             if len(arrived_ranks) < world_size - 1:
                 time.sleep(poll_interval_s)
         if len(arrived_ranks) < world_size - 1:
-            logger.warning(
-                "Timed out after %.1fs waiting for sibling TPU workers of sub-host engine %s "
-                "(arrived=%s, world_size=%d); acquiring %s anyway.",
-                timeout_s,
-                engine_id,
-                sorted(arrived_ranks),
-                world_size,
-                lock_path,
+            missing = sorted(set(range(1, world_size)) - arrived_ranks)
+            raise TimeoutError(
+                f"Timed out waiting for sibling TPU worker(s) {missing} of sub-host engine {engine_id} "
+                f"to reach init_device gate (arrived={sorted(arrived_ranks)}, world_size={world_size}); aborting."
             )
 
         host_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
-        fcntl.flock(host_fd, fcntl.LOCK_EX)
+        if not _acquire_flock(host_fd, safety_deadline, poll_interval_s):
+            raise TimeoutError(
+                f"Timed out after {safety_timeout_s}s waiting to acquire host StartSession lock {lock_path} "
+                f"for sub-host engine {engine_id}; aborting."
+            )
         host_locked = True
+
+        # Ensure every sibling is still alive and waiting at the gate before starting StartSession.
+        departed = [r for r in range(1, world_size) if not _is_lock_held(rank_path(r))]
+        if departed:
+            raise RuntimeError(
+                f"Sibling TPU worker(s) {departed} of sub-host engine {engine_id} exited while waiting for "
+                f"{lock_path}; aborting StartSession."
+            )
+
         marker = f"{engine_id}:{os.getpid()}\n".encode()
         os.pwrite(host_fd, marker, 0)
         os.ftruncate(host_fd, len(marker))
 
         _write_atomic(go_path, b"GO\n")
-        signaled_go = True
 
         yield
         succeeded = True
     finally:
         all_siblings_done = False
+        exit_timed_out_rank: int | None = None
         try:
-            if not signaled_go:
+            if not succeeded:
                 try:
                     _write_atomic(go_path, b"ABORT\n")
                 except OSError:
                     pass
-            elif succeeded:
-                exit_deadline = time.monotonic() + timeout_s
+            else:
+                exit_deadline = None if safety_timeout_s is None else time.monotonic() + safety_timeout_s
                 all_siblings_done = True
                 for r in range(1, world_size):
                     r_path = rank_path(r)
                     if r in arrived_ranks or _file_nonempty(r_path):
                         if not _wait_for_flock_release(r_path, exit_deadline, poll_interval_s):
                             all_siblings_done = False
+                            exit_timed_out_rank = r
                             logger.warning(
                                 "Timed out waiting for sibling rank %d of sub-host engine %s to finish "
                                 "init_device; releasing %s.",
@@ -875,6 +916,11 @@ def serialize_subhost_start_session(
                     os.unlink(path)
                 except OSError:
                     pass
+        if exit_timed_out_rank is not None:
+            raise TimeoutError(
+                f"Timed out after {safety_timeout_s}s waiting for sibling rank {exit_timed_out_rank} of "
+                f"sub-host engine {engine_id} to finish init_device."
+            )
 
 
 def patch_tpu_worker_subhost_start_session() -> None:

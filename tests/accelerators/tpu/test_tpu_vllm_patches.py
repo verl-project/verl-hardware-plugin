@@ -499,7 +499,8 @@ def test_subhost_start_session_serializes_engines_while_running_siblings_concurr
                 world_size=world_size,
                 engine_id=engine_id,
                 lock_path=lock_path,
-                timeout_s=15.0,
+                peer_appear_timeout_s=15.0,
+                safety_timeout_s=15.0,
                 poll_interval_s=0.005,
             ):
                 t_enter = time.monotonic()
@@ -554,7 +555,8 @@ def test_subhost_start_session_releases_lock_before_model_load(tmp_path):
                 world_size=2,
                 engine_id=engine_id,
                 lock_path=lock_path,
-                timeout_s=10.0,
+                peer_appear_timeout_s=10.0,
+                safety_timeout_s=10.0,
                 poll_interval_s=0.005,
             ):
                 time.sleep(0.02)
@@ -586,7 +588,8 @@ def test_subhost_start_session_serializes_across_subprocesses(tmp_path):
         "rank, world_size = int(sys.argv[4]), int(sys.argv[5])\n"
         "with serialize_subhost_start_session(\n"
         "    rank=rank, world_size=world_size, engine_id=engine_id,\n"
-        "    lock_path=lock_path, timeout_s=15.0, poll_interval_s=0.005,\n"
+        "    lock_path=lock_path, peer_appear_timeout_s=15.0,\n"
+        "    safety_timeout_s=15.0, poll_interval_s=0.005,\n"
         "):\n"
         "    t0 = time.time()\n"
         "    time.sleep(0.08)\n"
@@ -613,6 +616,74 @@ def test_subhost_start_session_serializes_across_subprocesses(tmp_path):
     assert spans[0][1] <= spans[1][0], f"Subprocess engines overlapped: {spans}"
 
 
+@pytest.mark.parametrize("safety_timeout_s", [10.0, None])
+def test_subhost_start_session_siblings_wait_while_other_engine_holds_lock_past_appear_timeout(
+    tmp_path, safety_timeout_s
+):
+    """If another engine holds the host lock longer than peer_appear_timeout_s (e.g. >120s in prod), siblings
+    keep waiting while rank 0 holds its leader lock and never enter the guarded section before rank 0."""
+    lock_path = str(tmp_path / "start_session.lock")
+    peer_hold_s = 0.25
+    short_appear_timeout_s = 0.05  # 5x shorter than peer_hold_s (models the old 120s window)
+
+    peer_locked = threading.Event()
+    peer_released_at: list[float] = []
+    entered_before_peer_release: list[int] = []
+    entered_at: dict[int, float] = {}
+    intra = threading.Barrier(4)
+    errors: list[BaseException] = []
+
+    def peer_engine():
+        with tpu_vllm_patches.serialize_subhost_start_session(
+            rank=0,
+            world_size=1,
+            engine_id="eng-peer-slow",
+            lock_path=lock_path,
+            safety_timeout_s=10.0,
+            poll_interval_s=0.005,
+        ):
+            peer_locked.set()
+            time.sleep(peer_hold_s)
+            peer_released_at.append(time.monotonic())
+
+    def waiting_worker(rank: int):
+        try:
+            assert peer_locked.wait(timeout=5.0)
+            with tpu_vllm_patches.serialize_subhost_start_session(
+                rank=rank,
+                world_size=4,
+                engine_id="eng-waiter",
+                lock_path=lock_path,
+                peer_appear_timeout_s=short_appear_timeout_s,
+                safety_timeout_s=safety_timeout_s,
+                poll_interval_s=0.005,
+            ):
+                t_enter = time.monotonic()
+                if not peer_released_at:
+                    entered_before_peer_release.append(rank)
+                entered_at[rank] = t_enter
+                intra.wait(timeout=5.0)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    peer = threading.Thread(target=peer_engine)
+    workers = [threading.Thread(target=waiting_worker, args=(r,)) for r in range(4)]
+    peer.start()
+    for w in workers:
+        w.start()
+    peer.join(timeout=10.0)
+    for w in workers:
+        w.join(timeout=10.0)
+        assert not w.is_alive()
+
+    assert errors == []
+    assert entered_before_peer_release == [], (
+        f"Workers entered before peer released lock: {entered_before_peer_release}"
+    )
+    assert set(entered_at) == {0, 1, 2, 3}
+    assert min(entered_at.values()) >= peer_released_at[0]
+
+
 @pytest.mark.parametrize("failing_rank", [0, 2])
 def test_subhost_start_session_releases_lock_on_exception(tmp_path, failing_rank):
     """If an engine raises during init_device (either rank 0 or a sibling), the lock is released and peers proceed."""
@@ -627,7 +698,8 @@ def test_subhost_start_session_releases_lock_on_exception(tmp_path, failing_rank
                 world_size=4,
                 engine_id="eng-fail",
                 lock_path=lock_path,
-                timeout_s=5.0,
+                peer_appear_timeout_s=5.0,
+                safety_timeout_s=5.0,
                 poll_interval_s=0.005,
             ):
                 intra.wait(timeout=5.0)
@@ -651,17 +723,18 @@ def test_subhost_start_session_releases_lock_on_exception(tmp_path, failing_rank
         world_size=1,
         engine_id="eng-peer",
         lock_path=lock_path,
-        timeout_s=5.0,
+        safety_timeout_s=5.0,
         poll_interval_s=0.005,
     ):
         peer_ran.append(True)
     assert peer_ran == [True]
 
 
-def test_subhost_start_session_unblocks_siblings_when_rank0_aborts_before_go(tmp_path):
-    """If rank 0 raises before GO, siblings see ABORT and unblock promptly instead of waiting for timeout."""
+def test_subhost_start_session_aborts_siblings_when_rank0_aborts_before_go(tmp_path):
+    """If rank 0 raises before GO, siblings see ABORT and raise instead of entering init_device unserialized."""
     lock_path = str(tmp_path / "start_session.lock")
-    sibling_done = threading.Event()
+    sibling_entered = threading.Event()
+    sibling_errors: list[BaseException] = []
     real_open = os.open
 
     def fail_on_host_lock(path, flags, *args, **kwargs):
@@ -670,15 +743,19 @@ def test_subhost_start_session_unblocks_siblings_when_rank0_aborts_before_go(tmp
         return real_open(path, flags, *args, **kwargs)
 
     def sibling_fn():
-        with tpu_vllm_patches.serialize_subhost_start_session(
-            rank=1,
-            world_size=2,
-            engine_id="eng-abort",
-            lock_path=lock_path,
-            timeout_s=30.0,
-            poll_interval_s=0.005,
-        ):
-            sibling_done.set()
+        try:
+            with tpu_vllm_patches.serialize_subhost_start_session(
+                rank=1,
+                world_size=2,
+                engine_id="eng-abort",
+                lock_path=lock_path,
+                peer_appear_timeout_s=30.0,
+                safety_timeout_s=30.0,
+                poll_interval_s=0.005,
+            ):
+                sibling_entered.set()
+        except BaseException as exc:
+            sibling_errors.append(exc)
 
     sibling = threading.Thread(target=sibling_fn)
     sibling.start()
@@ -690,14 +767,92 @@ def test_subhost_start_session_unblocks_siblings_when_rank0_aborts_before_go(tmp
                     world_size=2,
                     engine_id="eng-abort",
                     lock_path=lock_path,
-                    timeout_s=30.0,
+                    peer_appear_timeout_s=30.0,
+                    safety_timeout_s=30.0,
                     poll_interval_s=0.005,
                 ):
                     pass
-        assert sibling_done.wait(timeout=3.0), "Sibling did not unblock on rank-0 ABORT"
+        sibling.join(timeout=3.0)
+        assert not sibling.is_alive(), "Sibling did not abort promptly on rank-0 ABORT"
+        assert not sibling_entered.is_set(), "Sibling must not enter guarded section after rank-0 ABORT"
+        assert len(sibling_errors) == 1 and isinstance(sibling_errors[0], RuntimeError)
     finally:
         sibling.join(timeout=5.0)
         assert not sibling.is_alive()
+
+
+def test_subhost_start_session_aborts_all_ranks_when_safety_timeout_expires(tmp_path):
+    """If another engine holds the lock past safety_timeout_s, every rank aborts instead of running unserialized."""
+    lock_path = str(tmp_path / "start_session.lock")
+    blocker_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+    fcntl.flock(blocker_fd, fcntl.LOCK_EX)
+    entered: list[int] = []
+    errors: dict[int, BaseException] = {}
+    err_lock = threading.Lock()
+    try:
+
+        def worker_fn(rank: int):
+            try:
+                with tpu_vllm_patches.serialize_subhost_start_session(
+                    rank=rank,
+                    world_size=4,
+                    engine_id="eng-safety-timeout",
+                    lock_path=lock_path,
+                    peer_appear_timeout_s=5.0,
+                    safety_timeout_s=0.15,
+                    poll_interval_s=0.005,
+                ):
+                    entered.append(rank)
+            except BaseException as exc:
+                with err_lock:
+                    errors[rank] = exc
+
+        threads = [threading.Thread(target=worker_fn, args=(r,)) for r in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+            assert not t.is_alive()
+
+        assert entered == [], f"No rank may enter guarded section on safety timeout; entered={entered}"
+        assert set(errors) == {0, 1, 2, 3}
+        assert isinstance(errors[0], TimeoutError)
+        for r in (1, 2, 3):
+            assert isinstance(errors[r], TimeoutError | RuntimeError)
+    finally:
+        fcntl.flock(blocker_fd, fcntl.LOCK_UN)
+        os.close(blocker_fd)
+
+
+def test_subhost_start_session_aborts_when_peer_never_arrives(tmp_path):
+    """Missing sibling or missing leader aborts with TimeoutError instead of proceeding unserialized."""
+    lock_path = str(tmp_path / "start_session.lock")
+    entered = False
+    with pytest.raises(TimeoutError, match="sibling TPU worker"):
+        with tpu_vllm_patches.serialize_subhost_start_session(
+            rank=0,
+            world_size=2,
+            engine_id="eng-missing-sibling",
+            lock_path=lock_path,
+            peer_appear_timeout_s=0.08,
+            safety_timeout_s=5.0,
+            poll_interval_s=0.005,
+        ):
+            entered = True
+    assert not entered
+
+    with pytest.raises(TimeoutError, match="waiting for rank 0"):
+        with tpu_vllm_patches.serialize_subhost_start_session(
+            rank=1,
+            world_size=2,
+            engine_id="eng-missing-leader",
+            lock_path=lock_path,
+            peer_appear_timeout_s=0.08,
+            safety_timeout_s=5.0,
+            poll_interval_s=0.005,
+        ):
+            entered = True
+    assert not entered
 
 
 def test_subhost_start_session_recovers_after_hard_process_crash(tmp_path):
@@ -723,21 +878,22 @@ def test_subhost_start_session_recovers_after_hard_process_crash(tmp_path):
         world_size=1,
         engine_id="eng-after-crash",
         lock_path=lock_path,
-        timeout_s=5.0,
+        safety_timeout_s=5.0,
         poll_interval_s=0.005,
     ):
         ran = True
     assert ran is True
 
 
-def test_subhost_start_session_sibling_detects_rank0_hard_crash_promptly(tmp_path):
-    """If rank 0 dies abruptly (os._exit) while waiting for the host lock, sibling rank 1 unblocks immediately."""
+def test_subhost_start_session_sibling_aborts_on_rank0_hard_crash(tmp_path):
+    """If rank 0 dies abruptly (os._exit) before GO, sibling ranks abort promptly instead of proceeding unserialized."""
     lock_path = str(tmp_path / "start_session.lock")
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     # Hold the host lock from the test process so rank 0 enters the leader section and blocks on host_fd.
     blocker_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
     fcntl.flock(blocker_fd, fcntl.LOCK_EX)
-    sibling_unblocked = threading.Event()
+    sibling_entered = threading.Event()
+    sibling_errors: list[BaseException] = []
     try:
         rank0_script = (
             "import os, sys, threading\n"
@@ -747,7 +903,8 @@ def test_subhost_start_session_sibling_detects_rank0_hard_crash_promptly(tmp_pat
             "threading.Timer(0.25, lambda: os._exit(99)).start()\n"
             "with serialize_subhost_start_session(\n"
             "    rank=0, world_size=2, engine_id='eng-r0-crash',\n"
-            "    lock_path=sys.argv[1], timeout_s=30.0, poll_interval_s=0.005,\n"
+            "    lock_path=sys.argv[1], peer_appear_timeout_s=30.0,\n"
+            "    safety_timeout_s=30.0, poll_interval_s=0.005,\n"
             "):\n"
             "    pass\n"
         )
@@ -757,23 +914,28 @@ def test_subhost_start_session_sibling_detects_rank0_hard_crash_promptly(tmp_pat
         )
 
         def sibling_fn():
-            with tpu_vllm_patches.serialize_subhost_start_session(
-                rank=1,
-                world_size=2,
-                engine_id="eng-r0-crash",
-                lock_path=lock_path,
-                timeout_s=30.0,
-                poll_interval_s=0.005,
-            ):
-                sibling_unblocked.set()
+            try:
+                with tpu_vllm_patches.serialize_subhost_start_session(
+                    rank=1,
+                    world_size=2,
+                    engine_id="eng-r0-crash",
+                    lock_path=lock_path,
+                    peer_appear_timeout_s=30.0,
+                    safety_timeout_s=30.0,
+                    poll_interval_s=0.005,
+                ):
+                    sibling_entered.set()
+            except BaseException as exc:
+                sibling_errors.append(exc)
 
         sibling = threading.Thread(target=sibling_fn)
         sibling.start()
         assert proc.wait(timeout=10.0) == 99
-        # Sibling detects leader_path flock drop well before timeout_s=30.0.
-        assert sibling_unblocked.wait(timeout=3.0), "Sibling did not detect rank-0 crash promptly"
-        sibling.join(timeout=5.0)
-        assert not sibling.is_alive()
+        # Sibling detects leader_path flock drop well before safety_timeout_s=30.0 and aborts with RuntimeError.
+        sibling.join(timeout=3.0)
+        assert not sibling.is_alive(), "Sibling did not detect rank-0 crash promptly"
+        assert not sibling_entered.is_set(), "Sibling must not enter guarded section after rank-0 death"
+        assert len(sibling_errors) == 1 and isinstance(sibling_errors[0], RuntimeError)
     finally:
         fcntl.flock(blocker_fd, fcntl.LOCK_UN)
         os.close(blocker_fd)
