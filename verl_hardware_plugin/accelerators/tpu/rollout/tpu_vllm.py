@@ -44,6 +44,12 @@ from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
     single_host_tpu_topology,
 )
 from verl_hardware_plugin.accelerators.tpu.profilers.tpu_vllm_timeline import vLLMServerTimelineMixin
+from verl_hardware_plugin.accelerators.tpu.rollout.tpu_subhost_affinity import (
+    SUBHOST_DEVICES_PER_ENGINE_ENV,
+    SUBHOST_ENGINES_PER_HOST_ENV,
+    SUBHOST_SLOT_ENV,
+    configure_subhost_server_cpu_pinning,
+)
 from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import (
     SUBHOST_MEGASCALE_PORT_ENV,
     patch_vllm_for_tpu,
@@ -210,12 +216,21 @@ def claim_host_for_subhost_engines(owner: str, path: str = SUBHOST_CLAIM_FILE) -
         raise
 
 
-def subhost_engine_env(slot: int, devices_per_engine: int, replica_rank: int) -> dict[str, str]:
+def subhost_engine_env(
+    slot: int,
+    devices_per_engine: int,
+    replica_rank: int,
+    devices_per_host: int = TPU_V7X_DEVICES_PER_HOST,
+) -> dict[str, str]:
     """The environment of a vLLM engine in slot ``slot`` of a host it shares with other engines.
 
-    Everything here is per engine; the per-worker part (MegaScale ports, libtpu log dir) is set in each worker by
-    ``tpu_vllm_patches.patch_tpu_worker_subhost_env``, which ``SUBHOST_MEGASCALE_PORT_ENV`` switches on.
+    Everything here is per engine; the per-worker part (MegaScale ports, libtpu log dir, and CPU
+    pinning) is set in each worker by ``tpu_vllm_patches.patch_tpu_worker_subhost_env``, which
+    ``SUBHOST_MEGASCALE_PORT_ENV`` switches on.
     """
+    if devices_per_engine <= 0 or devices_per_host % devices_per_engine:
+        raise ValueError(f"Engines of {devices_per_engine} devices do not tile a host of {devices_per_host} devices")
+    engines_per_host = devices_per_host // devices_per_engine
     offset = slot * devices_per_engine
     block = _subhost_port_base() + _PORTS_PER_DEVICE * offset
     return {
@@ -235,6 +250,10 @@ def subhost_engine_env(slot: int, devices_per_engine: int, replica_rank: int) ->
         SUBHOST_MEGASCALE_PORT_ENV: str(block),
         # The server actor claims the host for this controller (see claim_host_for_subhost_engines).
         SUBHOST_OWNER_ENV: _CONTROLLER_ID,
+        # Sub-host layout for dynamic NUMA and physical-core CPU pinning (see tpu_subhost_affinity.py).
+        SUBHOST_SLOT_ENV: str(slot),
+        SUBHOST_DEVICES_PER_ENGINE_ENV: str(devices_per_engine),
+        SUBHOST_ENGINES_PER_HOST_ENV: str(engines_per_host),
         # Compile caches of their own: a cache keyed by the replica alone hands one TP size's executables to another
         # ("local device count is 0" when a TP=8 engine loaded TP=4 executables).
         "VLLM_CACHE_ROOT": f"/tmp/vllm_cache_tp{devices_per_engine}_r{replica_rank}",
@@ -254,6 +273,9 @@ class TPUvLLMHttpServer(vLLMServerTimelineMixin, vLLMHttpServer):
         # Held until this actor exits; the engine's processes are its children.
         self._subhost_host_claim = claim_host_for_subhost_engines(owner, SUBHOST_CLAIM_FILE) if owner else None
         try:
+            # Pin the server / EngineCore to its NUMA-local physical-core slice and export per-worker
+            # slices before super().__init__ spawns EngineCoreProc.
+            self._subhost_cpu_plan = configure_subhost_server_cpu_pinning()
             super().__init__(*args, **kwargs)
         except BaseException:
             if self._subhost_host_claim is not None:
@@ -346,7 +368,10 @@ class TPUvLLMReplica(vLLMReplica):
                 node_id = node_ids[0]
                 name = self._server_actor_name()
                 slot = allocate_host_slot(node_id, name, chips_per_host, TPU_V7X_DEVICES_PER_HOST)
-                env_vars = {**env_vars, **subhost_engine_env(slot, chips_per_host, self.replica_rank)}
+                env_vars = {
+                    **env_vars,
+                    **subhost_engine_env(slot, chips_per_host, self.replica_rank, TPU_V7X_DEVICES_PER_HOST),
+                }
                 logger.info(
                     "Rollout engine %s takes slot %d (devices %d-%d) of host %s",
                     name,

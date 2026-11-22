@@ -402,6 +402,8 @@ def test_replica_gives_engines_on_one_host_disjoint_devices_and_ports(tpu_vllm, 
         assert env["DEBUG_TPU_LOCAL_RANK_OFFSET"] == env["TPU_LOCAL_RANK_OFFSET"]
         assert env["TPU_MULTIHOST_BACKEND"] == "mp"
         assert env["MASTER_ADDR"] == "127.0.0.1"
+        assert env[tpu_vllm.SUBHOST_DEVICES_PER_ENGINE_ENV] == str(chips)
+        assert env[tpu_vllm.SUBHOST_ENGINES_PER_HOST_ENV] == str(per_host)
         assert len(env["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == chips
         for name, prefix in (
             ("VLLM_CACHE_ROOT", "/tmp/vllm_cache"),
@@ -594,6 +596,63 @@ def test_two_controllers_on_one_host_fail_fast_instead_of_sharing_a_slot(tpu_vll
             else:
                 servers.append(tpu_vllm.TPUvLLMHttpServer())
     os.close(servers[0]._subhost_host_claim)
+
+
+def test_subhost_engine_env_sets_layout_and_keeps_three_arg_compatibility(tpu_vllm):
+    env3 = tpu_vllm.subhost_engine_env(1, 4, 5)
+    assert env3[tpu_vllm.SUBHOST_SLOT_ENV] == "1"
+    assert env3[tpu_vllm.SUBHOST_DEVICES_PER_ENGINE_ENV] == "4"
+    assert env3[tpu_vllm.SUBHOST_ENGINES_PER_HOST_ENV] == "2"
+
+    env4 = tpu_vllm.subhost_engine_env(2, 2, 7, devices_per_host=8)
+    assert env4[tpu_vllm.SUBHOST_SLOT_ENV] == "2"
+    assert env4[tpu_vllm.SUBHOST_DEVICES_PER_ENGINE_ENV] == "2"
+    assert env4[tpu_vllm.SUBHOST_ENGINES_PER_HOST_ENV] == "4"
+
+    with pytest.raises(ValueError, match="do not tile"):
+        tpu_vllm.subhost_engine_env(0, 3, 0, devices_per_host=8)
+
+
+def test_server_pins_subhost_cpus_after_host_claim_and_before_upstream_init(tpu_vllm, tmp_path, monkeypatch):
+    path = str(tmp_path / "claim.lock")
+    monkeypatch.setattr(tpu_vllm, "SUBHOST_CLAIM_FILE", path)
+    monkeypatch.setenv(tpu_vllm.SUBHOST_OWNER_ENV, "controller-a")
+    order = []
+
+    real_claim = tpu_vllm.claim_host_for_subhost_engines
+
+    def tracked_claim(owner, claim_path):
+        order.append("claim")
+        return real_claim(owner, claim_path)
+
+    def tracked_pin():
+        order.append("pin")
+        return "fake-plan"
+
+    tpu_vllm.patch_vllm_for_tpu.side_effect = lambda: order.append("patch")
+    with (
+        mock.patch.object(tpu_vllm, "claim_host_for_subhost_engines", side_effect=tracked_claim),
+        mock.patch.object(tpu_vllm, "configure_subhost_server_cpu_pinning", side_effect=tracked_pin),
+        mock.patch.object(_FakeHttpServer, "__init__", lambda self: order.append("upstream init")),
+    ):
+        server = tpu_vllm.TPUvLLMHttpServer()
+    assert order == ["patch", "claim", "pin", "upstream init"]
+    assert server._subhost_cpu_plan == "fake-plan"
+    os.close(server._subhost_host_claim)
+
+
+def test_server_does_not_pin_cpus_when_host_claim_fails(tpu_vllm, tmp_path, monkeypatch):
+    path = str(tmp_path / "claim.lock")
+    monkeypatch.setattr(tpu_vllm, "SUBHOST_CLAIM_FILE", path)
+    held_fd = tpu_vllm.claim_host_for_subhost_engines("controller-a", path)
+    monkeypatch.setenv(tpu_vllm.SUBHOST_OWNER_ENV, "controller-b")
+    try:
+        with mock.patch.object(tpu_vllm, "configure_subhost_server_cpu_pinning") as pin:
+            with pytest.raises(RuntimeError, match="another controller"):
+                tpu_vllm.TPUvLLMHttpServer()
+        pin.assert_not_called()
+    finally:
+        os.close(held_fd)
 
 
 # ---------------------------------------------------------------------------
