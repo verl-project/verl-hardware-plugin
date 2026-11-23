@@ -4284,3 +4284,137 @@ def test_pr170_cp_layer_transforms_and_torchtitan_dual_layout(monkeypatch):
         SimpleNamespace(scale_route_weights="scale_fn", stable_grouped_reduce="reduce_fn"),
     )
     assert tpu_ragged_ep._load_tt_token_dispatcher_helpers() == ("scale_fn", "reduce_fn")
+
+
+def test_torchtitan_main_tpu_routed_experts_bridge(monkeypatch):
+    """Bridge ``torchtitan`` ``main`` ``use_expert_parallel`` / ``TpuRoutedExperts``."""
+    from verl_hardware_plugin.accelerators.tpu.engines import (
+        tpu_model_kernels,
+        tpu_ragged_ep,
+        tpu_utils,
+    )
+
+    @dataclasses.dataclass
+    class _FakeMeta:
+        row_scale_R: torch.Tensor
+        row_scale_applied: bool = False
+
+    class _FakeInner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.use_pallas_grouped_mm = True
+            self.w = torch.nn.Parameter(torch.eye(4))
+
+        def unshard_weights(self):
+            return (self.w,)
+
+        def forward(self, x_RD, counts_e, *, row_scale_R=None, pre_unsharded_weights=None):
+            w = pre_unsharded_weights[0] if pre_unsharded_weights is not None else self.w
+            out = x_RD @ w
+            return out * row_scale_R.unsqueeze(-1) if row_scale_R is not None else out
+
+    class TpuAllToAllTokenDispatcher(torch.nn.Module):
+        def __init__(self, ep_transport: str = "auto", ep_capacity_factor: float | None = 1.25, ep_mesh=None):
+            super().__init__()
+            self.ep_transport = ep_transport
+            self.ep_capacity_factor = ep_capacity_factor
+            self.ep_mesh = ep_mesh
+
+        def _resolve_ep_transport(self, ep_size: int, x_TD: torch.Tensor) -> str:
+            return "ragged_all_to_all"
+
+        def dispatch(self, x_TD, scores_TK, ids_TK, counts_E):
+            return x_TD, counts_E, _FakeMeta(row_scale_R=scores_TK.sum(dim=-1))
+
+        def combine(self, out_RD, meta, x_TD):
+            return out_RD
+
+    class TpuRoutedExperts(torch.nn.Module):
+        def __init__(
+            self,
+            ep_transport: str = "auto",
+            num_token_chunks: int = 4,
+            max_inflight_chunks: int = 2,
+            ep_mesh=None,
+        ):
+            super().__init__()
+            self.token_dispatcher = TpuAllToAllTokenDispatcher(ep_transport=ep_transport, ep_mesh=ep_mesh)
+            self.inner_experts = _FakeInner()
+            self.scale_before_down_proj = True
+            self.num_token_chunks = num_token_chunks
+            self.max_inflight_chunks = max_inflight_chunks
+
+        def forward(self, x_TD, scores_TK, ids_TK, counts_E):
+            rin, c_e, meta = self.token_dispatcher.dispatch(x_TD, scores_TK, ids_TK, counts_E)
+            rout = self.inner_experts(rin, c_e, row_scale_R=meta.row_scale_R)
+            return self.token_dispatcher.combine(rout, meta, x_TD)
+
+    # 1. set_ep_capacity_factor + install_tpu_ep_token_dispatcher(static) update ep_capacity_factor when static.
+    mod = TpuRoutedExperts(ep_transport="auto")
+    assert tpu_model_kernels.set_ep_capacity_factor(mod, 4.0) == 1
+    assert mod.token_dispatcher.ep_capacity_factor == 4.0
+
+    mode, n_updated = tpu_ragged_ep.install_tpu_ep_token_dispatcher(mod, ep_dispatcher="static", capacity_factor=3.5)
+    assert (mode, n_updated) == ("static", 1)
+    assert mod.token_dispatcher.ep_capacity_factor == 3.5
+
+    # Dynamic ep_transport='all_to_all' is NOT treated as static.
+    dyn_mod = TpuRoutedExperts(ep_transport="all_to_all")
+    assert tpu_model_kernels.set_ep_capacity_factor(dyn_mod, 4.0) == 0
+
+    # 2. _relax_non_static_ep_moe_compile preserves fullgraph=True for static TpuAllToAllTokenDispatcher,
+    #    and relaxes to fullgraph=False when ep_transport='all_to_all'.
+    class _Block(torch.nn.Module):
+        def __init__(self, routed):
+            super().__init__()
+            self.routed = routed
+            self._compiled_call_impl = object()
+            self.compile_calls = []
+
+        def compile(self, *, backend: str, fullgraph: bool):
+            self.compile_calls.append((backend, fullgraph))
+
+    class _Model(torch.nn.Module):
+        def __init__(self, block):
+            super().__init__()
+            self.layers = torch.nn.ModuleDict({"0": block})
+
+    pdims = SimpleNamespace(ep_enabled=True)
+    ccfg = SimpleNamespace(enable=True, backend="tpu", components=["model"])
+
+    static_model = _Model(_Block(TpuRoutedExperts(ep_transport="auto")))
+    tpu_utils._relax_non_static_ep_moe_compile(static_model, parallel_dims=pdims, compile_config=ccfg)
+    assert static_model.layers["0"].compile_calls == []
+
+    dyn_model = _Model(_Block(TpuRoutedExperts(ep_transport="all_to_all")))
+    tpu_utils._relax_non_static_ep_moe_compile(dyn_model, parallel_dims=pdims, compile_config=ccfg)
+    assert dyn_model.layers["0"].compile_calls == [("tpu", False)]
+
+    # 3. install_ep_chunk_barriers delegates to TpuRoutedExperts.forward at EP=1, and runs sliding-window
+    #    chunk barriers at EP > 1 while preserving exact gradients.
+    barrier_arities: list[int] = []
+    monkeypatch.setattr(
+        tpu_model_kernels,
+        "_BARRIER_HOOK",
+        lambda tensors: [barrier_arities.append(len(tensors)), [t.clone() for t in tensors]][1],
+    )
+    assert tpu_model_kernels.install_ep_chunk_barriers(mod) == 1
+    assert tpu_model_kernels.install_ep_chunk_barriers(mod) == 0
+
+    x = torch.randn(8, 4, requires_grad=True)
+    scores = torch.rand(8, 2, requires_grad=True)
+    ids = torch.zeros(8, 2, dtype=torch.long)
+    counts = torch.tensor([4, 4, 4, 4], dtype=torch.int32)
+    # EP=1 fallback delegates to TpuRoutedExperts.forward without barriers:
+    out_ep1 = mod(x, scores, ids, counts)
+    assert barrier_arities == []
+    assert torch.allclose(out_ep1, (x @ mod.inner_experts.w) * scores.sum(dim=-1, keepdim=True), atol=1e-6)
+
+    # EP=2 runs 4 chunks with max_inflight_chunks=2 -> 2 forward barriers (arity 4) + 2 backward barriers (arity 3):
+    mod.token_dispatcher.ep_mesh = SimpleNamespace(size=lambda: 2)
+    x2 = x.detach().clone().requires_grad_(True)
+    scores2 = scores.detach().clone().requires_grad_(True)
+    out_ep2 = mod(x2, scores2, ids, counts)
+    out_ep2.sum().backward()
+    assert barrier_arities == [4, 4, 3, 3]
+    assert torch.allclose(out_ep2, out_ep1, atol=1e-6)

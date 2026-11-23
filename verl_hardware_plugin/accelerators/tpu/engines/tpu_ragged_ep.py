@@ -699,6 +699,13 @@ def install_tpu_ep_token_dispatcher(
                         seen_ids.add(id(candidate))
                         candidate.capacity_factor = capacity_factor  # type: ignore[attr-defined]
                         count += 1
+                    elif (
+                        any(c.__name__ == "TpuAllToAllTokenDispatcher" for c in type(candidate).__mro__)
+                        and getattr(candidate, "ep_transport", "all_to_all") != "all_to_all"
+                    ):
+                        seen_ids.add(id(candidate))
+                        candidate.ep_capacity_factor = capacity_factor  # type: ignore[attr-defined]
+                        count += 1
         return resolved, count
 
     compile_enabled = bool(getattr(compile_config, "enable", False))

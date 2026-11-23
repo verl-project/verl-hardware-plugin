@@ -296,6 +296,35 @@ def configure_qwen3_5_expert_parallel(
     EP; ``False`` (nothing changed) on torchtitan builds without the helper.
     """
     try:
+        ep_mod = importlib.import_module("torchtitan.experiments.tpu.components.expert_parallel")
+    except ImportError:
+        ep_mod = None
+    tpu_use_ep = getattr(ep_mod, "use_expert_parallel", None)
+    if callable(tpu_use_ep):
+        ep_params = inspect.signature(tpu_use_ep).parameters
+        if {"ep_degree", "ep_transport", "scale_before_down_proj", "num_token_chunks"} <= set(ep_params):
+            ep_kwargs: dict[str, Any] = {
+                "ep_degree": expert_parallel_degree,
+                "ep_transport": "auto",
+                "scale_before_down_proj": True,
+                "num_token_chunks": num_token_chunks or 1,
+            }
+            has_paired_arg = "paired_grouped_mm" in ep_params
+            if has_paired_arg:
+                ep_kwargs["paired_grouped_mm"] = bool(paired_grouped_mm)
+            if "accumulate_chunk_weight_grads_fp32" in ep_params:
+                ep_kwargs["accumulate_chunk_weight_grads_fp32"] = False
+            tpu_use_ep(model_spec.model, **ep_kwargs)
+            paired_enabled = bool(paired_grouped_mm) and has_paired_arg
+            logger.info(
+                "torchtitan TPU EP (main): ep=%d, num_token_chunks=%d, paired grouped mm under EP=%s",
+                expert_parallel_degree,
+                ep_kwargs["num_token_chunks"],
+                paired_enabled,
+            )
+            return paired_enabled
+
+    try:
         config_registry = _qwen3_5_config_registry()
     except ImportError:
         return False
@@ -565,9 +594,17 @@ def set_ep_capacity_factor(modules: Any, capacity_factor: float) -> int:
                 if candidate is None or id(candidate) in seen:
                     continue
                 seen.add(id(candidate))
-                is_dispatcher = any(c.__name__ == "TpuQwen35TokenDispatcher" for c in type(candidate).__mro__)
-                if is_dispatcher and hasattr(candidate, "capacity_factor") and candidate.capacity_factor != cap:
+                is_qwen35_disp = any(c.__name__ == "TpuQwen35TokenDispatcher" for c in type(candidate).__mro__)
+                if is_qwen35_disp and hasattr(candidate, "capacity_factor") and candidate.capacity_factor != cap:
                     candidate.capacity_factor = cap
+                    updated += 1
+                    continue
+                is_tpu_a2a_disp = (
+                    any(c.__name__ == "TpuAllToAllTokenDispatcher" for c in type(candidate).__mro__)
+                    and getattr(candidate, "ep_transport", "all_to_all") != "all_to_all"
+                )
+                if is_tpu_a2a_disp and hasattr(candidate, "ep_capacity_factor") and candidate.ep_capacity_factor != cap:
+                    candidate.ep_capacity_factor = cap
                     updated += 1
     return updated
 
@@ -766,11 +803,16 @@ def _get_barrier_routed_experts_cls(cls: type) -> type:
     cached = _BARRIER_ROUTED_EXPERTS_SUBCLASSES.get(cls)
     if cached is not None:
         return cached
-    base_cls: type = next((c for c in cls.__mro__ if c.__name__ == "TpuQwen35RoutedExperts"), cls)
+    base_cls: type = next(
+        (c for c in cls.__mro__ if c.__name__ in ("TpuQwen35RoutedExperts", "TpuRoutedExperts")),
+        cls,
+    )
+    is_main_tpu_routed = base_cls.__name__ == "TpuRoutedExperts"
     mod = sys.modules.get(base_cls.__module__)
     maybe_set_sparse_mesh = getattr(mod, "maybe_set_sparse_mesh", contextlib.nullcontext)
     tokens_per_expert = getattr(mod, "_tokens_per_expert", _default_tokens_per_expert)
-    dispatcher_cls = getattr(mod, "TpuQwen35TokenDispatcher", None)
+    dispatcher_name = "TpuAllToAllTokenDispatcher" if is_main_tpu_routed else "TpuQwen35TokenDispatcher"
+    dispatcher_cls = getattr(mod, dispatcher_name, None)
 
     def _forward_with_chunk_barriers(
         self: Any,
@@ -781,23 +823,47 @@ def _get_barrier_routed_experts_cls(cls: type) -> type:
     ) -> torch.Tensor:
         num_chunks = _resolve_ep_token_chunks(x_TD.shape[0], int(getattr(self, "num_token_chunks", 1)))
         ep_mesh = getattr(self.token_dispatcher, "ep_mesh", None)
-        is_qwen35_disp = (
-            isinstance(self.token_dispatcher, dispatcher_cls)
-            if dispatcher_cls is not None
-            else any(c.__name__ == "TpuQwen35TokenDispatcher" for c in type(self.token_dispatcher).__mro__)
-        )
-        weights_on_activation = (
-            ep_mesh is not None
-            and is_qwen35_disp
-            and bool(getattr(self.token_dispatcher, "roe_weights_on_activation", False))
-            and bool(getattr(self.inner_experts, "use_pallas_grouped_mm", False))
-        )
+        if is_main_tpu_routed:
+            ep_transport = getattr(self.token_dispatcher, "ep_transport", "all_to_all")
+            is_tpu_disp = ep_transport in ("ring_of_experts", "ragged_all_to_all", "auto") and (
+                isinstance(self.token_dispatcher, dispatcher_cls)
+                if dispatcher_cls is not None
+                else any(c.__name__ == "TpuAllToAllTokenDispatcher" for c in type(self.token_dispatcher).__mro__)
+            )
+            weights_on_activation = (
+                ep_mesh is not None
+                and is_tpu_disp
+                and bool(getattr(self, "scale_before_down_proj", False))
+                and bool(getattr(self.inner_experts, "use_pallas_grouped_mm", False))
+            )
+        else:
+            is_tpu_disp = (
+                isinstance(self.token_dispatcher, dispatcher_cls)
+                if dispatcher_cls is not None
+                else any(c.__name__ == "TpuQwen35TokenDispatcher" for c in type(self.token_dispatcher).__mro__)
+            )
+            weights_on_activation = (
+                ep_mesh is not None
+                and is_tpu_disp
+                and bool(getattr(self.token_dispatcher, "roe_weights_on_activation", False))
+                and bool(getattr(self.inner_experts, "use_pallas_grouped_mm", False))
+            )
         if (
-            (num_chunks <= 1 and not weights_on_activation)
+            (num_chunks <= 1 and (is_main_tpu_routed or not weights_on_activation))
             or ep_mesh is None
+            or ep_mesh.size() <= 1
+            or not is_tpu_disp
             or x_TD.shape[0] == 0
             or x_TD.shape[0] % num_chunks != 0
         ):
+            if is_main_tpu_routed:
+                return base_cls.forward(
+                    self,
+                    x_TD,
+                    topk_scores_TK,
+                    topk_expert_ids_TK,
+                    num_local_tokens_per_expert_E,
+                )
             return super(base_cls, self).forward(  # type: ignore[arg-type]
                 x_TD,
                 topk_scores_TK,
@@ -806,16 +872,24 @@ def _get_barrier_routed_experts_cls(cls: type) -> type:
             )
 
         needs_chunk_counts = True
-        resolve_comm_mode = getattr(self.token_dispatcher, "_resolve_comm_mode", None)
-        if is_qwen35_disp and callable(resolve_comm_mode):
-            needs_chunk_counts = resolve_comm_mode(ep_mesh.size()) != "ring_of_experts"
+        if is_main_tpu_routed:
+            resolve_ep_transport = getattr(self.token_dispatcher, "_resolve_ep_transport", None)
+            if callable(resolve_ep_transport):
+                needs_chunk_counts = resolve_ep_transport(ep_mesh.size(), x_TD) != "ring_of_experts"
+        else:
+            resolve_comm_mode = getattr(self.token_dispatcher, "_resolve_comm_mode", None)
+            if callable(resolve_comm_mode):
+                needs_chunk_counts = resolve_comm_mode(ep_mesh.size()) != "ring_of_experts"
 
         with maybe_set_sparse_mesh():
-            unsharded_weights = self.inner_experts(
-                x_TD,
-                num_local_tokens_per_expert_E,
-                unshard_only=True,
-            )
+            if hasattr(self.inner_experts, "unshard_weights"):
+                unsharded_weights = self.inner_experts.unshard_weights()
+            else:
+                unsharded_weights = self.inner_experts(
+                    x_TD,
+                    num_local_tokens_per_expert_E,
+                    unshard_only=True,
+                )
 
         x_chunks = list(x_TD.chunk(num_chunks, dim=0))
         score_chunks = list(topk_scores_TK.chunk(num_chunks, dim=0))
@@ -840,7 +914,8 @@ def _get_barrier_routed_experts_cls(cls: type) -> type:
             routed_input_c, num_tokens_per_expert_e, metadata_c = self.token_dispatcher.dispatch(
                 x_c, scores_c, ids_c, counts_c
             )
-            row_scale_c = getattr(metadata_c, "expert_row_scale_R", None) if weights_on_activation else None
+            scale_attr = "row_scale_R" if is_main_tpu_routed else "expert_row_scale_R"
+            row_scale_c = getattr(metadata_c, scale_attr, None) if weights_on_activation else None
             with maybe_set_sparse_mesh():
                 routed_output_c = self.inner_experts(
                     routed_input_c,
@@ -863,7 +938,7 @@ def _get_barrier_routed_experts_cls(cls: type) -> type:
 
 
 def install_ep_chunk_barriers(modules: Any) -> int:
-    """Installs sliding-window ``optimization_barrier`` + dynamic-bucket chunking on ``TpuQwen35RoutedExperts``."""
+    """Installs sliding-window ``optimization_barrier`` + dynamic-bucket chunking on TPU routed experts."""
     model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
     updated = 0
     for model in model_list:
@@ -872,7 +947,11 @@ def install_ep_chunk_barriers(modules: Any) -> int:
         for module in model.modules():
             if getattr(type(module), "_verl_ep_chunk_barrier_cls", False):
                 continue
-            if any(c.__name__ == "TpuQwen35RoutedExperts" for c in type(module).__mro__):
+            if any(c.__name__ in ("TpuQwen35RoutedExperts", "TpuRoutedExperts") for c in type(module).__mro__):
+                td = getattr(module, "token_dispatcher", None)
+                is_legacy_qwen35 = any(c.__name__ == "TpuQwen35RoutedExperts" for c in type(module).__mro__)
+                if getattr(td, "ep_transport", "auto") == "all_to_all" and not is_legacy_qwen35:
+                    continue
                 module.__class__ = _get_barrier_routed_experts_cls(type(module))
                 updated += 1
     return updated

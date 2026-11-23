@@ -1166,11 +1166,12 @@ def _wrap_routed_experts_on_edp_mesh(model: nn.Module, *, parallel_dims: Any, tr
         return
     from torch.distributed.fsdp import MixedPrecisionPolicy
     from torchtitan.config import TORCH_DTYPE_MAP
-    from torchtitan.distributed.utils import get_spmd_backend
+    from torchtitan.distributed import utils as tt_dist_utils
     from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
     from torchtitan.models.common.moe import MoE
 
-    use_spmd_types = get_spmd_backend() == "spmd_types"
+    get_spmd_backend = getattr(tt_dist_utils, "get_spmd_backend", None)
+    use_spmd_types = get_spmd_backend() == "spmd_types" if callable(get_spmd_backend) else True
     if parallel_dims.dp_replicate_enabled:
         dp_mode = "hybrid_shard" if (parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled) else "replicate"
         edp_mesh_names = ["dp_replicate", "efsdp"]
@@ -1231,13 +1232,20 @@ def _relax_non_static_ep_moe_compile(model: nn.Module, *, parallel_dims: Any, co
     if layers is None:
         return
     backend = getattr(compile_config, "backend", "tpu")
-    _static_dispatchers = ("TpuQwen35TokenDispatcher", "TpuRaggedEPTokenDispatcher")
+
+    def _is_static_ep_dispatcher(td: Any) -> bool:
+        mro_names = {c.__name__ for c in type(td).__mro__}
+        if mro_names & {"TpuQwen35TokenDispatcher", "TpuRaggedEPTokenDispatcher"}:
+            return True
+        if "TpuAllToAllTokenDispatcher" in mro_names and getattr(td, "ep_transport", "all_to_all") != "all_to_all":
+            return True
+        return False
+
     for _, block in layers.named_children():
         if getattr(block, "_compiled_call_impl", None) is None:
             continue
         needs_graph_break = any(
-            getattr(m, "token_dispatcher", None) is not None
-            and not any(c.__name__ in _static_dispatchers for c in type(m.token_dispatcher).__mro__)
+            getattr(m, "token_dispatcher", None) is not None and not _is_static_ep_dispatcher(m.token_dispatcher)
             for m in block.modules()
         )
         if needs_graph_break:

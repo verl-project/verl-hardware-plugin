@@ -1220,6 +1220,8 @@ class TorchTitanTPUEngine(BaseEngine):
             decay_type=self.optimizer_config.decay_type,
             min_lr_factor=self.optimizer_config.min_lr_factor,
         )
+        p_fields = getattr(ParallelismConfig, "__dataclass_fields__", None) or {}
+        has_spmd_backend_field = "spmd_backend" in p_fields
         parallelism_kwargs: dict[str, Any] = {
             "data_parallel_replicate_degree": self.engine_config.data_parallel_replicate_size,
             "data_parallel_shard_degree": self.engine_config.data_parallel_shard_size,
@@ -1228,9 +1230,10 @@ class TorchTitanTPUEngine(BaseEngine):
             "pipeline_parallel_degree": self.engine_config.pipeline_parallel_size,
             "context_parallel_degree": self.engine_config.context_parallel_size,
             "expert_parallel_degree": self.engine_config.expert_parallel_size,
-            "spmd_backend": self.engine_config.spmd_backend,
             "use_simple_fsdp": self._use_simple_fsdp,
         }
+        if has_spmd_backend_field:
+            parallelism_kwargs["spmd_backend"] = self.engine_config.spmd_backend
         topo_mesh = tpu_ragged_ep.should_enable_tpu_topo_mesh(tpu_options.enable_tpu_topo_mesh, ParallelismConfig)
         if topo_mesh is not None:
             parallelism_kwargs["enable_tpu_topo_mesh"] = topo_mesh
@@ -1287,8 +1290,9 @@ class TorchTitanTPUEngine(BaseEngine):
         # Activation checkpointing mode. Under spmd_backend="spmd_types" with eager execution
         # (use_torch_compile=False), selective/full AC recompute runs on the autograd backward thread
         # where the thread-local SPMD mesh is inactive, so spmd.assert_type() raises "no current mesh".
+        effective_spmd_backend = getattr(parallelism, "spmd_backend", "spmd_types")
         ac_mode = self.engine_config.activation_checkpoint
-        if parallelism.spmd_backend == "spmd_types" and not self.engine_config.use_torch_compile and ac_mode != "none":
+        if effective_spmd_backend == "spmd_types" and not self.engine_config.use_torch_compile and ac_mode != "none":
             logger.warning(
                 "Disabling activation_checkpoint=%r because spmd_backend='spmd_types' with "
                 "use_torch_compile=False does not support eager AC recomputation.",
@@ -1430,7 +1434,7 @@ class TorchTitanTPUEngine(BaseEngine):
                 model_parts,
                 ep_dispatcher=tpu_options.ep_dispatcher,
                 capacity_factor=ep_cap,
-                spmd_backend=parallelism.spmd_backend,
+                spmd_backend=getattr(parallelism, "spmd_backend", "spmd_types"),
                 compile_config=compile_config,
             )
             if n_ep:
@@ -1552,7 +1556,8 @@ class TorchTitanTPUEngine(BaseEngine):
                 "before cp_shard, and does not post-gather-unpermute outputs across CP shards. "
                 "Unset gdn_row_slot_len or turn context parallelism off."
             )
-        parallelism.spmd_backend = "spmd_types"
+        if hasattr(parallelism, "spmd_backend"):
+            parallelism.spmd_backend = "spmd_types"
         load_balancer = tpu_cp_load_balancer(strategy)
         parallelism.context_parallel_load_balancer = load_balancer
         inner_attention = model.first_full_attention_backend
@@ -2896,7 +2901,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         output_args["labels"] = labels
         input_ids = input_ids.contiguous()
 
-        if getattr(self.trainer.config.parallelism, "spmd_backend", None) == "spmd_types":
+        if getattr(self.trainer.config.parallelism, "spmd_backend", "spmd_types") == "spmd_types":
             import spmd_types as spmd
             from torchtitan.distributed.spmd_types import annotate_input_spmd_types
             from torchtitan.models.common.decoder_sharding import CP, DP, TP, SpmdType, decoder_input_sharding
