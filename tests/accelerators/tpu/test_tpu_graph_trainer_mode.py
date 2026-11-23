@@ -116,7 +116,12 @@ def test_validate_graph_trainer_engine():
     with pytest.raises(ValueError) as e:
         graph_trainer_mode.validate_graph_trainer_engine(
             bad,
-            _options(trainer_mode="graph_trainer", use_fused_linear_cross_entropy=False, gdn_row_slot_len=4096),
+            _options(
+                trainer_mode="graph_trainer",
+                use_fused_linear_cross_entropy=False,
+                gdn_row_slot_len=4096,
+                kda_document_budget=1,
+            ),
             use_simple_fsdp=False,
             tpu_kernels=frozenset({"kda"}),
         )
@@ -127,7 +132,7 @@ def test_validate_graph_trainer_engine():
         "static_micro_batch_len",
         "use_fused_linear_cross_entropy",
         "expert_parallel_size=2",
-        "KDA",
+        "kda_document_budget=1",
         "gdn_row_slot_len=4096",
     ):
         assert expected in message, (expected, message)
@@ -141,6 +146,31 @@ def test_validate_graph_trainer_engine():
             use_simple_fsdp=True,
             tpu_kernels=frozenset(),
         )
+
+
+def test_validate_graph_trainer_engine_accepts_kda():
+    good = SimpleNamespace(forward_only=False, param_offload=False, data_parallel_shard_size=8)
+    for budget in (None, 2, 80):
+        graph_trainer_mode.validate_graph_trainer_engine(
+            good,
+            _options(trainer_mode="graph_trainer", static_micro_batch_len=32768, kda_document_budget=budget),
+            use_simple_fsdp=True,
+            tpu_kernels=frozenset({"moe", "kda", "lce"}),
+        )
+
+
+def test_initial_kda_document_budget_is_documents_plus_padding_tail_or_the_option():
+    assert graph_trainer_mode.initial_kda_document_budget(_options(trainer_mode="graph_trainer"), 16) == 17
+    assert graph_trainer_mode.initial_kda_document_budget(_options(trainer_mode="graph_trainer"), 63) == 64
+    options = _options(trainer_mode="graph_trainer", kda_document_budget=24)
+    assert graph_trainer_mode.initial_kda_document_budget(options, 16) == 24
+
+
+def test_check_kda_document_budget_raises_only_when_the_documents_do_not_fit():
+    graph_trainer_mode.check_kda_document_budget(17, 16)  # 16 documents + padding tail fit 17 segments
+    graph_trainer_mode.check_kda_document_budget(17, 3)
+    with pytest.raises(RuntimeError, match="pinned the Tokamax KDA document budget"):
+        graph_trainer_mode.check_kda_document_budget(17, 17)
 
 
 def test_memory_policy_defaults_follow_activation_checkpoint():

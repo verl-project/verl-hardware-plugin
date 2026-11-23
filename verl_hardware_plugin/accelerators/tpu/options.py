@@ -296,6 +296,8 @@ class TPUEngineOptions:
         graph_trainer: Settings passed straight to TorchTitan's ``TpuGraphTrainerCompileConfig(**cfg)``
             (e.g. ``memory_policy``, ``save_regions``, ``fsdp_barrier_policy``, ``graph_split``).
             Ignored when ``trainer_mode`` is not ``graph_trainer``.
+        kda_document_budget: ``trainer_mode=graph_trainer`` with ``kda``: the Tokamax KDA ``max_num_segments`` (packed
+            documents per micro-batch + 1) pinned for the run (default: the first step's count + 1).
     """
 
     use_splash_attention: Optional[bool] = None
@@ -341,6 +343,7 @@ class TPUEngineOptions:
     frozen_param_regex: Optional[str] = None
     trainer_mode: Optional[str] = None
     graph_trainer: Optional[dict[str, Any]] = None
+    kda_document_budget: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.static_micro_batch_num_seqs is not None and (
@@ -396,6 +399,7 @@ _ENGINE_KINDS: dict[str, Any] = {
     "frozen_param_regex": str,
     "trainer_mode": str,
     "graph_trainer": dict,
+    "kda_document_budget": int,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 

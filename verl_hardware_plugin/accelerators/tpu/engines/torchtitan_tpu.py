@@ -1115,6 +1115,8 @@ class TorchTitanTPUEngine(BaseEngine):
             )
         self._graph_policy_loss_spec: Optional[graph_trainer_mode.GraphPolicyLossSpec] = None
         self._graph_trainer_traced_len: Optional[int] = None
+        # trainer_mode=graph_trainer with kda: the Tokamax KDA document budget pinned on the first step.
+        self._kda_pinned_budget: Optional[int] = None
         registry_params = inspect.signature(model_module.model_registry).parameters
         fuse_qkv_kwargs = (
             {"fuse_qkv": False}
@@ -1916,8 +1918,20 @@ class TorchTitanTPUEngine(BaseEngine):
             local_max_docs = max((gdn_slot_schedule.segmented_document_count(mb) for mb in segmented_mbs), default=0)
             global_max_docs = gdn_slot_schedule.sync_max_segmented_documents(local_max_docs)
             if global_max_docs > 0:
-                budget = tpu_model_kernels.packed_document_budget(global_max_docs)
-                updated = tpu_model_kernels.set_packed_document_budget(self.module, budget)
+                if graph_mode:
+                    # The traced graph freezes max_num_segments: set it on the first step, then only check later
+                    # steps against it.
+                    updated = 0
+                    if self._kda_pinned_budget is None:
+                        self._kda_pinned_budget = graph_trainer_mode.initial_kda_document_budget(
+                            tpu_options, global_max_docs
+                        )
+                        updated = tpu_model_kernels.set_packed_document_budget(self.module, self._kda_pinned_budget)
+                    budget = self._kda_pinned_budget
+                    graph_trainer_mode.check_kda_document_budget(budget, global_max_docs)
+                else:
+                    budget = tpu_model_kernels.packed_document_budget(global_max_docs)
+                    updated = tpu_model_kernels.set_packed_document_budget(self.module, budget)
                 if updated:
                     logger.info("Tokamax GatedDeltaNet: max_num_segments=%d in %d kernels", budget, updated)
 
