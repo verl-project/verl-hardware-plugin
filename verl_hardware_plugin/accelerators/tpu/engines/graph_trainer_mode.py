@@ -11,8 +11,6 @@ backward), the TPU pass pipeline (memory policy / remat, FSDP schedule) runs on 
 ``StaticCompiler`` compiles it whole. Every later micro-batch reuses that executable. The HF load, SimpleFSDP, the
 optimizer, LR scheduler, chunked optimizer step, grad clipping and the tpu-sync weight export are unchanged.
 
-Phase 1 scope:
-
 * Actor training only. ``old_log_probs`` must come from the rollout (``rollout_correction.bypass_mode=True``) and the
   KL loss must be off, so no forward-only pass runs: ``forward_only`` / ``infer_batch`` raises (TODO-3), and so does a
   reference (``forward_only``) engine configured with this mode.
@@ -20,10 +18,9 @@ Phase 1 scope:
   and no rejection sampling), ``token-mean`` aggregation, no entropy term. Its tensor math is traced into the graph;
   verl's own ``ppo_loss`` then runs eagerly under ``no_grad`` on the per-token log-probs the graph returns, so the
   logged loss and metrics (``pg_clipfrac``, ``ppo_kl``, rollout-correction metrics, ...) are verl's.
-* One micro-batch per mini-batch per rank: TorchTitan's ``TpuGraphTrainer`` assigns ``param.grad`` instead of
-  accumulating it, so more micro-batches raise (TODO-1). Set ``ppo_max_token_len_per_gpu`` (with ``use_dynamic_bsz``)
-  and ``static_micro_batch_len`` large enough for one micro-batch. Its loss is normalized by the mini-batch's global
-  token count, as in the eager engine.
+* Several micro-batches per mini-batch: ``TpuGraphTrainer`` adds each micro-batch's gradients to ``param.grad``.
+  Every micro-batch loss is normalized by the mini-batch's global token count, as in the eager engine, so the sum is
+  the mini-batch's token mean.
 * One sequence shape (``static_micro_batch_len``), traced once (TODO-2: cache one graph per bucket length).
 
 Loss scaling: verl's ``token-mean`` loss is ``sum(pg * mask) / global_tokens * dp_size`` and the eager engine scales
@@ -48,16 +45,12 @@ from verl_hardware_plugin.accelerators.tpu.options import TRAINER_MODE_GRAPH_TRA
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-# The traced step's auxiliary output (``_wrap_step_for_loss_aux``): the detached per-token
-# log-probs of the micro-batch, from which verl's metrics are computed eagerly.
-NUM_LOSS_AUX_OUTPUTS = 1
+# Key of the detached per-token log-probs in the loss metrics the traced step returns (``trainer.last_loss_metrics``);
+# verl's loss and metrics are computed eagerly from them.
+LOG_PROBS_METRIC = "log_probs"
 # TorchTitan's compile mode for the graph trainer: trace forward + loss + backward of a step into one FX graph.
 TPU_COMPILE_MODE = "aot_fx_trace"
 
-_TODO_1 = (
-    "graph_trainer mode runs one micro-batch per mini-batch per rank (TODO-1: gradient accumulation across "
-    "micro-batches)"
-)
 _TODO_2 = "graph_trainer mode traces one sequence shape and cannot retrace (TODO-2: one traced graph per bucket length)"
 _TODO_3 = (
     "graph_trainer mode has no forward-only path yet (TODO-3): run with algorithm.rollout_correction.bypass_mode=True "
@@ -78,13 +71,6 @@ def shape_change_error(traced_len: int, padded_len: int) -> RuntimeError:
     return RuntimeError(
         f"{_TODO_2}: traced with {traced_len} packed tokens, got {padded_len}. Raise "
         "engine_kwargs.tpu.static_micro_batch_len to at least the largest micro-batch (e.g. ppo_max_token_len_per_gpu)."
-    )
-
-
-def multi_micro_batch_error(num_micro_batches: int) -> RuntimeError:
-    return RuntimeError(
-        f"{_TODO_1}, got {num_micro_batches}. Raise actor.ppo_max_token_len_per_gpu (use_dynamic_bsz) and "
-        "engine_kwargs.tpu.static_micro_batch_len so that a mini-batch fits in one micro-batch per rank."
     )
 
 
@@ -180,8 +166,7 @@ def build_graph_trainer_config(
     Eager activation checkpointing is off (``activation_checkpoint=None``): the graph trainer's memory policy pass
     chooses what to save and what to recompute in the traced graph instead. ``compile.enable=False`` keeps the TPU
     recipe parallelize_fn from compiling anything; ``compile.mode=aot_fx_trace`` makes ``forward_backward_step``
-    trace and compile the whole step. Needs TorchTitan with ``TpuGraphTrainerCompileConfig`` (e.g. 109bd618, the
-    verl TPU Dockerfile pin).
+    trace and compile the whole step.
 
     ``compile`` accepts settings straight from ``engine_kwargs.tpu.graph_trainer``
     (passed through to ``TpuGraphTrainerCompileConfig(**cfg)``).
@@ -241,74 +226,6 @@ def build_graph_trainer_config(
     return TpuGraphTrainer.Config(**kwargs)
 
 
-def _wrap_step_for_loss_aux(trainer: Any, num_aux: int):
-    """Context manager threading ``num_aux`` extra loss tensors out of upstream ``TpuGraphTrainer``'s FX step.
-
-    TorchTitan's ``make_fwd_bwd_step`` drops any second tuple element returned by ``loss_fn`` instead of returning it
-    as a graph output. Wrapping ``make_fwd_bwd_step`` during trace appends the auxiliary tensors (detached per-token
-    log-probs) to the graph's outputs, and wrapping ``run_traced`` pops them onto ``trainer.last_loss_aux`` before
-    ``TpuGraphTrainer`` unpacks ``[loss, *grads, *routing_metrics]``, leaving TorchTitan's pass pipeline untouched.
-    """
-    from contextlib import contextmanager
-
-    from torchtitan.experiments.graph_trainer import make_fx_tracer
-    from torchtitan.experiments.graph_trainer import trainer as trainer_mod
-
-    @contextmanager
-    def _ctx():
-        orig_make_fwd_bwd = trainer_mod.make_fwd_bwd_step
-        orig_run_traced = make_fx_tracer.run_traced
-
-        def make_fwd_bwd_with_aux(model: Any, loss_fn: Callable, *args: Any, **kwargs: Any) -> Callable:
-            captured_aux: list[tuple[torch.Tensor, ...]] = []
-
-            def loss_fn_capturing_aux(*l_args: Any, **l_kwargs: Any) -> torch.Tensor:
-                result = loss_fn(*l_args, **l_kwargs)
-                if not (isinstance(result, tuple) and len(result) == 2):
-                    raise ValueError(
-                        "trainer_mode=graph_trainer loss_fn must return (loss, tuple_of_aux_tensors), "
-                        f"got {type(result).__name__}"
-                    )
-                loss_val, aux = result
-                if not isinstance(aux, tuple | list) or len(aux) != num_aux:
-                    raise ValueError(f"Expected {num_aux} auxiliary loss outputs, got {aux!r}")
-                captured_aux.append(tuple(aux))
-                return loss_val
-
-            base_step = orig_make_fwd_bwd(model, loss_fn_capturing_aux, *args, **kwargs)
-
-            def fwd_bwd_step(*s_args: Any, **s_kwargs: Any) -> list[torch.Tensor]:
-                captured_aux.clear()
-                outs = list(base_step(*s_args, **s_kwargs))
-                if len(captured_aux) != 1:
-                    raise RuntimeError(f"Expected loss_fn to run once during trace, ran {len(captured_aux)} times")
-                outs.extend(captured_aux[0])
-                return outs
-
-            return fwd_bwd_step
-
-        def run_traced_with_aux(*r_args: Any, **r_kwargs: Any) -> Callable:
-            runner = orig_run_traced(*r_args, **r_kwargs)
-
-            def run(*call_args: Any, **call_kwargs: Any) -> list[torch.Tensor]:
-                outs = list(runner(*call_args, **call_kwargs))
-                trainer.last_loss_aux = tuple(outs[-num_aux:])
-                return outs[:-num_aux]
-
-            return run
-
-        if trainer._traced_step is None:
-            trainer_mod.make_fwd_bwd_step = make_fwd_bwd_with_aux  # type: ignore[assignment]
-        make_fx_tracer.run_traced = run_traced_with_aux  # type: ignore[assignment]
-        try:
-            yield
-        finally:
-            trainer_mod.make_fwd_bwd_step = orig_make_fwd_bwd  # type: ignore[assignment]
-            make_fx_tracer.run_traced = orig_run_traced  # type: ignore[assignment]
-
-    return _ctx()
-
-
 def _packed_stream_as_one_row() -> Any:
     """Clears TorchTitan's unflatten-shim row length while the step runs, as the eager engine leaves it.
 
@@ -325,16 +242,16 @@ def _packed_stream_as_one_row() -> Any:
 
 
 def build_rl_graph_trainer(config: Any) -> Any:
-    """Builds a ``TpuGraphTrainer`` whose traced step also returns the detached per-token log-probs (aux output)."""
+    """Builds a ``TpuGraphTrainer`` that runs its step on the packed micro-batch as one row.
+
+    See ``_packed_stream_as_one_row``. The traced step returns ``GraphPolicyLoss``'s metrics (the detached per-token
+    log-probs) as ``trainer.last_loss_metrics``.
+    """
     from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 
     class _RLTpuGraphTrainer(TpuGraphTrainer):
-        def __init__(self, cfg: Any) -> None:
-            super().__init__(cfg)
-            self.last_loss_aux = ()
-
         def _make_fx_forward_backward_step(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-            with _packed_stream_as_one_row(), _wrap_step_for_loss_aux(self, NUM_LOSS_AUX_OUTPUTS):
+            with _packed_stream_as_one_row():
                 return super()._make_fx_forward_backward_step(*args, **kwargs)
 
     return _RLTpuGraphTrainer(config)
@@ -449,8 +366,8 @@ class GraphPolicyLoss:
     ``pred`` is the model output with the fused LM-head override, ``(hidden_states, lm_head_weight_t)``: log-probs
     come from the Tokamax kernel, with no ``[tokens, vocab]`` logits (graph mode always uses the fused path). ``labels``
     is the tuple ``(target_ids, old_log_probs, advantages, loss_mask)`` of packed ``[T]`` tensors
-    (``pack_rl_loss_targets``). Returns ``(loss, (log_probs.detach(),))``; the second element becomes the graph's
-    auxiliary output.
+    (``pack_rl_loss_targets``). Returns ``(loss, {LOG_PROBS_METRIC: log_probs.detach()})``; TorchTitan returns the
+    metrics from the traced step as ``trainer.last_loss_metrics``.
 
     Same math as ``verl.trainer.ppo.core_algos.compute_policy_loss_vanilla`` with ``token-mean`` ``agg_loss``, without
     the ``dp_size`` factor (see the module docstring).
@@ -475,7 +392,6 @@ class GraphPolicyLoss:
             target_ids,
             lm_head_weight_t,
             temperature=self.spec.temperature,
-            functional_backward=True,
             **tpu_model_kernels.lce_block_sizes(
                 self.tpu_kernels,
                 hidden_size=int(lm_head_weight_t.shape[0]),
@@ -485,7 +401,7 @@ class GraphPolicyLoss:
 
     def __call__(
         self, pred: Any, labels: tuple[torch.Tensor, ...], *, global_valid_tokens: torch.Tensor
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         target_ids, old_log_probs, advantages, loss_mask = labels
         log_prob = self.log_probs(pred, target_ids)
         spec = self.spec
@@ -500,7 +416,7 @@ class GraphPolicyLoss:
         # verl_F.masked_sum: zero outside the mask first, so bucket-padding tokens cannot leak NaN / inf.
         masked = torch.where(loss_mask.bool(), pg_losses, torch.zeros_like(pg_losses)) * loss_mask
         loss = masked.sum() / torch.clamp(global_valid_tokens.to(masked.dtype), min=1.0)
-        return loss, (log_prob.detach(),)
+        return loss, {LOG_PROBS_METRIC: log_prob.detach()}
 
 
 def _sequence_lengths(micro_batch: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:

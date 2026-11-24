@@ -213,8 +213,8 @@ class TPUEngineOptions:
             update smaller than half a bf16 ulp (lr 1e-6 updates mostly round to zero). With
             ``optimizer_host_offload`` the masters stay resident in host memory with the optimizer states.
         ep_dispatcher: MoE expert-parallel token dispatcher mode when ``expert_parallel_size > 1``: ``auto``
-            (default: ``ragged`` when ``torch.ops.tpu._ragged_all_to_all`` is available and ``spmd_backend`` is not
-            ``spmd_types``, else ``static``), ``ragged`` (:class:`TpuRaggedEPTokenDispatcher` sending ``1.0x`` real
+            (default: ``static``; ``ragged`` is not supported on TorchTitan's ``spmd_types`` path, its only SPMD
+            path), ``ragged`` (:class:`TpuRaggedEPTokenDispatcher` sending ``1.0x`` real
             routed tokens + unpadded MegaBlox ``gmm``/``tgmm`` group counts), or ``static`` (uniform ``[ep * cap, D]``
             ``TpuQwen35TokenDispatcher``).
         enable_tpu_topo_mesh: Preserve physical 3D ICI torus ``(x, y, z)`` rank order on ``ParallelismConfig``

@@ -1059,12 +1059,11 @@ def test_fused_linear_cross_entropy_tpu_and_logprobs():
 
     seen_calls = []
 
-    def _fake_forward_op(b_block, h_block, v_block):
-        def op(x, labels, weight_t):
-            seen_calls.append((x.shape, labels.shape, labels.dtype, weight_t.shape, (b_block, h_block, v_block)))
-            return torch.full((x.shape[0],), 0.5), torch.zeros(x.shape[0])
-
-        return op
+    def _fake_loss(x, labels, weight_t, *, reduction, implementation, b_block_size, h_block_size, v_block_size):
+        seen_calls.append(
+            (x.shape, labels.shape, labels.dtype, weight_t.shape, reduction, (b_block_size, h_block_size, v_block_size))
+        )
+        return torch.full((x.shape[0],), 0.5)
 
     lm_head = _FakeFusedLossLinearWrapper(16, 32, bias=False)
     x = torch.randn(2, 5, 16)
@@ -1085,88 +1084,46 @@ def test_fused_linear_cross_entropy_tpu_and_logprobs():
         is False
     )
     labels = torch.randint(0, 32, (2, 5))
-    with mock.patch.object(fused_logprob, "_forward_op", _fake_forward_op):
+    loss_mod = SimpleNamespace(linear_softmax_cross_entropy_loss=_fake_loss)
+    with mock.patch.object(fused_logprob, "_loss_module", return_value=loss_mod):
         logprobs = fused_linear_logprobs_tpu(out_fused[0], labels, out_fused[1])
     assert logprobs.shape == (10,)
     assert torch.allclose(logprobs, torch.full((10,), -0.5))
-    # torchtitan's forward op gets T padded to a multiple of 1024, int32 labels and the (H, V) weight_t as is.
+    # torchtitan's per-row op gets T padded to a multiple of 1024, int32 labels and the (H, V) weight_t as is.
     assert seen_calls == [
-        (torch.Size([1024, 16]), torch.Size([1024]), torch.int32, torch.Size([16, 32]), (1024, 512, 2048))
+        (torch.Size([1024, 16]), torch.Size([1024]), torch.int32, torch.Size([16, 32]), "none", (1024, 512, 2048))
     ]
 
 
-def test_fused_logprob_chunked_backward_matches_autograd():
-    """The chunked backward of the fused log-prob gives the gradients of log_softmax(x @ W / t)[label]."""
+def test_fused_logprob_gradients_match_autograd():
+    """Temperature scaling, row padding and the sign around torchtitan's per-row op give the gradients of
+    log_softmax(x @ W / t)[label]; padded rows get no gradient."""
     from verl_hardware_plugin.accelerators.tpu.engines import fused_logprob
+
+    def _reference_loss(x, labels, weight_t, *, reduction, **_):
+        # Dense stand-in for torchtitan's linear_softmax_cross_entropy_loss(reduction="none"): -log p(label) per row.
+        assert reduction == "none"
+        logits = x.float() @ weight_t.float()
+        return torch.logsumexp(logits, -1) - logits.gather(-1, labels.long().unsqueeze(-1)).squeeze(-1)
 
     torch.manual_seed(0)
     x = torch.randn(10, 8)
     weight_t = torch.randn(8, 30) * 0.3
     labels = torch.randint(0, 30, (10,))
     cotangent = torch.randn(10)
-
-    def _forward_op(b_block, h_block, v_block):
-        def op(x, labels, weight_t):
-            logits = x.float() @ weight_t.float()
-            lse = torch.logsumexp(logits, -1)
-            return lse - logits.gather(-1, labels.long().unsqueeze(-1)).squeeze(-1), lse
-
-        return op
-
+    loss_mod = SimpleNamespace(linear_softmax_cross_entropy_loss=_reference_loss)
     for temperature in (1.0, 2.0):
         xr, wr = x.clone().requires_grad_(), weight_t.clone().requires_grad_()
         expected = torch.log_softmax(xr @ wr / temperature, -1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
         (expected * cotangent).sum().backward()
 
         xk, wk = x.clone().requires_grad_(), weight_t.clone().requires_grad_()
-        with (
-            mock.patch.object(fused_logprob, "_forward_op", _forward_op),
-            # Several vocab chunks (30 columns in chunks of 8), the last one ragged; labels fall in every chunk.
-            mock.patch.object(fused_logprob, "backward_vocab_chunk", lambda num_tokens, vocab: 8),
-        ):
+        with mock.patch.object(fused_logprob, "_loss_module", return_value=loss_mod):
             logp = fused_logprob.fused_linear_logprobs_tpu(xk, labels, wk, temperature=temperature, b_block_size=16)
         (logp * cotangent).sum().backward()
         torch.testing.assert_close(logp, expected.detach())
         torch.testing.assert_close(xk.grad, xr.grad, rtol=1e-4, atol=1e-5)
         torch.testing.assert_close(wk.grad, wr.grad, rtol=1e-4, atol=1e-5)
-
-
-def test_fused_logprob_backward_never_holds_the_whole_fp32_lm_head():
-    """The backward's largest temporaries are one [T, Vc] FP32 logits chunk and the [H, Vc] FP32 weight slice: it
-    must not make an FP32 copy of the whole (H, V) LM head or of its gradient (2 x 2.3 GiB for Qwen3-8B)."""
-    from verl_hardware_plugin.accelerators.tpu.engines import fused_logprob
-
-    # Qwen3-8B: 4096 x 151936 at 8192 tokens -> 512 MiB chunks of 16384 columns; a small vocab is one chunk.
-    assert fused_logprob.backward_vocab_chunk(8192, 151936) == 16384
-    assert fused_logprob.backward_vocab_chunk(65536, 151936) == 2048
-    assert fused_logprob.backward_vocab_chunk(1 << 20, 151936) == fused_logprob.BACKWARD_MIN_VOCAB_CHUNK
-    assert fused_logprob.backward_vocab_chunk(16, 30) == 30
-
-    torch.manual_seed(0)
-    tokens, hidden, vocab = 64, 16, 4096
-    x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
-    weight_t = (torch.randn(hidden, vocab) * 0.3).to(torch.bfloat16)
-    labels = torch.randint(0, vocab, (tokens,))
-    lse = torch.logsumexp(x.float() @ weight_t.float(), -1)
-    sizes: list[int] = []
-
-    class _Ctx:
-        saved_tensors = (x, labels.to(torch.int32), weight_t, lse)
-
-    real_float = torch.Tensor.float
-
-    def counting_float(t):
-        sizes.append(t.numel())
-        return real_float(t)
-
-    with (
-        mock.patch.object(fused_logprob, "backward_vocab_chunk", lambda num_tokens, v: 512),
-        mock.patch.object(torch.Tensor, "float", counting_float),
-    ):
-        grad_x, _, grad_w, _ = fused_logprob._FusedLogprob.backward(_Ctx, torch.ones(tokens))
-    assert grad_x.shape == x.shape and grad_w.shape == weight_t.shape and grad_w.dtype == weight_t.dtype
-    # No FP32 conversion of a (H, V)-sized tensor; the weight is converted one 512-column slice at a time.
-    assert max(sizes) <= max(tokens * hidden, hidden * 512)
 
 
 def test_fused_log_prob_is_required_for_moe():
@@ -1632,7 +1589,7 @@ def _fake_cp_modules(
         tpu_cp_inner_attention=lambda base, strat: calls.append(("inner", base, strat)) or (inner_attention or base),
         tpu_cp_load_balancer=lambda strat: "headtail" if strat == "all_gather" else None,
         validate_tpu_context_parallel=lambda model, parallelism: calls.append(
-            ("validate", parallelism.spmd_backend, parallelism.context_parallel_load_balancer)
+            ("validate", parallelism.context_parallel_load_balancer)
         ),
     )
     return {
@@ -1654,9 +1611,7 @@ def _cp_engine(strategy: str, **tpu_options: Any) -> SimpleNamespace:
 
 
 def _cp_parallelism() -> SimpleNamespace:
-    return SimpleNamespace(
-        context_parallel_degree=2, spmd_backend="partial_dtensor", context_parallel_load_balancer="headtail"
-    )
+    return SimpleNamespace(context_parallel_degree=2, context_parallel_load_balancer="headtail")
 
 
 _GDN_LAYER_MODULE = "torchtitan.models.qwen3_5.gdn"
@@ -1703,7 +1658,7 @@ def _fake_gdn_cp_module(*, with_options: bool) -> types.ModuleType:
     [("all_gather", "headtail"), ("ulysses", None)],
 )
 def test_enable_context_parallel_follows_torchtitan_cp_recipe(strategy, expected_lb):
-    """Sets SPMD backend + load balancer, applies ContextParallelTransform, validates, patches."""
+    """Sets the load balancer, applies ContextParallelTransform, validates, patches."""
 
     class _SDPA:
         pass
@@ -1718,12 +1673,11 @@ def test_enable_context_parallel_follows_torchtitan_cp_recipe(strategy, expected
         sys.modules.pop(_GDN_LAYER_MODULE, None)  # a model without GatedDeltaNet layers: traverse is never needed
         TorchTitanTPUEngine._enable_context_parallel(_cp_engine(strategy), parallelism, model)
 
-    assert parallelism.spmd_backend == "spmd_types"
     assert parallelism.context_parallel_load_balancer == expected_lb
     assert [c if c[0] != "transform" else ("transform", [t.inner_attention for t in c[1]]) for c in calls] == [
         ("inner", _SDPA, strategy),
         ("transform", [_CPSDPA]),
-        ("validate", "spmd_types", expected_lb),
+        ("validate", expected_lb),
         "patches",
     ]
 
@@ -1831,7 +1785,7 @@ def test_enable_context_parallel_rejects_gdn_row_slots(strategy):
     with mock.patch.dict(sys.modules, _fake_cp_modules([], layer_modules=modules)):
         with pytest.raises(ValueError, match="gdn_row_slot_len is not supported"):
             TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
-    assert parallelism.spmd_backend == "partial_dtensor"
+    assert parallelism.context_parallel_load_balancer == "headtail"  # rejected before the CP setup
 
 
 def test_cp_layer_module_available_does_not_hide_broken_imports(tmp_path, monkeypatch):
@@ -1894,16 +1848,14 @@ def test_enable_context_parallel_all_gather_requires_splash():
                 engine_config=SimpleNamespace(engine_kwargs={"tpu": {"context_parallel_strategy": strategy}}),
                 _use_splash_attention=False,
             )
-            parallelism = SimpleNamespace(
-                context_parallel_degree=2, spmd_backend="partial_dtensor", context_parallel_load_balancer=None
-            )
+            parallelism = SimpleNamespace(context_parallel_degree=2, context_parallel_load_balancer="unset")
             if raises:
                 with pytest.raises(ValueError, match="needs use_splash_attention=True"):
                     TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
-                assert parallelism.spmd_backend == "partial_dtensor"
+                assert parallelism.context_parallel_load_balancer == "unset"
             else:
                 TorchTitanTPUEngine._enable_context_parallel(engine, parallelism, model)
-                assert parallelism.spmd_backend == "spmd_types"
+                assert parallelism.context_parallel_load_balancer is None
 
 
 def test_headtail_restore_indices_cpu_matches_load_balancer():

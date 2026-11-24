@@ -1066,7 +1066,7 @@ def first_unpaddable_tensordict_entry(td: TensorDict, prefix: str = "") -> Optio
         return (prefix.rstrip(".") or "<root>", "0-D TensorDict")
     for key, value in td.items():
         path = f"{prefix}{key}"
-        if isinstance(value, (NonTensorData, NonTensorStack)):
+        if isinstance(value, NonTensorData | NonTensorStack):
             continue
         if isinstance(value, TensorDict):
             bad = first_unpaddable_tensordict_entry(value, prefix=f"{path}.")
@@ -1166,11 +1166,9 @@ def _wrap_routed_experts_on_edp_mesh(model: nn.Module, *, parallel_dims: Any, tr
         return
     from torch.distributed.fsdp import MixedPrecisionPolicy
     from torchtitan.config import TORCH_DTYPE_MAP
-    from torchtitan.distributed.utils import get_spmd_backend
     from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
     from torchtitan.models.common.moe import MoE
 
-    use_spmd_types = get_spmd_backend() == "spmd_types"
     if parallel_dims.dp_replicate_enabled:
         dp_mode = "hybrid_shard" if (parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled) else "replicate"
         edp_mesh_names = ["dp_replicate", "efsdp"]
@@ -1185,7 +1183,7 @@ def _wrap_routed_experts_on_edp_mesh(model: nn.Module, *, parallel_dims: Any, tr
         param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
         reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
     )
-    non_dp_mesh = parallel_dims.get_optional_mesh("ep") if use_spmd_types else None
+    non_dp_mesh = parallel_dims.get_optional_mesh("ep")  # TorchTitan always runs spmd_types
 
     for module_fqn, moe in model.named_modules():
         if not isinstance(moe, MoE):
