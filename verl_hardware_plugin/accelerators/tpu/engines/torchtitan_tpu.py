@@ -1102,8 +1102,13 @@ class TorchTitanTPUEngine(BaseEngine):
         model_module = importlib.import_module(get_torchtitan_model_module_name(torchtitan_name))
         # Optional TPU kernels (engine_kwargs.tpu.model_kernels, see engines/tpu_model_kernels.py). Only torchtitan
         # builds with the Qwen3.5 optimization PRs (google-pytorch/torchtitan#73-#80) provide any; on torchtitan
-        # main this is empty and every kernel hook below is a no-op.
-        self._tpu_kernels = tpu_model_kernels.resolve_tpu_model_kernels(torchtitan_name, tpu_options.model_kernels)
+        # main this is empty and every kernel hook below is a no-op. The flavor's model config (without converters, as
+        # in derive_torchtitan_name_and_flavor) tells whether it has MoE layers for ``moe``: dense flavors do not.
+        self._tpu_kernels = tpu_model_kernels.resolve_tpu_model_kernels(
+            torchtitan_name,
+            tpu_options.model_kernels,
+            model_config=model_module.model_registry(torchtitan_flavor).model,
+        )
         if self._tpu_kernels:
             logger.info("Optional torchtitan TPU kernels of %s: %s", torchtitan_name, sorted(self._tpu_kernels))
         # engine_kwargs.tpu.trainer_mode=graph_trainer: TorchTitan's TpuGraphTrainer traces and compiles the whole
