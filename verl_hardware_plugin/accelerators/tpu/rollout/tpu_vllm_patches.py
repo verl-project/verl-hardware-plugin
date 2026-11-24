@@ -20,7 +20,9 @@ patch to span several hosts. Each remaining patch fills a gap in vLLM (v0.29.0 -
   per-engine port base in vllm-torchtpu.
 """
 
+import functools
 import importlib
+import inspect
 import logging
 import multiprocessing.process
 import os
@@ -236,6 +238,205 @@ def _apply_tpu_precision_patches() -> None:
     patch_tpu_attention_fp32_stats()
 
 
+def _patch_unquantized_routed_experts() -> None:
+    """Apply vllm-torchtpu#2967 compat shim when ``VllmUnquantizedConfig`` lacks ``RoutedExperts`` support."""
+    try:
+        import vllm.model_executor.layers.fused_moe as fused_moe
+        import vllm_torchtpu.layers.adapter.quantization.configs as quant_configs
+        import vllm_torchtpu.layers.adapter.quantization.fp8 as fp8_mod
+        import vllm_torchtpu.layers.adapter.quantization.unquantized as unquantized_mod
+    except ImportError:
+        return
+
+    cfg_cls = getattr(unquantized_mod, "VllmUnquantizedConfig", None)
+    routed_experts_cls = getattr(fused_moe, "RoutedExperts", None)
+    should_quantize_on_load = getattr(quant_configs, "should_quantize_on_load", None)
+    fp8_cfg_cls = getattr(fp8_mod, "VllmFp8Config", None)
+    fp8_moe_cls = getattr(fp8_mod, "VllmFp8MoEMethodTPU", None)
+    if None in (cfg_cls, routed_experts_cls, should_quantize_on_load, fp8_cfg_cls, fp8_moe_cls):
+        return
+
+    orig_get_quant = cfg_cls.__dict__.get("get_quant_method") or getattr(cfg_cls, "get_quant_method", None)
+    if orig_get_quant is None or getattr(orig_get_quant, "_verl_pr2967_patched", False):
+        return
+
+    try:
+        if "RoutedExperts" in inspect.getsource(orig_get_quant):
+            return
+    except (OSError, TypeError):
+        pass
+
+    @functools.wraps(orig_get_quant)
+    def _get_quant_method_pr2967(self, layer, prefix):
+        if isinstance(layer, routed_experts_cls) and should_quantize_on_load(prefix):
+            moe_config = self.get_moe_config(layer)
+            if moe_config.has_bias:
+                raise NotImplementedError(
+                    f"QUANTIZE_ON_LOAD_PREFIXES matched {prefix}, but FP8 MoE "
+                    "on-load quantization does not support expert bias"
+                )
+            fp8_config = fp8_cfg_cls(is_checkpoint_fp8_serialized=False, activation_scheme="dynamic")
+            return fp8_moe_cls(fp8_config, moe_config)
+        return orig_get_quant(self, layer, prefix)
+
+    _get_quant_method_pr2967._verl_pr2967_patched = True  # type: ignore[attr-defined]
+    cfg_cls.get_quant_method = _get_quant_method_pr2967
+    logger.info("Installed vllm-torchtpu#2967 compatibility shim on VllmUnquantizedConfig.")
+
+
+def _create_dummy_online_fp8_moe_weights(
+    fp8_mod,
+    layer,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+) -> bool:
+    """Allocate dummy FP8 MoE buffers directly; returns False if block requantization falls back to BF16."""
+    _, requant_dtype, requant_block_size = fp8_mod._get_moe_quant_config(
+        "[MoE dummy online FP8]: allocating dummy FP8 MoE weights"
+    )
+    if requant_block_size is not None:
+        return False
+    if not hasattr(layer, "has_bias") and hasattr(layer, "moe_config"):
+        layer.has_bias = layer.moe_config.has_bias
+    aligned = (intermediate_size_per_partition + 127) // 128 * 128
+    w13 = torch.nn.Parameter(
+        torch.zeros(num_experts, hidden_size, 2 * aligned, dtype=requant_dtype), requires_grad=False
+    )
+    w2 = torch.nn.Parameter(torch.zeros(num_experts, aligned, hidden_size, dtype=requant_dtype), requires_grad=False)
+    w13_scale = torch.nn.Parameter(torch.ones(num_experts, 1, 1, 2 * aligned, dtype=torch.float32), requires_grad=False)
+    w2_scale = torch.nn.Parameter(torch.ones(num_experts, 1, 1, hidden_size, dtype=torch.float32), requires_grad=False)
+    w13.dummy_weight_value = 0  # type: ignore[attr-defined]
+    w2.dummy_weight_value = 0  # type: ignore[attr-defined]
+    w13_scale.dummy_weight_value = 1.0  # type: ignore[attr-defined]
+    w2_scale.dummy_weight_value = 1.0  # type: ignore[attr-defined]
+    layer.register_parameter("w13_weight", w13)
+    layer.register_parameter("w2_weight", w2)
+    layer.register_parameter("w13_weight_scale_inv", w13_scale)
+    layer.register_parameter("w2_weight_scale_inv", w2_scale)
+    if hasattr(layer, "weight_loader"):
+        for param in (w13, w2, w13_scale, w2_scale):
+            param.weight_loader = layer.weight_loader  # type: ignore[attr-defined]
+    layer._tpu_dummy_fp8_initialized = True
+    return True
+
+
+def _finalize_dummy_online_fp8_moe_weights(method, fp8_mod, layer, fused_moe_ep_mod) -> None:
+    """Finish MoE routing / kernel prebuild when dummy FP8 weights bypassed BF16->FP8 quantization."""
+    method._use_adaptive_fused_moe = fp8_mod.envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+    activation_str = method._set_tpu_activation(layer)
+    if layer.w13_weight.device.type == "tpu":
+        fp8_mod.synchronize_tensors(
+            [layer.w13_weight, layer.w2_weight, layer.w13_weight_scale_inv, layer.w2_weight_scale_inv]
+        )
+    if layer.moe_config.moe_parallel_config.use_ep:
+        fp8_mod.moe_routing.validate_linear_ep_placement(layer)
+    fp8_mod.moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+    if method._use_adaptive_fused_moe:
+        method._adaptive_fused_moe_op = fp8_mod.adaptive_moe.prebuild_adaptive_fused_moe(
+            layer,
+            topk=layer.moe_config.experts_per_token,
+            renormalize=layer.renormalize,
+            activation=activation_str,
+        )
+        return
+    prebuild_kwargs = {
+        "topk": layer.moe_config.experts_per_token,
+        "activation": activation_str,
+        "use_ep": layer.moe_config.moe_parallel_config.use_ep,
+    }
+    if "topk_weights_float32" in inspect.signature(fp8_mod.prebuild_fused_moe_kernel).parameters:
+        prebuild_kwargs["topk_weights_float32"] = getattr(method, "_tpu_topk_weights_float32", False)
+    fp8_mod.prebuild_fused_moe_kernel(**prebuild_kwargs)
+    if fused_moe_ep_mod is None:
+        raise ImportError("vllm_torchtpu.layers.adapter.fused_moe_ep is required for non-adaptive FP8 MoE")
+    ep_op = fused_moe_ep_mod.prebuild_fused_moe_ep(
+        layer,
+        topk=layer.moe_config.experts_per_token,
+        renormalize=layer.renormalize,
+        activation=activation_str,
+    )
+    setattr(method, fused_moe_ep_mod.FUSED_MOE_EP_OP_ATTR, ep_op)
+    if ep_op is not None:
+        fused_moe_ep_mod.register_score_bias_buffer(layer)
+
+
+def _patch_fp8_moe_dummy_load() -> None:
+    """Allocate dummy FP8 MoE buffers directly under ``load_format == 'dummy'`` if vllm-torchtpu lacks it."""
+    try:
+        import vllm_torchtpu.layers.adapter.quantization.fp8 as fp8_mod
+    except ImportError:
+        return
+
+    try:
+        from vllm.config import get_current_vllm_config
+    except ImportError:
+        get_current_vllm_config = None
+
+    try:
+        import vllm_torchtpu.layers.adapter.fused_moe_ep as fused_moe_ep_mod
+    except ImportError:
+        fused_moe_ep_mod = None
+
+    moe_cls = getattr(fp8_mod, "VllmFp8MoEMethodTPU", None)
+    if moe_cls is None or hasattr(moe_cls, "_create_dummy_online_fp8_weights"):
+        return
+    orig_create = moe_cls.__dict__.get("create_weights") or getattr(moe_cls, "create_weights", None)
+    orig_process = moe_cls.__dict__.get("process_weights_after_loading") or getattr(
+        moe_cls, "process_weights_after_loading", None
+    )
+    if orig_create is None or orig_process is None or getattr(orig_create, "_verl_dummy_fp8_patched", False):
+        return
+
+    @functools.wraps(orig_create)
+    def _create_weights_dummy_fp8(
+        self,
+        layer,
+        num_experts,
+        hidden_size,
+        intermediate_size_per_partition,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        vllm_config = getattr(self.quant_config, "vllm_config", None)
+        if vllm_config is None and get_current_vllm_config is not None:
+            try:
+                vllm_config = get_current_vllm_config()
+            except Exception:
+                vllm_config = None
+        load_format = getattr(getattr(vllm_config, "load_config", None), "load_format", None)
+        if (
+            not self.quant_config.is_checkpoint_fp8_serialized
+            and load_format == "dummy"
+            and _create_dummy_online_fp8_moe_weights(
+                fp8_mod, layer, num_experts, hidden_size, intermediate_size_per_partition
+            )
+        ):
+            return None
+        return orig_create(
+            self, layer, num_experts, hidden_size, intermediate_size_per_partition, params_dtype, **extra_weight_attrs
+        )
+
+    @functools.wraps(orig_process)
+    def _process_weights_dummy_fp8(self, layer):
+        if getattr(layer, "_tpu_dummy_fp8_initialized", False):
+            _finalize_dummy_online_fp8_moe_weights(self, fp8_mod, layer, fused_moe_ep_mod)
+            return None
+        return orig_process(self, layer)
+
+    _create_weights_dummy_fp8._verl_dummy_fp8_patched = True  # type: ignore[attr-defined]
+    _process_weights_dummy_fp8._verl_dummy_fp8_patched = True  # type: ignore[attr-defined]
+    moe_cls.create_weights = _create_weights_dummy_fp8
+    moe_cls.process_weights_after_loading = _process_weights_dummy_fp8
+    logger.info("Installed dummy online FP8 MoE allocation patch on VllmFp8MoEMethodTPU.")
+
+
+def patch_tpu_fp8_moe_rollout() -> None:
+    """Install FP8 MoE dummy-load and pre-vllm-torchtpu#2967 shims when needed."""
+    _patch_unquantized_routed_experts()
+    _patch_fp8_moe_dummy_load()
+
+
 def patch_vllm_for_tpu() -> None:
     """Install the patches in this process. Later calls return at once."""
     global _PATCHES_APPLIED
@@ -252,6 +453,7 @@ def patch_vllm_for_tpu() -> None:
         return
 
     _apply_tpu_precision_patches()
+    patch_tpu_fp8_moe_rollout()
     if os.environ.get(SUBHOST_MEGASCALE_PORT_ENV):
         patch_tpu_worker_subhost_env()
     _PATCHES_APPLIED = True
