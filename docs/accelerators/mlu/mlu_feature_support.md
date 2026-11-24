@@ -29,7 +29,7 @@ MLU 上已支持并测试完成 Qwen 系列模型，包括dense模型、MoE模�
 
 vLLM 已预安装在 cambricon_release docker image 中，用户无需额外操作可以直接使用。
 
-注意，当使用cambricon_release docker image进行RL训练时，请确认处在`pytorch_infer`的环境中。
+注意，当使用cambricon_release docker image进行RL训练时，请确认处在`pytorch_vllm`的环境中。
 
 #### vLLM主要参数特性支持
 
@@ -109,6 +109,29 @@ MLU 支持 Megatron 和 Megatron-Bridge，且已经预安装在 cambricon_releas
 
 更多参数配置参考 [verl megatron config](https://github.com/verl-project/verl/blob/main/verl/trainer/config/engine/megatron.yaml)
 
+### 3.2.1 Megatron Muon 优化器
+
+MLU 支持在训练后端为 Megatron 的场景下启用 Muon 优化器：对 2D 权重矩阵应用 Muon，其余参数（embedding、norm、bias、router、lm_head 等）仍使用 AdamW。
+依赖: python >= 3.12 | 安装 emerging-optimizers
+启用方式及推荐参数如下：
+
+| verl 参数 | 简介 |
+| --- | --- |
+| `actor_rollout_ref.actor.optim.optimizer=muon` | 选择 Muon 优化器（矩阵参数走 Muon，其余参数退回 AdamW） |
+| `actor_rollout_ref.actor.optim.use_layer_wise_distributed_optimizer=True` | 走 Megatron LayerWise 分布式优化器路径，Muon 逐层 buffer 分布式存储，将显存压到 AdamW 以下（30B 规模推荐） |
+| `actor_rollout_ref.actor.optim.muon_momentum=0.95` | Muon 内部 SGD 的动量系数 |
+| `actor_rollout_ref.actor.optim.muon_nesterov=False` | 是否在 Muon 内部 SGD 使用 Nesterov 动量 |
+| `actor_rollout_ref.actor.optim.muon_split_qkv=True` | 对 fused QKV 按 head 独立切分后再做 Muon 正交化 |
+| `actor_rollout_ref.actor.optim.muon_scale_mode=spectral` | Muon 更新的缩放模式 |
+| `actor_rollout_ref.actor.optim.muon_coefficient_type=quintic` | Newton-Schulz 迭代的系数类型 |
+| `actor_rollout_ref.actor.optim.muon_num_ns_steps=5` | Newton-Schulz 正交化的迭代步数 |
+| `actor_rollout_ref.actor.optim.muon_tp_mode=blockwise` | 张量并行下 Newton-Schulz 计算的分片模式 |
+| `actor_rollout_ref.actor.optim.muon_match_adamw_update_rms=True` | 由 betas[0] 派生 muon_extra_scale_factor，使 Muon 更新 RMS 匹配 AdamW |
+
+> 注意：启用 Muon 后学习率不可直接沿用 AdamW 的 `lr`。Megatron 默认 `muon_extra_scale_factor=1.0`，会使 Muon 的有效步长约为 AdamW 的 4.4 倍，易导致训练不稳定；建议始终开启 `muon_match_adamw_update_rms=True` 自动派生缩放，而非手填常数。
+
+更多参数配置参考 [verl megatron muon optimizer config](https://github.com/verl-project/verl/blob/main/examples/muon/README.md)
+
 ## 4. 融合算子
 | 算子 | 使用方式 | 说明 |
 | ------- | --- | --- |
@@ -121,6 +144,7 @@ MLU 支持 Megatron 和 Megatron-Bridge，且已经预安装在 cambricon_releas
 这里列出部分MLU支持的高级特性，供开发者参考
 | 特性 | 说明 |
 | -------- | --- |
+| Checkpoint Engine | Checkpoint Engine 用于异步训练时训练后端和推理后端间的权重同步，具体见[Checkpoint Engine](https://github.com/verl-project/verl/tree/main/verl/checkpoint_engine)。MLU 目前支持`cncl_checkpoint_engine`和`cnixl_checkpoint_engine`。通过在脚本中配置参数使能: <br>`actor_rollout_ref.rollout.checkpoint_engine.backend=cncl/cnixl` |
 | SFT 训练 | 使用verl框架进行sft训练，运行脚本参考[SFT example](https://github.com/verl-project/verl/tree/main/examples/sft/gsm8k) |
 | on policy distillation 训练 | OPD 在学生策略采样得到的状态上，将教师模型的知识蒸馏到学生模型。对比监督微调 (SFT) 或者标准知识蒸馏 (KD)，OPD 对齐训练阶段与推理阶段的状态，从而缓解暴露偏差。<br>运行及其详细说明见 [OPD example](https://github.com/verl-project/verl/tree/main/examples/on_policy_distillation_trainer)。|
 | Router Replay | Router Replay 是 verl 框架中面向混合专家（MoE）模型的高级路由回放功能。它通过记录并重放路由决策来实现确定性训练，保证训练计算多次之间模型行为保持一致。 |

@@ -212,7 +212,7 @@ class PlatformMLU(PlatformBase):
     def visible_devices_envvar(self) -> str:
         # Cambricon driver uses MLU_VISIBLE_DEVICES to control device visibility
         # (analogous to CUDA_VISIBLE_DEVICES)
-        return "MLU_VISIBLE_DEVICES"
+        return "CN_VISIBLE_DEVICES"
 
     # ------------------------------------------------------------------
     # Ray integration
@@ -220,16 +220,14 @@ class PlatformMLU(PlatformBase):
 
     def ray_resource_name(self) -> str:
         # For MLU devices, we use GPU as resource name
-        return "GPU"
+        return "MLU"
 
     def ray_resource_options(self, num_gpus: float) -> dict[str, Any]:
-        # For MLU devices, we use num_gpus because Ray clusters are typically
-        # configured with GPU resources even when using MLU hardware
-        return {"num_gpus": num_gpus}
+        return {"resources": {"MLU": num_gpus}}
 
     def ray_noset_envvars(self) -> list[str]:
         # Prevent Ray from auto-setting MLU_VISIBLE_DEVICES — verl manages this
-        return ["RAY_EXPERIMENTAL_NOSET_MLU_VISIBLE_DEVICES"]
+        return ["RAY_EXPERIMENTAL_NOSET_CN_VISIBLE_DEVICES"]
 
     # ------------------------------------------------------------------
     # IPC support
