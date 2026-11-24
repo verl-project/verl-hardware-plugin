@@ -253,7 +253,7 @@ def _patch_unquantized_routed_experts() -> None:
     should_quantize_on_load = getattr(quant_configs, "should_quantize_on_load", None)
     fp8_cfg_cls = getattr(fp8_mod, "VllmFp8Config", None)
     fp8_moe_cls = getattr(fp8_mod, "VllmFp8MoEMethodTPU", None)
-    if None in (cfg_cls, routed_experts_cls, should_quantize_on_load, fp8_cfg_cls, fp8_moe_cls):
+    if cfg_cls is None or None in (routed_experts_cls, should_quantize_on_load, fp8_cfg_cls, fp8_moe_cls):
         return
 
     orig_get_quant = cfg_cls.__dict__.get("get_quant_method") or getattr(cfg_cls, "get_quant_method", None)
