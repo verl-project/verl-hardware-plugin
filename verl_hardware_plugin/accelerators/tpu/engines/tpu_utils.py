@@ -1216,12 +1216,12 @@ def _wrap_routed_experts_on_edp_mesh(model: nn.Module, *, parallel_dims: Any, tr
 
 
 def _relax_non_static_ep_moe_compile(model: nn.Module, *, parallel_dims: Any, compile_config: Any) -> None:
-    """Use ``fullgraph=False`` on compiled MoE blocks whose EP dispatcher performs host split syncs.
+    """Use ``fullgraph=False`` on compiled MoE blocks under expert parallelism.
 
-    Without ``TpuQwen35TokenDispatcher`` (google-pytorch/torchtitan#6), ``AllToAllTokenDispatcher`` /
-    ``TpuAllToAllTokenDispatcher`` call ``.to("cpu")`` and ``.tolist()`` in ``_sync_token_count_exchange`` under
-    ``ep_enabled``, which raises a Dynamo graph-break error when ``apply_compile`` compiles the block with
-    ``fullgraph=True``.
+    torchtitan's EP token dispatchers do not trace with ``fullgraph=True`` under the engine's per-block
+    ``torch.compile``: upstream's ``AllToAllTokenDispatcher`` syncs token counts to the host (``.tolist()``), and
+    ``TpuAllToAllTokenDispatcher`` checks ``get_proxy_mode()`` (Dynamo: ``Unsupported _TorchDispatchModeKey``). Graph
+    mode traces them with TpuGraphTrainer instead.
     """
     if not getattr(parallel_dims, "ep_enabled", False) or not getattr(compile_config, "enable", False):
         return
@@ -1229,18 +1229,11 @@ def _relax_non_static_ep_moe_compile(model: nn.Module, *, parallel_dims: Any, co
     if layers is None:
         return
     backend = getattr(compile_config, "backend", "tpu")
-    _static_dispatchers = ("TpuQwen35TokenDispatcher", "TpuRaggedEPTokenDispatcher")
     for _, block in layers.named_children():
         if getattr(block, "_compiled_call_impl", None) is None:
             continue
-        needs_graph_break = any(
-            getattr(m, "token_dispatcher", None) is not None
-            and not any(c.__name__ in _static_dispatchers for c in type(m.token_dispatcher).__mro__)
-            for m in block.modules()
-        )
-        if needs_graph_break:
+        if any(getattr(m, "token_dispatcher", None) is not None for m in block.modules()):
             block.compile(backend=backend, fullgraph=False)
-            block._tpu_compile_relaxed = True  # type: ignore[attr-defined]
 
 
 def get_tpu_simple_fsdp_parallelize_fn(torchtitan_name: str) -> Callable[..., nn.Module]:
@@ -1648,7 +1641,7 @@ def pad_packed_inputs_for_tpu(
     """Bucket-pad packed (nested) 1D sequences on CPU before the H2D copy.
 
     Pad tokens get position 0, so the attention treats each one as its own document (it only attends to itself).
-    Under expert parallelism (``TpuQwen35TokenDispatcher``), repeating token 0 sends every pad slot to the same 8
+    Under expert parallelism, repeating token 0 sends every pad slot to the same 8
     experts, and cycling the micro-batch's own tokens concentrates pad traffic onto the same domain/math experts as
     real tokens; striding across ``vocab_size`` disperses pad slots across the full vocabulary and expert set.
     Returns ``(input_ids, position_ids, labels, orig_seq_len)``.

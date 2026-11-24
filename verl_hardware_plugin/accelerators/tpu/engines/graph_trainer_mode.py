@@ -82,9 +82,6 @@ def validate_graph_trainer_engine(
     # - forward_only (TODO-3): once TorchTitan's graph trainer can trace a forward-only log-prob step.
     # - static_micro_batch_len (TODO-2): once the traced step is cached per sequence shape (TorchTitan / plugin).
     # - pipeline / context / tensor parallel sizes: once the graph-trainer path supports and is validated with them.
-    # - expert_parallel_size: take graph-mode EP from TorchTitan's TpuGraphTrainer (EP stack from
-    #   google-pytorch/torchtitan#181; Qwen3.5 first, Qwen3 through the same helper) instead of porting the plugin's
-    #   eager tpu_ragged_ep. FSDP-only is the Phase 1 scope (EP mainly saves memory on the larger MoE models).
     # - gdn_row_slot_len: once the traced step restores the packed token order (gdn_contig_src) before the LM head
     #   and traces with the shim row length set to the slot length (see _packed_stream_as_one_row).
     # use_simple_fsdp and param_offload stay: the graph trainer shards with SimpleFSDP and holds the live parameters.
@@ -102,7 +99,7 @@ def validate_graph_trainer_engine(
             "it needs engine_kwargs.tpu.use_fused_linear_cross_entropy=True (the non-fused log-prob path "
             "materializes [tokens, vocab] logits and exhausts TPU HBM)"
         )
-    for name in ("pipeline_parallel_size", "context_parallel_size", "tensor_parallel_size", "expert_parallel_size"):
+    for name in ("pipeline_parallel_size", "context_parallel_size", "tensor_parallel_size"):
         size = int(getattr(engine_config, name, 1) or 1)
         if size > 1:
             errors.append(f"{name}={size} is not supported yet (FSDP only)")
@@ -271,7 +268,7 @@ def _plugin_preprocess_inputs(input_dict: dict[str, Any], **_: Any) -> tuple[Any
     return inputs, labels, batch
 
 
-def prepare_model_for_graph_trainer(model_parts: list[torch.nn.Module]) -> None:
+def prepare_model_for_graph_trainer(model_parts: list[torch.nn.Module], *, ep_enabled: bool = False) -> None:
     """Module FQN annotations for the graph passes, and the plugin's ``preprocess_inputs``; after the attention swap.
 
     TorchTitan's graph-trainer ``parallelize_qwen3`` annotates every module's forward with its FQN so that the memory
@@ -281,8 +278,19 @@ def prepare_model_for_graph_trainer(model_parts: list[torch.nn.Module]) -> None:
     """
     from torchtitan.experiments.graph_trainer.common_utils import annotate_module_fqns
 
+    try:  # TorchTitan's graph-trainer Qwen3.5 parallelize: FQNs of the EP-chunked expert all-gathers.
+        from torchtitan.experiments.tpu.graph_trainer.qwen3_5 import annotate_expert_unshard_fqns
+    except ImportError:
+        annotate_expert_unshard_fqns = None
+    if ep_enabled:
+        # As TorchTitan's graph-trainer parallelize_qwen3_5: mark the EP dispatch / combine regions for the passes.
+        from torchtitan.experiments.graph_trainer.common_utils import annotate_moe_ep_regions
+
+        annotate_moe_ep_regions()
     for model in model_parts:
         annotate_module_fqns(model)
+        if ep_enabled and annotate_expert_unshard_fqns is not None:
+            annotate_expert_unshard_fqns(model)
         model.preprocess_inputs = _plugin_preprocess_inputs  # type: ignore[method-assign]
 
 

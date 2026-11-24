@@ -13,7 +13,7 @@ per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 `splash_max_block_size`, `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`,
 `cp_full_positions`, `gdn_auto_row_slot_len`, `fuse_gdn_projections`, `sort_micro_batches_by_slot`,
 `gdn_row_slot_len`, `trainer_mode`, `graph_trainer`, `model_kernels`,
-`ep_capacity_factor`, `qwen3_pallas_experts`, `moe_paired_gemm`,
+`ep_capacity_factor`, `ep_transport`, `qwen3_pallas_experts`, `moe_paired_gemm`,
 `context_parallel_strategy`, `context_parallel_gdn_strategy` and `context_parallel_gdn_reduce_dtype` (see
 `TPUEngineOptions` in `options.py`); an unknown key is an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
 deprecated and log a warning.
@@ -89,7 +89,7 @@ Performance options for long packed micro-batches (the Qwen3-30B-A3B recipe sets
 | `rollout_expert_parallel: true` | Export stacked MoE experts (Qwen3.5 / Qwen3 MoE) in vllm-torchtpu's expert-parallel layout so the rollout receives them zero-copy into `w13_weight` / `w2_weight` without an HBM staging copy. When the rollout runs quantized MoE (`QUANTIZE_ON_LOAD_PREFIXES=experts` with `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=QUANTIZE_ON_LOAD_PREFIXES`), the trainer auto-discovers the rollout's `(quant_dtype, block_size)` format via `describe_vllm_params` and sends quantized experts + FP32 scales |
 | `rollout_fp8_moe: true / false` | Explicit override for trainer-side MoE quantization on the zero-copy expert-parallel path (`true` forces trainer-side quantization and implies `rollout_expert_parallel=true`; `false` keeps bf16 export) |
 | `gdn_row_slot_len: <max_model_len>` | Qwen3.5 (`context_parallel_size=1`, use `gdn_auto_row_slot_len` with `context_parallel_strategy='ulysses'` under CP): every sequence of a packed micro-batch starts at a multiple of this length, so the GatedDeltaNet runs one sequence per row (torchtitan's `set_unflatten_seq_len`) instead of resetting at packed documents through Tokamax `segment_ids`. Needs `use_dynamic_bsz=False`, a fixed `ppo_micro_batch_size_per_gpu`, `static_micro_batch_len` = that size x `gdn_row_slot_len`, and the fused log-prob |
-| `trainer_mode: graph_trainer` | Actor only (bypass mode, KL loss off, `use_simple_fsdp=True`, `static_micro_batch_len` set): traces the micro-batch forward, fused LM-head log-prob, dual-clip PPO loss and backward once with TorchTitan's `TpuGraphTrainer` (`aot_fx_trace`) and compiles it as one PJRT executable instead of per-block `torch.compile` |
+| `trainer_mode: graph_trainer` | Actor only (bypass mode, KL loss off, `use_simple_fsdp=True`, `static_micro_batch_len` set): traces the micro-batch forward, fused LM-head log-prob, dual-clip PPO loss and backward once with TorchTitan's `TpuGraphTrainer` (`aot_fx_trace`) and compiles it as one PJRT executable instead of per-block `torch.compile`. `expert_parallel_size > 1` traces TorchTitan's `TpuAllToAllTokenDispatcher` and, with `graph_split`, needs `backward_partition_mode: by_layer` with one layer per executable |
 | `graph_trainer: <dict>` | Optional compiler configuration passed straight to TorchTitan's `TpuGraphTrainerCompileConfig(**cfg)` (e.g. `memory_policy`, `save_regions`, `fsdp_barrier_policy`, `graph_split`); ignored when `trainer_mode` is not `graph_trainer` |
 
 ## Verify

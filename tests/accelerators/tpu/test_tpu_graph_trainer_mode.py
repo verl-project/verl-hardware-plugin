@@ -131,7 +131,6 @@ def test_validate_graph_trainer_engine():
         "use_simple_fsdp",
         "static_micro_batch_len",
         "use_fused_linear_cross_entropy",
-        "expert_parallel_size=2",
         "kda_document_budget=1",
         "gdn_row_slot_len=4096",
     ):
@@ -390,6 +389,38 @@ def test_prepare_model_for_graph_trainer_annotates_and_installs_preprocess_input
     with mock.patch.dict("sys.modules", modules):
         graph_trainer_mode.prepare_model_for_graph_trainer([model])
     assert annotated == [model]
+    assert model.preprocess_inputs is graph_trainer_mode._plugin_preprocess_inputs
+
+
+def test_validate_graph_trainer_engine_allows_ep():
+    engine = SimpleNamespace(forward_only=False, param_offload=False, expert_parallel_size=4)
+    options = _options(trainer_mode="graph_trainer", static_micro_batch_len=8192)
+    graph_trainer_mode.validate_graph_trainer_engine(engine, options, use_simple_fsdp=True, tpu_kernels=frozenset())
+
+
+def test_prepare_model_for_graph_trainer_annotates_ep_regions():
+    calls = []
+    common_utils = SimpleNamespace(
+        annotate_module_fqns=lambda m: calls.append(("fqns", m)),
+        annotate_moe_ep_regions=lambda: calls.append(("ep_regions", None)),
+    )
+    qwen3_5 = SimpleNamespace(annotate_expert_unshard_fqns=lambda m: calls.append(("expert_unshard", m)))
+    modules = {
+        name: SimpleNamespace()
+        for name in (
+            "torchtitan",
+            "torchtitan.experiments",
+            "torchtitan.experiments.graph_trainer",
+            "torchtitan.experiments.tpu",
+            "torchtitan.experiments.tpu.graph_trainer",
+        )
+    }
+    modules["torchtitan.experiments.graph_trainer.common_utils"] = common_utils
+    modules["torchtitan.experiments.tpu.graph_trainer.qwen3_5"] = qwen3_5
+    model = torch.nn.Module()
+    with mock.patch.dict("sys.modules", modules):
+        graph_trainer_mode.prepare_model_for_graph_trainer([model], ep_enabled=True)
+    assert calls == [("ep_regions", None), ("fqns", model), ("expert_unshard", model)]
     assert model.preprocess_inputs is graph_trainer_mode._plugin_preprocess_inputs
 
 

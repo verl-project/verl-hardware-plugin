@@ -177,9 +177,9 @@ class TPUEngineOptions:
             ``pad_to_length`` is set, else 256).
         model_kernels: Optional torchtitan TPU kernels of the model (``engines.tpu_model_kernels``): ``auto``
             (default: what the installed torchtitan provides), ``none``, ``all``, or a comma-separated subset.
-        ep_capacity_factor: Per-destination-rank token capacity multiplier of the TPU EP token dispatcher when
-            ``expert_parallel_size > 1`` (default: ``4.0``). torchtitan's pretraining default (``1.25``) drops
-            skewed RL / math tokens across 32-64 EP ranks while vLLM rollout is dropless.
+        ep_capacity_factor: With ``expert_parallel_size > 1``, cap each EP rank's expert rows at this multiple of its
+            balanced routed rows (torchtitan's ``TpuAllToAllTokenDispatcher``; routes past the cap are dropped).
+            Default: unset, dropless buffers, which matches the dropless vLLM rollout.
         qwen3_pallas_experts: Legacy Qwen3-30B-A3B flag; Pallas is required, so ``False`` is rejected.
         moe_paired_gemm: Legacy Qwen3-30B-A3B alias used only when ``moe_paired_grouped_mm`` is unset.
         mixed_precision_param: TorchTitan mixed-precision parameter dtype, ``bfloat16`` or ``float32``;
@@ -212,21 +212,19 @@ class TPUEngineOptions:
             and casts the result into the bf16 parameters (default: ``False``). Without it, bf16 weights absorb no
             update smaller than half a bf16 ulp (lr 1e-6 updates mostly round to zero). With
             ``optimizer_host_offload`` the masters stay resident in host memory with the optimizer states.
-        ep_dispatcher: MoE expert-parallel token dispatcher mode when ``expert_parallel_size > 1``: ``auto``
-            (default: ``static``; ``ragged`` is not supported on TorchTitan's ``spmd_types`` path, its only SPMD
-            path), ``ragged`` (:class:`TpuRaggedEPTokenDispatcher` sending ``1.0x`` real
-            routed tokens + unpadded MegaBlox ``gmm``/``tgmm`` group counts), or ``static`` (uniform ``[ep * cap, D]``
-            ``TpuQwen35TokenDispatcher``).
-        enable_tpu_topo_mesh: Preserve physical 3D ICI torus ``(x, y, z)`` rank order on ``ParallelismConfig``
-            (``torch.tpu.topology_aware_mesh`` + ``DeviceMesh(preserve_rank_order=True)``). ``None`` (default) enables
-            it automatically whenever supported by the installed ``torchtitan`` and ``torch`` (``torch >= 2.15``).
-        ep_token_chunks: With ``expert_parallel_size > 1`` and a torchtitan that has ``TpuQwen35RoutedExperts``
-            (Qwen3.5 fast dropless EP), pipeline each MoE layer's dispatch -> experts -> combine over this many token
-            chunks, overlapping one chunk's expert matmuls with the next chunk's EP collectives (default: unset, no
-            chunking). Needs ``ep_dispatcher=static`` so torchtitan's ``TpuQwen35TokenDispatcher`` runs.
-        ep_paired_grouped_mm: With ``expert_parallel_size > 1`` and a torchtitan whose ``TpuGroupedExperts`` has
-            ``allow_ep_paired_grouped_mm``, keep the paired (w1 + w3) Pallas grouped matmul under EP (default:
-            ``False``: unpaired under EP, as torchtitan builds without it require).
+        ep_transport: EP token transport of torchtitan's ``TpuAllToAllTokenDispatcher`` when
+            ``expert_parallel_size > 1``: ``auto`` (default: ``ring_of_experts`` when ``expert_parallel_size <=
+            num_experts_per_tok``, else ``ragged_all_to_all``), ``ring_of_experts`` (all-gather tokens, Pallas
+            gather / reduce, reduce-scatter) or ``ragged_all_to_all`` (send each routed token to its expert's rank,
+            static-shape buffers).
+        enable_tpu_topo_mesh: Preserve the physical 3D ICI torus ``(x, y, z)`` rank order in torchtitan's device
+            mesh (``ParallelismConfig.enable_tpu_topo_mesh``; default: ``False``). Needs a torch whose ``DeviceMesh``
+            takes ``preserve_rank_order`` (torch >= 2.15).
+        ep_token_chunks: With ``expert_parallel_size > 1``, pipeline each MoE layer's dispatch -> experts -> combine
+            over this many token chunks (torchtitan's ``TpuRoutedExperts``), overlapping one chunk's expert matmuls
+            with the next chunk's EP collectives (default: unset, no chunking).
+        ep_paired_grouped_mm: With ``expert_parallel_size > 1``, keep the paired (w1 + w3) Pallas grouped matmul
+            (default: ``False``, unpaired under EP).
         ac_save_splash_and_routing: When ``True`` and activation checkpointing is enabled, use a TPU ``SelectiveAC``
             policy that saves only Pallas ``SplashAttention`` forward outputs (``(out, lse)``) and MoE router
             ``aten.topk`` assignments while recomputing all projections, norms, GatedDeltaNet recurrences and MoE
@@ -321,8 +319,8 @@ class TPUEngineOptions:
     param_dtype: Optional[str] = None
     optimizer_host_offload: Optional[bool] = None
     fp32_master: Optional[bool] = None
-    ep_dispatcher: Optional[str] = None
-    enable_tpu_topo_mesh: Optional[bool] = None
+    ep_transport: Optional[str] = None
+    enable_tpu_topo_mesh: bool = False
     ep_token_chunks: Optional[int] = None
     ep_paired_grouped_mm: Optional[bool] = None
     ac_save_splash_and_routing: Optional[bool] = None
@@ -377,7 +375,7 @@ _ENGINE_KINDS: dict[str, Any] = {
     "param_dtype": str,
     "optimizer_host_offload": bool,
     "fp32_master": bool,
-    "ep_dispatcher": str,
+    "ep_transport": str,
     "enable_tpu_topo_mesh": bool,
     "ep_token_chunks": int,
     "ep_paired_grouped_mm": bool,
@@ -408,6 +406,7 @@ _ENGINE_CHOICES: dict[str, tuple[str, ...]] = {
     "context_parallel_strategy": ("all_gather", "ulysses"),
     "context_parallel_gdn_strategy": ("all_to_all", "allgather_reducescatter"),
     "context_parallel_gdn_reduce_dtype": ("float32", "bfloat16"),
+    "ep_transport": ("auto", "ring_of_experts", "ragged_all_to_all"),
 }
 
 # engine_kwargs.tpu.trainer_mode values.
@@ -482,14 +481,6 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
             )
         if values.get("rollout_expert_parallel") is None:
             values["rollout_expert_parallel"] = True
-    if values.get("ep_dispatcher") is not None:
-        ep_disp = values["ep_dispatcher"].strip().lower()
-        if ep_disp not in ("auto", "ragged", "static"):
-            raise ValueError(
-                f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ep_dispatcher must be auto, ragged, or static, "
-                f"got {values['ep_dispatcher']!r}"
-            )
-        values["ep_dispatcher"] = ep_disp
     for name, choices in _ENGINE_CHOICES.items():
         if values.get(name) is not None:
             choice = values[name].strip().lower()

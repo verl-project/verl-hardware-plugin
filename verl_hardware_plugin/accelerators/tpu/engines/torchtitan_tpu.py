@@ -79,7 +79,6 @@ from verl_hardware_plugin.accelerators.tpu.engines import (
     gdn_slot_schedule,
     graph_trainer_mode,
     tpu_model_kernels,
-    tpu_ragged_ep,
 )
 from verl_hardware_plugin.accelerators.tpu.engines.cp_layer_transforms import (
     context_parallel_layer_transforms,
@@ -1172,6 +1171,8 @@ class TorchTitanTPUEngine(BaseEngine):
             model_spec,
             self._tpu_kernels,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
+            ep_transport=tpu_options.ep_transport,
+            ep_capacity_factor=tpu_options.ep_capacity_factor,
             ep_token_chunks=tpu_options.ep_token_chunks,
             ep_paired_grouped_mm=bool(tpu_options.ep_paired_grouped_mm),
         )
@@ -1232,10 +1233,8 @@ class TorchTitanTPUEngine(BaseEngine):
             "context_parallel_degree": self.engine_config.context_parallel_size,
             "expert_parallel_degree": self.engine_config.expert_parallel_size,
             "use_simple_fsdp": self._use_simple_fsdp,
+            "enable_tpu_topo_mesh": tpu_options.enable_tpu_topo_mesh,
         }
-        topo_mesh = tpu_ragged_ep.should_enable_tpu_topo_mesh(tpu_options.enable_tpu_topo_mesh, ParallelismConfig)
-        if topo_mesh is not None:
-            parallelism_kwargs["enable_tpu_topo_mesh"] = topo_mesh
         parallelism = ParallelismConfig(**parallelism_kwargs)
         if parallelism.context_parallel_degree > 1:
             self._enable_context_parallel(parallelism, model_spec.model)
@@ -1422,34 +1421,12 @@ class TorchTitanTPUEngine(BaseEngine):
         if self._use_splash_attention:
             set_splash_max_block_size(resolve_tpu_splash_max_block_size(engine_config))
         install_tpu_attention(model_parts, use_splash=self._use_splash_attention)
-        if self.parallel_dims.ep_enabled:
-            ep_cap = (
-                tpu_options.ep_capacity_factor
-                if tpu_options.ep_capacity_factor is not None
-                else tpu_model_kernels.DEFAULT_EP_CAPACITY_FACTOR
-            )
-            ep_mode, n_ep = tpu_ragged_ep.install_tpu_ep_token_dispatcher(
-                model_parts,
-                ep_dispatcher=tpu_options.ep_dispatcher,
-                capacity_factor=ep_cap,
-                spmd_backend="spmd_types",  # TorchTitan's only SPMD path
-                compile_config=compile_config,
-            )
-            if n_ep:
-                logger.warning(
-                    "Configured %s TPU EP token dispatcher (capacity_factor=%.2f) on %d modules",
-                    ep_mode,
-                    ep_cap,
-                    n_ep,
-                )
-            if engine_config.use_torch_compile and ep_mode == "static":
-                n_barriers = tpu_model_kernels.install_ep_chunk_barriers(model_parts)
-                if n_barriers:
-                    logger.info("Installed EP chunk window barriers on %d routed-experts modules", n_barriers)
 
         if self._graph_trainer_mode:
             # After every module swap above: annotate the final module tree for the graph passes.
-            graph_trainer_mode.prepare_model_for_graph_trainer(model_parts)
+            graph_trainer_mode.prepare_model_for_graph_trainer(
+                model_parts, ep_enabled=bool(self.parallel_dims.ep_enabled)
+            )
 
         if engine_config.use_torch_compile:
             n_compiled = sum(
