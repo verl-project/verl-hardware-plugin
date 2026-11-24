@@ -6,6 +6,8 @@
 import logging
 import os
 
+from verl_hardware_plugin.accelerators.tpu.options import inproc_rollout_enabled
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -35,6 +37,13 @@ def register_rollout() -> None:
         def _load_vllm() -> type:
             from verl.utils.device import get_resource_name
 
+            if inproc_rollout_enabled():
+                # in-process colocation: the replica's server is the trainer worker itself (rollout/inproc)
+                from verl_hardware_plugin.accelerators.tpu.rollout import inproc
+                from verl_hardware_plugin.accelerators.tpu.rollout.inproc import engine as inproc_engine
+
+                inproc.check_switches()
+                return inproc_engine.TPUInProcReplica
             if get_resource_name() == "TPU":
                 from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm import TPUvLLMReplica
 
@@ -70,3 +79,16 @@ try:
     register_rollout()
 except Exception as exc:
     logger.debug("TPU rollout registration failed: %s", exc)
+
+# In-process colocation (rollout/inproc), in every process that imports verl: the ("vllm", "async") rollout class and
+# the trainer worker's direct rollout methods. The plugin's backend loader swallows a raise here, so the failure is
+# logged as a warning and the later fail-closed points refuse instead: the replica loader above re-checks the switches
+# when verl creates the replicas, and the rollout re-checks them in init_model.
+if inproc_rollout_enabled():
+    try:
+        from verl_hardware_plugin.accelerators.tpu.rollout import inproc
+
+        inproc.register()
+    except Exception as exc:
+        logger.warning("inproc REGISTRATION FAILED in pid %s: %s: %s", os.getpid(), type(exc).__name__, exc)
+        raise
