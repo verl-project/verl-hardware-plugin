@@ -15,9 +15,9 @@ patch to span several hosts. Each remaining patch fills a gap in vLLM (v0.29.0 -
 * ``multiprocessing.process.BaseProcess.__init__``: install these patches in the EngineCore process and
   in vLLM's worker processes, which do not import the plugin.
 * ``vllm_torchtpu.worker.tpu_worker._configure_tpu_process_env``, only in an engine that shares its TPU 7x host
-  with other engines (``tpu_vllm.subhost_engine_env``): per-worker MegaScale ports and libtpu log dir, and the
-  GKE webhook's container-level TPU variables and ``TORCH_TPU_DEVICES_PER_HOST`` dropped. Upstream fix: a
-  per-engine port base in vllm-torchtpu.
+  with other engines (``tpu_vllm.subhost_engine_env``): per-worker MegaScale ports, libtpu log dir, and
+  NUMA-local physical-core CPU pinning, with the GKE webhook's container-level TPU variables and
+  ``TORCH_TPU_DEVICES_PER_HOST`` dropped. Upstream fix: a per-engine port base in vllm-torchtpu.
 """
 
 import importlib
@@ -27,6 +27,8 @@ import os
 import sys
 
 import torch
+
+from verl_hardware_plugin.accelerators.tpu.rollout.tpu_subhost_affinity import apply_subhost_worker_cpu_pinning
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +314,7 @@ def patch_tpu_worker_subhost_env() -> None:
         env = subhost_worker_env(int(rank), int(local_rank), megascale_port)
         os.makedirs(env["TPU_LOG_DIR"], exist_ok=True)
         os.environ.update(env)
+        apply_subhost_worker_cpu_pinning(int(rank), int(local_rank))
 
     _configure_tpu_process_env._verl_subhost_env = True  # type: ignore[attr-defined]
     tpu_worker._configure_tpu_process_env = _configure_tpu_process_env

@@ -86,6 +86,12 @@ multi-host replicas launch as before.
   and ports. The first engine of a host claims it for its job (a shared `flock` on
   `/tmp/verl_tpu_subhost_rollout.lock`, held while the engine runs), and an engine of another job fails at startup.
   Give each job its own rollout hosts.
+- **NUMA and physical-core CPU pinning:** by default, each engine sharing a host discovers the host's allowed CPUs,
+  NUMA nodes, physical cores (excluding SMT siblings), and TPU PCIe NUMA affinity from Linux `sysfs`, and pins its
+  server / `EngineCore` process and each TP worker to disjoint physical-core slices on the NUMA node local to its
+  TPU devices (with deterministic fallbacks when PCIe NUMA or SMT topology is unavailable, and graceful skip when
+  `sched_setaffinity` is disallowed). Single-engine hosts (`TP=8` or multi-host) are untouched. Set
+  `VERL_TPU_SUBHOST_CPU_PINNING=0` (or `false` / `no` / `off`) to disable pinning.
 
 ## Verify
 

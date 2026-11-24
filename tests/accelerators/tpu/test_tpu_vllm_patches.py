@@ -7,7 +7,7 @@ import os
 import types
 from unittest import mock
 
-from verl_hardware_plugin.accelerators.tpu.rollout import tpu_vllm_patches
+from verl_hardware_plugin.accelerators.tpu.rollout import tpu_subhost_affinity, tpu_vllm_patches
 
 
 def test_patch_vllm_for_tpu_applies_precision_patches_and_leaves_tpu_worker_untouched():
@@ -110,3 +110,41 @@ def test_subhost_worker_hook_drops_torch_tpu_devices_per_host():
         _patch_in_fake_worker_process(modules)
         worker_mod._configure_tpu_process_env(1, 5, 4, 8)  # worker 1 of the second TP=4 engine of the host
         assert "TORCH_TPU_DEVICES_PER_HOST" not in os.environ
+
+
+def test_subhost_worker_hook_applies_worker_cpu_pinning_and_respects_opt_out():
+    worker_mod, modules = _fake_tpu_worker_module(lambda rank, local_rank, world_size, local_world_size: None)
+    base_env = {
+        tpu_vllm_patches.SUBHOST_MEGASCALE_PORT_ENV: "21080",
+        tpu_subhost_affinity.SUBHOST_WORKER_CPUS_ENV: "64-75;76-87;88-99;100-111",
+    }
+    pinned: list[tuple[int, set[int]]] = []
+    with (
+        mock.patch.dict(os.environ, base_env),
+        mock.patch.object(os, "makedirs"),
+        mock.patch.object(os, "listdir", side_effect=FileNotFoundError),
+        mock.patch.object(os, "sched_setaffinity", side_effect=lambda pid, mask: pinned.append((pid, set(mask)))),
+    ):
+        os.environ.pop(tpu_subhost_affinity.SUBHOST_CPU_PINNING_ENV, None)
+        _patch_in_fake_worker_process(modules)
+        worker_mod._configure_tpu_process_env(1, 5, 4, 8)
+    assert pinned == [(0, set(range(76, 88)))]
+
+    # Opt-out via VERL_TPU_SUBHOST_CPU_PINNING=0 skips affinity calls cleanly.
+    pinned.clear()
+    with (
+        mock.patch.dict(os.environ, {**base_env, tpu_subhost_affinity.SUBHOST_CPU_PINNING_ENV: "0"}),
+        mock.patch.object(os, "makedirs"),
+        mock.patch.object(os, "sched_setaffinity", side_effect=lambda pid, mask: pinned.append((pid, set(mask)))),
+    ):
+        worker_mod._configure_tpu_process_env(1, 5, 4, 8)
+    assert pinned == []
+
+    # PermissionError from sched_setaffinity in a restricted container does not fail worker startup.
+    with (
+        mock.patch.dict(os.environ, base_env),
+        mock.patch.object(os, "makedirs"),
+        mock.patch.object(os, "sched_setaffinity", side_effect=PermissionError("EPERM")),
+    ):
+        os.environ.pop(tpu_subhost_affinity.SUBHOST_CPU_PINNING_ENV, None)
+        worker_mod._configure_tpu_process_env(1, 5, 4, 8)
