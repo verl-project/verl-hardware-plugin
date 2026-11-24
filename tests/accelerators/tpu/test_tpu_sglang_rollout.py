@@ -9,6 +9,7 @@ SGLang, ``sglang-torchtpu`` and ``torch_tpu`` are not installed on CI, so ``asyn
 
 import asyncio
 import importlib
+import logging
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest import mock
@@ -705,3 +706,84 @@ def test_sglang_tpu_sync_worker_installs_weights_and_passes_parity_without_vllm(
         _assert_state(model, _expected_vllm_state(weights_step1, rank, tp))
     assert server.global_steps == 1
     assert "vllm" not in sys.modules
+
+
+def test_sglang_tpu_sync_worker_checks_the_tied_lm_head(monkeypatch, caplog):
+    """With tie_word_embeddings, the SGLang worker copies lm_head from the embedding and the driver checks it every sync
+    (the worker shares TPUSyncWorkerMixin.install_tpu_sync_weights with the vLLM one)."""
+    from tests.accelerators.tpu.test_tpu_sync_checkpoint_engine import (
+        KV_HEADS,
+        _expected_vllm_state,
+        _fake_ray_get,
+        _FakeTpuSync,
+        _FakeVllmModel,
+        _make_manager,
+        _NoCopyParameter,
+        _tied_trainer_weights,
+        _trainer_engine,
+    )
+
+    world = _FakeTpuSync()
+    for name, module in world.modules().items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(device_api, "_accelerator_is_tpu_cache", None)
+    monkeypatch.setattr(device_api, "_tpu_runtime_up_pid", None)
+    monkeypatch.setattr(torch, "tpu", SimpleNamespace(is_initialized=lambda: True), raising=False)
+    monkeypatch.setattr(torch, "accelerator", world.accelerator())
+    monkeypatch.setattr(tpu_sync_engine, "TPU_SYNC_DEVICE", "cpu")
+    monkeypatch.setattr(tpu_sync_engine, "get_tpu_sync_rendezvous", world.get_rendezvous)
+    monkeypatch.setattr(tpu_sync_engine, "create_tpu_sync_rendezvous", world.create_rendezvous)
+    monkeypatch.setattr(parity, "get_tpu_sync_rendezvous", world.get_rendezvous)
+    monkeypatch.setattr("ray.util.get_node_ip_address", lambda: "127.0.0.1")
+    monkeypatch.setattr(ray, "get", _fake_ray_get)
+    sys.modules.pop("verl_hardware_plugin.accelerators.tpu.rollout.tpu_sync_worker_extension", None)
+    ext_mod = importlib.import_module("verl_hardware_plugin.accelerators.tpu.rollout.tpu_sync_worker_extension")
+
+    tp = 2
+    weights = {"w": _tied_trainer_weights(seed=20)}
+    models = [_FakeVllmModel(tp=tp) for _ in range(tp)]
+    for rank, model in enumerate(models):
+        model.load_state_dict(_expected_vllm_state(weights["w"], rank, tp))
+    samplers = [
+        ext_mod.SGLangTPUSyncWorker(
+            SimpleNamespace(
+                tp_size=tp,
+                tp_group=SimpleNamespace(rank_in_group=rank, world_size=tp, cpu_group=None),
+                tp_worker=SimpleNamespace(
+                    model_runner=SimpleNamespace(
+                        model=model,
+                        model_config=SimpleNamespace(hf_text_config=None, get_total_num_kv_heads=lambda: KV_HEADS),
+                    )
+                ),
+            )
+        )
+        for rank, model in enumerate(models)
+    ]
+    events: list = []
+    manager, _ = _make_manager(
+        [_trainer_engine(0, tie_word_embeddings=True)],
+        lambda _r: iter(weights["w"].items()),
+        samplers,
+        events,
+        tie_word_embeddings=True,
+    )
+
+    for step in (0, 1):
+        weights["w"] = _tied_trainer_weights(seed=20 + step)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=tpu_sync_engine.__name__):
+            asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=step))
+        prefix = f"[TPU-SYNC TIED LM_HEAD | Step {step} | replica 0]"
+        lines = [line for line in caplog.text.splitlines() if prefix in line]
+        assert len(lines) == tp
+        assert all("lm_head copied; max|lm_head - embed|=0 (bitwise equal)" in line for line in lines)
+        for rank, model in enumerate(models):
+            assert torch.equal(model.lm_head.weight, weights["w"]["model.embed_tokens.weight"].chunk(tp, dim=0)[rank])
+
+    # A copy into one worker's lm_head that does not land: the next sync fails before generation resumes.
+    models[1].lm_head.weight = _NoCopyParameter(models[1].lm_head.weight.data, requires_grad=False)
+    weights["w"] = _tied_trainer_weights(seed=30)
+    events.clear()
+    with pytest.raises(RuntimeError, match=r"Sampler Rank 1: lm_head copied from embed_tokens but not bitwise equal"):
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=2))
+    assert "install_tpu_sync_weights" in events and "resume" not in events

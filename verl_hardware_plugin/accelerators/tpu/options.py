@@ -54,10 +54,10 @@ TPU_SYNC_DEFAULT_GROUP_SIZE = 16
 _warned: set[str] = set()
 
 
-def _warn_once(key: str, message: str) -> None:
+def _warn_once(key: str, message: str, level: int = logging.WARNING) -> None:
     if key not in _warned:
         _warned.add(key)
-        logger.warning(message)
+        logger.log(level, message)
 
 
 def _to_plain_dict(value: Any) -> Any:
@@ -587,7 +587,8 @@ class ReceiveIntoVllmMode:
 
     * ``auto`` (default): receive straight into vLLM's parameters when the rollout is vLLM and the trainer's
       weights can be exported in vLLM's layout without cross-rank exchange; fall back to rollout staging buffers
-      otherwise (e.g. SGLang, MoE / hybrid linear-attention models, ``FSDP != TP``, or replicated GQA KV heads).
+      otherwise (e.g. SGLang, MoE / hybrid linear-attention models, ``FSDP != TP``, replicated GQA KV heads, or
+      ``tie_word_embeddings``).
     * ``on``: require direct receive into vLLM's parameters; raise when unsupported.
     * ``off``: always use rollout staging buffers.
 
@@ -635,7 +636,8 @@ class TPUSyncOptions:
             weights in vLLM's layout (fused, transposed, one virtual tensor per vLLM parameter), so each rollout rank's
             TP slice is its vLLM weight. ``auto`` enables it for dense vLLM models whose trainer layout needs no
             cross-rank exchange (e.g. ``FSDP == TP``) and falls back to staging otherwise; ``on`` (``True``) requires
-            it and ``off`` (``False``) disables it.
+            it and ``off`` (``False``) disables it. It never fills ``lm_head`` from the embedding: with
+            ``tie_word_embeddings`` set, ``auto`` resolves to ``off`` and ``on`` is rejected (``get_tpu_sync_options``).
         direct_install_quantized_moe: Install quantized rollout MoE experts (e.g. vllm-torchtpu's FP8 MoE with
             ``QUANTIZE_ON_LOAD_PREFIXES=experts``) directly: each rollout rank requantizes the bf16 expert slices it
             received with the rollout's own quantizer and writes the live weights and scales (``True``, default).
@@ -685,12 +687,37 @@ def get_tpu_sync_options(engine_kwargs: Optional[Mapping[str, Any]], backend: st
     ``checkpoint_engine.engine_kwargs[backend]`` on the driver). Precedence per option:
     ``VERL_TPU_SYNC_RELEASE_BUFFERS`` (deprecated) > ``engine_kwargs.<backend>`` > the default.
 
+    With ``tie_word_embeddings`` set, ``receive_into_vllm=auto`` (the default) resolves to ``off`` and logs why, once:
+    receiving straight into vLLM's parameters never fills ``lm_head`` from the embedding, so the rollout needs its
+    staging buffers and the tied copy. That is the fallback ``auto`` takes for every setup it cannot serve; ``on``
+    raises instead.
+
     Raises:
-        ValueError: on an unknown key or a value of the wrong type.
+        ValueError: on an unknown key, a value of the wrong type, or ``receive_into_vllm=on`` (``True``) together with
+            ``tie_word_embeddings``.
     """
     target = f"checkpoint_engine.engine_kwargs.{backend}"
     values = _parse_section(engine_kwargs, _SYNC_KINDS, target, "tpu-sync")
     _apply_legacy_env(values, _SYNC_KINDS, _SYNC_LEGACY_ENV_VARS, target)
+    if values.get("tie_word_embeddings") and values.get("receive_into_vllm") != "off":
+        if values.get("receive_into_vllm") == "on":
+            raise ValueError(
+                f"{target}: receive_into_vllm=on (True) cannot be combined with tie_word_embeddings=True. With "
+                "receive_into_vllm nothing fills vLLM's lm_head from the embedding: a separate lm_head would keep its "
+                "checkpoint weights, and a tensor that lm_head shares with the embedding would receive nothing "
+                "either (the rollout lists it as lm_head.weight, which the trainer does not send). Leave "
+                "tie_word_embeddings unset, so that the trainer sends lm_head, or set receive_into_vllm to auto (the "
+                "default) or off: with tie_word_embeddings both use the rollout staging buffers."
+            )
+        # auto, set or the default. The trainer ranks' engine and the driver both parse the options, so both sides
+        # agree before the first sync. The driver parses them at every sync, so the line is logged once per process.
+        values["receive_into_vllm"] = "off"
+        _warn_once(
+            f"{target}:receive_into_vllm=auto+tie_word_embeddings",
+            f"{target}: receive_into_vllm=auto falling back to rollout staging buffers (tie_word_embeddings is set, "
+            "and receiving straight into vLLM's parameters never fills lm_head from the embedding)",
+            logging.INFO,
+        )
     return TPUSyncOptions(**{name: value for name, value in values.items() if value is not None})
 
 
