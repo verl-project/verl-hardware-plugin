@@ -99,7 +99,6 @@ def validate_graph_trainer_engine(
     # - expert_parallel_size: take graph-mode EP from TorchTitan's TpuGraphTrainer (EP stack from
     #   google-pytorch/torchtitan#181; Qwen3.5 first, Qwen3 through the same helper) instead of porting the plugin's
     #   eager tpu_ragged_ep. FSDP-only is the Phase 1 scope (EP mainly saves memory on the larger MoE models).
-    # - kda: once the plugin pins the Tokamax KDA document budget for the run instead of setting it per batch.
     # - gdn_row_slot_len: once the traced step restores the packed token order (gdn_contig_src) before the LM head
     #   and traces with the shim row length set to the slot length (see _packed_stream_as_one_row).
     # use_simple_fsdp and param_offload stay: the graph trainer shards with SimpleFSDP and holds the live parameters.
@@ -123,8 +122,9 @@ def validate_graph_trainer_engine(
             errors.append(f"{name}={size} is not supported yet (FSDP only)")
     if getattr(engine_config, "param_offload", False):
         errors.append("param_offload swaps parameter storages between steps; it is not supported yet")
-    if "kda" in tpu_kernels:
-        errors.append("the Tokamax KDA kernels change their document budget per batch; that would freeze in the graph")
+    budget = options.kda_document_budget
+    if "kda" in tpu_kernels and budget is not None and budget < 2:
+        errors.append(f"kda_document_budget={budget} must be at least 2 (one sequence plus the padding tail)")
     if options.gdn_row_slot_len:
         errors.append(
             f"gdn_row_slot_len={options.gdn_row_slot_len} is not supported yet (the traced step does not restore the "
@@ -132,6 +132,28 @@ def validate_graph_trainer_engine(
         )
     if errors:
         raise ValueError("engine_kwargs.tpu.trainer_mode=graph_trainer: " + "; ".join(errors))
+
+
+def initial_kda_document_budget(options: TPUEngineOptions, num_documents: int) -> int:
+    """The Tokamax KDA ``max_num_segments`` to pin for the run, set once before the first trace.
+
+    ``engine_kwargs.tpu.kda_document_budget`` if set, else ``num_documents + 1`` (one segment for the padding tail).
+    ``num_documents`` is the most documents in any micro-batch of the first step, across all ranks.
+    """
+    return int(options.kda_document_budget or num_documents + 1)
+
+
+def check_kda_document_budget(budget: int, num_documents: int) -> None:
+    """Raises if a micro-batch with ``num_documents`` documents does not fit the pinned ``budget``.
+
+    The traced graph froze ``max_num_segments`` at ``budget``; more documents would share recurrent state.
+    """
+    if num_documents + 1 > budget:
+        raise RuntimeError(
+            f"trainer_mode=graph_trainer pinned the Tokamax KDA document budget (max_num_segments) to {budget}, but a "
+            f"micro-batch packs {num_documents} documents and needs {num_documents + 1}. Set "
+            "engine_kwargs.tpu.kda_document_budget to at least the most documents per micro-batch plus one."
+        )
 
 
 def resolve_memory_policy(options: TPUEngineOptions, activation_checkpoint: str) -> str:
