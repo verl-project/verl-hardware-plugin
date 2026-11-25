@@ -146,6 +146,21 @@ def test_validate_graph_trainer_engine():
             tpu_kernels=frozenset(),
         )
 
+    # Multi-tier static_micro_batch_lens is rejected (graph_trainer traces one shape); single-tier is accepted.
+    with pytest.raises(ValueError, match=r"static_micro_batch_lens=\[4096, 8192\] has multiple tiers"):
+        graph_trainer_mode.validate_graph_trainer_engine(
+            good,
+            _options(trainer_mode="graph_trainer", static_micro_batch_lens=[4096, 8192]),
+            use_simple_fsdp=True,
+            tpu_kernels=frozenset(),
+        )
+    graph_trainer_mode.validate_graph_trainer_engine(
+        good,
+        _options(trainer_mode="graph_trainer", static_micro_batch_lens=[8192]),
+        use_simple_fsdp=True,
+        tpu_kernels=frozenset(),
+    )
+
 
 def test_validate_graph_trainer_engine_accepts_kda():
     good = SimpleNamespace(forward_only=False, param_offload=False, data_parallel_shard_size=8)

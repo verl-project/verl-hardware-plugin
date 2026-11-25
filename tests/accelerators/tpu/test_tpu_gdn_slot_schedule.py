@@ -1052,3 +1052,42 @@ def test_engine_init_dual_torchtitan_compatibility_and_validation_guards(caplog)
     # 5. HIGH-2: fuse_gdn_projections + tensor_parallel_size > 1 raises ValueError in __init__.
     with pytest.raises(ValueError, match="fuse_gdn_projections does not support tensor parallelism"):
         _build_engine({"fuse_gdn_projections": True}, layout="priv", has_216=True, tp=2)
+
+    # 6. gdn_auto_row_slot_len + static_micro_batch_lens (each tier divisible) emits no missing-static warning.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=torchtitan_tpu.__name__):
+        eng_tiers = _build_engine(
+            {
+                "gdn_auto_row_slot_len": 1024,
+                "static_micro_batch_lens": [1024, 2048],
+                "seq_bucket_size": 256,
+            },
+            layout="priv",
+            has_216=True,
+        )
+    assert eng_tiers._gdn_auto_row_slot_len == 1024
+    assert "without static_micro_batch_len" not in caplog.text
+
+
+def test_sort_micro_batches_for_slots_uses_static_micro_batch_lens_tiers():
+    """Sorting with ``static_lens`` snaps each MB to its tier before slot classification."""
+    # Bucket size 2048 does not divide auto_slot_len=16384, but tiers (16384, 32768) do.
+    # mb_row_2: 2 seqs of 12,000 + 13,000 = 25,000 tokens -> snaps to 32768 (2 x 16384 row slots -> ROW_SLOT).
+    # mb_row_1: 1 seq of 12,000 tokens -> snaps to 16384 (1 x 16384 row slot -> ROW_SLOT).
+    # mb_seg: 3 seqs of 6,000 + 6,000 + 6,000 = 18,000 tokens -> snaps to 32768 (3 seqs > 2 slots -> SEGMENTED).
+    mb_seg = _make_packed_mb([list(range(6000)), list(range(6000)), list(range(6000))])
+    mb_row_1 = _make_packed_mb([list(range(12000))])
+    mb_row_2 = _make_packed_mb([list(range(12000)), list(range(13000))])
+
+    ordered_mbs, ordered_idx = gdn_slot_schedule.sort_micro_batches_for_slots(
+        [mb_seg, mb_row_1, mb_row_2],
+        [["seg"], ["row1"], ["row2"]],
+        auto_slot_len=16384,
+        static_len=0,
+        static_lens=(16384, 32768),
+        bucket_size=2048,
+        forward_only=False,
+        allow_row_slot=True,
+    )
+    assert ordered_idx == [["row2"], ["row1"], ["seg"]]
+    assert ordered_mbs == [mb_row_2, mb_row_1, mb_seg]

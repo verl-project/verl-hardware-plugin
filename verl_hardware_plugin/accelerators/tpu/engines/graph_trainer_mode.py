@@ -92,7 +92,12 @@ def validate_graph_trainer_engine(
         errors.append(
             "it needs engine_kwargs.tpu.use_simple_fsdp=True (TorchTitan's graph trainer shards with SimpleFSDP)"
         )
-    if not options.static_micro_batch_len:
+    if options.static_micro_batch_lens and len(options.static_micro_batch_lens) > 1:
+        errors.append(
+            f"static_micro_batch_lens={list(options.static_micro_batch_lens)} has multiple tiers ({_TODO_2}); "
+            "use a single static_micro_batch_len"
+        )
+    elif not options.static_micro_batch_len and not options.static_micro_batch_lens:
         errors.append(f"it needs engine_kwargs.tpu.static_micro_batch_len ({_TODO_2})")
     if options.use_fused_linear_cross_entropy is False:
         errors.append(

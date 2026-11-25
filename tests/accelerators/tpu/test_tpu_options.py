@@ -424,3 +424,91 @@ def test_cp_gdn_slot_and_static_logprob_options():
     )
     assert valid_static.static_micro_batch_len == 32768
     assert valid_static.static_log_prob_micro_batch_len == 98304
+
+
+def test_static_micro_batch_lens_parsing_validation_and_gdn_alignment():
+    def _parse_lens(val):
+        return get_tpu_engine_options(_cfg({"static_micro_batch_lens": val})).static_micro_batch_lens
+
+    # List, tuple, string list, comma-separated string, and OmegaConf ListConfig normalize to sorted unique tuple.
+    assert _parse_lens([20480, 32768]) == (20480, 32768)
+    assert _parse_lens((32768, 20480)) == (20480, 32768)
+    assert _parse_lens([40960, 20480, 32768, 20480]) == (20480, 32768, 40960)
+    assert _parse_lens(["32768", "20480"]) == (20480, 32768)
+    assert _parse_lens("32768, 20480, 20480") == (20480, 32768)
+    assert _parse_lens("32768") == (32768,)
+    assert _parse_lens(None) is None
+    assert _parse_lens("") is None
+
+    # OmegaConf / Hydra list survives verl config conversion.
+    extend_torchtitan_engine_config()
+    raw = OmegaConf.create(
+        {
+            "_target_": "verl.workers.config.TorchtitanEngineConfig",
+            "engine_kwargs": {"tpu": {"static_micro_batch_lens": [32768, 20480]}},
+        }
+    )
+    cfg = omega_conf_to_dataclass(raw)
+    assert get_tpu_engine_options(cfg).static_micro_batch_lens == (20480, 32768)
+
+    # Direct dataclass construction also normalizes and validates.
+    direct_opts = TPUEngineOptions(static_micro_batch_lens=[32768, 20480])  # type: ignore[arg-type]
+    assert direct_opts.static_micro_batch_lens == (20480, 32768)
+    for bad_direct in ([], (), (0,), (-1, 20480), (True, 20480), (20480.5,)):
+        with pytest.raises(ValueError, match="static_micro_batch_lens"):
+            TPUEngineOptions(static_micro_batch_lens=bad_direct)  # type: ignore[arg-type]
+
+    # Empty, non-positive, non-integer, or wrong-type values fail loudly.
+    for bad_val in (
+        [],
+        (),
+        ",",
+        " , ",
+        "20480,,32768",
+        ",20480",
+        ["20480", ""],
+        [0],
+        [20480, 0],
+        [-1, 20480],
+        "0,32768",
+        "-4096",
+        [True, 20480],
+        [False],
+        [20480.5],
+        ["20480.5"],
+        ["abc"],
+        32768,
+        b"20480",
+        {"tier": 20480},
+    ):
+        with pytest.raises(ValueError, match="Invalid TPU engine option static_micro_batch_lens"):
+            get_tpu_engine_options(_cfg({"static_micro_batch_lens": bad_val}))
+
+    # Mutual exclusivity with static_micro_batch_len (both via parser and direct construction).
+    with pytest.raises(ValueError, match="static_micro_batch_len and static_micro_batch_lens are mutually exclusive"):
+        get_tpu_engine_options(_cfg({"static_micro_batch_len": 32768, "static_micro_batch_lens": [20480, 32768]}))
+    with pytest.raises(ValueError, match="static_micro_batch_len and static_micro_batch_lens are mutually exclusive"):
+        TPUEngineOptions(static_micro_batch_len=32768, static_micro_batch_lens=(20480, 32768))
+
+    # gdn_auto_row_slot_len alignment: every tier must be >= gdn_auto_row_slot_len and divisible by it.
+    valid_gdn = get_tpu_engine_options(
+        _cfg(
+            {
+                "gdn_auto_row_slot_len": 16384,
+                "static_micro_batch_lens": [16384, 32768, 49152],
+                "static_log_prob_micro_batch_len": 65536,
+            }
+        )
+    )
+    assert valid_gdn.static_micro_batch_lens == (16384, 32768, 49152)
+    assert valid_gdn.static_log_prob_micro_batch_len == 65536
+
+    for bad_gdn_cfg, bad_tier_str in (
+        ({"gdn_auto_row_slot_len": 16384, "static_micro_batch_lens": [8192, 32768]}, "8192"),
+        ({"gdn_auto_row_slot_len": 16384, "static_micro_batch_lens": [20480, 32768]}, "20480"),
+        ({"gdn_auto_row_slot_len": 16384, "static_micro_batch_lens": [16384, 40960]}, "40960"),
+        ({"gdn_auto_row_slot_len": 32768, "static_micro_batch_lens": "20480,32768"}, "20480"),
+    ):
+        with pytest.raises(ValueError, match="divisible by gdn_auto_row_slot_len") as exc_info:
+            get_tpu_engine_options(_cfg(bad_gdn_cfg))
+        assert bad_tier_str in str(exc_info.value)
