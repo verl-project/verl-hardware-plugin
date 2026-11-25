@@ -5,9 +5,9 @@
 
 The TPU compile pass needs ``torch_tpu`` on TPU; the on-TPU parity check against the eager engine runs in verl's TPU CI.
 These check the parts that decide numerics and TorchTitan integration: the option surface, the graph-trainer config,
-the trace-safe PPO loss against verl's, the packed loss inputs against verl's response layout, the
-out-of-place fused log-prob backward and fake-op shim, the RL ``TpuGraphTrainer`` wrapper's auxiliary outputs, and
-the one-micro-batch engine step.
+the trace-safe PPO loss against verl's, the packed loss inputs against verl's response layout, the RL
+``TpuGraphTrainer`` wrapper (loss metrics, packed stream as one row), and the engine step with gradient accumulation
+across micro-batches.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def _actor_config(**overrides):
     return config
 
 
-def _dense_fused_logprobs(hidden_states, labels, weight_t, *, temperature=1.0, functional_backward=False, **_):
+def _dense_fused_logprobs(hidden_states, labels, weight_t, *, temperature=1.0, **_):
     """CPU stand-in for the Tokamax ``fused_linear_logprobs_tpu`` (Pallas, TPU only): same math, dense logits."""
     logits = hidden_states.reshape(-1, hidden_states.shape[-1]).float() @ weight_t.float() / temperature
     return torch.log_softmax(logits, -1).gather(-1, labels.reshape(-1, 1).long()).squeeze(-1)
@@ -255,11 +255,12 @@ def test_graph_policy_loss_matches_verl_vanilla_ppo():
     old_log_probs[-1] = -1e4
 
     with _patch_fused_logprobs():
-        loss, (log_probs,) = loss_fn(
+        loss, metrics = loss_fn(
             (hidden_states, weight_t),
             (target_ids, old_log_probs, advantages, loss_mask),
             global_valid_tokens=torch.tensor(global_tokens),
         )
+    log_probs = metrics[graph_trainer_mode.LOG_PROBS_METRIC]
     loss.backward()
     graph_grads = (hidden_states.grad.clone(), weight_t.grad.clone())
     assert not log_probs.requires_grad
@@ -377,138 +378,6 @@ def test_packed_graph_loss_matches_verl_ppo_loss_on_the_same_log_probs():
     assert "actor/ppo_kl" in metrics and "actor/pg_clipfrac" in metrics
 
 
-def _reference_forward_op(b_block, h_block, v_block):
-    """FP32 stand-in for the Pallas forward kernel ``(x, labels, weight_t) -> (-log p(label), lse)``."""
-
-    def op(x, labels, weight_t):
-        # The Pallas kernel computes in FP32 whatever the autocast state; so does this reference.
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            logits = x.float() @ weight_t.float()
-            lse = torch.logsumexp(logits, -1)
-            return lse - logits.gather(-1, labels.long().unsqueeze(-1)).squeeze(-1), lse
-
-    return op
-
-
-def test_functional_fused_logprob_backward_matches_in_place_backward():
-    torch.manual_seed(0)
-    x = torch.randn(10, 8)
-    weight_t = torch.randn(8, 30) * 0.3
-    labels = torch.randint(0, 30, (10,))
-    cotangent = torch.randn(10)
-    grads = []
-    for functional in (False, True):
-        xk, wk = x.clone().requires_grad_(), weight_t.clone().requires_grad_()
-        with (
-            mock.patch.object(fused_logprob, "_forward_op", _reference_forward_op),
-            # Several vocab chunks of 7 columns over V = 30, the last one ragged.
-            mock.patch.object(fused_logprob, "backward_vocab_chunk", lambda num_tokens, vocab: 7),
-        ):
-            logp = fused_logprob.fused_linear_logprobs_tpu(
-                xk, labels, wk, temperature=1.5, b_block_size=16, functional_backward=functional
-            )
-        (logp * cotangent).sum().backward()
-        grads.append((logp.detach(), xk.grad, wk.grad))
-    for eager, functional in zip(*grads, strict=True):
-        torch.testing.assert_close(functional, eager)
-
-
-def test_functional_fused_logprob_backward_traces_without_mutations():
-    """make_fx of forward + backward records no in-place op from the functional backward."""
-    from torch.fx.experimental.proxy_tensor import make_fx
-
-    def step(x, weight_t, labels):
-        logp = fused_logprob.fused_linear_logprobs_tpu(x, labels, weight_t, b_block_size=16, functional_backward=True)
-        return torch.autograd.grad(logp.sum(), (x, weight_t))
-
-    with (
-        mock.patch.object(fused_logprob, "_forward_op", _reference_forward_op),
-        mock.patch.object(fused_logprob, "backward_vocab_chunk", lambda num_tokens, vocab: 7),
-    ):
-        gm = make_fx(step)(
-            torch.randn(10, 8, requires_grad=True), torch.randn(8, 30, requires_grad=True), torch.randint(0, 30, (10,))
-        )
-    in_place = [
-        n.target for n in gm.graph.nodes if n.op == "call_function" and str(n.target).split(".")[-2].endswith("_")
-    ]
-    assert not in_place, in_place
-
-
-@pytest.mark.parametrize("functional", [False, True])
-def test_fused_logprob_backward_stays_fp32_under_bf16_autocast(functional):
-    """Graph mode traces the backward inside the step's bf16 autocast: it must match the eager (no-autocast) one."""
-    from torch.fx.experimental.proxy_tensor import make_fx
-
-    def grads(x, weight_t, labels, *, autocast, trace):
-        def step(x, weight_t):
-            x, weight_t = x.detach().requires_grad_(), weight_t.detach().requires_grad_()
-            with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=autocast):
-                logp = fused_logprob.fused_linear_logprobs_tpu(
-                    x, labels, weight_t, b_block_size=16, functional_backward=functional
-                )
-                return torch.autograd.grad(logp.sum(), (x, weight_t))
-
-        return make_fx(step)(x, weight_t)(x, weight_t) if trace else step(x, weight_t)
-
-    with (
-        mock.patch.object(fused_logprob, "_forward_op", _reference_forward_op),
-        mock.patch.object(fused_logprob, "backward_vocab_chunk", lambda num_tokens, vocab: 7),
-    ):
-        # Two identical vocab columns: log p(label) = log(1/2) whatever x is, so d logp / dx = 0. Under autocast the
-        # bf16 logits made it 1.57 (PR #134 review).
-        x = torch.tensor([[1.03125]], dtype=torch.bfloat16)
-        weight_t = torch.tensor([[33.5, 33.5]], dtype=torch.bfloat16)
-        labels = torch.tensor([0])
-        for trace in (False, True):
-            (grad_x, _) = grads(x, weight_t, labels, autocast=True, trace=trace)
-            assert abs(float(grad_x)) < 1e-3, (trace, float(grad_x))
-
-        torch.manual_seed(0)
-        x = torch.randn(10, 8).to(torch.bfloat16)
-        weight_t = (torch.randn(8, 30) * 3).to(torch.bfloat16)
-        labels = torch.randint(0, 30, (10,))
-        expected = grads(x, weight_t, labels, autocast=False, trace=False)
-        for trace in (False, True):
-            got = grads(x, weight_t, labels, autocast=True, trace=trace)
-            for g, e in zip(got, expected, strict=True):
-                torch.testing.assert_close(g, e, rtol=0, atol=0)
-
-
-def test_forward_op_overrides_singleton_pallas_fake_for_make_fx():
-    """Unpatched TorchTitan registers a (1,) fake loss for reduction='none'; _forward_op overrides it to (rows,)."""
-    from torch.fx.experimental.proxy_tensor import make_fx
-
-    op_name = "linear_loss_fwd_test_singleton"
-    qualname = f"pallas::{op_name}"
-    if not hasattr(getattr(torch.ops, "pallas", None), op_name):
-
-        @torch.library.custom_op(
-            qualname, mutates_args=(), schema="(Tensor x, Tensor labels, Tensor weights) -> (Tensor, Tensor)"
-        )
-        def _singleton_fwd(x: torch.Tensor, labels: torch.Tensor, weights: torch.Tensor):
-            logits = x.float() @ weights.float()
-            lse = torch.logsumexp(logits, -1)
-            return lse - logits.gather(-1, labels.long().unsqueeze(-1)).squeeze(-1), lse
-
-        _singleton_fwd.register_fake(
-            lambda x, labels, weights: (
-                torch.empty(1, dtype=torch.float32, device=x.device),
-                torch.empty(x.shape[0], dtype=torch.float32, device=x.device),
-            )
-        )
-
-    fused_logprob._VERIFIED_FORWARD_OPS.discard(op_name)
-    loss_mod = SimpleNamespace(_get_loss_op_names=lambda *args: (op_name, "unused_bwd"))
-    with mock.patch.object(fused_logprob, "_loss_module", return_value=loss_mod):
-        gm = make_fx(
-            lambda x, labels, w: fused_logprob.fused_linear_logprobs_tpu(
-                x, labels, w, b_block_size=8, h_block_size=4, v_block_size=16, functional_backward=True
-            )
-        )(torch.randn(10, 4), torch.randint(0, 16, (10,)), torch.randn(4, 16))
-    out = gm(torch.randn(10, 4), torch.randint(0, 16, (10,)), torch.randn(4, 16))
-    assert tuple(out.shape) == (10,)
-
-
 def test_prepare_model_for_graph_trainer_annotates_and_installs_preprocess_inputs():
     annotated = []
     common_utils = SimpleNamespace(annotate_module_fqns=annotated.append)
@@ -552,17 +421,17 @@ class _FakeGraphTrainer:
     def __init__(self, model):
         self.model = model
         self.loss_fn = None
-        self.last_loss_aux = ()
+        self.last_loss_metrics = None
         self.calls = []
 
     def forward_backward_step(self, *, input_dict, global_valid_tokens):
         self.calls.append((tuple(input_dict["input"].shape), float(global_valid_tokens)))
         with _patch_fused_logprobs():
-            loss, aux = self.loss_fn(
+            loss, metrics = self.loss_fn(
                 self.model(input_dict["input"]), input_dict["labels"], global_valid_tokens=global_valid_tokens
             )
-        loss.backward()
-        self.last_loss_aux = aux
+        loss.backward()  # adds to param.grad, as TpuGraphTrainer accumulates the traced step's gradients
+        self.last_loss_metrics = metrics
         return loss.detach()
 
 
@@ -653,10 +522,6 @@ def test_graph_mode_step_matches_eager_ppo_loss_on_one_micro_batch():
     for g, p in zip(graph_grads, model.parameters(), strict=True):
         torch.testing.assert_close(g, p.grad, rtol=1e-5, atol=1e-6)
 
-    # TpuGraphTrainer assigns param.grad, so a second micro-batch would drop the first one's gradients (TODO-1).
-    with pytest.raises(RuntimeError, match="TODO-1"):
-        engine._graph_trainer_forward_backward(data, [micro_batch, micro_batch], None, loss_fn, global_tokens)
-
     # A micro-batch with another padded length cannot reuse the traced step.
     engine.prepare_model_inputs = lambda micro_batch: (
         torch.zeros(64, dtype=torch.int64),
@@ -666,6 +531,37 @@ def test_graph_mode_step_matches_eager_ppo_loss_on_one_micro_batch():
     )
     with pytest.raises(RuntimeError, match="TODO-2"):
         engine._graph_trainer_forward_backward(data, [micro_batch], None, loss_fn, global_tokens)
+
+
+def test_graph_mode_step_accumulates_gradients_across_micro_batches():
+    """Two micro-batches of one mini-batch: the gradients add up to eager verl's, each loss over the global tokens."""
+    torch.manual_seed(0)
+    padded_len = 48
+    micro_batches = [_engine_micro_batch([3, 5, 2], [4, 6, 5], 1), _engine_micro_batch([4, 2], [5, 7], 2)]
+    global_tokens = float(sum(mb["response_mask"].sum() for mb in micro_batches))
+    for mb in micro_batches:
+        tu.assign_non_tensor(mb, batch_num_tokens=global_tokens)
+    config = _actor_config()
+    loss_fn = functools.partial(ppo_loss, config=config)
+
+    model = _TinyLM()
+    engine = _graph_engine(model, padded_len)
+    out = engine._graph_trainer_forward_backward(micro_batches[0].copy(), micro_batches, None, loss_fn, global_tokens)
+    graph_grads = [p.grad.clone() for p in model.parameters()]
+    assert engine.trainer.calls == [((padded_len,), global_tokens)] * 2
+    assert len(out["loss"]) == 2
+
+    for p in model.parameters():
+        p.grad = None
+    for mb, graph_loss in zip(micro_batches, out["loss"], strict=True):
+        ids = mb["input_ids"].values()
+        logp = torch.log_softmax(model.logits(ids), -1).gather(-1, torch.roll(ids, -1)[:, None]).squeeze(-1)
+        output = {"log_probs": torch.nested.nested_tensor_from_jagged(logp, mb["input_ids"].offsets())}
+        loss, _ = ppo_loss(config, model_output=output, data=mb.copy())
+        loss.backward()
+        torch.testing.assert_close(float(loss), graph_loss, rtol=1e-5, atol=1e-6)
+    for g, p in zip(graph_grads, model.parameters(), strict=True):
+        torch.testing.assert_close(g, p.grad, rtol=1e-5, atol=1e-6)
 
 
 def test_graph_mode_step_uses_the_mini_batch_device_token_count():
@@ -801,42 +697,9 @@ def test_build_graph_trainer_config():
             fsdp_barrier_policy="none",
         )
 
-    # TorchTitan 109bd618 keeps the loss in torchtitan/experiments/tpu/loss.py.
-    legacy_modules = dict(new_modules)
-    legacy_modules["torchtitan.experiments.tpu.components"] = None
-    legacy_modules["torchtitan.experiments.tpu.components.loss"] = None
-    legacy_modules["torchtitan.experiments.tpu.loss"] = SimpleNamespace(PallasCrossEntropyLoss=PallasCrossEntropyLoss)
-    with mock.patch.dict("sys.modules", legacy_modules):
-        cfg = graph_trainer_mode.build_graph_trainer_config({}, opts, activation_checkpoint="full")
-        assert cfg.loss == PallasCrossEntropyLoss.Config()
 
-
-def test_build_rl_graph_trainer_traces_aux_outputs():
-    """Unpatched upstream TpuGraphTrainer: RLTpuGraphTrainer returns detached aux log-probs; the trace is reused."""
-    from torch.fx.experimental.proxy_tensor import make_fx
-
-    def upstream_make_fwd_bwd_step(model, loss_fn, *, collect_moe_routing_metrics: bool = False):
-        def fwd_bwd(inputs, labels, global_valid_tokens, extra_kwargs):
-            pred = model(inputs, **extra_kwargs)
-            routing = [pred[0].detach().sum()] if collect_moe_routing_metrics else []
-            res = loss_fn(pred, labels, global_valid_tokens=global_valid_tokens)
-            loss = res[0] if isinstance(res, tuple) else res  # upstream drops res[1]!
-            params = [p for _, p in model.named_parameters(remove_duplicate=False) if p.requires_grad]
-            grads = torch.autograd.grad(loss, params)
-            return [loss, *grads, *routing]
-
-        return fwd_bwd
-
-    def upstream_run_traced(traced_step, *, module):
-        def run(*args):
-            params_and_buffers = [t for _, t in module.named_parameters(remove_duplicate=False)]
-            return traced_step.gm(*params_and_buffers, *args)
-
-        return run
-
-    trainer_mod = SimpleNamespace(make_fwd_bwd_step=upstream_make_fwd_bwd_step)
-    tracer_mod = SimpleNamespace(run_traced=upstream_run_traced)
-
+def test_build_rl_graph_trainer_runs_the_step_as_one_packed_row():
+    """The RL TpuGraphTrainer clears the unflatten-shim row length for its step; the loss metrics come back as is."""
     # TorchTitan's unflatten shim: a module-level row length set by a context manager.
     shim_state = {"seq_len": None}
 
@@ -854,18 +717,15 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
     max_context_length = 4  # smaller than the 12-token micro-batch, as max_seq_len < static_micro_batch_len
 
     class UpstreamTpuGraphTrainerStub:
+        """TorchTitan's TpuGraphTrainer: sets the row length, runs the step, keeps its loss metrics, adds the grads."""
+
         def __init__(self, cfg):
             self.model = cfg.model
-            self.model_parts = [self.model]
             self.loss_fn = None
-            self._traced_step = None
-            self._collect_moe_routing_metrics = True
-            self.routing_received: list[list[torch.Tensor]] = []
-            self.optimizers = SimpleNamespace(optimizers=[torch.optim.SGD(self.model.parameters(), lr=0.1)])
+            self.last_loss_metrics = None
 
         def forward_backward_step(self, *, input_dict, global_valid_tokens):
-            params = [p for _, p in self.model.named_parameters(remove_duplicate=False) if p.requires_grad]
-            # As upstream: the step runs with the shim row length set to training.max_context_length.
+            params = [p for p in self.model.parameters() if p.requires_grad]
             with set_unflatten_seq_len(max_context_length):
                 return self._make_fx_forward_backward_step(
                     self.model,
@@ -877,34 +737,12 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
                 )
 
         def _make_fx_forward_backward_step(self, model, inputs, labels, global_valid_tokens, params, extra_kwargs):
-            if self._traced_step is None:
-                step_fn = trainer_mod.make_fwd_bwd_step(
-                    model, self.loss_fn, collect_moe_routing_metrics=self._collect_moe_routing_metrics
-                )
-
-                def flat_fn(*p_and_args):
-                    n_p = len(params)
-                    param_dict = {
-                        name: p
-                        for (name, _), p in zip(
-                            model.named_parameters(remove_duplicate=False), p_and_args[:n_p], strict=True
-                        )
-                    }
-                    with torch.nn.utils.stateless._reparametrize_module(model, param_dict):
-                        return step_fn(*p_and_args[n_p:])
-
-                gm = make_fx(flat_fn)(*params, inputs, labels, global_valid_tokens, extra_kwargs)
-                self._traced_step = SimpleNamespace(gm=gm)
-            outputs = tracer_mod.run_traced(self._traced_step, module=model)(
-                inputs, labels, global_valid_tokens, extra_kwargs
+            loss, self.last_loss_metrics = self.loss_fn(
+                model(inputs, **extra_kwargs), labels, global_valid_tokens=global_valid_tokens
             )
-            loss = outputs[0]
-            grads = outputs[1 : 1 + len(params)]
-            if self._collect_moe_routing_metrics:
-                self.routing_received.append(list(outputs[1 + len(params) :]))
-            for param, grad in zip(params, grads, strict=True):
-                param.grad = grad
-            return loss
+            for param, grad in zip(params, torch.autograd.grad(loss, params), strict=True):
+                param.grad = grad if param.grad is None else param.grad + grad
+            return loss.detach()
 
     class TinyPosLM(torch.nn.Module):
         def __init__(self) -> None:
@@ -921,16 +759,13 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
 
     torch.manual_seed(0)
     model = TinyPosLM()
-    ref_model = TinyPosLM()
-    ref_model.load_state_dict(model.state_dict())
-
     modules = {
         "torchtitan": SimpleNamespace(),
         "torchtitan.experiments": SimpleNamespace(),
-        "torchtitan.experiments.graph_trainer": SimpleNamespace(trainer=trainer_mod, make_fx_tracer=tracer_mod),
-        "torchtitan.experiments.graph_trainer.trainer": trainer_mod,
-        "torchtitan.experiments.graph_trainer.make_fx_tracer": tracer_mod,
         "torchtitan.experiments.tpu": SimpleNamespace(),
+        # Current (components/) and legacy layouts, so a real torchtitan on the path is not picked up instead.
+        "torchtitan.experiments.tpu.components": SimpleNamespace(unflatten_shim=shim_mod),
+        "torchtitan.experiments.tpu.components.unflatten_shim": shim_mod,
         "torchtitan.experiments.tpu.unflatten_shim": shim_mod,
         "torchtitan.experiments.tpu.graph_trainer": SimpleNamespace(),
         "torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer": SimpleNamespace(
@@ -942,41 +777,24 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
         spec = graph_trainer_mode.GraphPolicyLossSpec(0.2, 0.28, 3.0, temperature=1.0)
         trainer.loss_fn = graph_trainer_mode.GraphPolicyLoss(spec)
 
+        gen = torch.Generator().manual_seed(1)
+        tokens = torch.randint(0, 32, (12,), generator=gen)
+        labels = (torch.roll(tokens, -1), -torch.rand(12, generator=gen), torch.randn(12, generator=gen))
+        labels = (*labels, (torch.rand(12, generator=gen) > 0.2).float())
+        pos = torch.arange(12)
         global_tokens = torch.tensor(16.0)
-        mbs = []
-        for seed in (1, 2):
-            gen = torch.Generator().manual_seed(seed)
-            tokens = torch.randint(0, 32, (12,), generator=gen)
-            targets = torch.roll(tokens, -1)
-            old_lp = -torch.rand(12, generator=gen)
-            adv = torch.randn(12, generator=gen)
-            mask = (torch.rand(12, generator=gen) > 0.2).float()
-            mbs.append((tokens, (targets, old_lp, adv, mask), torch.arange(12)))
+        loss = trainer.forward_backward_step(
+            input_dict={"input": tokens, "labels": labels, "positions": pos}, global_valid_tokens=global_tokens
+        )
+        log_probs = trainer.last_loss_metrics[graph_trainer_mode.LOG_PROBS_METRIC]
+        ref_loss, ref_metrics = trainer.loss_fn(model(tokens, positions=pos), labels, global_valid_tokens=global_tokens)
+        torch.testing.assert_close(loss, ref_loss.detach())
+        torch.testing.assert_close(log_probs, ref_metrics[graph_trainer_mode.LOG_PROBS_METRIC])
+        assert not log_probs.requires_grad
 
-        # Two training steps of one micro-batch each: the second reuses the traced graph.
-        for tokens, labels, pos in mbs:
-            for m in (model, ref_model):
-                for p in m.parameters():
-                    p.grad = None
-            loss = trainer.forward_backward_step(
-                input_dict={"input": tokens, "labels": labels, "positions": pos},
-                global_valid_tokens=global_tokens,
-            )
-            (aux_logp,) = trainer.last_loss_aux
-            ref_loss, (ref_logp,) = trainer.loss_fn(
-                ref_model(tokens, positions=pos), labels, global_valid_tokens=global_tokens
-            )
-            ref_loss.backward()
-            torch.testing.assert_close(loss, ref_loss.detach())
-            torch.testing.assert_close(aux_logp, ref_logp)
-            for (_, p), (_, rp) in zip(model.named_parameters(), ref_model.named_parameters(), strict=True):
-                torch.testing.assert_close(p.grad, rp.grad)
-
-        # Routing metrics list kept its exact length (1 tensor per step), without leaking aux_logp into it.
-        assert [len(r) for r in trainer.routing_received] == [1, 1]
-        # The model ran once (the trace) with the shim cleared, as in the eager engine, so a GatedDeltaNet would see
-        # the packed micro-batch as one row, not max_context_length rows; the upstream value is restored afterwards.
-        assert model.seen_row_len == [None]
+        # The step ran with the shim cleared, as in the eager engine, so a GatedDeltaNet would see the packed
+        # micro-batch as one row, not max_context_length rows; the upstream value is restored afterwards.
+        assert model.seen_row_len[0] is None
         assert shim_mod.get_unflatten_seq_len() is None
         with set_unflatten_seq_len(max_context_length):
             with graph_trainer_mode._packed_stream_as_one_row():

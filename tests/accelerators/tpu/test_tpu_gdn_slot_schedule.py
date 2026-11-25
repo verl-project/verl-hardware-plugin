@@ -53,6 +53,12 @@ def _make_packed_mb(
     return mb
 
 
+@pytest.fixture(autouse=True)
+def _no_spmd_input_annotation(monkeypatch):
+    """The stub engines here have no real ``ParallelDims`` / SPMD mesh for TorchTitan's input type annotation."""
+    monkeypatch.setattr(torchtitan_tpu, "_annotate_input_spmd_types", lambda *args, **kwargs: None)
+
+
 def test_has_internal_document_resets_checks_exact_sequence_starts():
     # Two standard single-document sequences starting at 0.
     pos = torch.tensor([0, 1, 2, 0, 1, 2, 3])

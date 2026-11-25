@@ -61,8 +61,8 @@ takes precedence. With neither set, paired matmul stays off.
 MoE models also require the fused LM-head log-prob (`use_fused_linear_cross_entropy`, on by default for them, with or
 without `use_torch_compile`): Tokamax's fused linear + softmax + cross-entropy Pallas kernel computes the per-token
 log-probs without writing the `[tokens, vocab]` logits (151,936 columns for Qwen3) to HBM, which is what lets a
-micro-batch of tens of thousands of tokens per chip fit. Its backward runs in PyTorch, in chunks of 2048 tokens (with
-tokamax 0.0.14, the Mosaic-TPU backward kernel returns a wrong LM-head weight gradient). Entropy, when a pass reports it without
+micro-batch of tens of thousands of tokens per chip fit. Its per-token backward runs in Tokamax's backward kernel too
+(TorchTitan's `linear_softmax_cross_entropy_loss` with `reduction="none"`). Entropy, when a pass reports it without
 differentiating it (old log-probs), is computed one chunk of tokens at a time. If the kernel cannot be used
 (`tensor_parallel_size > 1`, tokamax missing) the engine raises instead of falling back to the logits; set
 `use_fused_linear_cross_entropy=False` to run without it. The engine logs the log-prob path it uses

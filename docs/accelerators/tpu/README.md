@@ -33,7 +33,7 @@ verl_hardware_plugin/accelerators/tpu/
 │   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SimpleFSDP, SPMD)
 │   ├── graph_trainer_mode.py         # Opt-in trainer_mode=graph_trainer: TorchTitan TpuGraphTrainer whole-step compile
 │   ├── tpu_utils.py                  # Attention, SimpleFSDP, compile and sequence-bucketing helpers; option resolvers
-│   ├── fused_logprob.py              # Fused LM-head log-prob: Tokamax forward kernel + chunked PyTorch backward
+│   ├── fused_logprob.py              # Fused LM-head log-prob: TorchTitan / Tokamax forward + backward kernels
 │   └── weight_export.py              # Exports the engine's weights as local FSDP shards or full tensors
 ├── losses/                           # verl core: verl/workers/utils/losses.py
 │   └── loss_inputs.py                # Static-shape inputs for verl's unmodified sft_loss / ppo_loss

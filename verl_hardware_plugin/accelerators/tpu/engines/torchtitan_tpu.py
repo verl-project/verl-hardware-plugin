@@ -10,7 +10,8 @@ Registers ``TorchTitanTPUEngineWithLMHead`` with verl's ``EngineRegistry`` under
 This module implements the TPU TorchTitan engine directly on top of ``verl.workers.engine.base.BaseEngine``
 without importing ``verl.workers.engine.torchtitan``, keeping the TPU TorchTitan backend completely
 decoupled from core verl's GPU TorchTitan engine:
-- ``spmd_backend="default"`` and ``CompileConfig(backend="tpu")`` with static-shape Dynamo settings
+- TorchTitan's ``spmd_types`` SPMD path (its only one; verl's ``engine.spmd_backend`` is not used) and
+  ``CompileConfig(backend="tpu")`` with static-shape Dynamo settings
 - torchtitan's TPU ``SplashAttention`` Pallas kernel for packed-document causal attention without dense 4D masks
 - ``SimpleFSDP`` DTensor parameter sharding with ``spmd_safe`` compiled TransformerBlocks and cross-rank shape alignment
 - ``DEFER_AND_FUSE`` eager execution mode for ops outside compiled blocks
@@ -1230,7 +1231,6 @@ class TorchTitanTPUEngine(BaseEngine):
             "pipeline_parallel_degree": self.engine_config.pipeline_parallel_size,
             "context_parallel_degree": self.engine_config.context_parallel_size,
             "expert_parallel_degree": self.engine_config.expert_parallel_size,
-            "spmd_backend": self.engine_config.spmd_backend,
             "use_simple_fsdp": self._use_simple_fsdp,
         }
         topo_mesh = tpu_ragged_ep.should_enable_tpu_topo_mesh(tpu_options.enable_tpu_topo_mesh, ParallelismConfig)
@@ -1286,13 +1286,13 @@ class TorchTitanTPUEngine(BaseEngine):
                 f"cache length ({training.max_context_length}); raise engine.max_seq_len or lower the bucket"
             )
 
-        # Activation checkpointing mode. Under spmd_backend="spmd_types" with eager execution
+        # Activation checkpointing mode. TorchTitan always runs spmd_types: with eager execution
         # (use_torch_compile=False), selective/full AC recompute runs on the autograd backward thread
         # where the thread-local SPMD mesh is inactive, so spmd.assert_type() raises "no current mesh".
         ac_mode = self.engine_config.activation_checkpoint
-        if parallelism.spmd_backend == "spmd_types" and not self.engine_config.use_torch_compile and ac_mode != "none":
+        if not self.engine_config.use_torch_compile and ac_mode != "none":
             logger.warning(
-                "Disabling activation_checkpoint=%r because spmd_backend='spmd_types' with "
+                "Disabling activation_checkpoint=%r because TorchTitan's spmd_types path with "
                 "use_torch_compile=False does not support eager AC recomputation.",
                 ac_mode,
             )
@@ -1339,7 +1339,7 @@ class TorchTitanTPUEngine(BaseEngine):
             self._enable_fused_logprob_head()
         logger.warning(
             "TPU log-prob path: %s",
-            "fused Tokamax linear + log-softmax (Pallas forward, chunked backward)"
+            "fused Tokamax linear + log-softmax (Pallas forward and backward)"
             if self._use_fused_linear_cross_entropy
             else "LM-head logits + chunked log-softmax",
         )
@@ -1432,7 +1432,7 @@ class TorchTitanTPUEngine(BaseEngine):
                 model_parts,
                 ep_dispatcher=tpu_options.ep_dispatcher,
                 capacity_factor=ep_cap,
-                spmd_backend=parallelism.spmd_backend,
+                spmd_backend="spmd_types",  # TorchTitan's only SPMD path
                 compile_config=compile_config,
             )
             if n_ep:
@@ -1554,7 +1554,6 @@ class TorchTitanTPUEngine(BaseEngine):
                 "before cp_shard, and does not post-gather-unpermute outputs across CP shards. "
                 "Unset gdn_row_slot_len or turn context parallelism off."
             )
-        parallelism.spmd_backend = "spmd_types"
         load_balancer = tpu_cp_load_balancer(strategy)
         parallelism.context_parallel_load_balancer = load_balancer
         inner_attention = model.first_full_attention_backend
@@ -2001,19 +2000,16 @@ class TorchTitanTPUEngine(BaseEngine):
         batch_num_tokens: Any,
         loss_scalars: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> dict[str, Any]:
-        """``trainer_mode=graph_trainer``: the mini-batch's micro-batch through TorchTitan's traced training step.
+        """``trainer_mode=graph_trainer``: the mini-batch's micro-batches through TorchTitan's traced training step.
 
-        The micro-batch is prepared as in the eager engine (packed, bucket-padded to ``static_micro_batch_len``, same
-        shape on every rank), so the one traced, compiled step serves every step.
+        Each micro-batch is prepared as in the eager engine (packed, bucket-padded to ``static_micro_batch_len``, same
+        shape on every rank), so the one traced, compiled step serves every micro-batch and step.
         ``TpuGraphTrainer.forward_backward_step`` runs the model, the fused LM-head log-prob, the PPO policy loss and
-        the backward as one executable and writes the gradients to ``param.grad`` for the unchanged
-        ``optimizer_step``. It assigns rather than accumulates ``param.grad``, so exactly one micro-batch per mini-batch
-        per rank is supported (TODO-1). The loss is normalized by the mini-batch's GLOBAL token count, as in the eager
-        engine. verl's ``ppo_loss`` then runs eagerly under ``no_grad`` on the per-token log-probs the graph returns,
-        so the reported loss and metrics are the eager engine's.
+        the backward as one executable and adds the gradients to ``param.grad`` for the unchanged ``optimizer_step``.
+        Each micro-batch loss is normalized by the mini-batch's GLOBAL token count, as in the eager engine, so the
+        accumulated gradient is the mini-batch's. verl's ``ppo_loss`` then runs eagerly under ``no_grad`` on the
+        per-token log-probs the graph returns, so the reported loss and metrics are the eager engine's.
         """
-        if len(micro_batches) != 1:
-            raise graph_trainer_mode.multi_micro_batch_error(len(micro_batches))
         self._ensure_graph_policy_loss(loss_function, micro_batches[0])
         timeline_ctx = timeline.span(
             "fwd_bwd",
@@ -2083,7 +2079,7 @@ class TorchTitanTPUEngine(BaseEngine):
             graph_loss = self.trainer.forward_backward_step(
                 input_dict=input_dict, global_valid_tokens=global_valid_tokens
             )
-        (log_probs,) = self.trainer.last_loss_aux
+        log_probs = self.trainer.last_loss_metrics[graph_trainer_mode.LOG_PROBS_METRIC]
 
         # verl's loss and metrics, eagerly on the graph's log-probs (same code path as the eager engine's outputs).
         with (
@@ -2910,22 +2906,8 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         output_args["labels"] = labels
         input_ids = input_ids.contiguous()
 
-        if getattr(self.trainer.config.parallelism, "spmd_backend", None) == "spmd_types":
-            import spmd_types as spmd
-            from torchtitan.distributed.spmd_types import annotate_input_spmd_types
-            from torchtitan.models.common.decoder_sharding import CP, DP, TP, SpmdType, decoder_input_sharding
-
-            sharding = dict(decoder_input_sharding())
-            spmd_inputs: dict[str, Any] = {"input": input_ids, "positions": extra_inputs["positions"]}
-            if use_remove_padding:
-                spmd_inputs["labels"] = labels
-            if "cp_full_positions" in extra_inputs:
-                spmd_inputs["cp_full_positions"] = extra_inputs["cp_full_positions"]
-                sharding["cp_full_positions"] = SpmdType(
-                    {DP: spmd.V, CP: spmd.R, TP: spmd.R},
-                    partition_spec=spmd.PartitionSpec(DP),
-                )
-            annotate_input_spmd_types(self.parallel_dims, spmd_inputs, sharding)
+        # TorchTitan always runs spmd_types: annotate the model inputs.
+        _annotate_input_spmd_types(self.parallel_dims, input_ids, extra_inputs, labels if use_remove_padding else None)
 
         return input_ids, extra_inputs, extra_kwargs, output_args
 
@@ -3168,3 +3150,24 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                 }
 
         return loss, output
+
+
+def _annotate_input_spmd_types(
+    parallel_dims: Any, input_ids: torch.Tensor, extra_inputs: dict[str, Any], labels: Optional[torch.Tensor]
+) -> None:
+    """Annotates the model inputs with TorchTitan's decoder input SPMD types (its only SPMD path)."""
+    import spmd_types as spmd
+    from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+    from torchtitan.models.common.decoder_sharding import CP, DP, TP, SpmdType, decoder_input_sharding
+
+    sharding = dict(decoder_input_sharding())
+    spmd_inputs: dict[str, Any] = {"input": input_ids, "positions": extra_inputs["positions"]}
+    if labels is not None:
+        spmd_inputs["labels"] = labels
+    if "cp_full_positions" in extra_inputs:
+        spmd_inputs["cp_full_positions"] = extra_inputs["cp_full_positions"]
+        sharding["cp_full_positions"] = SpmdType(
+            {DP: spmd.V, CP: spmd.R, TP: spmd.R},
+            partition_spec=spmd.PartitionSpec(DP),
+        )
+    annotate_input_spmd_types(parallel_dims, spmd_inputs, sharding)
