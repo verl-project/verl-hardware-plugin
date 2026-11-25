@@ -291,23 +291,23 @@ def test_tpu_chips_per_host_override(monkeypatch):
         tpu_chips_per_host_override()
 
 
-def test_ep_dispatcher_and_topo_mesh_options():
+def test_ep_transport_and_topo_mesh_options():
     from types import SimpleNamespace
 
     opts = tpu_options.get_tpu_engine_options(
-        SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": " RAGGED ", "enable_tpu_topo_mesh": True}})
+        SimpleNamespace(engine_kwargs={"tpu": {"ep_transport": " Ragged_All_To_All ", "enable_tpu_topo_mesh": True}})
     )
-    assert opts.ep_dispatcher == "ragged"
+    assert opts.ep_transport == "ragged_all_to_all"
     assert opts.enable_tpu_topo_mesh is True
 
-    opts_static = tpu_options.get_tpu_engine_options(
-        SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": "static", "enable_tpu_topo_mesh": False}})
+    opts_roe = tpu_options.get_tpu_engine_options(
+        SimpleNamespace(engine_kwargs={"tpu": {"ep_transport": "ring_of_experts", "enable_tpu_topo_mesh": False}})
     )
-    assert opts_static.ep_dispatcher == "static"
-    assert opts_static.enable_tpu_topo_mesh is False
+    assert opts_roe.ep_transport == "ring_of_experts"
+    assert opts_roe.enable_tpu_topo_mesh is False
 
-    with pytest.raises(ValueError, match="engine_kwargs.tpu.ep_dispatcher"):
-        tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"ep_dispatcher": "deepep"}}))
+    with pytest.raises(ValueError, match="engine_kwargs.tpu.ep_transport"):
+        tpu_options.get_tpu_engine_options(SimpleNamespace(engine_kwargs={"tpu": {"ep_transport": "all_to_all"}}))
 
 
 def test_ac_save_splash_and_routing_option():

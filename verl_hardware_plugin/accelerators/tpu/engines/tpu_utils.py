@@ -1066,7 +1066,7 @@ def first_unpaddable_tensordict_entry(td: TensorDict, prefix: str = "") -> Optio
         return (prefix.rstrip(".") or "<root>", "0-D TensorDict")
     for key, value in td.items():
         path = f"{prefix}{key}"
-        if isinstance(value, (NonTensorData, NonTensorStack)):
+        if isinstance(value, NonTensorData | NonTensorStack):
             continue
         if isinstance(value, TensorDict):
             bad = first_unpaddable_tensordict_entry(value, prefix=f"{path}.")
@@ -1166,11 +1166,9 @@ def _wrap_routed_experts_on_edp_mesh(model: nn.Module, *, parallel_dims: Any, tr
         return
     from torch.distributed.fsdp import MixedPrecisionPolicy
     from torchtitan.config import TORCH_DTYPE_MAP
-    from torchtitan.distributed.utils import get_spmd_backend
     from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
     from torchtitan.models.common.moe import MoE
 
-    use_spmd_types = get_spmd_backend() == "spmd_types"
     if parallel_dims.dp_replicate_enabled:
         dp_mode = "hybrid_shard" if (parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled) else "replicate"
         edp_mesh_names = ["dp_replicate", "efsdp"]
@@ -1185,7 +1183,7 @@ def _wrap_routed_experts_on_edp_mesh(model: nn.Module, *, parallel_dims: Any, tr
         param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
         reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
     )
-    non_dp_mesh = parallel_dims.get_optional_mesh("ep") if use_spmd_types else None
+    non_dp_mesh = parallel_dims.get_optional_mesh("ep")  # TorchTitan always runs spmd_types
 
     for module_fqn, moe in model.named_modules():
         if not isinstance(moe, MoE):
@@ -1218,12 +1216,12 @@ def _wrap_routed_experts_on_edp_mesh(model: nn.Module, *, parallel_dims: Any, tr
 
 
 def _relax_non_static_ep_moe_compile(model: nn.Module, *, parallel_dims: Any, compile_config: Any) -> None:
-    """Use ``fullgraph=False`` on compiled MoE blocks whose EP dispatcher performs host split syncs.
+    """Use ``fullgraph=False`` on compiled MoE blocks under expert parallelism.
 
-    Without ``TpuQwen35TokenDispatcher`` (google-pytorch/torchtitan#6), ``AllToAllTokenDispatcher`` /
-    ``TpuAllToAllTokenDispatcher`` call ``.to("cpu")`` and ``.tolist()`` in ``_sync_token_count_exchange`` under
-    ``ep_enabled``, which raises a Dynamo graph-break error when ``apply_compile`` compiles the block with
-    ``fullgraph=True``.
+    torchtitan's EP token dispatchers do not trace with ``fullgraph=True`` under the engine's per-block
+    ``torch.compile``: upstream's ``AllToAllTokenDispatcher`` syncs token counts to the host (``.tolist()``), and
+    ``TpuAllToAllTokenDispatcher`` checks ``get_proxy_mode()`` (Dynamo: ``Unsupported _TorchDispatchModeKey``). Graph
+    mode traces them with TpuGraphTrainer instead.
     """
     if not getattr(parallel_dims, "ep_enabled", False) or not getattr(compile_config, "enable", False):
         return
@@ -1231,18 +1229,11 @@ def _relax_non_static_ep_moe_compile(model: nn.Module, *, parallel_dims: Any, co
     if layers is None:
         return
     backend = getattr(compile_config, "backend", "tpu")
-    _static_dispatchers = ("TpuQwen35TokenDispatcher", "TpuRaggedEPTokenDispatcher")
     for _, block in layers.named_children():
         if getattr(block, "_compiled_call_impl", None) is None:
             continue
-        needs_graph_break = any(
-            getattr(m, "token_dispatcher", None) is not None
-            and not any(c.__name__ in _static_dispatchers for c in type(m.token_dispatcher).__mro__)
-            for m in block.modules()
-        )
-        if needs_graph_break:
+        if any(getattr(m, "token_dispatcher", None) is not None for m in block.modules()):
             block.compile(backend=backend, fullgraph=False)
-            block._tpu_compile_relaxed = True  # type: ignore[attr-defined]
 
 
 def get_tpu_simple_fsdp_parallelize_fn(torchtitan_name: str) -> Callable[..., nn.Module]:
@@ -1650,7 +1641,7 @@ def pad_packed_inputs_for_tpu(
     """Bucket-pad packed (nested) 1D sequences on CPU before the H2D copy.
 
     Pad tokens get position 0, so the attention treats each one as its own document (it only attends to itself).
-    Under expert parallelism (``TpuQwen35TokenDispatcher``), repeating token 0 sends every pad slot to the same 8
+    Under expert parallelism, repeating token 0 sends every pad slot to the same 8
     experts, and cycling the micro-batch's own tokens concentrates pad traffic onto the same domain/math experts as
     real tokens; striding across ``vocab_size`` disperses pad slots across the full vocabulary and expert set.
     Returns ``(input_ids, position_ids, labels, orig_seq_len)``.
