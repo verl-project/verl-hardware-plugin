@@ -55,7 +55,7 @@ class CPLayerTransform:
     layer_config: str
     transform: str
     requirement: str
-    option_fields: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    option_fields: Mapping[str, str | tuple[str, ...]] = dataclasses.field(default_factory=dict)
 
 
 _REGISTRY: list[CPLayerTransform] = []
@@ -144,21 +144,26 @@ def _build_transform(spec: CPLayerTransform, load_balancer: Optional[str], optio
     field_names = (
         {f.name for f in dataclasses.fields(transform_cls)} if dataclasses.is_dataclass(transform_cls) else None
     )
-    for option, keyword in spec.option_fields.items():
+    for option, keyword_or_candidates in spec.option_fields.items():
         value = getattr(options, option, None)
         if value is None:
             continue  # keep the transform's own default
-        if field_names is not None and keyword not in field_names:
-            raise ValueError(
-                f"engine_kwargs.tpu.{option}={value!r} is set, but the installed torchtitan's {spec.transform} has "
-                f"no {keyword!r} field. Upgrade torchtitan or unset the option."
-            )
-        kwargs[keyword] = value
+        candidates = (
+            (keyword_or_candidates,) if isinstance(keyword_or_candidates, str) else tuple(keyword_or_candidates)
+        )
+        if field_names is not None:
+            matched_kw = next((kw for kw in candidates if kw in field_names), None)
+            if matched_kw is None:
+                raise ValueError(
+                    f"engine_kwargs.tpu.{option}={value!r} is set, but the installed torchtitan's {spec.transform} has "
+                    f"no {candidates[0]!r} field. Upgrade torchtitan or unset the option."
+                )
+        else:
+            matched_kw = candidates[0]
+        kwargs[matched_kw] = value
     transform = transform_cls(**kwargs)
-    if (
-        getattr(options, "context_parallel_gdn_reduce_dtype", None) is not None
-        and getattr(transform, "strategy", None) == "all_to_all"
-    ):
+    resolved_strategy = getattr(transform, "cp_strategy", getattr(transform, "strategy", None))
+    if getattr(options, "context_parallel_gdn_reduce_dtype", None) is not None and resolved_strategy == "all_to_all":
         raise ValueError(
             "engine_kwargs.tpu.context_parallel_gdn_reduce_dtype requires "
             "context_parallel_gdn_strategy='allgather_reducescatter' "
@@ -207,10 +212,12 @@ QWEN3_5_GATED_DELTA_NET = register_cp_layer_transform(
         name="Qwen3.5 GatedDeltaNet",
         layer_config="torchtitan.models.qwen3_5.gdn:GatedDeltaNet.Config",
         transform="torchtitan.experiments.tpu.qwen3_5.cp_gated_delta:GatedDeltaNetContextParallelTransform",
-        requirement="a torchtitan with google-pytorch/torchtitan#201 (experiments/tpu/qwen3_5/cp_gated_delta.py)",
+        requirement=(
+            "a torchtitan with google-pytorch/torchtitan#201 or #200 (experiments/tpu/qwen3_5/cp_gated_delta.py)"
+        ),
         option_fields={
-            "context_parallel_gdn_strategy": "strategy",
-            "context_parallel_gdn_reduce_dtype": "reduce_dtype",
+            "context_parallel_gdn_strategy": ("strategy", "cp_strategy"),
+            "context_parallel_gdn_reduce_dtype": ("reduce_dtype", "cp_reduce_dtype"),
         },
     )
 )

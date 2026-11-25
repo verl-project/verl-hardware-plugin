@@ -521,81 +521,87 @@ class _Fp32Masters:
 
         is_tpu = grad_norm.device.type == "tpu"
         cpu_opt = self._ensure_cpu_adamw(group)
-        d2h_events: list[Any] = [None, None]
-        h2d_events: list[Any] = [None, None]
-        slot_bufs: list[list[torch.Tensor]] = [[], []]
+        prev_threads = torch.get_num_threads()
+        opt_threads = int(os.environ.get("VERL_TPU_CPU_OPT_THREADS", str(min(24, max(8, (os.cpu_count() or 64) // 8)))))
+        torch.set_num_threads(opt_threads)
+        try:
+            d2h_events: list[Any] = [None, None]
+            h2d_events: list[Any] = [None, None]
+            slot_bufs: list[list[torch.Tensor]] = [[], []]
 
-        def _enqueue_d2h(chunk_params: list[torch.nn.Parameter], slot: int) -> None:
-            if h2d_events[slot] is not None:
-                h2d_events[slot].synchronize()
-                h2d_events[slot] = None
-            for p in chunk_params:
-                if isinstance(p.grad, DTensor) and any(pl.is_partial() for pl in p.grad.placements):
-                    p.grad = p.grad.redistribute(placements=p.placements)
-            torch.nn.utils.clip_grads_with_norm_(chunk_params, max_norm, grad_norm, foreach=False)
+            def _enqueue_d2h(chunk_params: list[torch.nn.Parameter], slot: int) -> None:
+                if h2d_events[slot] is not None:
+                    h2d_events[slot].synchronize()
+                    h2d_events[slot] = None
+                for p in chunk_params:
+                    if isinstance(p.grad, DTensor) and any(pl.is_partial() for pl in p.grad.placements):
+                        p.grad = p.grad.redistribute(placements=p.placements)
+                torch.nn.utils.clip_grads_with_norm_(chunk_params, max_norm, grad_norm, foreach=False)
+                if is_tpu:
+                    # Fuse all gradient clip scalings of this chunk into one async XLA program before D2H DMAs.
+                    tpu_synchronize(wait=False)
+                cur_bufs: list[torch.Tensor] = []
+                for idx, p in enumerate(chunk_params):
+                    assert p.grad is not None
+                    local_g = p.grad._local_tensor if isinstance(p.grad, DTensor) else p.grad
+                    src_g = _direct_d2h_source(local_g)
+                    buf = self._get_slot_buffer(slot, idx, src_g.shape, src_g.dtype)
+                    buf.copy_(src_g, non_blocking=is_tpu)
+                    cur_bufs.append(buf)
+                    p.grad = None
+                slot_bufs[slot] = cur_bufs
+                d2h_events[slot] = _record_tpu_event(is_tpu)
+
+            def _step_cpu_and_enqueue_h2d(chunk_params: list[torch.nn.Parameter], slot: int) -> None:
+                if d2h_events[slot] is not None:
+                    d2h_events[slot].synchronize()
+                    d2h_events[slot] = None
+                elif is_tpu:
+                    tpu_synchronize(wait=True)
+
+                mps: list[torch.nn.Parameter] = []
+                bufs = slot_bufs[slot]
+                for p, buf in zip(chunk_params, bufs, strict=True):
+                    mp = self._get_or_bind_cpu_master(p, cpu_opt)
+                    mp.grad = buf.to(dtype=torch.float32)
+                    mps.append(mp)
+
+                cpu_opt.param_groups[0]["params"] = mps
+                try:
+                    cpu_opt.step()
+                finally:
+                    cpu_opt.param_groups[0]["params"] = []
+
+                for p, mp, buf in zip(chunk_params, mps, bufs, strict=True):
+                    pid = id(p)
+                    master_view, state_view = self._entries[pid]
+                    if not state_view:
+                        cpu_state = cpu_opt.state.get(mp, {})
+                        bound_state = {
+                            k: _wrap_local_like_param(v, p) if isinstance(v, torch.Tensor) else v
+                            for k, v in cpu_state.items()
+                        }
+                        self._entries[pid] = (master_view, bound_state)
+                    mp.grad = None
+                    buf.copy_(mp.detach())
+                    local_p = p._local_tensor if isinstance(p, DTensor) else p.data
+                    local_p.copy_(buf, non_blocking=is_tpu)
+                h2d_events[slot] = _record_tpu_event(is_tpu)
+
+            _enqueue_d2h(active_chunks[0], 0)
+            for i, chunk_params in enumerate(active_chunks):
+                if i + 1 < len(active_chunks):
+                    _enqueue_d2h(active_chunks[i + 1], (i + 1) % 2)
+                _step_cpu_and_enqueue_h2d(chunk_params, i % 2)
+
+            for slot in (0, 1):
+                if h2d_events[slot] is not None:
+                    h2d_events[slot].synchronize()
+                    h2d_events[slot] = None
             if is_tpu:
-                # Fuse all gradient clip scalings of this chunk into one async XLA program before D2H DMAs.
-                tpu_synchronize(wait=False)
-            cur_bufs: list[torch.Tensor] = []
-            for idx, p in enumerate(chunk_params):
-                assert p.grad is not None
-                local_g = p.grad._local_tensor if isinstance(p.grad, DTensor) else p.grad
-                src_g = _direct_d2h_source(local_g)
-                buf = self._get_slot_buffer(slot, idx, src_g.shape, src_g.dtype)
-                buf.copy_(src_g, non_blocking=is_tpu)
-                cur_bufs.append(buf)
-                p.grad = None
-            slot_bufs[slot] = cur_bufs
-            d2h_events[slot] = _record_tpu_event(is_tpu)
-
-        def _step_cpu_and_enqueue_h2d(chunk_params: list[torch.nn.Parameter], slot: int) -> None:
-            if d2h_events[slot] is not None:
-                d2h_events[slot].synchronize()
-                d2h_events[slot] = None
-            elif is_tpu:
                 tpu_synchronize(wait=True)
-
-            mps: list[torch.nn.Parameter] = []
-            bufs = slot_bufs[slot]
-            for p, buf in zip(chunk_params, bufs, strict=True):
-                mp = self._get_or_bind_cpu_master(p, cpu_opt)
-                mp.grad = buf.to(dtype=torch.float32)
-                mps.append(mp)
-
-            cpu_opt.param_groups[0]["params"] = mps
-            try:
-                cpu_opt.step()
-            finally:
-                cpu_opt.param_groups[0]["params"] = []
-
-            for p, mp, buf in zip(chunk_params, mps, bufs, strict=True):
-                pid = id(p)
-                master_view, state_view = self._entries[pid]
-                if not state_view:
-                    cpu_state = cpu_opt.state.get(mp, {})
-                    bound_state = {
-                        k: _wrap_local_like_param(v, p) if isinstance(v, torch.Tensor) else v
-                        for k, v in cpu_state.items()
-                    }
-                    self._entries[pid] = (master_view, bound_state)
-                mp.grad = None
-                buf.copy_(mp.detach())
-                local_p = p._local_tensor if isinstance(p, DTensor) else p.data
-                local_p.copy_(buf, non_blocking=is_tpu)
-            h2d_events[slot] = _record_tpu_event(is_tpu)
-
-        _enqueue_d2h(active_chunks[0], 0)
-        for i, chunk_params in enumerate(active_chunks):
-            if i + 1 < len(active_chunks):
-                _enqueue_d2h(active_chunks[i + 1], (i + 1) % 2)
-            _step_cpu_and_enqueue_h2d(chunk_params, i % 2)
-
-        for slot in (0, 1):
-            if h2d_events[slot] is not None:
-                h2d_events[slot].synchronize()
-                h2d_events[slot] = None
-        if is_tpu:
-            tpu_synchronize(wait=True)
+        finally:
+            torch.set_num_threads(prev_threads)
 
     @torch.no_grad()
     def begin(self, opt: Any, chunk: list[torch.nn.Parameter]) -> list[tuple[torch.nn.Parameter, torch.nn.Parameter]]:
@@ -1389,8 +1395,10 @@ class TorchTitanTPUEngine(BaseEngine):
         for override_import in tpu_model_kernels.override_imports(self._tpu_kernels):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
+        self._bin_slot_len = int(os.environ.get("VERL_TPU_BIN_SLOT_LEN", "0") or 0)
         if self._graph_trainer_mode:
-            self.trainer = graph_trainer_mode.build_rl_graph_trainer(self.config)
+            init_slot = self._gdn_row_slot_len or self._bin_slot_len
+            self.trainer = graph_trainer_mode.build_rl_graph_trainer(self.config, row_slot_len=init_slot)
         else:
             self.trainer = Trainer(self.config)
         if engine_config.use_torch_compile:
@@ -1405,11 +1413,13 @@ class TorchTitanTPUEngine(BaseEngine):
         # TorchTitan disables gradient division by default (for global token normalization),
         # but verl's loss function multiplies by dp_size to compensate for gradient averaging.
         model_parts = self.trainer.model_parts
-        gdn_slot_schedule.validate_model_cp_slot_support(
+        has_full_pos, _ = gdn_slot_schedule.validate_model_cp_slot_support(
             model_parts,
             need_cp_full_positions=self._cp_full_positions and self.parallel_dims.cp_enabled,
             need_document_resets_override=bool(self._gdn_auto_row_slot_len),
         )
+        if tpu_options.cp_full_positions is None and self.parallel_dims.cp_enabled and has_full_pos:
+            self._cp_full_positions = True
         if self.engine_config.data_parallel_shard_size > 1:
             dp_size = self.get_data_parallel_size()
             for model_part in model_parts:
@@ -1817,15 +1827,32 @@ class TorchTitanTPUEngine(BaseEngine):
         # scalars as 0-D device tensors, so the loss programs do not bake them in as constants.
         loss_scalars = device_loss_scalars(data, get_device_id) if loss_function is not None else {}
 
-        micro_batches, indices = prepare_micro_batches(
-            data=data,
-            dp_group=dp_group,
-            same_micro_num_in_dp=True,
-        )
         tpu_options = get_tpu_engine_options(self.engine_config)
         static_len = int(tpu_options.static_micro_batch_len or 0)
         if forward_only and tpu_options.static_log_prob_micro_batch_len:
             static_len = int(tpu_options.static_log_prob_micro_batch_len)
+        bin_slot_len = int(getattr(self, "_bin_slot_len", 0) or 0)
+        if (
+            bin_slot_len > 0
+            and static_len >= bin_slot_len
+            and static_len % bin_slot_len == 0
+            and getattr(self.engine_config, "use_dynamic_bsz", False)
+            and getattr(data["input_ids"], "is_nested", False)
+        ):
+            from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import pack_micro_batches_into_bins
+
+            micro_batches, indices = pack_micro_batches_into_bins(
+                data=data,
+                dp_group=dp_group,
+                bin_len=bin_slot_len,
+                num_bins=static_len // bin_slot_len,
+            )
+        else:
+            micro_batches, indices = prepare_micro_batches(
+                data=data,
+                dp_group=dp_group,
+                same_micro_num_in_dp=True,
+            )
         static_response_len = int(tpu_options.static_max_response_len or 0)
         slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)
         # Pad the PPO loss rows to a common bucket only for losses that provably ignore fully masked rows.
@@ -1997,47 +2024,166 @@ class TorchTitanTPUEngine(BaseEngine):
         )
         output_lst = []
         with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode):
-            for micro_batch_idx, micro_batch in enumerate(micro_batches):
-                output_lst.append(
-                    self._graph_trainer_micro_batch(
-                        micro_batch, micro_batch_idx, loss_function, batch_num_tokens, loss_scalars
+            if os.getenv("VERL_TPU_ASYNC_MB_ENQUEUE", "0") == "1" and len(micro_batches) > 1:
+                enqueued = [
+                    self._graph_trainer_micro_batch_enqueue(
+                        micro_batch, micro_batch_idx, batch_num_tokens, loss_scalars
                     )
-                )
+                    for micro_batch_idx, micro_batch in enumerate(micro_batches)
+                ]
+                output_lst = [self._graph_trainer_micro_batch_finalize(item, loss_function) for item in enqueued]
+            else:
+                for micro_batch_idx, micro_batch in enumerate(micro_batches):
+                    output_lst.append(
+                        self._graph_trainer_micro_batch(
+                            micro_batch, micro_batch_idx, loss_function, batch_num_tokens, loss_scalars
+                        )
+                    )
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
-    def _graph_trainer_micro_batch(
+    def _annotate_graph_extra_spmd_types(self, input_dict: dict[str, Any]) -> None:
+        if getattr(self.parallel_dims, "world_mesh", None) is None:
+            return
+        import spmd_types as spmd
+        from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+        from torchtitan.models.common.decoder_sharding import CP, DP, TP, SpmdType
+
+        if "token_mask" in input_dict:
+            annotate_input_spmd_types(
+                self.parallel_dims,
+                {"token_mask": input_dict["token_mask"]},
+                {
+                    "token_mask": SpmdType(
+                        {DP: spmd.V, CP: spmd.V, TP: spmd.R},
+                        partition_spec=spmd.PartitionSpec((DP, CP)),
+                    )
+                },
+            )
+        if "cp_full_segment_ids" in input_dict:
+            cs = input_dict["cp_full_segment_ids"]
+            trailing = (None,) * (cs.ndim - 1)
+            annotate_input_spmd_types(
+                self.parallel_dims,
+                {"cp_full_segment_ids": cs},
+                {
+                    "cp_full_segment_ids": SpmdType(
+                        {DP: spmd.V, CP: spmd.R, TP: spmd.R},
+                        partition_spec=spmd.PartitionSpec(DP, *trailing),
+                    )
+                },
+            )
+
+    def _graph_trainer_micro_batch_enqueue(
         self,
         micro_batch: TensorDict,
         micro_batch_idx: int,
-        loss_function: Callable,
         batch_num_tokens: Any,
         loss_scalars: Optional[Mapping[str, torch.Tensor]] = None,
-    ) -> dict[str, Any]:
-        """One micro-batch of ``_graph_trainer_forward_backward``: the traced step, then verl's loss and metrics."""
+        *,
+        non_blocking_h2d: bool = True,
+    ) -> tuple[Any, ...]:
+        """Phase 1 of ``_graph_trainer_micro_batch``: enqueue ``forward_backward_step`` without host syncs."""
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
-        if extra_kwargs or set(extra_inputs) != {"positions"} or "orig_seq_len" not in output_args:
+        allowed_extra_inputs = {"positions", "cp_full_positions"}
+        allowed_extra_kwargs = {"cp_full_segment_ids"}
+        if (
+            not set(extra_inputs).issubset(allowed_extra_inputs)
+            or not set(extra_kwargs).issubset(allowed_extra_kwargs)
+            or "orig_seq_len" not in output_args
+        ):
             raise NotImplementedError(
                 "trainer_mode=graph_trainer supports packed text-only inputs (use_remove_padding=True, no "
-                f"multi-modal or CP inputs), got {sorted(extra_inputs)} / {sorted(extra_kwargs)}"
+                f"multi-modal inputs), got {sorted(extra_inputs)} / {sorted(extra_kwargs)}"
             )
-        padded_len = int(input_ids.shape[-1])
+        local_padded_len = int(input_ids.shape[-1])
+        parallel_dims = getattr(self, "parallel_dims", None)
+        cp_enabled = parallel_dims is not None and bool(getattr(parallel_dims, "cp_enabled", False))
+        cp_size = int(parallel_dims.cp) if (parallel_dims is not None and cp_enabled) else 1
+        full_padded_len = local_padded_len * cp_size
         if self._graph_trainer_traced_len is None:
-            self._graph_trainer_traced_len = padded_len
-        elif padded_len != self._graph_trainer_traced_len:
-            raise graph_trainer_mode.shape_change_error(self._graph_trainer_traced_len, padded_len)
+            self._graph_trainer_traced_len = local_padded_len
+        elif local_padded_len != self._graph_trainer_traced_len:
+            raise graph_trainer_mode.shape_change_error(self._graph_trainer_traced_len, local_padded_len)
 
-        # Fixed pytree with fixed shapes every step: the packed [T] RL loss inputs and a 0-d tensor token count (the
-        # mini-batch's global count, the same for every micro-batch).
-        old_log_probs, advantages, loss_mask = graph_trainer_mode.pack_rl_loss_targets(micro_batch, padded_len)
+        old_log_probs, advantages, loss_mask = graph_trainer_mode.pack_rl_loss_targets(micro_batch, full_padded_len)
+        slot_src_cpu = output_args.get("gdn_slot_src_cpu")
         device = input_ids.device
-        labels = (
-            output_args["labels"],
-            old_log_probs.to(device),
-            advantages.to(device),
-            loss_mask.to(device),
+        target_ids = output_args["labels"]
+        if target_ids.dim() > 1:
+            target_ids = target_ids.squeeze(0)
+        if slot_src_cpu is not None:
+            old_log_probs = old_log_probs.index_select(0, slot_src_cpu)
+            advantages = advantages.index_select(0, slot_src_cpu)
+            loss_mask = loss_mask.index_select(0, slot_src_cpu)
+            if not output_args.get("labels_already_permuted", False):
+                target_ids = target_ids.index_select(0, output_args["gdn_slot_src"])
+
+        mods = getattr(self, "module", None)
+        use_moe_skip_pad = (
+            os.getenv("VERL_TPU_MOE_SKIP_PAD", "1") != "0"
+            and mods is not None
+            and len(mods) > 0
+            and gdn_slot_schedule.forward_accepts_kwarg(mods[0], "token_mask")
         )
-        # The same 0-D tensor as the eager loss (device_loss_scalars), else built here (not on TPU, e.g. CPU tests),
-        # clamped to >= 1.0 when batch_num_tokens == 0 globally to match GraphPolicyLoss and avoid 0.0 / 0.0 = NaN.
+        token_mask_cpu: Optional[torch.Tensor] = None
+        if use_moe_skip_pad:
+            orig_seq_len = int(output_args["orig_seq_len"])
+            token_mask_cpu = torch.arange(full_padded_len, dtype=torch.int64) < orig_seq_len
+            if slot_src_cpu is not None:
+                token_mask_cpu = token_mask_cpu.index_select(0, slot_src_cpu)
+
+        assert self._graph_policy_loss_spec is not None
+        seq_ids_cpu: Optional[torch.Tensor] = None
+        if self._graph_policy_loss_spec.needs_seq_ids:
+            seq_ids_cpu = graph_trainer_mode.pack_rl_seq_ids(micro_batch, full_padded_len)
+            if slot_src_cpu is not None:
+                seq_ids_cpu = seq_ids_cpu.index_select(0, slot_src_cpu)
+
+        if cp_enabled and parallel_dims is not None:
+            cp_mesh = parallel_dims.get_mesh("cp")
+            cp_rank = int(cp_mesh.get_local_rank())
+            lb_type = self.trainer.config.parallelism.context_parallel_load_balancer
+            cache_attr = "_cp_local_shard_idx_cache"
+            idx_cache: dict[tuple[int, int, int, Optional[str]], torch.Tensor] = getattr(self, cache_attr, {})
+            cache_key = (full_padded_len, cp_size, cp_rank, lb_type)
+            local_cp_idx = idx_cache.get(cache_key)
+            if local_cp_idx is None:
+                if lb_type is None:
+                    local_cp_idx = torch.arange(
+                        cp_rank * local_padded_len, (cp_rank + 1) * local_padded_len, dtype=torch.int64
+                    )
+                elif lb_type == "headtail":
+                    perm = _HeadTailLoadBalancer(full_padded_len, cp_size, "cpu")._generate_indices(restore=False)[0]
+                    local_cp_idx = (
+                        perm[cp_rank * local_padded_len : (cp_rank + 1) * local_padded_len].to(torch.int64).contiguous()
+                    )
+                else:
+                    raise NotImplementedError(f"context_parallel_load_balancer={lb_type!r} is not supported")
+                idx_cache[cache_key] = local_cp_idx
+                setattr(self, cache_attr, idx_cache)
+            old_log_probs = old_log_probs.index_select(0, local_cp_idx).contiguous()
+            advantages = advantages.index_select(0, local_cp_idx).contiguous()
+            loss_mask = loss_mask.index_select(0, local_cp_idx).contiguous()
+            if seq_ids_cpu is not None:
+                seq_ids_cpu = seq_ids_cpu.index_select(0, local_cp_idx).contiguous()
+            if token_mask_cpu is not None:
+                token_mask_cpu = token_mask_cpu.index_select(0, local_cp_idx).contiguous()
+
+        if seq_ids_cpu is not None:
+            labels: tuple[torch.Tensor, ...] = (
+                target_ids,
+                old_log_probs.to(device, non_blocking=non_blocking_h2d),
+                advantages.to(device, non_blocking=non_blocking_h2d),
+                loss_mask.to(device, non_blocking=non_blocking_h2d),
+                seq_ids_cpu.to(device, non_blocking=non_blocking_h2d),
+            )
+        else:
+            labels = (
+                target_ids,
+                old_log_probs.to(device, non_blocking=non_blocking_h2d),
+                advantages.to(device, non_blocking=non_blocking_h2d),
+                loss_mask.to(device, non_blocking=non_blocking_h2d),
+            )
         global_valid_tokens = (loss_scalars or {}).get("batch_num_tokens")
         if global_valid_tokens is None or global_valid_tokens.device != device:
             global_valid_tokens = torch.tensor(max(float(batch_num_tokens), 1.0), dtype=torch.float32, device=device)
@@ -2046,7 +2192,20 @@ class TorchTitanTPUEngine(BaseEngine):
             if loss_scalars and "batch_num_tokens" in loss_scalars
             else {**(loss_scalars or {}), "batch_num_tokens": global_valid_tokens}
         )
-        input_dict = {"input": input_ids, "labels": labels, "positions": extra_inputs["positions"]}
+        input_dict: dict[str, Any] = {
+            "input": input_ids,
+            "labels": labels,
+            "positions": extra_inputs["positions"],
+            **extra_kwargs,
+        }
+        if "cp_full_positions" in extra_inputs:
+            input_dict["cp_full_positions"] = extra_inputs["cp_full_positions"]
+        if token_mask_cpu is not None:
+            input_dict["token_mask"] = token_mask_cpu.to(device=device, non_blocking=True).contiguous()
+        if "token_mask" in input_dict or "cp_full_segment_ids" in input_dict:
+            self._annotate_graph_extra_spmd_types(input_dict)
+        if hasattr(self.trainer, "active_slot_len") and output_args.get("active_bin_slot"):
+            self.trainer.active_slot_len = int(output_args["active_bin_slot"])
         # bf16 autocast as in the eager engine; it must be active while the step is traced (step 1), which records the
         # casts into the graph.
         with (
@@ -2057,6 +2216,17 @@ class TorchTitanTPUEngine(BaseEngine):
                 input_dict=input_dict, global_valid_tokens=global_valid_tokens
             )
         log_probs = self.trainer.last_loss_metrics[graph_trainer_mode.LOG_PROBS_METRIC]
+        return (log_probs, graph_loss, micro_batch, output_args, eager_scalars, full_padded_len)
+
+    def _graph_trainer_micro_batch_finalize(self, item: tuple[Any, ...], loss_function: Callable) -> dict[str, Any]:
+        log_probs, graph_loss, micro_batch, output_args, eager_scalars, full_padded_len = item
+        parallel_dims = getattr(self, "parallel_dims", None)
+        cp_enabled = bool(parallel_dims is not None and parallel_dims.cp_enabled)
+        if cp_enabled:
+            with torch.no_grad(), spmd_no_typecheck_context():
+                log_probs = self._gather_context_parallel(log_probs, full_padded_len)
+        if "gdn_contig_src" in output_args:
+            log_probs = log_probs.index_select(0, output_args["gdn_contig_src"])
 
         # verl's loss and metrics, eagerly on the graph's log-probs (same code path as the eager engine's outputs).
         with (
@@ -2076,13 +2246,34 @@ class TorchTitanTPUEngine(BaseEngine):
                 if hasattr(value, TPU_PADDED_VALUES_ATTR):
                     delattr(value, TPU_PADDED_VALUES_ATTR)
         verl_loss = loss.detach().item()
-        graph_trainer_mode.check_loss_consistency(
-            graph_loss.detach().float().item(),
-            verl_loss,
-            self.get_data_parallel_size(),
-            raise_on_mismatch=os.getenv("VERL_TPU_LOSS_CONSISTENCY_RAISE", "1") != "0",
-        )
+        if not cp_enabled:
+            graph_trainer_mode.check_loss_consistency(
+                graph_loss.detach().float().item(),
+                verl_loss,
+                self.get_data_parallel_size(),
+                raise_on_mismatch=os.getenv("VERL_TPU_LOSS_CONSISTENCY_RAISE", "1") != "0",
+            )
+        elif not math.isfinite(graph_loss.detach().float().item()) or not math.isfinite(verl_loss):
+            raise RuntimeError(f"Non-finite loss under CP graph_trainer: graph={graph_loss.item()}, verl={verl_loss}")
         return {"model_output": detach_tree(model_output), "loss": verl_loss, "metrics": metrics}
+
+    def _graph_trainer_micro_batch(
+        self,
+        micro_batch: TensorDict,
+        micro_batch_idx: int,
+        loss_function: Callable,
+        batch_num_tokens: Any,
+        loss_scalars: Optional[Mapping[str, torch.Tensor]] = None,
+    ) -> dict[str, Any]:
+        """One micro-batch of ``_graph_trainer_forward_backward``: the traced step, then verl's loss and metrics."""
+        item = self._graph_trainer_micro_batch_enqueue(
+            micro_batch,
+            micro_batch_idx,
+            batch_num_tokens,
+            loss_scalars,
+            non_blocking_h2d=False,
+        )
+        return self._graph_trainer_micro_batch_finalize(item, loss_function)
 
     def _ensure_graph_policy_loss(self, loss_function: Callable, micro_batch: TensorDict) -> None:
         """Installs the traced PPO loss as ``TpuGraphTrainer.loss_fn`` on the first step; later steps must match it.
@@ -2098,7 +2289,11 @@ class TorchTitanTPUEngine(BaseEngine):
             has_rollout_is_weights="rollout_is_weights" in micro_batch.keys(),
         )
         if self._graph_policy_loss_spec is None:
-            self.trainer.loss_fn = graph_trainer_mode.GraphPolicyLoss(spec, self._tpu_kernels)
+            parallel_dims = getattr(self, "parallel_dims", None)
+            cp_group = (
+                self.get_context_parallel_group() if (parallel_dims is not None and parallel_dims.cp_enabled) else None
+            )
+            self.trainer.loss_fn = graph_trainer_mode.GraphPolicyLoss(spec, self._tpu_kernels, cp_group=cp_group)
             self._graph_policy_loss_spec = spec
         elif spec != self._graph_policy_loss_spec:
             raise RuntimeError(
@@ -2172,6 +2367,21 @@ class TorchTitanTPUEngine(BaseEngine):
         ):
             for p in getattr(self, "_frozen_params", ()):
                 p.grad = None  # frozen: out of the gradient norm, and AdamW skips parameters without a gradient
+            if getattr(self, "_graph_trainer_mode", False) and os.environ.get("VERL_TPU_COMPILED_OPT_STEP", "0") == "1":
+                grad_norm = self.trainer._clip_grad_norm()
+                tpu_synchronize(grad_norm, wait=True)
+                grad_norm_val = grad_norm.item()
+                if not math.isfinite(grad_norm_val):
+                    logger.warning("grad_norm is not finite (%s); skipping this optimizer step", grad_norm_val)
+                    self.optimizer.zero_grad()
+                    if grad_norm.device.type == "tpu":
+                        tpu_synchronize(wait=True)
+                    return grad_norm_val
+                self.trainer.optimizers.step()
+                self.optimizer.zero_grad()
+                if grad_norm.device.type == "tpu":
+                    tpu_synchronize(wait=True)
+                return grad_norm_val
             param_chunks = self._optimizer_param_chunks()
             grad_norm = self._chunked_grad_norm(param_chunks)
             tpu_synchronize(grad_norm, wait=True)
@@ -2254,6 +2464,7 @@ class TorchTitanTPUEngine(BaseEngine):
         max_norm = self.config.training.max_norm
         tpu_options = getattr(self, "_tpu_options", None)
         host_offload = bool(tpu_options and tpu_options.optimizer_host_offload)
+        async_chunks = not host_offload and os.environ.get("VERL_TPU_ASYNC_OPT_CHUNKS", "0") == "1"
         masters = _fp32_masters_of(self)
         for opt, group_entries in param_chunks:
             for group, _, _ in group_entries:
@@ -2273,7 +2484,7 @@ class TorchTitanTPUEngine(BaseEngine):
                             opt.step()
                             masters.write_back(pairs)
                             if grad_norm.device.type == "tpu":
-                                tpu_synchronize(wait=True)
+                                tpu_synchronize(wait=not async_chunks)
                             masters.end(opt, pairs)
                             group["params"] = []
                             continue
@@ -2282,7 +2493,7 @@ class TorchTitanTPUEngine(BaseEngine):
                             _move_optimizer_state(opt, chunk, chunk[0].device)
                         opt.step()
                         if grad_norm.device.type == "tpu":
-                            tpu_synchronize(wait=True)  # end this chunk's program before tracing the next one
+                            tpu_synchronize(wait=not async_chunks)
                         if host_offload:
                             # The chunk's optimizer states live in host memory between steps (engine_kwargs.tpu.
                             # optimizer_host_offload), so only one chunk's states are ever on the device.
@@ -2290,6 +2501,8 @@ class TorchTitanTPUEngine(BaseEngine):
                         for p in chunk:
                             p.grad = None
                         group["params"] = []
+                if async_chunks and grad_norm.device.type == "tpu":
+                    tpu_synchronize(wait=True)
             finally:
                 for group, params, _ in group_entries:
                     group["params"] = params
@@ -2774,9 +2987,40 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                     )
                 # One sequence per GatedDeltaNet row; prepare_model_outputs restores the packed order.
                 slot_src, contig_src = row_slot_permutation(cu_seqlens, input_ids.shape[-1], self._gdn_row_slot_len)
+                output_args["gdn_slot_src_cpu"] = slot_src
                 slot_src = slot_src.to(input_ids.device)
+                output_args["gdn_slot_src"] = slot_src
                 input_ids, position_ids = input_ids[..., slot_src], position_ids[..., slot_src]
                 output_args["gdn_contig_src"] = contig_src.to(input_ids.device)
+            elif (
+                (
+                    eff_bin_slot := int(
+                        tu.get_non_tensor_data(data=micro_batch, key="mb_bin_slot_len", default=0)
+                        or getattr(self, "_bin_slot_len", 0)
+                        or 0
+                    )
+                )
+                and input_ids.shape[-1] >= eff_bin_slot
+                and input_ids.shape[-1] % eff_bin_slot == 0
+            ):
+                from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import bin_slot_permutation
+
+                slot_src, contig_src, tail_ranges = bin_slot_permutation(
+                    cu_seqlens, int(input_ids.shape[-1]), int(eff_bin_slot)
+                )
+                output_args["active_bin_slot"] = int(eff_bin_slot)
+                output_args["gdn_slot_src_cpu"] = slot_src
+                slot_src_dev = slot_src.to(input_ids.device, non_blocking=True)
+                output_args["gdn_slot_src"] = slot_src_dev
+                input_ids = input_ids[..., slot_src_dev]
+                labels = labels[..., slot_src_dev]
+                position_ids = position_ids[..., slot_src_dev].clone()
+                for t_start, t_end in tail_ranges:
+                    position_ids[..., t_start:t_end] = torch.arange(
+                        t_end - t_start, dtype=position_ids.dtype, device=position_ids.device
+                    )
+                output_args["gdn_contig_src"] = contig_src.to(input_ids.device, non_blocking=True)
+                output_args["labels_already_permuted"] = True
         else:
             if self.parallel_dims.cp_enabled and getattr(self, "_cp_full_positions", False):
                 if multi_modal_inputs or position_ids.dim() > 2:
@@ -2814,7 +3058,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         padded_seq_len = int(input_ids.shape[-1])
         output_args["padded_seq_len"] = padded_seq_len
         extra_kwargs: dict[str, Any] = {}
-        slot_src_cpu: Optional[torch.Tensor] = None
+        slot_src_cpu: Optional[torch.Tensor] = output_args.get("gdn_slot_src_cpu")
         mb_slot_len = self._effective_mb_slot_len(
             micro_batch,
             allow_auto_row_slot=self._allow_auto_row_slot(),

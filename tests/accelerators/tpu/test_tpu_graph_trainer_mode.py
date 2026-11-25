@@ -112,14 +112,15 @@ def test_validate_graph_trainer_engine():
     options = _options(trainer_mode="graph_trainer", static_micro_batch_len=8192)
     graph_trainer_mode.validate_graph_trainer_engine(good, options, use_simple_fsdp=True, tpu_kernels=frozenset())
 
-    bad = SimpleNamespace(forward_only=True, param_offload=True, expert_parallel_size=2, context_parallel_size=1)
+    bad = SimpleNamespace(
+        forward_only=True, param_offload=True, expert_parallel_size=2, context_parallel_size=1, tensor_parallel_size=2
+    )
     with pytest.raises(ValueError) as e:
         graph_trainer_mode.validate_graph_trainer_engine(
             bad,
             _options(
                 trainer_mode="graph_trainer",
                 use_fused_linear_cross_entropy=False,
-                gdn_row_slot_len=4096,
                 kda_document_budget=1,
             ),
             use_simple_fsdp=False,
@@ -132,16 +133,23 @@ def test_validate_graph_trainer_engine():
         "static_micro_batch_len",
         "use_fused_linear_cross_entropy",
         "kda_document_budget=1",
-        "gdn_row_slot_len=4096",
+        "tensor_parallel_size=2",
     ):
         assert expected in message, (expected, message)
     assert "param_offload" in message
 
-    # gdn_row_slot_len alone: the traced step never restores the packed token order of the slot layout.
-    with pytest.raises(ValueError, match="gdn_row_slot_len=4096"):
+    # Context parallelism and divisible gdn_row_slot_len are supported; non-divisible gdn_row_slot_len raises.
+    cp_engine = SimpleNamespace(forward_only=False, param_offload=False, context_parallel_size=2)
+    graph_trainer_mode.validate_graph_trainer_engine(
+        cp_engine,
+        _options(trainer_mode="graph_trainer", static_micro_batch_len=8192, gdn_row_slot_len=4096),
+        use_simple_fsdp=True,
+        tpu_kernels=frozenset(),
+    )
+    with pytest.raises(ValueError, match="must be a multiple of gdn_row_slot_len=3000"):
         graph_trainer_mode.validate_graph_trainer_engine(
             good,
-            _options(trainer_mode="graph_trainer", static_micro_batch_len=8192, gdn_row_slot_len=4096),
+            _options(trainer_mode="graph_trainer", static_micro_batch_len=8192, gdn_row_slot_len=3000),
             use_simple_fsdp=True,
             tpu_kernels=frozenset(),
         )
@@ -202,16 +210,21 @@ def test_policy_loss_spec_reads_and_checks_the_actor_config():
         (dict(loss_agg_mode="seq-mean-token-mean"), "loss_agg_mode"),
         (dict(policy_loss=_ActorConfig(loss_mode="gspo")), "loss_mode='gspo'"),
         (
-            dict(policy_loss=_ActorConfig(loss_mode="bypass_mode", rollout_correction=_ActorConfig(rollout_rs="seq"))),
+            dict(
+                policy_loss=_ActorConfig(
+                    loss_mode="bypass_mode",
+                    rollout_correction=_ActorConfig(rollout_rs="unsupported_rs", rollout_rs_threshold="0.5"),
+                )
+            ),
             "rollout_rs",
         ),
         (
             dict(
                 policy_loss=_ActorConfig(
-                    loss_mode="bypass_mode", rollout_correction=_ActorConfig(loss_type="reinforce")
+                    loss_mode="bypass_mode", rollout_correction=_ActorConfig(loss_type="unknown_loss")
                 )
             ),
-            "reinforce",
+            "unknown_loss",
         ),
     ]
     for overrides, match in unsupported:
@@ -831,3 +844,126 @@ def test_build_rl_graph_trainer_runs_the_step_as_one_packed_row():
             with graph_trainer_mode._packed_stream_as_one_row():
                 assert shim_mod.get_unflatten_seq_len() is None
             assert shim_mod.get_unflatten_seq_len() == max_context_length
+
+
+def test_graph_policy_loss_bypass_reinforce_is_and_rollout_rs():
+    """Traced bypass-mode REINFORCE + truncated token IS + seq_mean_k1/k2 rollout_rs matches analytical math."""
+    torch.manual_seed(7)
+    prompt_lens, response_lens, padded_len = [3, 4], [5, 4], 24
+    mb = _rl_micro_batch(prompt_lens, response_lens)
+    old_lp, adv, mask = graph_trainer_mode.pack_rl_loss_targets(mb, padded_len)
+    seq_ids = graph_trainer_mode.pack_rl_seq_ids(mb, padded_len)
+
+    cfg = _actor_config(
+        policy_loss=_ActorConfig(
+            loss_mode="bypass_mode",
+            rollout_correction=_ActorConfig(
+                loss_type="reinforce",
+                rollout_is="token",
+                rollout_is_threshold=5.0,
+                rollout_rs="seq_mean_k1,seq_mean_k2",
+                rollout_rs_threshold="0.998_1.002,0.25",
+            ),
+        )
+    )
+    spec = graph_trainer_mode.GraphPolicyLossSpec.from_loss_function(
+        functools.partial(ppo_loss, config=cfg),
+        temperature=1.0,
+        calculate_entropy=False,
+        has_rollout_is_weights=False,
+    )
+    assert spec.loss_type == "reinforce"
+    assert spec.rollout_is == "token" and spec.rollout_is_upper == 5.0
+    assert spec.needs_seq_ids
+
+    # Sequence 0 matches rollout closely (kept); sequence 1 drifts far (rejected by seq_mean_k1/k2).
+    log_p = old_lp.clone()
+    log_p[seq_ids == 0] += 0.0005
+    log_p[seq_ids == 1] += 1.2
+    log_p.requires_grad_(True)
+
+    loss_fn = graph_trainer_mode.GraphPolicyLoss(spec)
+    global_tokens = torch.tensor(float(mask.sum()))
+    with mock.patch.object(loss_fn, "log_probs", return_value=log_p):
+        loss, metrics = loss_fn(
+            None,
+            (None, old_lp, adv, mask, seq_ids),
+            global_valid_tokens=global_tokens,
+        )
+    assert graph_trainer_mode.LOG_PROBS_METRIC in metrics
+    loss.backward()
+
+    # Only sequence 0 should contribute; sequence 1 gradients must be zeroed by rollout_rs.
+    kept_mask = mask * (seq_ids == 0).float()
+    expected_w = torch.clamp(torch.exp((log_p.detach() - old_lp).clamp(-20.0, 20.0)) * mask, max=5.0)
+    expected_loss = (-adv * log_p.detach() * expected_w * kept_mask).sum() / global_tokens
+    torch.testing.assert_close(loss.detach(), expected_loss, rtol=1e-5, atol=1e-6)
+    assert torch.all(log_p.grad[seq_ids == 1] == 0.0)
+    assert log_p.grad[seq_ids == 0].abs().sum() > 0.0
+
+
+def test_ffd_bin_slot_packing_and_roundtrip():
+    """FFD bin packing groups variable-length sequences into fixed bins and restores exact packed token order."""
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+        bin_slot_permutation,
+        pack_micro_batches_into_bins,
+    )
+
+    lengths = [10, 6, 4, 9, 5, 3]
+    offsets = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()])
+    tokens = torch.arange(sum(lengths), dtype=torch.int64)
+    data = TensorDict(
+        {"input_ids": torch.nested.nested_tensor_from_jagged(tokens, offsets)},
+        batch_size=[len(lengths)],
+    )
+    mbs, mb_indices = pack_micro_batches_into_bins(data, dp_group=None, bin_len=16, num_bins=2)
+    # 10+6=16, 9+5=14, 4+3=7 -> 3 bins -> 2 micro-batches of <=2 bins each.
+    assert len(mbs) == 2
+    assert sorted(i for grp in mb_indices for i in grp) == list(range(len(lengths)))
+
+    # Round-trip bin_slot_permutation on the first micro-batch padded to 32 (2 x 16).
+    mb0_offsets = mbs[0]["input_ids"].offsets()
+    mb0_vals = mbs[0]["input_ids"].values()
+    padded = torch.cat([mb0_vals, torch.full((32 - mb0_vals.numel(),), -1, dtype=torch.int64)])
+    slot_src, contig_src, tail_ranges = bin_slot_permutation(mb0_offsets, padded_len=32, bin_len=16)
+    permuted = padded[slot_src]
+    restored = permuted[contig_src]
+    torch.testing.assert_close(restored, padded)
+    for start, end in tail_ranges:
+        assert 0 <= start < end <= 32
+        assert torch.all(permuted[start:end] == -1)
+
+
+def test_cp_layer_transforms_accepts_torchtitan_200_and_legacy_fields():
+    """GatedDeltaNetContextParallelTransform supports both (#200) cp_strategy/cp_reduce_dtype and legacy field names."""
+    from verl_hardware_plugin.accelerators.tpu.engines import cp_layer_transforms
+
+    @dataclasses.dataclass
+    class Transform200:
+        load_balancer: str | None = None
+        cp_strategy: str = "all_to_all"
+        cp_reduce_dtype: str | None = None
+
+    @dataclasses.dataclass
+    class TransformLegacy:
+        load_balancer: str | None = None
+        strategy: str = "all_to_all"
+        reduce_dtype: str | None = None
+
+    opts = _options(
+        context_parallel_gdn_strategy="allgather_reducescatter",
+        context_parallel_gdn_reduce_dtype="bfloat16",
+    )
+    spec = cp_layer_transforms.QWEN3_5_GATED_DELTA_NET
+    for cls, s_attr, d_attr in (
+        (Transform200, "cp_strategy", "cp_reduce_dtype"),
+        (TransformLegacy, "strategy", "reduce_dtype"),
+    ):
+        fake_mod = SimpleNamespace(GatedDeltaNetContextParallelTransform=cls)
+        with (
+            mock.patch.object(cp_layer_transforms, "module_available", return_value=True),
+            mock.patch.object(cp_layer_transforms.importlib, "import_module", return_value=fake_mod),
+        ):
+            t = cp_layer_transforms._build_transform(spec, load_balancer=None, options=opts, num_layers=3)
+            assert getattr(t, s_attr) == "allgather_reducescatter"
+            assert getattr(t, d_attr) == "bfloat16"

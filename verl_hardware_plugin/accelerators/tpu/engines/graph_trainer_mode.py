@@ -50,6 +50,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 LOG_PROBS_METRIC = "log_probs"
 # TorchTitan's compile mode for the graph trainer: trace forward + loss + backward of a step into one FX graph.
 TPU_COMPILE_MODE = "aot_fx_trace"
+# Static sequence-count grid for traced sequence-level rollout correction (rollout_rs / sequence rollout_is).
+MAX_PACKED_SEQS = 128
 
 _TODO_2 = "graph_trainer mode traces one sequence shape and cannot retrace (TODO-2: one traced graph per bucket length)"
 _TODO_3 = (
@@ -99,20 +101,21 @@ def validate_graph_trainer_engine(
             "it needs engine_kwargs.tpu.use_fused_linear_cross_entropy=True (the non-fused log-prob path "
             "materializes [tokens, vocab] logits and exhausts TPU HBM)"
         )
-    for name in ("pipeline_parallel_size", "context_parallel_size", "tensor_parallel_size"):
+    for name in ("pipeline_parallel_size", "tensor_parallel_size"):
         size = int(getattr(engine_config, name, 1) or 1)
         if size > 1:
-            errors.append(f"{name}={size} is not supported yet (FSDP only)")
+            errors.append(f"{name}={size} is not supported yet")
     if getattr(engine_config, "param_offload", False):
         errors.append("param_offload swaps parameter storages between steps; it is not supported yet")
     budget = options.kda_document_budget
     if "kda" in tpu_kernels and budget is not None and budget < 2:
         errors.append(f"kda_document_budget={budget} must be at least 2 (one sequence plus the padding tail)")
-    if options.gdn_row_slot_len:
-        errors.append(
-            f"gdn_row_slot_len={options.gdn_row_slot_len} is not supported yet (the traced step does not restore the "
-            "packed token order of the one-sequence-per-row layout, so log-probs would pair with the wrong labels)"
-        )
+    if options.gdn_row_slot_len and options.static_micro_batch_len:
+        if int(options.static_micro_batch_len) % int(options.gdn_row_slot_len) != 0:
+            errors.append(
+                f"static_micro_batch_len={options.static_micro_batch_len} must be a multiple of "
+                f"gdn_row_slot_len={options.gdn_row_slot_len}"
+            )
     if errors:
         raise ValueError("engine_kwargs.tpu.trainer_mode=graph_trainer: " + "; ".join(errors))
 
@@ -177,7 +180,8 @@ def build_graph_trainer_config(
     from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
     from torchtitan.experiments.tpu.tpu_job_config import TPUConfig
 
-    user_cfg = dict(options.graph_trainer or {})
+    raw_user_cfg = dict(options.graph_trainer or {})
+    user_cfg = dict(raw_user_cfg)
 
     # Normalize save_regions if passed as string or list
     if "save_regions" in user_cfg:
@@ -186,6 +190,20 @@ def build_graph_trainer_config(
             user_cfg["save_regions"] = tuple(r.strip() for r in sr.split(",") if r.strip())
         elif isinstance(sr, list | set):
             user_cfg["save_regions"] = tuple(sr)
+
+    if "save_last_n_layers" in user_cfg and isinstance(user_cfg["save_last_n_layers"], dict):
+        flat_slnl: dict[str, int] = {}
+        for k, v in user_cfg["save_last_n_layers"].items():
+            if isinstance(v, dict):
+                for sub_k, sub_v in v.items():
+                    flat_slnl[f"{k}.{sub_k}"] = int(sub_v)
+            else:
+                norm_k = "moe.gate_up" if k == "moe_gate_up" else str(k)
+                flat_slnl[norm_k] = int(v)
+        user_cfg["save_last_n_layers"] = flat_slnl
+
+    raw_gs = raw_user_cfg.get("graph_split")
+    user_set_bwd_part = isinstance(raw_gs, dict) and "backward_partition_mode" in raw_gs
 
     # Normalize graph_split if passed as a dict
     if "graph_split" in user_cfg and isinstance(user_cfg["graph_split"], dict):
@@ -198,12 +216,19 @@ def build_graph_trainer_config(
 
     memory_policy = user_cfg.pop("memory_policy", None) or resolve_memory_policy(options, activation_checkpoint)
     fsdp_barrier_policy = user_cfg.pop("fsdp_barrier_policy", None) or "none"
+    gs_obj = user_cfg.get("graph_split")
+    gs_enabled = bool(getattr(gs_obj, "enabled", False)) if gs_obj is not None else False
     enable_remat_barriers = user_cfg.pop(
         "enable_remat_barriers",
-        memory_policy == "tpu_selective" or fsdp_barrier_policy != "none",
+        (memory_policy == "tpu_selective" or fsdp_barrier_policy != "none") and not gs_enabled,
     )
 
-    compile_kwargs = {
+    parallelism = trainer_config_kwargs.get("parallelism")
+    ep_degree = int(getattr(parallelism, "expert_parallel_degree", 1) or 1)
+    cp_degree = int(getattr(parallelism, "context_parallel_degree", 1) or 1)
+    cp_strategy = options.context_parallel_strategy or "all_gather"
+
+    compile_kwargs: dict[str, Any] = {
         "enable": False,
         "mode": TPU_COMPILE_MODE,
         "memory_policy": memory_policy,
@@ -211,6 +236,10 @@ def build_graph_trainer_config(
         "fsdp_barrier_policy": fsdp_barrier_policy,
     }
     compile_kwargs.update(user_cfg)
+    if ep_degree > 1:
+        compile_kwargs["compile_grad_norm"] = False
+    if (ep_degree > 1 or (cp_degree > 1 and cp_strategy == "all_gather")) and gs_enabled and not user_set_bwd_part:
+        compile_kwargs["graph_split"].backward_partition_mode = "by_layer"
 
     # bld_block_layout=False keeps packed [T, D] inputs for the plugin's Splash / varlen attention modules, as in
     # eager_blocks mode.
@@ -218,38 +247,54 @@ def build_graph_trainer_config(
     compile_config = TpuGraphTrainerCompileConfig(**compile_kwargs)
 
     kwargs = dict(trainer_config_kwargs)
+    if "xla_flags" not in kwargs:
+        try:
+            from torchtitan.experiments.tpu import tpu_flags
+
+            kwargs["xla_flags"] = tpu_flags.merge_flags(xla_enable_hlo_sharding_v3=False)
+        except ImportError:
+            pass
     kwargs.update(compile=compile_config, activation_checkpoint=None, tpu_config=tpu_config, loss=_pallas_loss_config())
     logger.warning("TPU trainer_mode=graph_trainer: TpuGraphTrainer (aot_fx_trace), compile_config=%s", compile_config)
     return TpuGraphTrainer.Config(**kwargs)
 
 
-def _packed_stream_as_one_row() -> Any:
-    """Clears TorchTitan's unflatten-shim row length while the step runs, as the eager engine leaves it.
+def _packed_stream_as_one_row(slot_len: int | None = None) -> Any:
+    """Sets or clears TorchTitan's unflatten-shim row length while the step runs.
 
     ``TpuGraphTrainer.forward_backward_step`` sets the row length to ``training.max_context_length`` (the engine's
-    ``max_seq_len``). Kernels that read it split the packed ``[T]`` micro-batch into ``max_seq_len`` rows: Qwen3.5's
-    GatedDeltaNet then restarts its convolution and recurrent state at every row start, in the middle of any sequence
-    that crosses one (``static_micro_batch_len`` is usually larger than ``max_seq_len``). With no row length the packed
-    micro-batch is one row and the state resets only at document boundaries, as in the eager engine. The value is read
-    while tracing, so the traced graph keeps it.
+    ``max_seq_len``). When ``slot_len`` is None, clearing it treats the packed ``[T]`` micro-batch as one row so
+    Qwen3.5's GatedDeltaNet resets only at document boundaries. When ``slot_len`` is set (``gdn_row_slot_len`` or
+    fixed-slot bin packing), each ``slot_len``-token bin runs as an independent row.
     """
     from verl_hardware_plugin.accelerators.tpu.engines.gdn_slot_schedule import unflatten_seq_len_context
 
-    return unflatten_seq_len_context(None)
+    return unflatten_seq_len_context(slot_len)
 
 
-def build_rl_graph_trainer(config: Any) -> Any:
-    """Builds a ``TpuGraphTrainer`` that runs its step on the packed micro-batch as one row.
+def build_rl_graph_trainer(config: Any, *, row_slot_len: int | None = None) -> Any:
+    """Builds a ``TpuGraphTrainer`` that runs its step with the configured packed/bin row-slot length.
 
     See ``_packed_stream_as_one_row``. The traced step returns ``GraphPolicyLoss``'s metrics (the detached per-token
     log-probs) as ``trainer.last_loss_metrics``.
     """
     from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 
+    shim_len = int(row_slot_len) if row_slot_len else None
+
     class _RLTpuGraphTrainer(TpuGraphTrainer):
+        def __init__(self, cfg: Any) -> None:
+            super().__init__(cfg)
+            self.active_slot_len: int | None = shim_len
+            self._slot_cache: dict[int | None, tuple[Any, Any]] = {}
+
         def _make_fx_forward_backward_step(self, *args: Any, **kwargs: Any) -> torch.Tensor:
-            with _packed_stream_as_one_row():
-                return super()._make_fx_forward_backward_step(*args, **kwargs)
+            cur_slot = self.active_slot_len
+            self._traced_step, self._graph_runner = self._slot_cache.get(cur_slot, (None, None))
+            with _packed_stream_as_one_row(cur_slot):
+                out = super()._make_fx_forward_backward_step(*args, **kwargs)
+            self._slot_cache[cur_slot] = (self._traced_step, self._graph_runner)
+            return out
 
     return _RLTpuGraphTrainer(config)
 
@@ -303,6 +348,48 @@ def _config_get(config: Any, key: str, default: Any = None) -> Any:
     return getattr(config, key, default)
 
 
+def _parse_rs_specs(
+    rollout_rs: str | None, rollout_rs_threshold: str | float | None
+) -> tuple[tuple[str, float | None, float], ...]:
+    """Parses ``(option_name, lower_bound_or_None, upper_bound)`` tuples for ``rollout_rs``."""
+    if not rollout_rs:
+        return ()
+    opts = []
+    for raw in str(rollout_rs).split(","):
+        s = raw.strip()
+        if s and s not in opts:
+            opts.append(s)
+    if not opts:
+        return ()
+    if rollout_rs_threshold is None:
+        raise ValueError("rollout_rs_threshold must be set when rollout_rs is enabled")
+    thresh_parts = [p.strip() for p in str(rollout_rs_threshold).split(",") if p.strip()]
+    if len(thresh_parts) == 1 and len(opts) > 1:
+        thresh_parts = thresh_parts * len(opts)
+    if len(thresh_parts) != len(opts):
+        raise ValueError(f"rollout_rs={rollout_rs!r} has {len(opts)} options, got thresholds {rollout_rs_threshold!r}")
+    parsed: list[tuple[str, float | None, float]] = []
+    for opt, t_str in zip(opts, thresh_parts, strict=True):
+        if opt.endswith("k1"):
+            if "_" not in t_str:
+                raise ValueError(f"rollout_rs k1 option {opt!r} requires 'lower_upper' threshold, got {t_str!r}")
+            lo_s, hi_s = t_str.split("_", 1)
+            parsed.append((opt, math.log(float(lo_s)), math.log(float(hi_s))))
+        else:
+            parsed.append((opt, None, float(t_str)))
+    return tuple(parsed)
+
+
+def _parse_is_bounds(rollout_is_threshold: str | float | None) -> tuple[float | None, float]:
+    if rollout_is_threshold is None:
+        return None, 2.0
+    s = str(rollout_is_threshold).strip()
+    if "_" in s:
+        lo_s, hi_s = s.split("_", 1)
+        return float(lo_s), float(hi_s)
+    return None, float(s)
+
+
 @dataclasses.dataclass(frozen=True)
 class GraphPolicyLossSpec:
     """The constants of the traced policy loss; they are baked into the graph, so they must not change per step."""
@@ -311,6 +398,15 @@ class GraphPolicyLossSpec:
     clip_ratio_high: float
     clip_ratio_c: float
     temperature: float
+    loss_type: str = "ppo_clip"
+    rollout_is: str | None = None
+    rollout_is_lower: float | None = None
+    rollout_is_upper: float = 2.0
+    rollout_rs_specs: tuple[tuple[str, float | None, float], ...] = ()
+
+    @property
+    def needs_seq_ids(self) -> bool:
+        return bool(self.rollout_rs_specs) or self.rollout_is == "sequence"
 
     @classmethod
     def from_loss_function(
@@ -321,7 +417,7 @@ class GraphPolicyLossSpec:
         calculate_entropy: bool,
         has_rollout_is_weights: bool,
     ) -> GraphPolicyLossSpec:
-        """Reads verl's actor config from ``partial(ppo_loss, config=actor_config)`` and checks Phase 1 supports it."""
+        """Reads verl's actor config from ``partial(ppo_loss, config=actor_config)``."""
         config = getattr(loss_function, "keywords", {}).get("config") if loss_function is not None else None
         func = getattr(loss_function, "func", loss_function)
         if config is None or getattr(func, "__name__", "") != "ppo_loss":
@@ -332,13 +428,40 @@ class GraphPolicyLossSpec:
         errors = []
         policy_loss = _config_get(config, "policy_loss")
         loss_mode = _config_get(policy_loss, "loss_mode", "vanilla")
+        loss_type = "ppo_clip"
+        rollout_is: str | None = None
+        rollout_is_lower: float | None = None
+        rollout_is_upper: float = 2.0
+        rollout_rs_specs: tuple[tuple[str, float | None, float], ...] = ()
         if loss_mode == "bypass_mode":
             rollout_correction = _config_get(policy_loss, "rollout_correction")
-            loss_type = _config_get(rollout_correction, "loss_type", "ppo_clip")
-            if loss_type != "ppo_clip":
-                errors.append(f"bypass_mode loss_type={loss_type!r} (only ppo_clip)")
-            if _config_get(rollout_correction, "rollout_rs") is not None:
-                errors.append("rollout rejection sampling (rollout_rs) changes the loss mask")
+            loss_type = str(_config_get(rollout_correction, "loss_type", "ppo_clip") or "ppo_clip")
+            if loss_type not in ("ppo_clip", "reinforce"):
+                errors.append(f"bypass_mode loss_type={loss_type!r} (only ppo_clip or reinforce)")
+            if _config_get(rollout_correction, "rollout_is_batch_normalize", False):
+                errors.append("rollout_is_batch_normalize=True is not supported yet")
+            raw_is = _config_get(rollout_correction, "rollout_is")
+            if raw_is is not None and str(raw_is) != "null":
+                rollout_is = str(raw_is)
+                if rollout_is not in ("token", "sequence"):
+                    errors.append(f"rollout_is={rollout_is!r} (only token or sequence)")
+                rollout_is_lower, rollout_is_upper = _parse_is_bounds(
+                    _config_get(rollout_correction, "rollout_is_threshold", 2.0)
+                )
+            raw_rs = _config_get(rollout_correction, "rollout_rs")
+            if raw_rs is not None and str(raw_rs) != "null":
+                try:
+                    rollout_rs_specs = _parse_rs_specs(
+                        str(raw_rs), _config_get(rollout_correction, "rollout_rs_threshold")
+                    )
+                    for opt_name, _, _ in rollout_rs_specs:
+                        if not (
+                            opt_name in ("token_k1", "token_k2", "token_k3")
+                            or opt_name.startswith(("seq_mean_k", "seq_sum_k"))
+                        ):
+                            errors.append(f"rollout_rs option {opt_name!r} is not supported yet")
+                except ValueError as exc:
+                    errors.append(str(exc))
         elif loss_mode == "vanilla":
             if has_rollout_is_weights:
                 errors.append("rollout_is_weights with loss_mode=vanilla")
@@ -365,25 +488,81 @@ class GraphPolicyLossSpec:
             clip_ratio_high=float(clip_ratio if clip_ratio_high is None else clip_ratio_high),
             clip_ratio_c=clip_ratio_c,
             temperature=float(temperature),
+            loss_type=loss_type,
+            rollout_is=rollout_is if loss_type == "reinforce" else None,
+            rollout_is_lower=rollout_is_lower,
+            rollout_is_upper=rollout_is_upper,
+            rollout_rs_specs=rollout_rs_specs,
         )
 
 
+def _cp_all_reduce_sum(x: torch.Tensor, cp_group: Any) -> torch.Tensor:
+    """Trace-safe ``all_reduce(sum)`` over ``cp_group`` (no-op when ``cp_group`` is None)."""
+    if cp_group is None:
+        return x
+    import torch.distributed._functional_collectives as funcol
+
+    out = funcol.all_reduce(x, reduceOp="sum", group=cp_group)
+    if isinstance(out, funcol.AsyncCollectiveTensor):
+        out = out.wait()
+    return out
+
+
+def _apply_traced_rollout_rs(
+    log_ratio_safe: torch.Tensor,
+    loss_mask: torch.Tensor,
+    seq_ids: torch.Tensor,
+    rs_specs: tuple[tuple[str, float | None, float], ...],
+    cp_group: Any = None,
+) -> torch.Tensor:
+    """Static-shape ``[MAX_PACKED_SEQS, T]`` equivalent of ``compute_rollout_rejection_mask``."""
+    if not rs_specs:
+        return loss_mask
+    seq_grid = torch.arange(MAX_PACKED_SEQS, device=seq_ids.device, dtype=seq_ids.dtype).unsqueeze(1)
+    one_hot = ((seq_ids.unsqueeze(0) == seq_grid) & loss_mask.bool().unsqueeze(0)).to(log_ratio_safe.dtype)
+    seq_counts = _cp_all_reduce_sum(one_hot.sum(dim=-1), cp_group).clamp_min(1.0)
+    token_k1 = -log_ratio_safe
+    token_k2 = 0.5 * log_ratio_safe * log_ratio_safe
+    token_k3 = torch.exp(log_ratio_safe) - 1.0 - log_ratio_safe
+    combined_mask = torch.ones_like(loss_mask, dtype=log_ratio_safe.dtype)
+    for opt_name, lo_val, hi_val in rs_specs:
+        if opt_name.endswith("k1"):
+            stat_tok = token_k1
+        elif opt_name.endswith("k2"):
+            stat_tok = token_k2
+        else:
+            stat_tok = token_k3
+        if opt_name.startswith("token_"):
+            keep_tok = stat_tok <= hi_val if lo_val is None else ((stat_tok >= lo_val) & (stat_tok <= hi_val))
+            combined_mask = combined_mask * keep_tok.to(combined_mask.dtype)
+        else:
+            seq_sum = _cp_all_reduce_sum((one_hot * stat_tok.unsqueeze(0)).sum(dim=-1), cp_group)
+            seq_stat = seq_sum / seq_counts if opt_name.startswith("seq_mean_") else seq_sum
+            seq_keep = seq_stat <= hi_val if lo_val is None else ((seq_stat >= lo_val) & (seq_stat <= hi_val))
+            keep_tok_f = (one_hot * seq_keep.to(one_hot.dtype).unsqueeze(1)).sum(dim=0)
+            combined_mask = combined_mask * keep_tok_f
+    return (loss_mask * combined_mask).to(loss_mask.dtype)
+
+
 class GraphPolicyLoss:
-    """Trace-safe verl vanilla dual-clip PPO loss, the ``loss_fn`` of ``TpuGraphTrainer`` (pure tensor ops).
+    """Trace-safe verl PPO / bypass REINFORCE policy loss, the ``loss_fn`` of ``TpuGraphTrainer`` (pure tensor ops).
 
     ``pred`` is the model output with the fused LM-head override, ``(hidden_states, lm_head_weight_t)``: log-probs
     come from the Tokamax kernel, with no ``[tokens, vocab]`` logits (graph mode always uses the fused path). ``labels``
-    is the tuple ``(target_ids, old_log_probs, advantages, loss_mask)`` of packed ``[T]`` tensors
-    (``pack_rl_loss_targets``). Returns ``(loss, {LOG_PROBS_METRIC: log_probs.detach()})``; TorchTitan returns the
-    metrics from the traced step as ``trainer.last_loss_metrics``.
+    is the tuple ``(target_ids, old_log_probs, advantages, loss_mask[, seq_ids])`` of packed ``[T]`` tensors
+    (``pack_rl_loss_targets`` / ``pack_rl_seq_ids``). Returns ``(loss, {LOG_PROBS_METRIC: log_probs.detach()})``;
+    TorchTitan returns the metrics from the traced step as ``trainer.last_loss_metrics``.
 
-    Same math as ``verl.trainer.ppo.core_algos.compute_policy_loss_vanilla`` with ``token-mean`` ``agg_loss``, without
-    the ``dp_size`` factor (see the module docstring).
+    Same math as ``verl.trainer.ppo.core_algos`` (vanilla dual-clip PPO or ``bypass_mode`` ``reinforce`` with
+    ``rollout_is`` and ``rollout_rs``) with ``token-mean`` ``agg_loss``, without the ``dp_size`` factor.
     """
 
-    def __init__(self, spec: GraphPolicyLossSpec, tpu_kernels: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self, spec: GraphPolicyLossSpec, tpu_kernels: frozenset[str] = frozenset(), cp_group: Any = None
+    ) -> None:
         self.spec = spec
         self.tpu_kernels = tpu_kernels
+        self.cp_group = cp_group
 
     def log_probs(self, pred: Any, target_ids: torch.Tensor) -> torch.Tensor:
         if not (isinstance(pred, tuple) and len(pred) == 2):
@@ -410,19 +589,64 @@ class GraphPolicyLoss:
     def __call__(
         self, pred: Any, labels: tuple[torch.Tensor, ...], *, global_valid_tokens: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        target_ids, old_log_probs, advantages, loss_mask = labels
+        if len(labels) == 5:
+            target_ids, old_log_probs, advantages, loss_mask, seq_ids = labels
+        else:
+            target_ids, old_log_probs, advantages, loss_mask = labels
+            seq_ids = None
         log_prob = self.log_probs(pred, target_ids)
         spec = self.spec
-        negative_approx_kl = torch.clamp(log_prob - old_log_probs, min=-20.0, max=20.0)
-        ratio = torch.exp(negative_approx_kl)
-        pg_losses1 = -advantages * ratio
-        pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - spec.clip_ratio_low, 1.0 + spec.clip_ratio_high)
-        clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
-        pg_losses3 = -advantages * spec.clip_ratio_c
-        clip_pg_losses2 = torch.minimum(pg_losses3, clip_pg_losses1)
-        pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+        detached_log_ratio = torch.clamp(log_prob.detach() - old_log_probs, min=-20.0, max=20.0)
+        effective_mask = loss_mask
+        if spec.rollout_rs_specs:
+            assert seq_ids is not None
+            effective_mask = _apply_traced_rollout_rs(
+                detached_log_ratio, loss_mask, seq_ids, spec.rollout_rs_specs, cp_group=self.cp_group
+            )
+
+        if spec.loss_type == "reinforce":
+            if spec.rollout_is == "token":
+                raw_w = torch.exp(detached_log_ratio) * loss_mask
+                if spec.rollout_is_lower is not None:
+                    kept = (raw_w >= spec.rollout_is_lower) & (raw_w <= spec.rollout_is_upper)
+                    w = torch.where(kept, raw_w, torch.zeros_like(raw_w))
+                else:
+                    w = torch.clamp(raw_w, max=spec.rollout_is_upper)
+                pg_losses = -advantages * log_prob * w
+            elif spec.rollout_is == "sequence":
+                assert seq_ids is not None
+                seq_grid = torch.arange(MAX_PACKED_SEQS, device=seq_ids.device, dtype=seq_ids.dtype).unsqueeze(1)
+                one_hot = ((seq_ids.unsqueeze(0) == seq_grid) & loss_mask.bool().unsqueeze(0)).to(
+                    detached_log_ratio.dtype
+                )
+                seq_lr = torch.clamp(
+                    _cp_all_reduce_sum(
+                        (one_hot * (log_prob.detach() - old_log_probs).unsqueeze(0)).sum(dim=-1),
+                        self.cp_group,
+                    ),
+                    -20.0,
+                    20.0,
+                )
+                raw_w = (one_hot * torch.exp(seq_lr).unsqueeze(1)).sum(dim=0) * loss_mask
+                if spec.rollout_is_lower is not None:
+                    kept = (raw_w >= spec.rollout_is_lower) & (raw_w <= spec.rollout_is_upper)
+                    w = torch.where(kept, raw_w, torch.zeros_like(raw_w))
+                else:
+                    w = torch.clamp(raw_w, max=spec.rollout_is_upper)
+                pg_losses = -advantages * log_prob * w
+            else:
+                pg_losses = -advantages * log_prob
+        else:
+            negative_approx_kl = torch.clamp(log_prob - old_log_probs, min=-20.0, max=20.0)
+            ratio = torch.exp(negative_approx_kl)
+            pg_losses1 = -advantages * ratio
+            pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - spec.clip_ratio_low, 1.0 + spec.clip_ratio_high)
+            clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+            pg_losses3 = -advantages * spec.clip_ratio_c
+            clip_pg_losses2 = torch.minimum(pg_losses3, clip_pg_losses1)
+            pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
         # verl_F.masked_sum: zero outside the mask first, so bucket-padding tokens cannot leak NaN / inf.
-        masked = torch.where(loss_mask.bool(), pg_losses, torch.zeros_like(pg_losses)) * loss_mask
+        masked = torch.where(effective_mask.bool(), pg_losses, torch.zeros_like(pg_losses)) * effective_mask
         loss = masked.sum() / torch.clamp(global_valid_tokens.to(masked.dtype), min=1.0)
         return loss, {LOG_PROBS_METRIC: log_prob.detach()}
 
@@ -475,6 +699,26 @@ def pack_rl_loss_targets(micro_batch: TensorDict, padded_len: int) -> tuple[torc
         out[flat_index] = tensor[valid]
         packed.append(out)
     return packed[0], packed[1], packed[2]
+
+
+def pack_rl_seq_ids(micro_batch: TensorDict, padded_len: int) -> torch.Tensor:
+    """Sequence index ``0 .. num_seqs - 1`` per response token in the packed ``[padded_len]`` layout (CPU, int32)."""
+    prompt_lens, response_lens = _sequence_lengths(micro_batch)
+    num_seqs = int(prompt_lens.numel())
+    if num_seqs > MAX_PACKED_SEQS:
+        raise ValueError(
+            f"trainer_mode=graph_trainer supports at most {MAX_PACKED_SEQS} sequences per micro-batch for "
+            f"sequence-level rollout correction, got {num_seqs}"
+        )
+    seq_ends = (prompt_lens + response_lens).cumsum(dim=0)
+    width = max(int(response_lens.max().item()), 1)
+    cols = torch.arange(width, dtype=torch.int64).unsqueeze(0)
+    valid = cols < response_lens.to(torch.int64).unsqueeze(1)
+    index = (seq_ends - response_lens - 1).to(torch.int64).unsqueeze(1) + cols
+    seq_rows = torch.arange(num_seqs, dtype=torch.int32).unsqueeze(1).expand(-1, width)
+    out = torch.full((padded_len,), MAX_PACKED_SEQS, dtype=torch.int32)
+    out[index[valid]] = seq_rows[valid]
+    return out
 
 
 def check_loss_consistency(

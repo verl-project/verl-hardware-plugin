@@ -49,10 +49,15 @@ def fused_linear_logprobs_tpu(
     num_tokens, pad = x.shape[0], -x.shape[0] % b_block_size
     if pad:
         x, labels = F.pad(x, (0, 0, 0, pad)), F.pad(labels, (0, pad))
+    # Single-buffered H>=2048 Mosaic backward fits TPU7x 64 MiB VMEM in bf16 (~51.9 MiB vs ~69.9 MiB in fp32).
+    if h_block_size >= 2048 and weight_t.dtype == torch.float32:
+        x_in, w_in = x.to(torch.bfloat16), weight_t.to(torch.bfloat16)
+    else:
+        x_in, w_in = x, weight_t
     loss = _loss_module().linear_softmax_cross_entropy_loss(
-        x.contiguous(),
+        x_in.contiguous(),
         labels.contiguous(),
-        weight_t,
+        w_in,
         reduction="none",
         implementation="mosaic_tpu",
         b_block_size=b_block_size,

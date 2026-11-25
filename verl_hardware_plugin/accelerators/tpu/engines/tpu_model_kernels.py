@@ -65,8 +65,8 @@ class LceBlockSizes(TypedDict, total=False):
 # Fused linear cross-entropy block sizes of ``lce`` (google-pytorch/torchtitan#78).
 _LCE_BLOCK_SIZES = LceBlockSizes(b_block_size=1024, h_block_size=2048, v_block_size=640)
 # Pallas grouped-matmul tiles of ``moe`` (google-pytorch/torchtitan#79).
-_MOE_GROUPED_MM_TILE_M = 512
-_MOE_GROUPED_MM_TGMM_TILING = (512, 0, 0)
+_MOE_GROUPED_MM_TILE_M = int(os.environ.get("VERL_TPU_MOE_TILE_M", "512"))
+_MOE_GROUPED_MM_TGMM_TILING = (_MOE_GROUPED_MM_TILE_M, 0, 0)
 _MOE_GROUPED_MM_TILES_MAX_DIM = 2048  # the model width those tiles fit (VMEM)
 # dWeight (TGMM) tiles of wider models (Qwen3.5-397B-A17B: hidden 4096, expert hidden 1024). The full-K/N tiles of
 # ``_use_tpu_moe_kernels`` keep (K, N) FP32 accumulators in VMEM: 16 MB for the down projection and 2 x 16 MB for the
@@ -213,7 +213,12 @@ def model_registry_kwargs(kernels: frozenset[str]) -> dict[str, Any]:
     """Extra ``model_registry`` kwargs of ``kernels``: the TPU MoE converters for ``moe``."""
     if "moe" not in kernels:
         return {}
-    return {"converters": list(_qwen3_5_config_registry()._TPU_MOE_CONVERTERS)}
+    converters = list(_qwen3_5_config_registry()._TPU_MOE_CONVERTERS)
+    if os.environ.get("VERL_TPU_SCALE_BEFORE_W2", "0") == "1":
+        TpuRoutedExpertsConverter = _import_tpu_token_dispatcher().TpuRoutedExpertsConverter
+        if not any(isinstance(c, TpuRoutedExpertsConverter.Config) for c in converters):
+            converters.append(TpuRoutedExpertsConverter.Config())
+    return {"converters": converters}
 
 
 def configure_model_spec(
@@ -273,6 +278,16 @@ def configure_model_spec(
             experts.pallas_grouped_mm_tile_m = _MOE_GROUPED_MM_TILE_M
         if hasattr(experts, "pallas_grouped_mm_tgmm_tiling"):
             experts.pallas_grouped_mm_tgmm_tiling = _MOE_GROUPED_MM_TGMM_TILING
+    if expert_parallel_degree <= 1 and os.environ.get("VERL_TPU_SCALE_BEFORE_W2", "0") == "1":
+        disp_mod = _import_tpu_token_dispatcher()
+        TpuRoutedExperts = disp_mod.TpuRoutedExperts
+        TpuRoutedExpertsConverter = disp_mod.TpuRoutedExpertsConverter
+        TpuAllToAllTokenDispatcher = disp_mod.TpuAllToAllTokenDispatcher
+        model_spec.model = TpuRoutedExpertsConverter(TpuRoutedExpertsConverter.Config()).convert(model_spec.model)
+        for _, disp, _, _ in model_spec.model.traverse(TpuAllToAllTokenDispatcher.Config):
+            disp.fuse_route_score_backward = False
+        for _, routed, _, _ in model_spec.model.traverse(TpuRoutedExperts.Config):
+            routed.scale_before_down_proj = True
 
 
 def configure_qwen3_5_expert_parallel(
@@ -466,11 +481,14 @@ def lce_block_sizes(kernels: frozenset[str], hidden_size: int, vocab_size: int) 
     single H block; wider models such as Qwen3.5-397B-A17B (``H=4096``) keep Tokamax's ``(1024, 512, 2048)`` default
     (matching ``qwen35_moe_397b_split_tokamax_ep_benchmark`` in google-pytorch/torchtitan#142).
     """
-    if (
-        "lce" not in kernels
-        or hidden_size != _LCE_BLOCK_SIZES["h_block_size"]
-        or vocab_size % _LCE_BLOCK_SIZES["v_block_size"] != 0
-    ):
+    if "lce" not in kernels:
+        return LceBlockSizes()
+    env_blocks = os.environ.get("VERL_TPU_LCE_BLOCKS", "").strip()
+    if env_blocks:
+        parts = [int(p.strip()) for p in env_blocks.split(",") if p.strip()]
+        if len(parts) == 3 and hidden_size % parts[1] == 0 and vocab_size % parts[2] == 0:
+            return LceBlockSizes(b_block_size=parts[0], h_block_size=parts[1], v_block_size=parts[2])
+    if hidden_size != _LCE_BLOCK_SIZES["h_block_size"] or vocab_size % _LCE_BLOCK_SIZES["v_block_size"] != 0:
         return LceBlockSizes()
     return LceBlockSizes(**_LCE_BLOCK_SIZES)
 
