@@ -8,6 +8,8 @@ because torchtitan's op only backpropagates a reduced loss and tokamax 0.0.14's 
 """
 
 import importlib
+import inspect
+import os
 from typing import Any
 
 import torch
@@ -189,6 +191,21 @@ class _FusedLogprobFunctional(_FusedLogprob):
             return grad_x.to(x.dtype), None, torch.cat(grad_w_chunks, dim=1), None
 
 
+_HAS_PALLAS_PER_ROW_BWD: bool | None = None
+
+
+def _has_pallas_per_row_bwd() -> bool:
+    """Whether installed TorchTitan supports per-row backward in ``linear_softmax_cross_entropy_loss`` (#214)."""
+    global _HAS_PALLAS_PER_ROW_BWD
+    if _HAS_PALLAS_PER_ROW_BWD is None:
+        try:
+            src = inspect.getsource(_loss_module()._my_bwd)
+            _HAS_PALLAS_PER_ROW_BWD = 'reduction != "none"' in src or "reduction != 'none'" in src
+        except (ImportError, AttributeError, OSError, TypeError):
+            _HAS_PALLAS_PER_ROW_BWD = False
+    return _HAS_PALLAS_PER_ROW_BWD
+
+
 def fused_linear_logprobs_tpu(
     hidden_states: torch.Tensor,
     labels: torch.Tensor,
@@ -205,7 +222,7 @@ def fused_linear_logprobs_tpu(
     ``hidden_states`` ``(..., H)`` and ``labels`` ``(...)`` are flattened to ``T`` tokens; ``weight_t`` is the
     ``(H, V)`` transposed LM-head weight (BF16), passed as is. ``T`` is zero-padded to whole ``b_block_size`` row
     blocks for the kernel; padded rows get no gradient. ``functional_backward`` selects the out-of-place backward
-    for whole-step tracing (see ``_FusedLogprobFunctional``).
+    for whole-step tracing (see ``_FusedLogprobFunctional``) when Pallas per-row backward is unavailable.
     """
     x = hidden_states.reshape(-1, hidden_states.shape[-1])
     if temperature != 1.0:
@@ -214,6 +231,23 @@ def fused_linear_logprobs_tpu(
     num_tokens, pad = x.shape[0], -x.shape[0] % b_block_size
     if pad:
         x, labels = F.pad(x, (0, 0, 0, pad)), F.pad(labels, (0, pad))
+    if x.device.type == "tpu" and os.getenv("VERL_TPU_PALLAS_LOGPROB_BWD", "1") != "0" and _has_pallas_per_row_bwd():
+        # Single-buffered H=2048 Mosaic backward fits TPU7x 64 MiB VMEM in bf16 (~51.9 MiB vs ~69.9 MiB in fp32).
+        if h_block_size >= 2048 and weight_t.dtype == torch.float32:
+            x_in, w_in = x.to(torch.bfloat16), weight_t.to(torch.bfloat16)
+        else:
+            x_in, w_in = x, weight_t
+        loss = _loss_module().linear_softmax_cross_entropy_loss(
+            x_in.contiguous(),
+            labels.contiguous(),
+            w_in,
+            reduction="none",
+            implementation="mosaic_tpu",
+            b_block_size=b_block_size,
+            h_block_size=h_block_size,
+            v_block_size=v_block_size,
+        )
+        return (-loss)[:num_tokens]
     blocks = (b_block_size, h_block_size, v_block_size)
     fn = _FusedLogprobFunctional if functional_backward else _FusedLogprob
     return fn.apply(x.contiguous(), labels.contiguous(), weight_t, blocks)[:num_tokens]

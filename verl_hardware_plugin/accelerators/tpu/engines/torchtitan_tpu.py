@@ -1390,8 +1390,10 @@ class TorchTitanTPUEngine(BaseEngine):
         for override_import in tpu_model_kernels.override_imports(self._tpu_kernels):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
+        self._bin_slot_len = int(os.environ.get("VERL_TPU_BIN_SLOT_LEN", "0") or 0)
         if self._graph_trainer_mode:
-            self.trainer = graph_trainer_mode.build_rl_graph_trainer(self.config)
+            init_slot = self._gdn_row_slot_len or self._bin_slot_len
+            self.trainer = graph_trainer_mode.build_rl_graph_trainer(self.config, row_slot_len=init_slot)
         else:
             self.trainer = Trainer(self.config)
         if engine_config.use_torch_compile:
@@ -1406,11 +1408,13 @@ class TorchTitanTPUEngine(BaseEngine):
         # TorchTitan disables gradient division by default (for global token normalization),
         # but verl's loss function multiplies by dp_size to compensate for gradient averaging.
         model_parts = self.trainer.model_parts
-        gdn_slot_schedule.validate_model_cp_slot_support(
+        has_full_pos, _ = gdn_slot_schedule.validate_model_cp_slot_support(
             model_parts,
             need_cp_full_positions=self._cp_full_positions and self.parallel_dims.cp_enabled,
             need_document_resets_override=bool(self._gdn_auto_row_slot_len),
         )
+        if tpu_options.cp_full_positions is None and self.parallel_dims.cp_enabled and has_full_pos:
+            self._cp_full_positions = True
         if self.engine_config.data_parallel_shard_size > 1:
             dp_size = self.get_data_parallel_size()
             for model_part in model_parts:
@@ -1428,9 +1432,14 @@ class TorchTitanTPUEngine(BaseEngine):
                 if tpu_options.ep_capacity_factor is not None
                 else tpu_model_kernels.DEFAULT_EP_CAPACITY_FACTOR
             )
+            ep_disp = (
+                "static"
+                if (self._graph_trainer_mode and tpu_options.ep_dispatcher == "auto")
+                else tpu_options.ep_dispatcher
+            )
             ep_mode, n_ep = tpu_ragged_ep.install_tpu_ep_token_dispatcher(
                 model_parts,
-                ep_dispatcher=tpu_options.ep_dispatcher,
+                ep_dispatcher=ep_disp,
                 capacity_factor=ep_cap,
                 spmd_backend=parallelism.spmd_backend,
                 compile_config=compile_config,
@@ -1841,15 +1850,32 @@ class TorchTitanTPUEngine(BaseEngine):
         # scalars as 0-D device tensors, so the loss programs do not bake them in as constants.
         loss_scalars = device_loss_scalars(data, get_device_id) if loss_function is not None else {}
 
-        micro_batches, indices = prepare_micro_batches(
-            data=data,
-            dp_group=dp_group,
-            same_micro_num_in_dp=True,
-        )
         tpu_options = get_tpu_engine_options(self.engine_config)
         static_len = int(tpu_options.static_micro_batch_len or 0)
         if forward_only and tpu_options.static_log_prob_micro_batch_len:
             static_len = int(tpu_options.static_log_prob_micro_batch_len)
+        bin_slot_len = int(getattr(self, "_bin_slot_len", 0) or 0)
+        if (
+            bin_slot_len > 0
+            and static_len >= bin_slot_len
+            and static_len % bin_slot_len == 0
+            and getattr(self.engine_config, "use_dynamic_bsz", False)
+            and getattr(data["input_ids"], "is_nested", False)
+        ):
+            from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import pack_micro_batches_into_bins
+
+            micro_batches, indices = pack_micro_batches_into_bins(
+                data=data,
+                dp_group=dp_group,
+                bin_len=bin_slot_len,
+                num_bins=static_len // bin_slot_len,
+            )
+        else:
+            micro_batches, indices = prepare_micro_batches(
+                data=data,
+                dp_group=dp_group,
+                same_micro_num_in_dp=True,
+            )
         static_response_len = int(tpu_options.static_max_response_len or 0)
         slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)
         # Pad the PPO loss rows to a common bucket only for losses that provably ignore fully masked rows.
@@ -2012,7 +2038,7 @@ class TorchTitanTPUEngine(BaseEngine):
         engine. verl's ``ppo_loss`` then runs eagerly under ``no_grad`` on the per-token log-probs the graph returns,
         so the reported loss and metrics are the eager engine's.
         """
-        if len(micro_batches) != 1:
+        if len(micro_batches) != 1 and not graph_trainer_mode.supports_multi_micro_batch():
             raise graph_trainer_mode.multi_micro_batch_error(len(micro_batches))
         self._ensure_graph_policy_loss(loss_function, micro_batches[0])
         timeline_ctx = timeline.span(
@@ -2024,12 +2050,21 @@ class TorchTitanTPUEngine(BaseEngine):
         )
         output_lst = []
         with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode):
-            for micro_batch_idx, micro_batch in enumerate(micro_batches):
-                output_lst.append(
-                    self._graph_trainer_micro_batch(
-                        micro_batch, micro_batch_idx, loss_function, batch_num_tokens, loss_scalars
+            if os.getenv("VERL_TPU_ASYNC_MB_ENQUEUE", "1") != "0" and len(micro_batches) > 1:
+                enqueued = [
+                    self._graph_trainer_micro_batch_enqueue(
+                        micro_batch, micro_batch_idx, batch_num_tokens, loss_scalars
                     )
-                )
+                    for micro_batch_idx, micro_batch in enumerate(micro_batches)
+                ]
+                output_lst = [self._graph_trainer_micro_batch_finalize(item, loss_function) for item in enqueued]
+            else:
+                for micro_batch_idx, micro_batch in enumerate(micro_batches):
+                    output_lst.append(
+                        self._graph_trainer_micro_batch(
+                            micro_batch, micro_batch_idx, loss_function, batch_num_tokens, loss_scalars
+                        )
+                    )
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def _graph_trainer_micro_batch(
@@ -2041,30 +2076,117 @@ class TorchTitanTPUEngine(BaseEngine):
         loss_scalars: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> dict[str, Any]:
         """One micro-batch of ``_graph_trainer_forward_backward``: the traced step, then verl's loss and metrics."""
-        input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
-        if extra_kwargs or set(extra_inputs) != {"positions"} or "orig_seq_len" not in output_args:
-            raise NotImplementedError(
-                "trainer_mode=graph_trainer supports packed text-only inputs (use_remove_padding=True, no "
-                f"multi-modal or CP inputs), got {sorted(extra_inputs)} / {sorted(extra_kwargs)}"
-            )
-        padded_len = int(input_ids.shape[-1])
-        if self._graph_trainer_traced_len is None:
-            self._graph_trainer_traced_len = padded_len
-        elif padded_len != self._graph_trainer_traced_len:
-            raise graph_trainer_mode.shape_change_error(self._graph_trainer_traced_len, padded_len)
+        enqueued = self._graph_trainer_micro_batch_enqueue(micro_batch, micro_batch_idx, batch_num_tokens, loss_scalars)
+        return self._graph_trainer_micro_batch_finalize(enqueued, loss_function)
 
-        # Fixed pytree with fixed shapes every step: the packed [T] RL loss inputs and a 0-d tensor token count (the
-        # mini-batch's global count, the same for every micro-batch).
-        old_log_probs, advantages, loss_mask = graph_trainer_mode.pack_rl_loss_targets(micro_batch, padded_len)
+    def _graph_trainer_micro_batch_enqueue(
+        self,
+        micro_batch: TensorDict,
+        micro_batch_idx: int,
+        batch_num_tokens: Any,
+        loss_scalars: Optional[Mapping[str, torch.Tensor]] = None,
+    ) -> tuple[Any, ...]:
+        """Phase 1 of micro-batching: enqueue ``forward_backward_step`` without host ``.item()`` syncs."""
+        input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+        allowed_extra_inputs = {"positions", "cp_full_positions"}
+        allowed_extra_kwargs = {"cp_full_segment_ids"}
+        if (
+            not set(extra_inputs).issubset(allowed_extra_inputs)
+            or not set(extra_kwargs).issubset(allowed_extra_kwargs)
+            or "orig_seq_len" not in output_args
+        ):
+            raise NotImplementedError(
+                "trainer_mode=graph_trainer supports packed text-only inputs "
+                f"(use_remove_padding=True, no multi-modal inputs), got {sorted(extra_inputs)} / {sorted(extra_kwargs)}"
+            )
+        local_padded_len = int(input_ids.shape[-1])
+        parallel_dims = getattr(self, "parallel_dims", None)
+        cp_enabled = bool(getattr(parallel_dims, "cp_enabled", False))
+        cp_size = int(parallel_dims.cp) if cp_enabled else 1
+        full_padded_len = local_padded_len * cp_size
+        if self._graph_trainer_traced_len is None:
+            self._graph_trainer_traced_len = local_padded_len
+        elif local_padded_len != self._graph_trainer_traced_len:
+            raise graph_trainer_mode.shape_change_error(self._graph_trainer_traced_len, local_padded_len)
+
+        old_log_probs, advantages, loss_mask = graph_trainer_mode.pack_rl_loss_targets(micro_batch, full_padded_len)
+        slot_src_cpu = output_args.get("gdn_slot_src_cpu")
         device = input_ids.device
-        labels = (
-            output_args["labels"],
-            old_log_probs.to(device),
-            advantages.to(device),
-            loss_mask.to(device),
+        target_ids = output_args["labels"]
+        if target_ids.dim() > 1:
+            target_ids = target_ids.squeeze(0)
+        if slot_src_cpu is not None:
+            old_log_probs = old_log_probs.index_select(0, slot_src_cpu)
+            advantages = advantages.index_select(0, slot_src_cpu)
+            loss_mask = loss_mask.index_select(0, slot_src_cpu)
+            if not output_args.get("labels_already_permuted", False):
+                target_ids = target_ids.index_select(0, output_args["gdn_slot_src"])
+
+        mods = getattr(self, "module", None)
+        use_moe_skip_pad = (
+            os.getenv("VERL_TPU_MOE_SKIP_PAD", "1") != "0"
+            and bool(mods)
+            and gdn_slot_schedule.forward_accepts_kwarg(mods[0], "token_mask")
         )
-        # The same 0-D tensor as the eager loss (device_loss_scalars), else built here (not on TPU, e.g. CPU tests),
-        # clamped to >= 1.0 when batch_num_tokens == 0 globally to match GraphPolicyLoss and avoid 0.0 / 0.0 = NaN.
+        token_mask_cpu: Optional[torch.Tensor] = None
+        if use_moe_skip_pad:
+            orig_seq_len = int(output_args["orig_seq_len"])
+            token_mask_cpu = torch.arange(full_padded_len, dtype=torch.int64) < orig_seq_len
+            if slot_src_cpu is not None:
+                token_mask_cpu = token_mask_cpu.index_select(0, slot_src_cpu)
+
+        assert self._graph_policy_loss_spec is not None
+        seq_ids_cpu: Optional[torch.Tensor] = None
+        if self._graph_policy_loss_spec.needs_seq_ids:
+            seq_ids_cpu = graph_trainer_mode.pack_rl_seq_ids(micro_batch, full_padded_len)
+            if slot_src_cpu is not None:
+                seq_ids_cpu = seq_ids_cpu.index_select(0, slot_src_cpu)
+
+        if cp_enabled:
+            cp_mesh = parallel_dims.get_mesh("cp")
+            cp_rank = int(cp_mesh.get_local_rank())
+            lb_type = self.trainer.config.parallelism.context_parallel_load_balancer
+            cache_attr = "_cp_local_shard_idx_cache"
+            idx_cache: dict[tuple[int, int, int, Optional[str]], torch.Tensor] = getattr(self, cache_attr, {})
+            cache_key = (full_padded_len, cp_size, cp_rank, lb_type)
+            local_cp_idx = idx_cache.get(cache_key)
+            if local_cp_idx is None:
+                if lb_type is None:
+                    local_cp_idx = torch.arange(
+                        cp_rank * local_padded_len, (cp_rank + 1) * local_padded_len, dtype=torch.int64
+                    )
+                elif lb_type == "headtail":
+                    perm = _HeadTailLoadBalancer(full_padded_len, cp_size, "cpu")._generate_indices(restore=False)[0]
+                    local_cp_idx = (
+                        perm[cp_rank * local_padded_len : (cp_rank + 1) * local_padded_len].to(torch.int64).contiguous()
+                    )
+                else:
+                    raise NotImplementedError(f"context_parallel_load_balancer={lb_type!r} is not supported")
+                idx_cache[cache_key] = local_cp_idx
+                setattr(self, cache_attr, idx_cache)
+            old_log_probs = old_log_probs.index_select(0, local_cp_idx).contiguous()
+            advantages = advantages.index_select(0, local_cp_idx).contiguous()
+            loss_mask = loss_mask.index_select(0, local_cp_idx).contiguous()
+            if seq_ids_cpu is not None:
+                seq_ids_cpu = seq_ids_cpu.index_select(0, local_cp_idx).contiguous()
+            if token_mask_cpu is not None:
+                token_mask_cpu = token_mask_cpu.index_select(0, local_cp_idx).contiguous()
+
+        if seq_ids_cpu is not None:
+            labels: tuple[torch.Tensor, ...] = (
+                target_ids,
+                old_log_probs.to(device, non_blocking=True),
+                advantages.to(device, non_blocking=True),
+                loss_mask.to(device, non_blocking=True),
+                seq_ids_cpu.to(device, non_blocking=True),
+            )
+        else:
+            labels = (
+                target_ids,
+                old_log_probs.to(device, non_blocking=True),
+                advantages.to(device, non_blocking=True),
+                loss_mask.to(device, non_blocking=True),
+            )
         global_valid_tokens = (loss_scalars or {}).get("batch_num_tokens")
         if global_valid_tokens is None or global_valid_tokens.device != device:
             global_valid_tokens = torch.tensor(max(float(batch_num_tokens), 1.0), dtype=torch.float32, device=device)
@@ -2073,9 +2195,50 @@ class TorchTitanTPUEngine(BaseEngine):
             if loss_scalars and "batch_num_tokens" in loss_scalars
             else {**(loss_scalars or {}), "batch_num_tokens": global_valid_tokens}
         )
-        input_dict = {"input": input_ids, "labels": labels, "positions": extra_inputs["positions"]}
-        # bf16 autocast as in the eager engine; it must be active while the step is traced (step 1), which records the
-        # casts into the graph.
+        input_dict: dict[str, Any] = {
+            "input": input_ids,
+            "labels": labels,
+            "positions": extra_inputs["positions"],
+            **extra_kwargs,
+        }
+        if "cp_full_positions" in extra_inputs:
+            input_dict["cp_full_positions"] = extra_inputs["cp_full_positions"]
+        if token_mask_cpu is not None:
+            token_mask_dev = token_mask_cpu.to(device=device, non_blocking=True).contiguous()
+            import spmd_types as spmd
+            from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+            from torchtitan.models.common.decoder_sharding import CP, DP, TP, SpmdType
+
+            annotate_input_spmd_types(
+                self.parallel_dims,
+                {"token_mask": token_mask_dev},
+                {
+                    "token_mask": SpmdType(
+                        {DP: spmd.V, CP: spmd.V, TP: spmd.R},
+                        partition_spec=spmd.PartitionSpec((DP, CP)),
+                    )
+                },
+            )
+            input_dict["token_mask"] = token_mask_dev
+        if "cp_full_segment_ids" in input_dict:
+            import spmd_types as spmd
+            from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+            from torchtitan.models.common.decoder_sharding import CP, DP, TP, SpmdType
+
+            cs = input_dict["cp_full_segment_ids"]
+            trailing = (None,) * (cs.ndim - 1)
+            annotate_input_spmd_types(
+                self.parallel_dims,
+                {"cp_full_segment_ids": cs},
+                {
+                    "cp_full_segment_ids": SpmdType(
+                        {DP: spmd.V, CP: spmd.R, TP: spmd.R},
+                        partition_spec=spmd.PartitionSpec(DP, *trailing),
+                    )
+                },
+            )
+        if hasattr(self.trainer, "active_slot_len") and output_args.get("active_bin_slot"):
+            self.trainer.active_slot_len = int(output_args["active_bin_slot"])
         with (
             torch.profiler.record_function(f"micro_batch{micro_batch_idx}"),
             torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16),
@@ -2084,6 +2247,16 @@ class TorchTitanTPUEngine(BaseEngine):
                 input_dict=input_dict, global_valid_tokens=global_valid_tokens
             )
         (log_probs,) = self.trainer.last_loss_aux
+        return (log_probs, graph_loss, micro_batch, output_args, eager_scalars, full_padded_len)
+
+    def _graph_trainer_micro_batch_finalize(self, item: tuple[Any, ...], loss_function: Callable) -> dict[str, Any]:
+        log_probs, graph_loss, micro_batch, output_args, eager_scalars, full_padded_len = item
+        cp_enabled = bool(getattr(getattr(self, "parallel_dims", None), "cp_enabled", False))
+        if cp_enabled:
+            with torch.no_grad(), spmd_no_typecheck_context():
+                log_probs = self._gather_context_parallel(log_probs, full_padded_len)
+        if "gdn_contig_src" in output_args:
+            log_probs = log_probs.index_select(0, output_args["gdn_contig_src"])
 
         # verl's loss and metrics, eagerly on the graph's log-probs (same code path as the eager engine's outputs).
         with (
@@ -2103,12 +2276,15 @@ class TorchTitanTPUEngine(BaseEngine):
                 if hasattr(value, TPU_PADDED_VALUES_ATTR):
                     delattr(value, TPU_PADDED_VALUES_ATTR)
         verl_loss = loss.detach().item()
-        graph_trainer_mode.check_loss_consistency(
-            graph_loss.detach().float().item(),
-            verl_loss,
-            self.get_data_parallel_size(),
-            raise_on_mismatch=os.getenv("VERL_TPU_LOSS_CONSISTENCY_RAISE", "1") != "0",
-        )
+        if not cp_enabled:
+            graph_trainer_mode.check_loss_consistency(
+                graph_loss.detach().float().item(),
+                verl_loss,
+                self.get_data_parallel_size(),
+                raise_on_mismatch=os.getenv("VERL_TPU_LOSS_CONSISTENCY_RAISE", "1") != "0",
+            )
+        elif not math.isfinite(graph_loss.detach().float().item()) or not math.isfinite(verl_loss):
+            raise RuntimeError(f"Non-finite loss under CP graph_trainer: graph={graph_loss.item()}, verl={verl_loss}")
         return {"model_output": detach_tree(model_output), "loss": verl_loss, "metrics": metrics}
 
     def _ensure_graph_policy_loss(self, loss_function: Callable, micro_batch: TensorDict) -> None:
@@ -2125,7 +2301,9 @@ class TorchTitanTPUEngine(BaseEngine):
             has_rollout_is_weights="rollout_is_weights" in micro_batch.keys(),
         )
         if self._graph_policy_loss_spec is None:
-            self.trainer.loss_fn = graph_trainer_mode.GraphPolicyLoss(spec, self._tpu_kernels)
+            cp_enabled = bool(getattr(getattr(self, "parallel_dims", None), "cp_enabled", False))
+            cp_group = self.get_context_parallel_group() if cp_enabled else None
+            self.trainer.loss_fn = graph_trainer_mode.GraphPolicyLoss(spec, self._tpu_kernels, cp_group=cp_group)
             self._graph_policy_loss_spec = spec
         elif spec != self._graph_policy_loss_spec:
             raise RuntimeError(
@@ -2199,6 +2377,21 @@ class TorchTitanTPUEngine(BaseEngine):
         ):
             for p in getattr(self, "_frozen_params", ()):
                 p.grad = None  # frozen: out of the gradient norm, and AdamW skips parameters without a gradient
+            if getattr(self, "_graph_trainer_mode", False) and os.environ.get("VERL_TPU_COMPILED_OPT_STEP", "0") == "1":
+                grad_norm = self.trainer._clip_grad_norm()
+                tpu_synchronize(grad_norm, wait=True)
+                grad_norm_val = grad_norm.item()
+                if not math.isfinite(grad_norm_val):
+                    logger.warning("grad_norm is not finite (%s); skipping this optimizer step", grad_norm_val)
+                    self.optimizer.zero_grad()
+                    if grad_norm.device.type == "tpu":
+                        tpu_synchronize(wait=True)
+                    return grad_norm_val
+                self.trainer.optimizers.step()
+                self.optimizer.zero_grad()
+                if grad_norm.device.type == "tpu":
+                    tpu_synchronize(wait=True)
+                return grad_norm_val
             param_chunks = self._optimizer_param_chunks()
             grad_norm = self._chunked_grad_norm(param_chunks)
             tpu_synchronize(grad_norm, wait=True)
@@ -2801,9 +2994,40 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                     )
                 # One sequence per GatedDeltaNet row; prepare_model_outputs restores the packed order.
                 slot_src, contig_src = row_slot_permutation(cu_seqlens, input_ids.shape[-1], self._gdn_row_slot_len)
+                output_args["gdn_slot_src_cpu"] = slot_src
                 slot_src = slot_src.to(input_ids.device)
+                output_args["gdn_slot_src"] = slot_src
                 input_ids, position_ids = input_ids[..., slot_src], position_ids[..., slot_src]
                 output_args["gdn_contig_src"] = contig_src.to(input_ids.device)
+            elif (
+                (
+                    eff_bin_slot := int(
+                        tu.get_non_tensor_data(data=micro_batch, key="mb_bin_slot_len", default=0)
+                        or getattr(self, "_bin_slot_len", 0)
+                        or 0
+                    )
+                )
+                and input_ids.shape[-1] >= eff_bin_slot
+                and input_ids.shape[-1] % eff_bin_slot == 0
+            ):
+                from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import bin_slot_permutation
+
+                slot_src, contig_src, tail_ranges = bin_slot_permutation(
+                    cu_seqlens, int(input_ids.shape[-1]), int(eff_bin_slot)
+                )
+                output_args["active_bin_slot"] = int(eff_bin_slot)
+                output_args["gdn_slot_src_cpu"] = slot_src
+                slot_src_dev = slot_src.to(input_ids.device, non_blocking=True)
+                output_args["gdn_slot_src"] = slot_src_dev
+                input_ids = input_ids[..., slot_src_dev]
+                labels = labels[..., slot_src_dev]
+                position_ids = position_ids[..., slot_src_dev].clone()
+                for t_start, t_end in tail_ranges:
+                    position_ids[..., t_start:t_end] = torch.arange(
+                        t_end - t_start, dtype=position_ids.dtype, device=position_ids.device
+                    )
+                output_args["gdn_contig_src"] = contig_src.to(input_ids.device, non_blocking=True)
+                output_args["labels_already_permuted"] = True
         else:
             if self.parallel_dims.cp_enabled and getattr(self, "_cp_full_positions", False):
                 if multi_modal_inputs or position_ids.dim() > 2:
@@ -2841,7 +3065,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         padded_seq_len = int(input_ids.shape[-1])
         output_args["padded_seq_len"] = padded_seq_len
         extra_kwargs: dict[str, Any] = {}
-        slot_src_cpu: Optional[torch.Tensor] = None
+        slot_src_cpu: Optional[torch.Tensor] = output_args.get("gdn_slot_src_cpu")
         mb_slot_len = self._effective_mb_slot_len(
             micro_batch,
             allow_auto_row_slot=self._allow_auto_row_slot(),

@@ -108,18 +108,23 @@ def test_trainer_mode_options():
 
 
 def test_validate_graph_trainer_engine():
-    good = SimpleNamespace(forward_only=False, param_offload=False, data_parallel_shard_size=16)
-    options = _options(trainer_mode="graph_trainer", static_micro_batch_len=8192)
+    good = SimpleNamespace(
+        forward_only=False,
+        param_offload=False,
+        data_parallel_shard_size=8,
+        expert_parallel_size=2,
+        context_parallel_size=2,
+    )
+    options = _options(trainer_mode="graph_trainer", static_micro_batch_len=8192, gdn_row_slot_len=4096)
     graph_trainer_mode.validate_graph_trainer_engine(good, options, use_simple_fsdp=True, tpu_kernels=frozenset())
 
-    bad = SimpleNamespace(forward_only=True, param_offload=True, expert_parallel_size=2, context_parallel_size=1)
+    bad = SimpleNamespace(forward_only=True, param_offload=True, tensor_parallel_size=2, pipeline_parallel_size=2)
     with pytest.raises(ValueError) as e:
         graph_trainer_mode.validate_graph_trainer_engine(
             bad,
             _options(
                 trainer_mode="graph_trainer",
                 use_fused_linear_cross_entropy=False,
-                gdn_row_slot_len=4096,
                 kda_document_budget=1,
             ),
             use_simple_fsdp=False,
@@ -131,18 +136,18 @@ def test_validate_graph_trainer_engine():
         "use_simple_fsdp",
         "static_micro_batch_len",
         "use_fused_linear_cross_entropy",
-        "expert_parallel_size=2",
+        "tensor_parallel_size=2",
+        "pipeline_parallel_size=2",
         "kda_document_budget=1",
-        "gdn_row_slot_len=4096",
     ):
         assert expected in message, (expected, message)
     assert "param_offload" in message
 
-    # gdn_row_slot_len alone: the traced step never restores the packed token order of the slot layout.
-    with pytest.raises(ValueError, match="gdn_row_slot_len=4096"):
+    # Non-divisible gdn_row_slot_len still raises.
+    with pytest.raises(ValueError, match="gdn_row_slot_len=3000"):
         graph_trainer_mode.validate_graph_trainer_engine(
             good,
-            _options(trainer_mode="graph_trainer", static_micro_batch_len=8192, gdn_row_slot_len=4096),
+            _options(trainer_mode="graph_trainer", static_micro_batch_len=8192, gdn_row_slot_len=3000),
             use_simple_fsdp=True,
             tpu_kernels=frozenset(),
         )
@@ -197,6 +202,31 @@ def test_policy_loss_spec_reads_and_checks_the_actor_config():
     )
     assert (spec.clip_ratio_low, spec.clip_ratio_high) == (0.1, 0.1)
 
+    # bypass_mode reinforce + rollout_is + rollout_rs are supported.
+    spec_reinf = graph_trainer_mode.GraphPolicyLossSpec.from_loss_function(
+        functools.partial(
+            ppo_loss,
+            config=_actor_config(
+                policy_loss=_ActorConfig(
+                    loss_mode="bypass_mode",
+                    rollout_correction=_ActorConfig(
+                        loss_type="reinforce",
+                        rollout_is="token",
+                        rollout_is_threshold=2.0,
+                        rollout_rs="seq_mean_k1",
+                        rollout_rs_threshold="0.998_1.002",
+                    ),
+                )
+            ),
+        ),
+        temperature=1.0,
+        calculate_entropy=False,
+        has_rollout_is_weights=False,
+    )
+    assert spec_reinf.loss_type == "reinforce"
+    assert spec_reinf.rollout_is == "token"
+    assert spec_reinf.needs_seq_ids is True
+
     unsupported = [
         (dict(use_kl_loss=True), "use_kl_loss"),
         (dict(entropy_coeff=0.01), "entropy"),
@@ -204,15 +234,23 @@ def test_policy_loss_spec_reads_and_checks_the_actor_config():
         (dict(policy_loss=_ActorConfig(loss_mode="gspo")), "loss_mode='gspo'"),
         (
             dict(policy_loss=_ActorConfig(loss_mode="bypass_mode", rollout_correction=_ActorConfig(rollout_rs="seq"))),
-            "rollout_rs",
+            "rollout_rs_threshold",
         ),
         (
             dict(
                 policy_loss=_ActorConfig(
-                    loss_mode="bypass_mode", rollout_correction=_ActorConfig(loss_type="reinforce")
+                    loss_mode="bypass_mode", rollout_correction=_ActorConfig(loss_type="unknown_loss")
                 )
             ),
-            "reinforce",
+            "unknown_loss",
+        ),
+        (
+            dict(
+                policy_loss=_ActorConfig(
+                    loss_mode="bypass_mode", rollout_correction=_ActorConfig(rollout_is_batch_normalize=True)
+                )
+            ),
+            "rollout_is_batch_normalize",
         ),
     ]
     for overrides, match in unsupported:
@@ -653,9 +691,19 @@ def test_graph_mode_step_matches_eager_ppo_loss_on_one_micro_batch():
     for g, p in zip(graph_grads, model.parameters(), strict=True):
         torch.testing.assert_close(g, p.grad, rtol=1e-5, atol=1e-6)
 
-    # TpuGraphTrainer assigns param.grad, so a second micro-batch would drop the first one's gradients (TODO-1).
-    with pytest.raises(RuntimeError, match="TODO-1"):
+    # TpuGraphTrainer assigns param.grad on older builds without accumulate_param_grads_ (TODO-1).
+    with (
+        mock.patch.object(graph_trainer_mode, "supports_multi_micro_batch", return_value=False),
+        pytest.raises(RuntimeError, match="TODO-1"),
+    ):
         engine._graph_trainer_forward_backward(data, [micro_batch, micro_batch], None, loss_fn, global_tokens)
+
+    # When TorchTitan supports accumulate_param_grads_, async multi-micro-batch enqueue runs all micro-batches.
+    with mock.patch.object(graph_trainer_mode, "supports_multi_micro_batch", return_value=True):
+        out_multi = engine._graph_trainer_forward_backward(
+            data, [micro_batch, micro_batch], None, loss_fn, global_tokens
+        )
+        assert len(out_multi["loss"]) == 2
 
     # A micro-batch with another padded length cannot reuse the traced step.
     engine.prepare_model_inputs = lambda micro_batch: (
@@ -931,6 +979,8 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
         "torchtitan.experiments.graph_trainer.trainer": trainer_mod,
         "torchtitan.experiments.graph_trainer.make_fx_tracer": tracer_mod,
         "torchtitan.experiments.tpu": SimpleNamespace(),
+        "torchtitan.experiments.tpu.components": SimpleNamespace(unflatten_shim=shim_mod),
+        "torchtitan.experiments.tpu.components.unflatten_shim": shim_mod,
         "torchtitan.experiments.tpu.unflatten_shim": shim_mod,
         "torchtitan.experiments.tpu.graph_trainer": SimpleNamespace(),
         "torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer": SimpleNamespace(
@@ -982,3 +1032,60 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
             with graph_trainer_mode._packed_stream_as_one_row():
                 assert shim_mod.get_unflatten_seq_len() is None
             assert shim_mod.get_unflatten_seq_len() == max_context_length
+
+
+def test_graph_policy_loss_bypass_reinforce_and_rollout_rs():
+    """Traced bypass REINFORCE + token TIS + seq_mean_k1 RS computes finite, masked loss & gradients."""
+    torch.manual_seed(7)
+    num_tokens, hidden, vocab = 32, 8, 16
+    spec = graph_trainer_mode.GraphPolicyLossSpec(
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.28,
+        clip_ratio_c=3.0,
+        temperature=1.0,
+        loss_type="reinforce",
+        rollout_is="token",
+        rollout_is_upper=2.0,
+        rollout_rs_specs=(("seq_mean_k1", -0.05, 0.05),),
+    )
+    loss_fn = graph_trainer_mode.GraphPolicyLoss(spec)
+    hidden_states = torch.randn(num_tokens, hidden, requires_grad=True)
+    weight_t = torch.randn(hidden, vocab, requires_grad=True)
+    target_ids = torch.randint(0, vocab, (num_tokens,))
+    with torch.no_grad():
+        logits = hidden_states @ weight_t
+        exact_lp = torch.log_softmax(logits, dim=-1).gather(-1, target_ids[:, None]).squeeze(-1)
+    # Sequence 0 matches rollout (kept); sequence 1 drifts far (rejected by seq_mean_k1).
+    old_lp = exact_lp.clone()
+    old_lp[16:] = exact_lp[16:] - 0.5
+    advantages = torch.ones(num_tokens)
+    loss_mask = torch.ones(num_tokens)
+    seq_ids = torch.cat([torch.zeros(16, dtype=torch.int64), torch.ones(16, dtype=torch.int64)])
+
+    with _patch_fused_logprobs():
+        loss, (log_prob,) = loss_fn(
+            (hidden_states, weight_t),
+            (target_ids, old_lp, advantages, loss_mask, seq_ids),
+            global_valid_tokens=torch.tensor(32.0),
+        )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert float(hidden_states.grad[16:].abs().max()) == 0.0
+    assert float(hidden_states.grad[:16].abs().max()) > 0.0
+    torch.testing.assert_close(log_prob, exact_lp, rtol=1e-5, atol=1e-5)
+
+
+def test_bin_slot_permutation_and_pack_micro_batches_into_bins():
+    """FFD bin-packing preserves exact token-level round-trip permutation and tail position resets."""
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+
+    cu = torch.tensor([0, 30, 50, 85, 100], dtype=torch.int64)
+    slot_src, contig_src, tail_ranges = tpu_utils.bin_slot_permutation(cu, padded_len=128, bin_len=64)
+    assert slot_src.shape == (128,)
+    x = torch.arange(128)
+    packed = x[slot_src]
+    restored = packed[contig_src]
+    torch.testing.assert_close(restored, x)
+    # Two bins of 64 tokens: (35 + 20 = 55) and (30 + 15 = 45), leaving tail padding in both bins.
+    assert len(tail_ranges) == 2
+    assert sum(e - s for s, e in tail_ranges) == 28
