@@ -1483,7 +1483,9 @@ def _tpu_attention(inner: torch.nn.Module, use_splash: bool, local_window_size: 
     if not use_splash:
         return reference
     splash_cls = precision_splash_attention_cls(_splash_attention_cls())
-    if has_64mib_scoped_vmem() and _splash_accepts_block_kwargs(splash_cls):
+    max_blk_env = int(os.environ.get("TT_SPLASH_MAX_BLOCK", "0") or 0)
+    use_tk_env = os.environ.get("TT_SPLASH_USE_TOKAMAX", "0") == "1"
+    if has_64mib_scoped_vmem() and _splash_accepts_block_kwargs(splash_cls) and max_blk_env <= 1024 and not use_tk_env:
         return _get_splash_1024_auto_cls(splash_cls)(
             is_causal=True,
             local_window_size=local_window_size,
@@ -1542,6 +1544,116 @@ def row_slot_permutation(cu_seqlens: torch.Tensor, padded_len: int, slot_len: in
     contig_src = torch.empty_like(slot_src)
     contig_src[slot_src] = torch.arange(padded_len)
     return slot_src, contig_src
+
+
+def _ffd_pack_indices(items_with_len: list[tuple[int, int]], bin_cap: int) -> list[list[int]]:
+    bins: list[list[int]] = []
+    used: list[int] = []
+    for idx, ln in sorted(items_with_len, key=lambda kv: -kv[1]):
+        placed = False
+        for b in range(len(bins)):
+            if used[b] + ln <= bin_cap:
+                bins[b].append(idx)
+                used[b] += ln
+                placed = True
+                break
+        if not placed:
+            bins.append([idx])
+            used.append(ln)
+    return bins
+
+
+def bin_slot_permutation(
+    cu_seqlens: torch.Tensor, padded_len: int, bin_len: int
+) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int]]]:
+    """First-Fit Decreasing multi-sequence packing into ``padded_len // bin_len`` bins of ``bin_len`` tokens."""
+    offsets = cu_seqlens.tolist()
+    lengths = [b - a for a, b in zip(offsets[:-1], offsets[1:], strict=True)]
+    num_bins = padded_len // bin_len
+    if padded_len % bin_len or max(lengths, default=0) > bin_len:
+        raise ValueError(f"bin_slot_len={bin_len}: sequences {lengths} exceed bin_len in {padded_len}")
+    bin_used = [0] * num_bins
+    placed: list[tuple[int, int, int]] = []
+    ffd_ok = True
+    for i in sorted(range(len(lengths)), key=lambda k: -lengths[k]):
+        length = lengths[i]
+        b_idx = next((b for b in range(num_bins) if bin_used[b] + length <= bin_len), -1)
+        if b_idx < 0:
+            ffd_ok = False
+            break
+        placed.append((i, b_idx, bin_used[b_idx]))
+        bin_used[b_idx] += length
+    if not ffd_ok:
+        # Monotonic power-of-2 sub-bin pairing fallback: if sequences fit 2^k * num_bins smaller bins, pair them.
+        sub_len = bin_len // 2
+        recovered = False
+        while sub_len >= 1024 and padded_len % sub_len == 0:
+            if max(lengths, default=0) <= sub_len:
+                sub_bins = _ffd_pack_indices([(i, lengths[i]) for i in range(len(lengths))], sub_len)
+                ratio = bin_len // sub_len
+                if len(sub_bins) <= num_bins * ratio:
+                    bin_used = [0] * num_bins
+                    placed = []
+                    for sb_idx, sb_items in enumerate(sub_bins):
+                        b_idx = sb_idx // ratio
+                        for i in sb_items:
+                            placed.append((i, b_idx, bin_used[b_idx]))
+                            bin_used[b_idx] += lengths[i]
+                    recovered = True
+                    break
+            sub_len //= 2
+        if not recovered:
+            raise ValueError(f"bin_slot_len={bin_len}: sequences {lengths} need > {num_bins} bins")
+    slot_src = torch.full((padded_len,), -1, dtype=torch.int64)
+    for i, b_idx, off in placed:
+        start, length = offsets[i], lengths[i]
+        dst = b_idx * bin_len + off
+        slot_src[dst : dst + length] = torch.arange(start, start + length)
+    slot_src[slot_src < 0] = torch.arange(offsets[-1] if offsets else 0, padded_len)
+    contig_src = torch.empty_like(slot_src)
+    contig_src[slot_src] = torch.arange(padded_len)
+    tail_ranges = [(b * bin_len + bin_used[b], (b + 1) * bin_len) for b in range(num_bins) if bin_used[b] < bin_len]
+    return slot_src, contig_src, tail_ranges
+
+
+def pack_micro_batches_into_bins(
+    data: TensorDict, dp_group: Any, bin_len: int, num_bins: int
+) -> tuple[list[TensorDict], list[list[int]]]:
+    """Packs ``data`` into micro-batches that each provably fit ``num_bins`` bins of ``bin_len`` tokens."""
+    input_ids = data["input_ids"]
+    lengths = input_ids.offsets().diff().tolist()
+    bins: list[list[int]] = []
+    bin_used: list[int] = []
+    for idx in sorted(range(len(lengths)), key=lambda k: -int(lengths[k])):
+        ln = int(lengths[idx])
+        placed = False
+        for b in range(len(bins)):
+            if bin_used[b] + ln <= bin_len:
+                bins[b].append(idx)
+                bin_used[b] += ln
+                placed = True
+                break
+        if not placed:
+            bins.append([idx])
+            bin_used.append(ln)
+    mb_indices: list[list[int]] = []
+    for start_b in range(0, len(bins), num_bins):
+        merged = [idx for b_list in bins[start_b : start_b + num_bins] for idx in b_list]
+        mb_indices.append(sorted(merged))
+    if not mb_indices:
+        mb_indices = [list(range(len(lengths)))]
+    if dp_group is not None and torch.distributed.is_initialized() and torch.distributed.get_world_size(dp_group) > 1:
+        t_cnt = torch.tensor([len(mb_indices)], dtype=torch.int64)
+        torch.distributed.all_reduce(t_cnt, op=torch.distributed.ReduceOp.MAX, group=dp_group)
+        target_mbs = int(t_cnt.item())
+        while len(mb_indices) < target_mbs:
+            split_pos = max(range(len(mb_indices)), key=lambda k: len(mb_indices[k]))
+            if len(mb_indices[split_pos]) <= 1:
+                break
+            popped = mb_indices[split_pos].pop()
+            mb_indices.append([popped])
+    mbs = [tu.index_select_tensor_dict(data, idxs) for idxs in mb_indices]
+    return mbs, mb_indices
 
 
 def install_tpu_attention(modules: Any, use_splash: bool) -> int:
