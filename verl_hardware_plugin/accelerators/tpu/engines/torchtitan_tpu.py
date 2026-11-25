@@ -2101,8 +2101,8 @@ class TorchTitanTPUEngine(BaseEngine):
             )
         local_padded_len = int(input_ids.shape[-1])
         parallel_dims = getattr(self, "parallel_dims", None)
-        cp_enabled = bool(getattr(parallel_dims, "cp_enabled", False))
-        cp_size = int(parallel_dims.cp) if cp_enabled else 1
+        cp_enabled = parallel_dims is not None and bool(getattr(parallel_dims, "cp_enabled", False))
+        cp_size = int(parallel_dims.cp) if (parallel_dims is not None and cp_enabled) else 1
         full_padded_len = local_padded_len * cp_size
         if self._graph_trainer_traced_len is None:
             self._graph_trainer_traced_len = local_padded_len
@@ -2125,7 +2125,8 @@ class TorchTitanTPUEngine(BaseEngine):
         mods = getattr(self, "module", None)
         use_moe_skip_pad = (
             os.getenv("VERL_TPU_MOE_SKIP_PAD", "1") != "0"
-            and bool(mods)
+            and mods is not None
+            and len(mods) > 0
             and gdn_slot_schedule.forward_accepts_kwarg(mods[0], "token_mask")
         )
         token_mask_cpu: Optional[torch.Tensor] = None
@@ -2142,7 +2143,7 @@ class TorchTitanTPUEngine(BaseEngine):
             if slot_src_cpu is not None:
                 seq_ids_cpu = seq_ids_cpu.index_select(0, slot_src_cpu)
 
-        if cp_enabled:
+        if cp_enabled and parallel_dims is not None:
             cp_mesh = parallel_dims.get_mesh("cp")
             cp_rank = int(cp_mesh.get_local_rank())
             lb_type = self.trainer.config.parallelism.context_parallel_load_balancer
