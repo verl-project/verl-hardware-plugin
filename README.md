@@ -43,6 +43,18 @@ The platforms and engines in this repository are **reference implementations** â
 pip install --no-build-isolation -e .
 ```
 
+Each backend lists its own pip-installable dependencies as an extra, in
+`verl_hardware_plugin/accelerators/<backend>/requirements.txt`:
+
+```bash
+pip install "verl-hardware-plugin[xpu]"        # also: enflame, iluvatar, metax, mlu, musa, neuron, rocm, supa, tpu
+```
+
+Extra names are case-insensitive. Most backends get their torch build and runtime from a vendor image, so their extra
+is empty until the backend maintainers add public pins. Index flags cannot be part of package metadata; each backend's
+install guide gives the full command (for XPU: `docs/accelerators/xpu/install_guidance.md`). To add or change a backend's
+dependencies, edit its `requirements.txt`: pins only, no `--index-url` lines. `tests/test_vendor_extras.py` checks this.
+
 ## Usage
 
 After `pip install`, the plugin is automatically discovered by verl through the

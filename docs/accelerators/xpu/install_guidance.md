@@ -32,8 +32,8 @@ plugin-side monkeypatch over `torch.distributed.all_reduce`
 
 ## 1. Install verl and verl-hardware-plugin
 
-Pick one. Both install the same set of packages (torch 2.14.0+xpu, vLLM 0.32.0+xpu, transformers 5.16.1): the Docker
-image runs the commands of Option B.
+Pick one. All three install the same set of packages (torch 2.14.0+xpu, vLLM 0.32.0+xpu, transformers 5.16.1): the Docker
+image runs the commands of Option C.
 
 ### Option A: Docker (recommended)
 
@@ -52,7 +52,7 @@ The image is built in stages (`drivers` -> `runtime-base` -> `builder` -> `runti
 the verl / plugin checkouts (`/opt/verl`, `/opt/verl-hardware-plugin`) are shipped. It contains:
 
 - the Intel GPU user-mode driver (compute-runtime 26.27, IGC 2.38.2, Level Zero 1.32), matching vLLM 0.32.0's XPU image;
-- gcc/g++ and the Python headers, `ffmpeg`, `libnuma-dev` and `libze-dev` (see the system packages under Option B);
+- gcc/g++ and the Python headers, `ffmpeg`, `libnuma-dev` and `libze-dev` (see the system packages under Option C);
 - `CCL_SYCL_ALLGATHERV_TMP_BUF`, `CCL_SYCL_ALLREDUCE_TMP_BUF`, `CCL_SYCL_REDUCE_SCATTER_TMP_BUF` and
   `CCL_SYCL_BROADCAST_TMP_BUF`, all set to `1`: they stop oneCCL from caching IPC handles of freed buffers, which
   leaked host memory on multi-GPU runs. Set them yourself when you install from source.
@@ -60,7 +60,41 @@ the verl / plugin checkouts (`/opt/verl`, `/opt/verl-hardware-plugin`) are shipp
 The build needs a verl checkout whose `requirements.txt` allows transformers >= 5.16.1 (verl `main` since PR #8390).
 An older `VERL_REF` is rejected by a check at the end of the build.
 
-### Option B: From source
+### Option B: pip extras
+
+For an existing Python 3.12 environment. The plugin's `xpu` extra pins the Intel build of torch and its runtime
+packages, and `vllm-xpu` pins the vLLM XPU wheel; the pins live in
+[`verl_hardware_plugin/accelerators/xpu/`](../../../verl_hardware_plugin/accelerators/xpu/) (`requirements.txt`,
+`requirements-vllm.txt`). pip cannot read an index from package metadata, so the three index flags are required. Without
+them pip stops with "no matching distribution found for torch==2.14.0+xpu" instead of installing a CUDA torch.
+
+Install the system packages listed under Option C first (`libnuma-dev`, `libze-dev`, `g++`/`gcc` and the Python headers).
+pip cannot install them. Then:
+
+```bash
+python3 -m venv /opt/venv && source /opt/venv/bin/activate
+export LD_LIBRARY_PATH=/opt/venv/lib:/usr/local/lib   # without it oneCCL fails: "could not load any plugin"
+export CCL_SYCL_ALLGATHERV_TMP_BUF=1 CCL_SYCL_ALLREDUCE_TMP_BUF=1 \
+       CCL_SYCL_REDUCE_SCATTER_TMP_BUF=1 CCL_SYCL_BROADCAST_TMP_BUF=1
+
+git clone https://github.com/verl-project/verl-hardware-plugin.git && cd verl-hardware-plugin
+pip install "verl[verl-core] @ git+https://github.com/verl-project/verl.git@<commit>" ".[xpu,vllm-xpu]" \
+    --extra-index-url https://download.pytorch.org/whl/xpu \
+    --extra-index-url https://wheels.vllm.ai/0.32.0/xpu \
+    --extra-index-url https://wheels.vllm.ai/xpu
+```
+
+- verl comes from a git commit because the verl on PyPI (0.9.1) pins `transformers<5.11`, while vLLM 0.32.0 needs
+  `>=5.16.1`; use a commit whose `requirements.txt` allows it (verl `main` since PR #8390). `verl[verl-core]` adds
+  `TransferQueue`, `pyzmq` and `mathruler`, which `verl.trainer.main_ppo` imports and verl's base install omits.
+- Extra names are case-insensitive: `[xpu]` and `[XPU]` are the same extra. Choose one vendor extra; a second vendor's
+  torch pin would conflict.
+- This path leaves both `triton` and `triton-xpu` installed. Option C removes `triton`; a 2-step GRPO run on 2 B60 cards
+  worked with both present, so it is not required here.
+- The XPU pins track vLLM 0.32.0 (`torch==2.14.0+xpu`). When vLLM moves, change `requirements.txt` and
+  `requirements-vllm.txt` together, and keep them in step with `docker/xpu/Dockerfile.stable.vllm` in verl.
+
+### Option C: From source
 
 verl pins its own versions, and `pip install -e .` on a verl checkout can replace the XPU build of torch with a
 different one (it also moves `transformers` and `tensordict` to verl's pins). Install the dependencies as below and
