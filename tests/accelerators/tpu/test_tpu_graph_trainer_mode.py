@@ -1030,3 +1030,16 @@ def test_backfill_empty_micro_batch_metrics_uses_the_nearest_filled_micro_batch(
     outputs = [{"metrics": None}]
     torchtitan_tpu._backfill_empty_micro_batch_metrics(engine, outputs)
     assert outputs[0]["metrics"] == {"a": [3.0]}
+
+
+def test_zero_loss_keeping_graph_is_finite_and_backpropagates_zeros():
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+
+    log_probs = torch.tensor([0.5, float("inf"), float("nan"), -1.0], requires_grad=True)
+    loss = torchtitan_tpu._zero_loss_keeping_graph(log_probs)
+    assert float(loss) == 0.0
+    loss.backward()
+    assert torch.equal(log_probs.grad, torch.zeros(4))
+
+    jagged = torch.nested.nested_tensor_from_jagged(torch.tensor([1.0, 2.0, 3.0]), torch.tensor([0, 1, 3]))
+    assert float(torchtitan_tpu._zero_loss_keeping_graph(jagged)) == 0.0

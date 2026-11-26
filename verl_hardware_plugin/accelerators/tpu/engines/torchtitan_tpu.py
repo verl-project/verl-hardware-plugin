@@ -183,6 +183,16 @@ def _check_empty_micro_batch_can_skip_loss(loss_function: Any) -> None:
         )
 
 
+def _zero_loss_keeping_graph(log_probs: torch.Tensor) -> torch.Tensor:
+    """A zero loss that depends on ``log_probs``, so its backward runs the model's backward (and its collectives).
+
+    Masked positions may hold non-finite values; ``where`` keeps both the loss and its (zero) gradient finite.
+    """
+    values = log_probs.values() if getattr(log_probs, "is_nested", False) else log_probs
+    values = values.float()
+    return torch.where(torch.isfinite(values), values, torch.zeros_like(values)).sum() * 0.0
+
+
 def _backfill_empty_micro_batch_metrics(engine: Any, output_lst: list[dict]) -> None:
     """Fills the metrics of empty micro-batches (``metrics is None``) in place.
 
@@ -3449,10 +3459,8 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                         # FSDP/EP collectives pair with the other ranks'), so use a zero loss that keeps the graph.
                         # The caller fills its metrics (_backfill_empty_micro_batch_metrics).
                         _check_empty_micro_batch_can_skip_loss(loss_function)
-                        log_probs = model_output["log_probs"]
-                        values = log_probs.values() if getattr(log_probs, "is_nested", False) else log_probs
                         logger.warning("micro-batch has no valid response tokens; using a zero loss")
-                        loss, metrics = values.float().sum() * 0.0, None
+                        loss, metrics = _zero_loss_keeping_graph(model_output["log_probs"]), None
                 else:
                     assert forward_only, "loss_function must be provided when not forward_only"
                     loss = torch.tensor(1.0, device=device_name)
