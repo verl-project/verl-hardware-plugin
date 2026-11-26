@@ -133,21 +133,81 @@ from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-# verl's rollout-correction helper raises this for a micro-batch whose response tokens are all masked out.
-_NO_VALID_RESPONSE_TOKENS = "response_mask must contain at least one valid token"
 
 
-def _metrics_for_empty_micro_batch(engine: Any) -> dict:
-    """Metrics for a micro-batch whose response tokens are all masked out (it has no loss terms of its own).
+def _has_valid_response_tokens(data: Any) -> bool:
+    """Whether a micro-batch's loss inputs hold at least one valid response token.
+
+    At 64K context a micro-batch can hold a single sequence, so one fully masked trajectory (a filtered or failed
+    episode) leaves a micro-batch with no loss terms; verl's rollout correction rejects such a micro-batch.
+    """
+    mask = data.get("response_mask", None) if hasattr(data, "get") else None
+    if mask is None:
+        return True
+    values = mask.values() if getattr(mask, "is_nested", False) else mask
+    return bool(values.any())
+
+
+def _policy_loss_config(loss_function: Any) -> Any:
+    config = getattr(loss_function, "keywords", {}).get("config")
+    return getattr(config, "policy_loss", None)
+
+
+def _loss_rejects_empty_micro_batch(loss_function: Any) -> bool:
+    """Whether verl's loss raises for a micro-batch without valid response tokens.
+
+    Bypass mode's rollout correction does ("response_mask must contain at least one valid token"); the other policy
+    losses return finite zero terms and metrics for it, so those micro-batches go through the loss as usual.
+    """
+    policy_loss = _policy_loss_config(loss_function)
+    loss_mode = policy_loss.get("loss_mode", None) if hasattr(policy_loss, "get") else None
+    return loss_mode == "bypass_mode"
+
+
+def _loss_needs_every_rank(loss_function: Any) -> bool:
+    """Whether verl's loss runs a cross-rank collective, so a rank cannot skip it for an empty micro-batch.
+
+    Rollout correction with ``rollout_is_batch_normalize`` all-reduces the IS-weight mean inside the loss.
+    """
+    policy_loss = _policy_loss_config(loss_function)
+    rollout_correction = policy_loss.get("rollout_correction", None) if hasattr(policy_loss, "get") else None
+    return bool(rollout_correction and rollout_correction.get("rollout_is_batch_normalize", False))
+
+
+def _check_empty_micro_batch_can_skip_loss(loss_function: Any) -> None:
+    if _loss_needs_every_rank(loss_function):
+        raise RuntimeError(
+            "A micro-batch has no valid response tokens, and the loss all-reduces across ranks "
+            "(rollout_correction.rollout_is_batch_normalize=True), so this rank cannot skip it without desynchronizing "
+            "the others. Disable rollout_is_batch_normalize or use larger micro-batches."
+        )
+
+
+def _backfill_empty_micro_batch_metrics(engine: Any, output_lst: list[dict]) -> None:
+    """Fills the metrics of empty micro-batches (``metrics is None``) in place.
 
     verl aggregates each metric across data-parallel ranks per micro-batch and requires every rank to report the same
-    number of values, so an empty dict would fail the step on the rank that hit the empty micro-batch. Repeat the
-    previous micro-batch's metrics instead: same keys and aggregation types, and min/max are not distorted.
+    number of values, so an empty micro-batch must still report one value per metric. Repeat the metrics of the nearest
+    non-empty micro-batch of this call (earlier first), else of the last one seen by this engine: same keys and
+    aggregation types, and min/max are not distorted (means count that micro-batch twice).
     """
     import copy
 
-    previous = getattr(engine, "_last_micro_batch_metrics", None)
-    return copy.deepcopy(previous) if previous is not None else {}
+    filled = [o["metrics"] for o in output_lst if o.get("metrics") is not None]
+    if filled:
+        engine._last_micro_batch_metrics = filled[-1]
+    for index, output in enumerate(output_lst):
+        if output.get("metrics") is not None:
+            continue
+        donor = next((output_lst[j]["metrics"] for j in range(index - 1, -1, -1) if output_lst[j]["metrics"]), None)
+        if donor is None:
+            donor = filled[0] if filled else getattr(engine, "_last_micro_batch_metrics", None)
+        if donor is None:
+            logger.warning(
+                "every micro-batch on this rank is empty and no earlier metrics exist; reporting none, which can "
+                "fail verl's cross-rank metric aggregation"
+            )
+        output["metrics"] = copy.deepcopy(donor) if donor is not None else {}
 
 
 def _headtail_restore_indices_cpu(seq_len: int, cp_size: int) -> torch.Tensor:
@@ -2008,6 +2068,7 @@ class TorchTitanTPUEngine(BaseEngine):
                         del loss
                 output_lst.append(output)
 
+        _backfill_empty_micro_batch_metrics(self, output_lst)
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def _graph_trainer_forward_backward(
@@ -2054,6 +2115,7 @@ class TorchTitanTPUEngine(BaseEngine):
                             micro_batch, micro_batch_idx, loss_function, batch_num_tokens, loss_scalars
                         )
                     )
+        _backfill_empty_micro_batch_metrics(self, output_lst)
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def _annotate_graph_extra_spmd_types(self, input_dict: dict[str, Any]) -> None:
@@ -2253,21 +2315,17 @@ class TorchTitanTPUEngine(BaseEngine):
                 "log_probs": _to_jagged(log_probs, micro_batch["input_ids"].offsets(), output_args["orig_seq_len"])
             }
             loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch, eager_scalars)
-            try:
+            if not _loss_rejects_empty_micro_batch(loss_function) or _has_valid_response_tokens(loss_data):
                 loss, metrics = loss_function(
                     model_output=loss_model_output, data=loss_data, dp_group=self.get_data_parallel_group()
                 )
                 _add_rollout_consistency_metrics(loss_function, loss_model_output, loss_data, metrics)
-            except ValueError as err:
-                if _NO_VALID_RESPONSE_TOKENS not in str(err):
-                    raise
-                # Every response token of this micro-batch is masked out (with one sequence per micro-batch, one
-                # filtered trajectory is enough). It has no loss terms: the traced step already contributed nothing
-                # for it, so report its (zero) graph loss and no metrics instead of failing the step.
-                logger.warning("micro-batch has no valid response tokens; repeating the previous micro-batch's metrics")
-                loss, metrics = graph_loss.detach().float(), _metrics_for_empty_micro_batch(self)
             else:
-                self._last_micro_batch_metrics = metrics
+                # Every response token is masked out: no loss terms, and the traced step contributed nothing for it.
+                # Report its (zero) graph loss; the caller fills its metrics (_backfill_empty_micro_batch_metrics).
+                _check_empty_micro_batch_can_skip_loss(loss_function)
+                logger.warning("micro-batch has no valid response tokens; skipping its loss")
+                loss, metrics = graph_loss.detach().float(), None
             for value in model_output.values():
                 if hasattr(value, TPU_PADDED_VALUES_ATTR):
                     delattr(value, TPU_PADDED_VALUES_ATTR)
@@ -3375,25 +3433,26 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
                 if loss_function is not None:
                     loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch, loss_scalars)
-                    try:
+                    if (
+                        forward_only
+                        or not _loss_rejects_empty_micro_batch(loss_function)
+                        or _has_valid_response_tokens(loss_data)
+                    ):
                         loss, metrics = loss_function(
                             model_output=loss_model_output,
                             data=loss_data,
                             dp_group=self.get_data_parallel_group(),
                         )
                         _add_rollout_consistency_metrics(loss_function, loss_model_output, loss_data, metrics)
-                    except ValueError as err:
-                        if _NO_VALID_RESPONSE_TOKENS not in str(err):
-                            raise
-                        # Every response token of this micro-batch is masked out. It has no loss terms, but the
-                        # backward must still run (its FSDP/EP collectives pair with the other ranks'), so use a
-                        # zero loss that keeps the graph: zero gradients, same collectives.
+                    else:
+                        # Every response token is masked out: no loss terms, but the backward must still run (its
+                        # FSDP/EP collectives pair with the other ranks'), so use a zero loss that keeps the graph.
+                        # The caller fills its metrics (_backfill_empty_micro_batch_metrics).
+                        _check_empty_micro_batch_can_skip_loss(loss_function)
                         log_probs = model_output["log_probs"]
                         values = log_probs.values() if getattr(log_probs, "is_nested", False) else log_probs
                         logger.warning("micro-batch has no valid response tokens; using a zero loss")
-                        loss, metrics = values.float().sum() * 0.0, _metrics_for_empty_micro_batch(self)
-                    else:
-                        self._last_micro_batch_metrics = metrics
+                        loss, metrics = values.float().sum() * 0.0, None
                 else:
                     assert forward_only, "loss_function must be provided when not forward_only"
                     loss = torch.tensor(1.0, device=device_name)
