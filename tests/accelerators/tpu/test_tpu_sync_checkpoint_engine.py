@@ -3056,3 +3056,34 @@ def test_weight_sync_manager_calls_fall_back_to_replica_by_replica(monkeypatch):
         )
     )
     assert manager_calls == ["resume", "resume"]
+
+
+def test_weight_sync_fails_the_step_when_a_cached_transfer_hangs(fake_tpu_sync, worker_ext, monkeypatch):
+    """A transfer that never finishes (a rollout host gone entirely) fails the step instead of hanging the run, once
+    the transfer plan is cached; the first transfer of a run, which also plans the reshard, is not bounded."""
+    tp = 2
+    weights = _trainer_weights()
+    samplers = [_make_sampler(worker_ext, rank, tp, _FakeVllmModel(tp)) for rank in range(tp)]
+    manager, _ = _make_manager(
+        [_trainer_engine(rank) for rank in range(2)],
+        lambda rank: iter(weights.items()),
+        samplers,
+        [],
+        return_after_d2h=False,
+    )
+    monkeypatch.setattr(tpu_sync_engine, "TPU_SYNC_TRANSFER_TIMEOUT_S", 0.2)
+    try:
+        # First transfer: slower than the timeout, but not bounded.
+        fake_tpu_sync.transfer_gate = threading.Event()
+        threading.Timer(0.5, fake_tpu_sync.transfer_gate.set).start()
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+
+        # Cached plan: a transfer that does not finish in time fails the step.
+        fake_tpu_sync.transfer_gate = threading.Event()
+        threading.Timer(1.0, fake_tpu_sync.transfer_gate.set).start()  # lets the blocked transfer thread exit
+        with pytest.raises(RuntimeError, match="weight transfer to the rollout did not finish within"):
+            asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    finally:
+        if fake_tpu_sync.transfer_gate is not None:
+            fake_tpu_sync.transfer_gate.set()
+        fake_tpu_sync.transfer_gate = None

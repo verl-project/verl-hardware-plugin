@@ -77,6 +77,11 @@ TPU_SYNC_REGISTRATION_TIMEOUT_S = 60.0
 # resume) before it drops the replica for the rest of the run. Without a bound, one rollout host that stops answering
 # (a hung or dead vLLM engine) keeps every replica paused and the trainer waiting for samples forever.
 TPU_SYNC_REPLICA_RPC_TIMEOUT_S = float(os.getenv("VERL_TPU_SYNC_REPLICA_RPC_TIMEOUT_S", "300"))
+# How long the driver waits for a weight transfer whose plan is already cached (every sync after the first; about a
+# minute for Qwen3.5-397B to 128 replicas) before failing the step. A rollout host that is gone entirely (not just its
+# vLLM engine) can leave the transfer waiting forever; failing loudly beats a silent hang. The first transfer of a run
+# also plans the reshard (tens of minutes at scale, partly blocking the driver), so it is not bounded.
+TPU_SYNC_TRANSFER_TIMEOUT_S = float(os.getenv("VERL_TPU_SYNC_TRANSFER_TIMEOUT_S", "1800"))
 # tpu-sync reads and writes device buffers in place, so the tensors it is given must live on this device.
 TPU_SYNC_DEVICE = "tpu"
 # Set in the metrics a trainer rank returns from send_weights when it staged its weights in host memory itself
@@ -1129,7 +1134,20 @@ async def _finish_tpu_sync(
         req_id=f"verl_step_{global_steps or 0}",
         **transfer_kwargs,
     )
-    await transfer_future.wait()
+    # The plan of a transfer to these rollout units is cached once one has finished (see below).
+    plan_cached = getattr(manager, "_tpu_sync_transferred_dst_units", None) == dst_units
+    if plan_cached:
+        try:
+            await asyncio.wait_for(transfer_future.wait(), timeout=TPU_SYNC_TRANSFER_TIMEOUT_S)
+        except asyncio.TimeoutError as err:
+            dropped = sorted(_dead_replica_keys(manager))
+            raise RuntimeError(
+                f"[TPU-SYNC] Step {global_steps}: the weight transfer to the rollout did not finish within "
+                f"{TPU_SYNC_TRANSFER_TIMEOUT_S:.0f}s (VERL_TPU_SYNC_TRANSFER_TIMEOUT_S); a rollout host may be gone"
+                f"{f' (dropped replicas: {dropped})' if dropped else ''}. Failing the step instead of hanging."
+            ) from err
+    else:
+        await transfer_future.wait()
     t_transfer = time.perf_counter() - t_transfer_start
     # The plan of a transfer to these rollout units is cached now, so the trainer may stage the next syncs itself.
     manager._tpu_sync_transferred_dst_units = list(dst_units)
