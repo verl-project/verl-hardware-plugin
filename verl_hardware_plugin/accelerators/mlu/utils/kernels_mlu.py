@@ -34,8 +34,10 @@ Implementations of the linear cross entropy with token entropy kernel.
 # ruff: noqa: E501
 # mypy: ignore-errors
 
+import importlib.metadata
 import itertools
 import os
+import re
 import typing
 from dataclasses import dataclass
 
@@ -76,6 +78,36 @@ except ImportError:
     _devprob = {}
     TOTAL_CORE_NUM = 0
 
+
+_REGRESSION_TRITON_MIN = (3, 4, 0, 2, 2, 0)
+
+
+def _triton_version_tuple() -> tuple[int, ...] | None:
+    try:
+        raw = importlib.metadata.version("triton")
+    except importlib.metadata.PackageNotFoundError:
+        raw = triton.__version__
+    base, _, suffix = raw.partition("+")
+    if not re.search(r"mlu(\d+(?:\.\d+)*)", suffix):
+        # No mlu suffix: either community triton (never MLU-tuned; the big
+        # tiles were tuned on triton-mlu only) or stripped metadata on a
+        # triton-mlu build where the real suffix is unknown. Conservative.
+        return None
+    numbers = []
+    for part in base.split(".")[:3]:
+        match = re.match(r"(\d+)", part)
+        numbers.append(int(match.group(1)) if match else 0)
+    numbers += [0] * (3 - len(numbers))
+    match = re.search(r"mlu(\d+(?:\.\d+)*)", suffix)
+    mlu = [int(item) for item in match.group(1).split(".")]
+    mlu += [0] * (3 - len(mlu))
+    return tuple(numbers + mlu)
+
+
+_TRITON_VERSION_TUPLE = _triton_version_tuple()
+_TRITON_LOW_VERSION_COMPAT = (
+    HAVE_TRITON and _TRITON_VERSION_TUPLE is not None and _TRITON_VERSION_TUPLE < _REGRESSION_TRITON_MIN
+)
 
 if not HAVE_TRITON:
     from contextlib import contextmanager
@@ -204,19 +236,53 @@ def set_backward_method(backward_method: BackwardEnum):
     _config._backward = backward_method
 
 
+def _tile_config(
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    *,
+    num_stages: int,
+    num_warps: int,
+    group_size_m: typing.Optional[int] = None,
+) -> "triton.Config":
+    """Shorthand for the repeated BLOCK_SIZE_* ``triton.Config`` pattern.
+
+    ``num_stages``/``num_warps`` are required (no defaults): they are the two
+    levers that decide NRAM occupancy on MLU, so every call site states them
+    explicitly to keep the tuning auditable.
+    """
+    kwargs = {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": block_k}
+    if group_size_m is not None:
+        kwargs["GROUP_SIZE_M"] = group_size_m
+    return triton.Config(kwargs, num_stages=num_stages, num_warps=num_warps)
+
+
+def _entropy_forward_configs():
+    """NRAM-aware autotune list for the forward mainloop."""
+    if not _devprob:
+        # No MLU triton backend (community triton / CPU import): keep upstream.
+        return [
+            _tile_config(128, 1024, 256, num_stages=3, num_warps=4),
+            _tile_config(256, 256, 128, num_stages=3, num_warps=1),
+        ]
+    if _TRITON_LOW_VERSION_COMPAT:
+        return [
+            _tile_config(128, 1024, 256, num_stages=3, num_warps=4),
+            _tile_config(256, 128, 128, num_stages=3, num_warps=1),
+            _tile_config(64, 256, 256, num_stages=3, num_warps=1),
+            _tile_config(256, 256, 128, num_stages=3, num_warps=1),
+            _tile_config(64, 256, 128, num_stages=3, num_warps=1),
+        ]
+    return [
+        _tile_config(128, 128, 512, num_stages=3, num_warps=4),
+        _tile_config(64, 256, 256, num_stages=3, num_warps=1),
+        _tile_config(256, 256, 128, num_stages=3, num_warps=1),
+        _tile_config(64, 256, 128, num_stages=3, num_warps=1),
+    ]
+
+
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 1024, "BLOCK_SIZE_K": 256},
-            num_stages=3,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128},
-            num_stages=3,
-            num_warps=1,
-        ),
-    ],
+    configs=_entropy_forward_configs(),
     key=["num_tokens", "hidden_size", "vocab_size"],
 )
 @triton.jit
@@ -829,25 +895,26 @@ def efficient_entropy_forward(
     return (logprobs, entropy, maximum, accumulate, entropy_b)
 
 
+def _entropy_backward_mainloop_mn_configs():
+    """NRAM-aware autotune list for the fused (d_logits+d_hidden+d_weight) backward."""
+    if not _devprob:
+        # No MLU triton backend (community triton / CPU import): keep upstream.
+        return [
+            _tile_config(128, 128, 256, num_stages=2, num_warps=4, group_size_m=16),
+            _tile_config(128, 64, 512, num_stages=3, num_warps=4, group_size_m=16),
+            _tile_config(128, 128, 256, num_stages=1, num_warps=1, group_size_m=16),
+        ]
+    return [
+        _tile_config(128, 64, 256, num_stages=1, num_warps=1, group_size_m=16),
+        _tile_config(128, 128, 256, num_stages=2, num_warps=4, group_size_m=16),
+        _tile_config(128, 128, 256, num_stages=1, num_warps=1, group_size_m=16),
+    ]
+
+
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 16},
-            num_stages=2,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 512, "GROUP_SIZE_M": 16},
-            num_stages=3,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 16},
-            num_stages=1,
-            num_warps=1,
-        ),
-    ],
+    configs=_entropy_backward_mainloop_mn_configs(),
     key=["num_tokens", "hidden_size", "vocab_size"],
+    reset_to_zero=["d_hidden_ptr", "d_weight_ptr"],
 )
 @triton.jit
 def efficient_entropy_backward_kernel_general_mainloop_MN(
@@ -1056,49 +1123,11 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
 
 
 def _entropy_backward_d_hidden_configs():
-    """Per-part autotune list, tuned with tuning/sweep_backward_kernels.py.
-
-    Parts differ in on-chip memory: 512 KB-NRAM parts vs 1 MB-NRAM parts
-    (e.g. MLU692/M9). The two winner sets are mutually incompatible — a config
-    tuned on one part can exhaust NRAM/SRAM on the other, so pick by
-    ``max_nram_size`` instead of merging the lists.
-    """
-    if _devprob.get("max_nram_size", 0) >= 1024 * 1024:
-        # 1 MB-NRAM parts: 1.00x on every shape in results_local.jsonl
-        return [
-            # large tokens / hidden: overall fastest
-            triton.Config(
-                {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 512, "GROUP_SIZE_M": 8},
-                num_stages=1,
-                num_warps=1,
-            ),
-            # hidden_size=8192-class shapes
-            triton.Config(
-                {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 8},
-                num_stages=3,
-                num_warps=1,
-            ),
-            # small / odd shapes (e.g. correctness-guard sizes)
-            triton.Config(
-                {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 8},
-                num_stages=3,
-                num_warps=4,
-            ),
-        ]
-    # 512 KB-NRAM parts: 1.00x on every shape in results.jsonl / results_refine.jsonl
     return [
-        # best on every training shape scanned
-        triton.Config(
-            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 512, "GROUP_SIZE_M": 8},
-            num_stages=2,
-            num_warps=4,
-        ),
-        # small / odd shapes (e.g. correctness-guard sizes)
-        triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 8},
-            num_stages=3,
-            num_warps=4,
-        ),
+        _tile_config(128, 64, 512, num_stages=1, num_warps=1, group_size_m=8),
+        _tile_config(128, 64, 256, num_stages=3, num_warps=1, group_size_m=8),
+        _tile_config(128, 128, 256, num_stages=3, num_warps=4, group_size_m=8),
+        _tile_config(256, 64, 512, num_stages=2, num_warps=4, group_size_m=8),
     ]
 
 
@@ -1256,40 +1285,10 @@ def efficient_entropy_backward_kernel_d_hidden(
 
 
 def _entropy_backward_d_weight_configs():
-    """Per-part autotune list, tuned with tuning/sweep_backward_kernels.py.
-
-    Same NRAM-based part split as ``_entropy_backward_d_hidden_configs``; the
-    two winner sets are mutually incompatible (NRAM/SRAM overflow across parts).
-    """
-    if _devprob.get("max_nram_size", 0) >= 1024 * 1024:
-        # 1 MB-NRAM parts, tuned on MLU692/M9 (results_local.jsonl). Pruned:
-        # the dropped (256,64,512,s2,w4) twin only beat (256,64,512,s3,w4) by
-        # ~2% on the small correctness-guard shape (noise-level elsewhere).
-        return [
-            # best on hidden_size>=4096 shapes
-            triton.Config(
-                {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 512, "GROUP_SIZE_M": 8},
-                num_stages=3,
-                num_warps=4,
-            ),
-            # best on hidden_size=2048-class shapes
-            triton.Config(
-                {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 8},
-                num_stages=3,
-                num_warps=1,
-            ),
-        ]
-    # 512 KB-NRAM parts, tuned on m9dk (results.jsonl / results_refine.jsonl).
-    # Pruned to a single config: the dropped (256,64,512,s3,w4) was only ~1%
-    # ahead on training shapes (noise-level) and ~2% ahead on the small
-    # correctness-guard shape.
     return [
-        # best or within ~1% on every training shape scanned
-        triton.Config(
-            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 512, "GROUP_SIZE_M": 8},
-            num_stages=3,
-            num_warps=4,
-        ),
+        _tile_config(128, 128, 512, num_stages=3, num_warps=4, group_size_m=8),
+        _tile_config(256, 64, 512, num_stages=3, num_warps=4, group_size_m=8),
+        _tile_config(128, 64, 256, num_stages=3, num_warps=1, group_size_m=8),
     ]
 
 
@@ -1458,19 +1457,27 @@ def efficient_entropy_backward_kernel_d_weight(
         )
 
 
+def _entropy_backward_d_logits_configs():
+    """NRAM-aware autotune list shared by both d_logits kernels:
+    ``efficient_entropy_backward_kernel_general_d_logits``
+    (``BackwardEnum._Total_Separate``) and
+    ``efficient_entropy_backward_kernel_general_d_logits_split_N``
+    (``BackwardEnum._Split_Dlogits_N``) — same tile space, one list.
+    """
+    if not _devprob:
+        return [
+            _tile_config(256, 128, 512, num_stages=3, num_warps=8, group_size_m=16),
+            _tile_config(256, 64, 256, num_stages=3, num_warps=1, group_size_m=16),
+        ]
+    return [
+        _tile_config(128, 64, 256, num_stages=3, num_warps=1, group_size_m=16),
+        _tile_config(128, 64, 128, num_stages=3, num_warps=1, group_size_m=16),
+        _tile_config(256, 64, 256, num_stages=3, num_warps=1, group_size_m=16),
+    ]
+
+
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 512, "GROUP_SIZE_M": 16},
-            num_stages=3,
-            num_warps=8,
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 16},
-            num_stages=3,
-            num_warps=1,
-        ),
-    ],
+    configs=_entropy_backward_d_logits_configs(),
     key=["num_tokens", "hidden_size", "vocab_size"],
 )
 @triton.jit
@@ -1641,18 +1648,7 @@ def efficient_entropy_backward_kernel_general_d_logits(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 512, "GROUP_SIZE_M": 16},
-            num_stages=3,
-            num_warps=8,
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 16},
-            num_stages=3,
-            num_warps=1,
-        ),
-    ],
+    configs=_entropy_backward_d_logits_configs(),
     key=["num_tokens", "hidden_size", "vocab_size"],
 )
 @triton.jit
