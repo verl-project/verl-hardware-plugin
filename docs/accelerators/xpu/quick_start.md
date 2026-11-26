@@ -61,8 +61,8 @@ python3 -m verl.trainer.main_ppo \
     data.max_response_length=128 \
     actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
     actor_rollout_ref.actor.optim.lr=5e-7 \
-    actor_rollout_ref.model.use_remove_padding=False \
-    +actor_rollout_ref.model.override_config.attn_implementation=eager \
+    actor_rollout_ref.model.use_remove_padding=True \
+    +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
@@ -77,12 +77,20 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+    trainer.logger='["console"]' \
     trainer.total_epochs=1 \
     trainer.total_training_steps=2 \
     trainer.test_freq=-1 \
     trainer.save_freq=-1 \
     +ray_kwargs.ray_init.num_gpus=1
 ```
+
+Attention runs through flash-attention 2 (`attn_implementation=flash_attention_2` with `use_remove_padding=True`). On XPU
+the kernel comes from the `kernels` package (`kernels-community/flash-attn2`) and is downloaded from the Hugging Face Hub the
+first time it is used, so the first run needs network access to huggingface.co.
+
+`trainer.logger='["console"]'` is set because verl's default logger list also contains `wandb`, which stops the run before
+the first step on a machine that is not logged in to wandb.
 
 This is a smoke test: `total_training_steps=2` stops after two steps (without it, `total_epochs=1` over GSM8K at
 batch 16 is about 467 steps). Raise it for a longer run. A `DataLoader worker ... is killed by signal` traceback
