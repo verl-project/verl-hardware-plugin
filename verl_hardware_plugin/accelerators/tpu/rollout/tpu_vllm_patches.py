@@ -239,7 +239,14 @@ def _apply_tpu_precision_patches() -> None:
 
 
 def _patch_unquantized_routed_experts() -> None:
-    """Apply vllm-torchtpu#2967 compat shim when ``VllmUnquantizedConfig`` lacks ``RoutedExperts`` support."""
+    """Backport vllm-torchtpu#2967 (717a50d1): FP8 MoE for ``QUANTIZE_ON_LOAD_PREFIXES``-matched ``RoutedExperts``.
+
+    Pre-#2967 ``VllmUnquantizedConfig.get_quant_method`` (e.g. 281b52666) returns ``VllmUnquantizedFusedMoEMethod``
+    for every ``RoutedExperts``. The wrapper replaces exactly that result, for matching prefixes, with
+    ``VllmFp8MoEMethodTPU``; anything else upstream returns (its own FP8 method included) passes through, so the
+    wrapper is a no-op on #2967+ however upstream structures the routing. Drop it once the pinned vllm-torchtpu
+    includes 717a50d1.
+    """
     try:
         import vllm.model_executor.layers.fused_moe as fused_moe
         import vllm_torchtpu.layers.adapter.quantization.configs as quant_configs
@@ -253,35 +260,38 @@ def _patch_unquantized_routed_experts() -> None:
     should_quantize_on_load = getattr(quant_configs, "should_quantize_on_load", None)
     fp8_cfg_cls = getattr(fp8_mod, "VllmFp8Config", None)
     fp8_moe_cls = getattr(fp8_mod, "VllmFp8MoEMethodTPU", None)
-    if cfg_cls is None or None in (routed_experts_cls, should_quantize_on_load, fp8_cfg_cls, fp8_moe_cls):
+    unquantized_moe_cls = getattr(unquantized_mod, "VllmUnquantizedFusedMoEMethod", None)
+    deps = (routed_experts_cls, should_quantize_on_load, fp8_cfg_cls, fp8_moe_cls, unquantized_moe_cls)
+    if cfg_cls is None or None in deps:
         return
 
     orig_get_quant = cfg_cls.__dict__.get("get_quant_method") or getattr(cfg_cls, "get_quant_method", None)
     if orig_get_quant is None or getattr(orig_get_quant, "_verl_pr2967_patched", False):
         return
 
-    try:
-        if "RoutedExperts" in inspect.getsource(orig_get_quant):
-            return
-    except (OSError, TypeError):
-        pass
-
     @functools.wraps(orig_get_quant)
     def _get_quant_method_pr2967(self, layer, prefix):
-        if isinstance(layer, routed_experts_cls) and should_quantize_on_load(prefix):
-            moe_config = self.get_moe_config(layer)
-            if moe_config.has_bias:
-                raise NotImplementedError(
-                    f"QUANTIZE_ON_LOAD_PREFIXES matched {prefix}, but FP8 MoE "
-                    "on-load quantization does not support expert bias"
-                )
-            fp8_config = fp8_cfg_cls(is_checkpoint_fp8_serialized=False, activation_scheme="dynamic")
-            return fp8_moe_cls(fp8_config, moe_config)
-        return orig_get_quant(self, layer, prefix)
+        method = orig_get_quant(self, layer, prefix)
+        if not (
+            isinstance(method, unquantized_moe_cls)
+            and isinstance(layer, routed_experts_cls)
+            and should_quantize_on_load(prefix)
+        ):
+            return method
+        moe_config = self.get_moe_config(layer)
+        if moe_config.has_bias:
+            raise NotImplementedError(
+                f"QUANTIZE_ON_LOAD_PREFIXES matched {prefix}, but FP8 MoE "
+                "on-load quantization does not support expert bias"
+            )
+        if not getattr(_get_quant_method_pr2967, "_verl_pr2967_engaged", False):
+            _get_quant_method_pr2967._verl_pr2967_engaged = True  # type: ignore[attr-defined]
+            logger.info("vllm-torchtpu#2967 backport: RoutedExperts matching QUANTIZE_ON_LOAD_PREFIXES use FP8 MoE.")
+        fp8_config = fp8_cfg_cls(is_checkpoint_fp8_serialized=False, activation_scheme="dynamic")
+        return fp8_moe_cls(fp8_config, moe_config)
 
     _get_quant_method_pr2967._verl_pr2967_patched = True  # type: ignore[attr-defined]
     cfg_cls.get_quant_method = _get_quant_method_pr2967
-    logger.info("Installed vllm-torchtpu#2967 compatibility shim on VllmUnquantizedConfig.")
 
 
 def _create_dummy_online_fp8_moe_weights(
