@@ -79,6 +79,7 @@ from verl_hardware_plugin.accelerators.tpu.engines import (
     gdn_slot_schedule,
     graph_trainer_mode,
     tpu_model_kernels,
+    train_step_precompile,
 )
 from verl_hardware_plugin.accelerators.tpu.engines.cp_layer_transforms import (
     context_parallel_layer_transforms,
@@ -2100,6 +2101,7 @@ class TorchTitanTPUEngine(BaseEngine):
         accumulated gradient is the mini-batch's. verl's ``ppo_loss`` then runs eagerly under ``no_grad`` on the
         per-token log-probs the graph returns, so the reported loss and metrics are the eager engine's.
         """
+        self._graph_step_loss_function = loss_function
         self._ensure_graph_policy_loss(loss_function, micro_batches[0])
         timeline_ctx = timeline.span(
             "fwd_bwd",
@@ -2126,6 +2128,8 @@ class TorchTitanTPUEngine(BaseEngine):
                         )
                     )
         _backfill_empty_micro_batch_metrics(self, output_lst)
+        # A real step ran on the precompiled graph (or retraced it): the trace is no longer provisional.
+        setattr(self, train_step_precompile.PROVISIONAL_ATTR, False)
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def _annotate_graph_extra_spmd_types(self, input_dict: dict[str, Any]) -> None:
@@ -2187,6 +2191,14 @@ class TorchTitanTPUEngine(BaseEngine):
         cp_enabled = parallel_dims is not None and bool(getattr(parallel_dims, "cp_enabled", False))
         cp_size = int(parallel_dims.cp) if (parallel_dims is not None and cp_enabled) else 1
         full_padded_len = local_padded_len * cp_size
+        if (
+            self._graph_trainer_traced_len is not None
+            and local_padded_len != self._graph_trainer_traced_len
+            and train_step_precompile.reset_provisional_trace(
+                self, f"padded length {self._graph_trainer_traced_len} -> {local_padded_len}"
+            )
+        ):
+            self._ensure_graph_policy_loss(self._graph_step_loss_function, micro_batch)
         if self._graph_trainer_traced_len is None:
             self._graph_trainer_traced_len = local_padded_len
         elif local_padded_len != self._graph_trainer_traced_len:
@@ -2382,6 +2394,14 @@ class TorchTitanTPUEngine(BaseEngine):
             ),
             has_rollout_is_weights="rollout_is_weights" in micro_batch.keys(),
         )
+        if (
+            self._graph_policy_loss_spec is not None
+            and spec != self._graph_policy_loss_spec
+            and train_step_precompile.reset_provisional_trace(
+                self, f"policy loss {self._graph_policy_loss_spec} -> {spec}"
+            )
+        ):
+            assert self._graph_policy_loss_spec is None
         if self._graph_policy_loss_spec is None:
             parallel_dims = getattr(self, "parallel_dims", None)
             cp_group = (
