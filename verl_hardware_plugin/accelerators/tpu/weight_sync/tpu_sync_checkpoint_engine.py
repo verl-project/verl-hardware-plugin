@@ -73,6 +73,10 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # How long the driver waits for every trainer and rollout worker to register with the controller.
 TPU_SYNC_REGISTRATION_TIMEOUT_S = 60.0
+# How long the driver waits for one rollout replica to answer a weight-sync RPC (init, abort, install, set_global_steps,
+# resume) before it drops the replica for the rest of the run. Without a bound, one rollout host that stops answering
+# (a hung or dead vLLM engine) keeps every replica paused and the trainer waiting for samples forever.
+TPU_SYNC_REPLICA_RPC_TIMEOUT_S = float(os.getenv("VERL_TPU_SYNC_REPLICA_RPC_TIMEOUT_S", "300"))
 # tpu-sync reads and writes device buffers in place, so the tensors it is given must live on this device.
 TPU_SYNC_DEVICE = "tpu"
 # Set in the metrics a trainer rank returns from send_weights when it staged its weights in host memory itself
@@ -1025,7 +1029,13 @@ async def _quiesce_rollout(manager: Any, global_steps: Optional[int]) -> float:
     t0 = time.perf_counter()
     if global_steps and global_steps > 0:
         try:
-            await manager.abort_replicas()
+            await _run_on_live_replicas(
+                manager,
+                "abort_all_requests",
+                manager.abort_replicas,
+                lambda replica, _: replica.abort_all_requests(),
+                global_steps,
+            )
         except Exception as e:
             logger.warning(f"Failed to abort replicas at step {global_steps}: {e}")
     return time.perf_counter() - t0
@@ -1076,21 +1086,21 @@ async def _finish_tpu_sync(
     extra_init_kwargs: dict[str, Any] = {} if direct_quantized else {"direct_install_quantized_moe": False}
     if global_dtypes:
         extra_init_kwargs["global_dtypes"] = global_dtypes
-    await asyncio.gather(
-        *[
-            replica.server_handle.collective_rpc.remote(
-                method="init_tpu_sync_on_worker",
-                kwargs={
-                    "controller_address": manager._tpu_sync_address,
-                    "global_shapes": global_shapes,
-                    "parallelism": parallelism,
-                    "job_name": _sampler_job_name(replica, replica_idx),
-                    "receive_into_vllm": receive_into_vllm,
-                    **extra_init_kwargs,
-                },
-            )
-            for replica_idx, replica in enumerate(manager.replicas)
-        ]
+    await _call_live_replicas(
+        manager,
+        "init_tpu_sync_on_worker",
+        lambda replica, replica_idx: replica.server_handle.collective_rpc.remote(
+            method="init_tpu_sync_on_worker",
+            kwargs={
+                "controller_address": manager._tpu_sync_address,
+                "global_shapes": global_shapes,
+                "parallelism": parallelism,
+                "job_name": _sampler_job_name(replica, replica_idx),
+                "receive_into_vllm": receive_into_vllm,
+                **extra_init_kwargs,
+            },
+        ),
+        global_steps,
     )
     t_init_sampler = time.perf_counter() - t_init_sampler_start
 
@@ -1138,12 +1148,15 @@ async def _finish_tpu_sync(
 
     # 5. Rollout workers copy the received weights to TPU HBM and fuse them into vLLM's parameters.
     t_install_start = time.perf_counter()
-    install_results = await asyncio.gather(
-        *[
-            replica.server_handle.collective_rpc.remote(method="install_tpu_sync_weights", kwargs=exact_install_kwargs)
-            for replica in manager.replicas
-        ]
+    installed = await _call_live_replicas(
+        manager,
+        "install_tpu_sync_weights",
+        lambda replica, _: replica.server_handle.collective_rpc.remote(
+            method="install_tpu_sync_weights", kwargs=exact_install_kwargs
+        ),
+        global_steps,
     )
+    install_results = [result for _, result in installed]
     t_install = time.perf_counter() - t_install_start
     # collective_rpc returns one result per TP worker of each replica (when the server passes worker results
     # through); each is the timing dict returned by vLLMTPUSyncWorkerExtension.install_tpu_sync_weights. The
@@ -1158,8 +1171,11 @@ async def _finish_tpu_sync(
     # weights and keep the previous tag.
     t_finalize_start = time.perf_counter()
     if global_steps is not None:
-        await asyncio.gather(
-            *[replica.server_handle.set_global_steps.remote(global_steps) for replica in manager.replicas]
+        await _call_live_replicas(
+            manager,
+            "set_global_steps",
+            lambda replica, _: replica.server_handle.set_global_steps.remote(global_steps),
+            global_steps,
         )
     t_finalize = time.perf_counter() - t_finalize_start
 
@@ -1168,7 +1184,8 @@ async def _finish_tpu_sync(
     #    of resuming generation on wrong weights.
     t_parity_start = time.perf_counter()
     if exact_install_kwargs:
-        report_exact_parity(global_steps, install_results, _replica_labels(manager))
+        labels = _replica_labels(manager)
+        report_exact_parity(global_steps, install_results, [labels[index] for index, _ in installed])
     if verify_parity:
         await _verify_parity(manager, global_steps)
     t_parity = time.perf_counter() - t_parity_start
@@ -1177,7 +1194,13 @@ async def _finish_tpu_sync(
     #    for the trainer to free its send buffers below: that only gives trainer HBM back and must not keep the
     #    rollout idle.
     t_resume_start = time.perf_counter()
-    await manager.resume_generation_replicas()
+    await _run_on_live_replicas(
+        manager,
+        "resume_generation",
+        manager.resume_generation_replicas,
+        lambda replica, _: replica.resume_generation(),
+        global_steps,
+    )
     t_resume = time.perf_counter() - t_resume_start
     # From the pause (abort) to the resume (0 on the step-0 sync, which does not pause the rollout).
     t_rollout_paused = time.perf_counter() - t_paused_start if global_steps else 0.0
@@ -1254,11 +1277,135 @@ async def _finish_tpu_sync(
         "timing_s/tpu-sync/trainer_release": t_release,
         "timing_s/tpu-sync/total_sync": t_total,
     }
+    if _dead_replica_keys(manager):
+        # Only once a replica has been dropped, so a healthy run reports the same metrics as before.
+        metrics["tpu-sync/dropped_replicas"] = float(len(_dead_replica_keys(manager)))
     if t_h2d_pure is not None:
         # Pure _tpu_sync_ws.h2d() time on the slowest sampler worker (sampler_h2d above also includes the
         # fuse/transpose into vLLM params, the TPU sync barrier and the RPC round trip).
         metrics["timing_s/tpu-sync/sampler_h2d_pure"] = t_h2d_pure
     return metrics
+
+
+def _replica_key(replica: Any, index: int) -> str:
+    """Identifies a rollout replica: its server address (the load balancer's server id), or its rank."""
+    return getattr(replica, "server_address", None) or f"replica{_replica_rank(replica, index)}"
+
+
+def _dead_replica_keys(manager: Any) -> set[str]:
+    """The replicas dropped from the weight sync (and from request routing) for the rest of the run."""
+    dead = getattr(manager, "_tpu_sync_dead_replicas", None)
+    if dead is None:
+        dead = manager._tpu_sync_dead_replicas = set()
+    return dead
+
+
+def _live_replicas(manager: Any) -> list[tuple[int, Any]]:
+    """``(index, replica)`` of every replica in ``manager.replicas`` that has not been dropped."""
+    dead = _dead_replica_keys(manager)
+    return [
+        (index, replica) for index, replica in enumerate(manager.replicas) if _replica_key(replica, index) not in dead
+    ]
+
+
+def _rollout_load_balancers() -> list[tuple[list[str], Any]]:
+    """``(server addresses, load balancer)`` of the rollout's request routers in this (driver) process.
+
+    Only looked up when a replica is dropped, which is rare, so a scan of the live objects is cheap enough and does
+    not depend on when the plugin's hooks were installed relative to verl creating its LLMServerManager.
+    """
+    try:
+        from verl.workers.rollout.llm_server import LLMServerManager
+    except ImportError:
+        return []
+    balancers = []
+    for obj in gc.get_objects():
+        if isinstance(obj, LLMServerManager) and getattr(obj, "global_load_balancer", None) is not None:
+            balancers.append((list(getattr(obj, "server_addresses", None) or []), obj.global_load_balancer))
+    return balancers
+
+
+async def _drop_replicas(manager: Any, failed: list[tuple[int, Any, BaseException]], what: str, global_steps) -> None:
+    """Drops replicas that failed or timed out on a weight-sync RPC, from the sync and from request routing.
+
+    A dropped replica keeps its place in ``manager.replicas`` (and its units in the transfer, whose plan is cached for
+    that destination), so the remaining replicas reuse the cached plan; it is only skipped by every RPC from now on.
+    Taking it out of the load balancer matters as much as unblocking the sync: a dead engine fails its requests at
+    once, so a least-in-flight balancer would otherwise send it most new sessions.
+    """
+    dead = _dead_replica_keys(manager)
+    keys = []
+    for index, replica, err in failed:
+        key = _replica_key(replica, index)
+        dead.add(key)
+        keys.append(key)
+        logger.error(
+            f"[TPU-SYNC] Step {global_steps}: rollout replica {_replica_rank(replica, index)} ({key}) failed "
+            f"{what} ({type(err).__name__}: {err}); dropping it from the weight sync and from request routing for the "
+            f"rest of the run ({len(dead)}/{len(manager.replicas)} replicas dropped)"
+        )
+    for addresses, balancer in _rollout_load_balancers():
+        gone = [key for key in keys if key in addresses]
+        if not gone:
+            continue
+        try:
+            await asyncio.wait_for(balancer.remove_servers.remote(gone), timeout=60)
+        except Exception as e:
+            logger.warning(f"[TPU-SYNC] Failed to remove {gone} from the rollout load balancer: {e}")
+    if len(dead) >= len(manager.replicas):
+        first_error = failed[0][2]
+        raise RuntimeError(
+            f"[TPU-SYNC] Step {global_steps}: every rollout replica failed {what}; cannot continue "
+            f"(first error: {type(first_error).__name__}: {first_error})"
+        ) from first_error
+
+
+async def _call_live_replicas(manager: Any, what: str, call, global_steps) -> list[tuple[int, Any]]:
+    """Runs ``call(replica, index)`` on every live replica, each bounded by ``TPU_SYNC_REPLICA_RPC_TIMEOUT_S``.
+
+    Replicas that raise or time out are dropped (``_drop_replicas``); returns ``(index, result)`` of the others.
+    """
+    live = _live_replicas(manager)
+
+    async def call_one(replica: Any, index: int) -> Any:
+        # Awaited inside the coroutine so an error raised while issuing the call counts as that replica failing too.
+        return await call(replica, index)
+
+    results = await asyncio.gather(
+        *[
+            asyncio.wait_for(call_one(replica, index), timeout=TPU_SYNC_REPLICA_RPC_TIMEOUT_S)
+            for index, replica in live
+        ],
+        return_exceptions=True,
+    )
+    answered, failed = [], []
+    for (index, replica), result in zip(live, results, strict=True):
+        if isinstance(result, BaseException):
+            failed.append((index, replica, result))
+        else:
+            answered.append((index, result))
+    if failed:
+        await _drop_replicas(manager, failed, what, global_steps)
+    return answered
+
+
+async def _run_on_live_replicas(manager: Any, what: str, manager_call, replica_call, global_steps) -> None:
+    """Runs a manager-wide call (``abort_replicas``/``resume_generation_replicas``) bounded by the replica timeout.
+
+    While no replica has been dropped, the manager's own call runs as before. If it fails or times out (some replica
+    stopped answering), or once a replica has been dropped, the call runs replica by replica
+    (``_call_live_replicas``), which finds and drops the replicas that do not answer. Both calls are idempotent.
+    """
+    if not _dead_replica_keys(manager):
+        try:
+            await asyncio.wait_for(manager_call(), timeout=TPU_SYNC_REPLICA_RPC_TIMEOUT_S)
+            return
+        except Exception as e:
+            logger.warning(
+                f"[TPU-SYNC] Step {global_steps}: {what} failed on the rollout ({type(e).__name__}: {e}); "
+                "retrying replica by replica"
+            )
+    await _call_live_replicas(manager, what, replica_call, global_steps)
 
 
 def _replica_labels(manager: Any) -> list[str]:
