@@ -967,3 +967,79 @@ def test_cp_layer_transforms_accepts_torchtitan_200_and_legacy_fields():
             t = cp_layer_transforms._build_transform(spec, load_balancer=None, options=opts, num_layers=3)
             assert getattr(t, s_attr) == "allgather_reducescatter"
             assert getattr(t, d_attr) == "bfloat16"
+
+
+def _empty_micro_batch_setup(empty):
+    micro_batches = [
+        _engine_micro_batch([3, 5, 2], [4, 6, 5], 1),
+        _engine_micro_batch([4, 2], [5, 7], 2),
+        _engine_micro_batch([2, 3], [6, 4], 3),
+    ]
+    for index in empty:
+        micro_batches[index]["response_mask"] = torch.zeros_like(micro_batches[index]["response_mask"])
+    global_tokens = float(sum(mb["response_mask"].sum() for mb in micro_batches))
+    for mb in micro_batches:
+        tu.assign_non_tensor(mb, batch_num_tokens=global_tokens)
+    return micro_batches, global_tokens
+
+
+@pytest.mark.parametrize("empty", [(1,), (0,), (0, 2)])
+def test_graph_mode_step_survives_micro_batches_without_valid_response_tokens(empty):
+    """A micro-batch whose response tokens are all masked out (at 397B a micro-batch holds about one sequence, so one
+    filtered trajectory is enough) must not fail the step: verl's bypass-mode rollout correction would raise
+    "response_mask must contain at least one valid token". It must also report one value per metric like the others,
+    since verl aggregates each metric across data-parallel ranks per micro-batch and needs equal counts on every rank,
+    including when the empty micro-batch comes first."""
+    torch.manual_seed(0)
+    micro_batches, global_tokens = _empty_micro_batch_setup(empty)
+    loss_fn = functools.partial(ppo_loss, config=_actor_config())
+    engine = _graph_engine(_TinyLM(), 48)
+
+    out = engine._graph_trainer_forward_backward(micro_batches[0].copy(), micro_batches, None, loss_fn, global_tokens)
+
+    assert len(out["loss"]) == 3
+    for index in empty:
+        assert out["loss"][index] == pytest.approx(0.0, abs=1e-6)
+    counts = {name: len(getattr(values, "values", values)) for name, values in out["metrics"].items()}
+    assert counts and set(counts.values()) == {3}, counts
+
+
+def test_empty_micro_batch_with_a_cross_rank_loss_fails_instead_of_hanging():
+    """With rollout_is_batch_normalize the loss all-reduces across ranks, so one rank cannot skip it."""
+    config = SimpleNamespace(policy_loss={"rollout_correction": {"rollout_is_batch_normalize": True}})
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+
+    loss_fn = functools.partial(ppo_loss, config=config)
+    assert torchtitan_tpu._loss_needs_every_rank(loss_fn)
+    with pytest.raises(RuntimeError, match="rollout_is_batch_normalize"):
+        torchtitan_tpu._check_empty_micro_batch_can_skip_loss(loss_fn)
+    assert not torchtitan_tpu._loss_needs_every_rank(functools.partial(ppo_loss, config=_actor_config()))
+
+
+def test_backfill_empty_micro_batch_metrics_uses_the_nearest_filled_micro_batch():
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+
+    engine = SimpleNamespace()
+    outputs = [{"metrics": None}, {"metrics": {"a": [1.0]}}, {"metrics": None}, {"metrics": {"a": [3.0]}}]
+    torchtitan_tpu._backfill_empty_micro_batch_metrics(engine, outputs)
+    assert [o["metrics"] for o in outputs] == [{"a": [1.0]}, {"a": [1.0]}, {"a": [1.0]}, {"a": [3.0]}]
+    assert outputs[0]["metrics"] is not outputs[1]["metrics"]  # copies
+    assert engine._last_micro_batch_metrics == {"a": [3.0]}
+
+    # A later call whose micro-batches are all empty repeats the last metrics this engine saw.
+    outputs = [{"metrics": None}]
+    torchtitan_tpu._backfill_empty_micro_batch_metrics(engine, outputs)
+    assert outputs[0]["metrics"] == {"a": [3.0]}
+
+
+def test_zero_loss_keeping_graph_is_finite_and_backpropagates_zeros():
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+
+    log_probs = torch.tensor([0.5, float("inf"), float("nan"), -1.0], requires_grad=True)
+    loss = torchtitan_tpu._zero_loss_keeping_graph(log_probs)
+    assert float(loss) == 0.0
+    loss.backward()
+    assert torch.equal(log_probs.grad, torch.zeros(4))
+
+    jagged = torch.nested.nested_tensor_from_jagged(torch.tensor([1.0, 2.0, 3.0]), torch.tensor([0, 1, 3]))
+    assert float(torchtitan_tpu._zero_loss_keeping_graph(jagged)) == 0.0
