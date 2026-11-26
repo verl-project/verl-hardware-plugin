@@ -133,6 +133,21 @@ from verl_hardware_plugin.accelerators.tpu.profilers import timeline
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+# verl's rollout-correction helper raises this for a micro-batch whose response tokens are all masked out.
+_NO_VALID_RESPONSE_TOKENS = "response_mask must contain at least one valid token"
+
+
+def _metrics_for_empty_micro_batch(engine: Any) -> dict:
+    """Metrics for a micro-batch whose response tokens are all masked out (it has no loss terms of its own).
+
+    verl aggregates each metric across data-parallel ranks per micro-batch and requires every rank to report the same
+    number of values, so an empty dict would fail the step on the rank that hit the empty micro-batch. Repeat the
+    previous micro-batch's metrics instead: same keys and aggregation types, and min/max are not distorted.
+    """
+    import copy
+
+    previous = getattr(engine, "_last_micro_batch_metrics", None)
+    return copy.deepcopy(previous) if previous is not None else {}
 
 
 def _headtail_restore_indices_cpu(seq_len: int, cp_size: int) -> torch.Tensor:
@@ -2238,10 +2253,21 @@ class TorchTitanTPUEngine(BaseEngine):
                 "log_probs": _to_jagged(log_probs, micro_batch["input_ids"].offsets(), output_args["orig_seq_len"])
             }
             loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch, eager_scalars)
-            loss, metrics = loss_function(
-                model_output=loss_model_output, data=loss_data, dp_group=self.get_data_parallel_group()
-            )
-            _add_rollout_consistency_metrics(loss_function, loss_model_output, loss_data, metrics)
+            try:
+                loss, metrics = loss_function(
+                    model_output=loss_model_output, data=loss_data, dp_group=self.get_data_parallel_group()
+                )
+                _add_rollout_consistency_metrics(loss_function, loss_model_output, loss_data, metrics)
+            except ValueError as err:
+                if _NO_VALID_RESPONSE_TOKENS not in str(err):
+                    raise
+                # Every response token of this micro-batch is masked out (with one sequence per micro-batch, one
+                # filtered trajectory is enough). It has no loss terms: the traced step already contributed nothing
+                # for it, so report its (zero) graph loss and no metrics instead of failing the step.
+                logger.warning("micro-batch has no valid response tokens; repeating the previous micro-batch's metrics")
+                loss, metrics = graph_loss.detach().float(), _metrics_for_empty_micro_batch(self)
+            else:
+                self._last_micro_batch_metrics = metrics
             for value in model_output.values():
                 if hasattr(value, TPU_PADDED_VALUES_ATTR):
                     delattr(value, TPU_PADDED_VALUES_ATTR)
@@ -3349,12 +3375,25 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
 
                 if loss_function is not None:
                     loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch, loss_scalars)
-                    loss, metrics = loss_function(
-                        model_output=loss_model_output,
-                        data=loss_data,
-                        dp_group=self.get_data_parallel_group(),
-                    )
-                    _add_rollout_consistency_metrics(loss_function, loss_model_output, loss_data, metrics)
+                    try:
+                        loss, metrics = loss_function(
+                            model_output=loss_model_output,
+                            data=loss_data,
+                            dp_group=self.get_data_parallel_group(),
+                        )
+                        _add_rollout_consistency_metrics(loss_function, loss_model_output, loss_data, metrics)
+                    except ValueError as err:
+                        if _NO_VALID_RESPONSE_TOKENS not in str(err):
+                            raise
+                        # Every response token of this micro-batch is masked out. It has no loss terms, but the
+                        # backward must still run (its FSDP/EP collectives pair with the other ranks'), so use a
+                        # zero loss that keeps the graph: zero gradients, same collectives.
+                        log_probs = model_output["log_probs"]
+                        values = log_probs.values() if getattr(log_probs, "is_nested", False) else log_probs
+                        logger.warning("micro-batch has no valid response tokens; using a zero loss")
+                        loss, metrics = values.float().sum() * 0.0, _metrics_for_empty_micro_batch(self)
+                    else:
+                        self._last_micro_batch_metrics = metrics
                 else:
                     assert forward_only, "loss_function must be provided when not forward_only"
                     loss = torch.tensor(1.0, device=device_name)

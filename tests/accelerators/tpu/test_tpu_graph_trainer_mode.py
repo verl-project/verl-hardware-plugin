@@ -967,3 +967,46 @@ def test_cp_layer_transforms_accepts_torchtitan_200_and_legacy_fields():
             t = cp_layer_transforms._build_transform(spec, load_balancer=None, options=opts, num_layers=3)
             assert getattr(t, s_attr) == "allgather_reducescatter"
             assert getattr(t, d_attr) == "bfloat16"
+
+
+def test_graph_mode_step_survives_a_micro_batch_without_valid_response_tokens(monkeypatch):
+    """A micro-batch whose response tokens are all masked out (at 397B a micro-batch holds about one sequence, so one
+    filtered trajectory is enough) must not fail the step, and must report the same metrics as the others: verl
+    aggregates each metric across data-parallel ranks per micro-batch and needs every rank to report as many values."""
+    from verl.trainer.ppo import rollout_corr_helper
+
+    torch.manual_seed(0)
+    padded_len = 48
+    micro_batches = [_engine_micro_batch([3, 5, 2], [4, 6, 5], 1), _engine_micro_batch([4, 2], [5, 7], 2)]
+    micro_batches[1]["response_mask"] = torch.zeros_like(micro_batches[1]["response_mask"])
+    global_tokens = float(micro_batches[0]["response_mask"].sum())
+    for mb in micro_batches:
+        tu.assign_non_tensor(mb, batch_num_tokens=global_tokens)
+    loss_fn = functools.partial(ppo_loss, config=_actor_config())
+
+    model = _TinyLM()
+    engine = _graph_engine(model, padded_len)
+    # verl's bypass-mode rollout correction raises "response_mask must contain at least one valid token" here.
+    out = engine._graph_trainer_forward_backward(micro_batches[0].copy(), micro_batches, None, loss_fn, global_tokens)
+
+    assert len(out["loss"]) == 2 and out["loss"][1] == pytest.approx(0.0, abs=1e-6)
+    counts = {name: len(getattr(values, "values", values)) for name, values in out["metrics"].items()}
+    assert counts and set(counts.values()) == {2}, counts
+
+    # Any other ValueError from the loss still fails the step.
+    def broken(*args, **kwargs):
+        raise ValueError("something else")
+
+    monkeypatch.setattr(rollout_corr_helper, "compute_rollout_correction_and_rejection_mask", broken)
+    with pytest.raises(ValueError, match="something else"):
+        engine._graph_trainer_forward_backward(micro_batches[0].copy(), micro_batches, None, loss_fn, global_tokens)
+
+
+def test_empty_micro_batch_marker_matches_verl():
+    """The plugin recognizes the all-masked micro-batch by verl's error message; fail loudly if verl rewords it."""
+    import inspect
+
+    from verl.trainer.ppo import rollout_corr_helper
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+
+    assert torchtitan_tpu._NO_VALID_RESPONSE_TOKENS in inspect.getsource(rollout_corr_helper)
