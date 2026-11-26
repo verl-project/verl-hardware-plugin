@@ -1,0 +1,4 @@
+# Dependencies for `pip install "verl-hardware-plugin[iluvatar]"`, owned by the iluvatar backend maintainers.
+# Empty on purpose until the backend lists packages that are pip-installable. The vendor torch build and runtime normally
+# come from the vendor image or portal (see docs/accelerators/iluvatar/); put only public, pip-installable pins here.
+# Pins only: index flags cannot go in this file, document them in docs/accelerators/iluvatar/.
