@@ -144,8 +144,18 @@ def get_rng_state(device: Any = None) -> torch.Tensor:
     return _default_generator(device).get_state()
 
 
+def set_rng_state(state: torch.Tensor, device: Any = None) -> None:
+    """Restores ``get_rng_state(device)``'s state on the device's default generator."""
+    _default_generator(device).set_state(state)
+
+
 def initial_seed() -> int:
     return _default_generator().initial_seed()
+
+
+def is_runtime_initialized() -> bool:
+    """Whether this process drives a TPU and has started its TPU runtime (querying it does not start it)."""
+    return accelerator_is_tpu() and _tpu_runtime_initialized()
 
 
 def _tpu_runtime_initialized() -> bool:

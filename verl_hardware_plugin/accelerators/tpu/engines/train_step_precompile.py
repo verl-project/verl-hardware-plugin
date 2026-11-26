@@ -4,16 +4,21 @@
 """Opt-in trainer precompile: trace and compile the graph-trainer step while the first rollout runs.
 
 With ``engine_kwargs.tpu.trainer_mode=graph_trainer`` the first ``update_actor`` traces the joint forward/backward
-step and compiles it with XLA (~400 s for Qwen3.5-35B-A3B at 128K tokens per micro-batch). In ``separate_async`` the
-trainer is idle while it waits for its first rollout batch, so ``VERL_TPU_PRECOMPILE_TRAIN_STEP=1`` runs that step
-once on a synthetic micro-batch in that window:
+step and compiles it with XLA (~400 s for Qwen3.5-35B-A3B at 128K tokens per micro-batch). With standalone rollout
+replicas (``separate_async``) the trainer is idle from the initial weight sync until its first rollout batch, so
+``engine_kwargs.tpu.precompile_train_step=True`` runs that step once on a synthetic micro-batch in that window:
 
-* driver: ``PPOTrainerSeparateAsync.on_train_begin`` fires ``precompile_train_step`` on every trainer worker without
-  blocking; ``PPOTrainer._update_actor`` waits for it (normally long finished) before the first real update.
+* driver: right after the first weight sync to the standalone rollout (``CheckpointEngineManager.update_weights``
+  with a TPU backend, see ``weight_sync_backends``), ``start_precompile`` calls ``precompile_train_step`` on every
+  trainer worker without waiting. Each worker is a Ray actor that runs its calls in order, so the trainer's next call
+  (e.g. the first ``update_actor``) starts after the precompile; the next weight sync collects and logs the results.
+  No trainer class is patched.
 * worker: ``precompile_engine_train_step`` runs the engine's own ``forward_backward_batch`` (same micro-batching,
-  static padding, bin-slot permutation, policy-loss spec) on synthetic data, then drops the gradients and restores
-  the module buffers. No optimizer step runs, so parameters and optimizer state are untouched, and no metrics leave
-  the worker.
+  static padding, bin-slot permutation, policy-loss spec) on synthetic data. Running it, not only tracing it, is what
+  compiles the executable: ``StaticCompiler`` lowers the graph at trace time but PJRT compiles it on its first
+  execution. Gradients are dropped and the module buffers, the trainer's per-step outputs and the CPU / TPU RNG
+  states are restored. No optimizer step runs, so parameters and optimizer state are untouched, and no metrics leave
+  the worker. A worker that also hosts a rollout engine (hybrid replicas on the trainer chips) skips it.
 
 If the real step then needs a different graph (other padded length or loss constants), the provisional trace is
 dropped and the real step traces as without this option. A failed precompile restores the untraced state.
@@ -21,6 +26,8 @@ dropped and the real step traces as without this option. A failed precompile res
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import logging
 import os
 import time
@@ -29,20 +36,28 @@ from typing import Any, Callable, Optional
 import torch
 from tensordict import TensorDict
 
+from verl_hardware_plugin.accelerators.tpu import device_api
+from verl_hardware_plugin.accelerators.tpu.profilers import timeline
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
-ENV_VAR = "VERL_TPU_PRECOMPILE_TRAIN_STEP"
 PROVISIONAL_ATTR = "_graph_precompile_provisional"
+_UNTRACED_STATE_ATTR = "_graph_precompile_untraced_state"
 _MISSING = object()
 
-# Engine / trainer attributes pinned by the first traced step.
+# Engine / trainer attributes pinned by the first traced step: restored when the precompile fails or its trace is
+# dropped.
 _ENGINE_PINNED_ATTRS = ("_graph_policy_loss_spec", "_graph_trainer_traced_len", "_kda_pinned_budget")
 _TRAINER_PINNED_ATTRS = ("loss_fn", "_traced_step", "_graph_runner", "active_slot_len")
+# Per-step outputs the synthetic step writes: always restored after it.
+_ENGINE_STEP_OUTPUT_ATTRS = ("_last_micro_batch_metrics",)
+_TRAINER_STEP_OUTPUT_ATTRS = ("ntokens_seen", "last_loss_metrics", "_ep_drop_stats_L2")
 
-
-def is_enabled() -> bool:
-    return os.getenv(ENV_VAR, "0").strip().lower() in ("1", "true", "yes")
+# Driver-side state on the CheckpointEngineManager.
+_STARTED_ATTR = "_tpu_precompile_started"
+_REFS_ATTR = "_tpu_precompile_refs"
+_T0_ATTR = "_tpu_precompile_t0"
 
 
 def build_synthetic_train_batch(
@@ -89,11 +104,24 @@ def build_synthetic_train_batch(
 
 
 def synthetic_sequence_lengths(
-    *, static_len: int, bin_slot_len: int = 0, max_seq_len: int = 0, target: int = 256
-) -> tuple[int, int]:
-    """``(prompt_len, response_len)`` of one sequence that fits a micro-batch, a bin slot and the model length."""
-    limits = [target] + [int(x) for x in (static_len, bin_slot_len, max_seq_len) if x and int(x) > 0]
-    total = max(4, min(limits))
+    *,
+    static_len: int,
+    num_seqs: int = 1,
+    row_slot_len: int = 0,
+    bin_slot_len: int = 0,
+    max_seq_len: int = 0,
+    target: int = 256,
+) -> Optional[tuple[int, int]]:
+    """``(prompt_len, response_len)`` of each of ``num_seqs`` sequences that fit one micro-batch, or ``None``.
+
+    ``num_seqs`` sequences must fit ``static_len`` together; each one must fit a GatedDeltaNet row slot, a bin slot and
+    the model length.
+    """
+    limits = [target, int(static_len) // max(1, int(num_seqs))]
+    limits += [int(x) for x in (row_slot_len, bin_slot_len, max_seq_len) if x and int(x) > 0]
+    total = min(limits)
+    if total < 2:
+        return None
     prompt_len = max(1, total // 4)
     return prompt_len, total - prompt_len
 
@@ -112,45 +140,69 @@ def _restore_buffers(saved: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
         buf.copy_(value)
 
 
+def _save_attrs(owner: Any, names: tuple[str, ...]) -> dict[str, Any]:
+    return {name: getattr(owner, name, _MISSING) for name in names} if owner is not None else {}
+
+
+def _restore_attrs(owner: Any, saved: dict[str, Any]) -> None:
+    if owner is None:
+        return
+    for name, value in saved.items():
+        if value is _MISSING:
+            if name in vars(owner):
+                delattr(owner, name)
+        else:
+            setattr(owner, name, value)
+
+
 def _save_pinned_state(engine: Any) -> dict[str, Any]:
     trainer = getattr(engine, "trainer", None)
-    state = {f"engine.{k}": getattr(engine, k, _MISSING) for k in _ENGINE_PINNED_ATTRS}
-    state.update({f"trainer.{k}": getattr(trainer, k, _MISSING) for k in _TRAINER_PINNED_ATTRS})
     slot_cache = getattr(trainer, "_slot_cache", None)
-    state["trainer._slot_cache"] = dict(slot_cache) if isinstance(slot_cache, dict) else _MISSING
-    return state
+    return {
+        "engine": _save_attrs(engine, _ENGINE_PINNED_ATTRS),
+        "trainer": _save_attrs(trainer, _TRAINER_PINNED_ATTRS),
+        "slot_cache": dict(slot_cache) if isinstance(slot_cache, dict) else None,
+    }
 
 
 def _restore_pinned_state(engine: Any, state: dict[str, Any]) -> None:
     trainer = getattr(engine, "trainer", None)
-    for key, value in state.items():
-        owner_name, attr = key.split(".", 1)
-        owner = engine if owner_name == "engine" else trainer
-        if owner is None:
-            continue
-        if attr == "_slot_cache" and value is not _MISSING:
-            cache = getattr(owner, "_slot_cache", None)
-            if isinstance(cache, dict):
-                cache.clear()
-                cache.update(value)
-                continue
-        if value is _MISSING:
-            if hasattr(owner, attr) and attr in vars(owner):
-                delattr(owner, attr)
-        else:
-            setattr(owner, attr, value)
+    _restore_attrs(engine, state["engine"])
+    _restore_attrs(trainer, state["trainer"])
+    cache = getattr(trainer, "_slot_cache", None)
+    if state["slot_cache"] is not None and isinstance(cache, dict):
+        cache.clear()
+        cache.update(state["slot_cache"])
+    # The dropped trace holds the compiled PJRT executable; graph modules keep reference cycles, so free it now
+    # rather than while the next step compiles its own.
+    gc.collect()
 
 
 def reset_provisional_trace(engine: Any, reason: str) -> bool:
     """Drops a precompile-only trace so the next step traces from scratch; True if there was one to drop."""
     if not getattr(engine, PROVISIONAL_ATTR, False):
         return False
-    state = getattr(engine, "_graph_precompile_untraced_state", None)
     logger.warning("trainer precompile: the real step needs another graph (%s); retracing", reason)
-    if state is not None:
-        _restore_pinned_state(engine, state)
+    state = getattr(engine, _UNTRACED_STATE_ATTR, None)
     setattr(engine, PROVISIONAL_ATTR, False)
+    if state is not None:
+        setattr(engine, _UNTRACED_STATE_ATTR, None)
+        _restore_pinned_state(engine, state)
     return True
+
+
+def _save_rng_state() -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """CPU and (when the TPU runtime is up) TPU default-generator states: a traced step that draws random numbers
+    advances the TPU generator (``StaticCompiler`` threads its state through the executable)."""
+    tpu_state = device_api.get_rng_state() if device_api.is_runtime_initialized() else None
+    return torch.get_rng_state(), tpu_state
+
+
+def _restore_rng_state(state: tuple[torch.Tensor, Optional[torch.Tensor]]) -> None:
+    cpu_state, tpu_state = state
+    torch.set_rng_state(cpu_state)
+    if tpu_state is not None:
+        device_api.set_rng_state(tpu_state)
 
 
 def _vocab_size(engine: Any) -> int:
@@ -162,72 +214,100 @@ def _vocab_size(engine: Any) -> int:
         return 1000
 
 
-def precompile_engine_train_step(
-    engine: Any,
-    loss_function: Optional[Callable],
-    *,
-    non_tensor: Optional[dict[str, Any]] = None,
-    num_seqs: int = 1,
-) -> dict[str, Any]:
-    """Runs one graph-trainer forward/backward on synthetic data and discards its effects (see module docstring).
+def _skip_reason(engine: Any, loss_function: Optional[Callable], non_tensor: dict[str, Any]) -> Optional[str]:
+    """Why ``precompile_engine_train_step`` does nothing for ``engine``, or ``None``."""
+    from verl_hardware_plugin.accelerators.tpu.engines import graph_trainer_mode
 
-    Every trainer rank must call this together (the step runs collectives). Returns a status dict.
-    """
-    t0 = time.perf_counter()
     if not getattr(engine, "_graph_trainer_mode", False):
-        return {"status": "skipped", "reason": "trainer_mode is not graph_trainer"}
+        return "trainer_mode is not graph_trainer"
+    options = getattr(engine, "_tpu_options", None)
+    if not getattr(options, "precompile_train_step", False):
+        return "engine_kwargs.tpu.precompile_train_step is off"
     if loss_function is None:
-        return {"status": "skipped", "reason": "no loss function installed"}
+        return "no loss function installed"
     if getattr(engine, "_graph_policy_loss_spec", None) is not None or getattr(
         engine, "_graph_trainer_traced_len", None
     ):
-        return {"status": "skipped", "reason": "graph step already traced"}
-    from verl_hardware_plugin.accelerators.tpu.options import get_tpu_engine_options
-
-    options = get_tpu_engine_options(engine.engine_config)
-    static_len = int(getattr(options, "static_micro_batch_len", 0) or 0)
-    if static_len <= 0:
-        return {"status": "skipped", "reason": "needs engine_kwargs.tpu.static_micro_batch_len (fixed traced shape)"}
+        return "graph step already traced"
+    if getattr(getattr(engine, "trainer", None), "_optimizer_in_graph", False):
+        # TpuGraphTrainer's in-graph AdamW steps the parameters inside forward_backward_step.
+        return "graph_trainer.optimizer_compile='in_graph' updates the parameters in the step"
     if "kda" in getattr(engine, "_tpu_kernels", ()) and not getattr(options, "kda_document_budget", None):
         # The first step pins max_num_segments from its document count: a synthetic count would not fit real steps.
-        return {"status": "skipped", "reason": "needs engine_kwargs.tpu.kda_document_budget with Tokamax KDA"}
+        return "needs engine_kwargs.tpu.kda_document_budget with Tokamax KDA"
+    try:
+        graph_trainer_mode.GraphPolicyLossSpec.from_loss_function(
+            loss_function,
+            temperature=float(non_tensor["temperature"]),
+            calculate_entropy=bool(non_tensor.get("calculate_entropy", False)),
+            has_rollout_is_weights=False,
+        )
+    except ValueError as exc:
+        return f"the real step cannot run in graph_trainer mode: {exc}"
+    return None
 
-    prompt_len, response_len = synthetic_sequence_lengths(
-        static_len=static_len,
-        bin_slot_len=int(getattr(engine, "_bin_slot_len", 0) or 0),
-        max_seq_len=int(getattr(engine.engine_config, "max_token_len_per_gpu", 0) or 0),
+
+def precompile_engine_train_step(engine: Any, loss_function: Optional[Callable], *, non_tensor: dict[str, Any]) -> dict:
+    """Runs one graph-trainer forward/backward on synthetic data and discards its effects (see module docstring).
+
+    ``non_tensor`` holds the micro-batch metadata of a real ``update_actor`` call (``temperature``,
+    ``use_dynamic_bsz``, ``micro_batch_size_per_gpu``, ...). Every trainer rank must call this together (the step runs
+    collectives). Returns a status dict.
+    """
+    t0 = time.perf_counter()
+    reason = _skip_reason(engine, loss_function, non_tensor)
+    if reason is not None:
+        return {"status": "skipped", "reason": reason}
+    options = engine._tpu_options
+    # Without dynamic batch sizes every micro-batch holds exactly micro_batch_size_per_gpu sequences.
+    num_seqs = (
+        1 if non_tensor.get("use_dynamic_bsz", True) else max(1, int(non_tensor.get("micro_batch_size_per_gpu") or 1))
     )
+    lengths = synthetic_sequence_lengths(
+        static_len=int(options.static_micro_batch_len or 0),
+        num_seqs=num_seqs,
+        row_slot_len=int(getattr(engine, "_gdn_row_slot_len", 0) or 0),
+        bin_slot_len=int(getattr(engine, "_bin_slot_len", 0) or 0),
+        max_seq_len=int(non_tensor.get("max_token_len_per_gpu") or 0),
+    )
+    if lengths is None:
+        return {"status": "skipped", "reason": f"{num_seqs} synthetic sequences do not fit static_micro_batch_len"}
+    prompt_len, response_len = lengths
     data = build_synthetic_train_batch(
         num_seqs=num_seqs, prompt_len=prompt_len, response_len=response_len, vocab_size=_vocab_size(engine)
     )
     from verl.utils import tensordict_utils as tu
 
-    tu.assign_non_tensor(data, **(non_tensor or {}))
+    tu.assign_non_tensor(data, **non_tensor)
 
+    trainer = getattr(engine, "trainer", None)
     untraced = _save_pinned_state(engine)
+    engine_outputs = _save_attrs(engine, _ENGINE_STEP_OUTPUT_ATTRS)
+    trainer_outputs = _save_attrs(trainer, _TRAINER_STEP_OUTPUT_ATTRS)
     buffers = _snapshot_buffers(getattr(engine, "module", None))
-    last_metrics = getattr(engine, "_last_micro_batch_metrics", _MISSING)
-    cpu_rng = torch.get_rng_state()
+    rng_state = _save_rng_state()
+    on_tpu = device_api.accelerator_is_tpu()
     result: dict[str, Any]
-    try:
-        engine.optimizer_zero_grad()
-        engine.forward_backward_batch(data, loss_function, forward_only=False)
-        result = {"status": "ok", "padded_len": getattr(engine, "_graph_trainer_traced_len", None)}
-    except Exception as exc:  # noqa: BLE001 - the real step must still run; it then traces from scratch.
-        logger.warning("trainer precompile failed; the first step will trace as usual: %r", exc, exc_info=True)
-        _restore_pinned_state(engine, untraced)
-        result = {"status": "failed", "error": repr(exc)}
-    finally:
-        engine.optimizer_zero_grad()
-        _restore_buffers(buffers)
-        if last_metrics is _MISSING:
-            if "_last_micro_batch_metrics" in vars(engine):
-                delattr(engine, "_last_micro_batch_metrics")
-        else:
-            engine._last_micro_batch_metrics = last_metrics
-        torch.set_rng_state(cpu_rng)
+    with timeline.span("precompile_train_step", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()):
+        try:
+            engine.optimizer_zero_grad()
+            engine.forward_backward_batch(data, loss_function, forward_only=False)
+            # Surface a failed (asynchronously dispatched) execution here, while the untraced state can be restored.
+            device_api.tpu_synchronize(wait=True, strict=on_tpu)
+            result = {"status": "ok", "padded_len": getattr(engine, "_graph_trainer_traced_len", None)}
+        except Exception as exc:  # noqa: BLE001 - the real step must still run; it then traces from scratch.
+            logger.warning("trainer precompile failed; the first step will trace as usual: %r", exc, exc_info=True)
+            _restore_pinned_state(engine, untraced)
+            result = {"status": "failed", "error": repr(exc)}
+        finally:
+            engine.optimizer_zero_grad()
+            _restore_buffers(buffers)
+            _restore_attrs(engine, engine_outputs)
+            _restore_attrs(trainer, trainer_outputs)
+            _restore_rng_state(rng_state)
+            device_api.tpu_synchronize(wait=True)
     if result["status"] == "ok":
-        engine._graph_precompile_untraced_state = untraced
+        setattr(engine, _UNTRACED_STATE_ATTR, untraced)
         setattr(engine, PROVISIONAL_ATTR, True)
     result["seconds"] = round(time.perf_counter() - t0, 3)
     result["synthetic_tokens"] = num_seqs * (prompt_len + response_len)
@@ -235,37 +315,42 @@ def precompile_engine_train_step(
     return result
 
 
-def _worker_precompile_train_step(worker: Any, spec: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """``ActorRolloutRefWorker.precompile_train_step`` body: the actor engine's precompile under ``train_mode``."""
+def worker_precompile_train_step(worker: Any) -> dict[str, Any]:
+    """``ActorRolloutRefWorker.precompile_train_step``: the actor engine's precompile, with ``update_actor``'s
+    micro-batch metadata built from the worker's own ``actor_rollout_ref`` config."""
+    if getattr(worker, "_is_rollout", False) or getattr(worker, "rollout", None) is not None:
+        return {"status": "skipped", "reason": "the worker hosts a rollout engine on the trainer devices"}
     actor = getattr(worker, "actor", None)
     engine = getattr(actor, "engine", None)
-    if actor is None or engine is None:
+    if engine is None:
         return {"status": "skipped", "reason": "worker has no actor engine"}
-    spec = dict(spec or {})
+    actor_cfg, rollout_cfg = worker.config.actor, worker.config.rollout
     model_config, engine_config = actor.model_config, actor.engine_config
+    rollout_correction = actor_cfg.policy_loss.get("rollout_correction", {}) or {}
     non_tensor = {
-        # As TrainingWorker.train_batch's default keys.
+        # As TrainingWorker.train_batch's defaults.
         "use_remove_padding": model_config.get("use_remove_padding", False),
         "use_dynamic_bsz": engine_config.use_dynamic_bsz,
         "max_token_len_per_gpu": engine_config.max_token_len_per_gpu,
         "micro_batch_size_per_gpu": engine_config.micro_batch_size_per_gpu,
         "use_fused_kernels": engine_config.use_fused_kernels,
         # As PPOTrainer._update_actor's extra_info.
-        "calculate_entropy": bool(spec.get("calculate_entropy", False)),
+        "calculate_entropy": bool(actor_cfg.calculate_entropy or actor_cfg.entropy_coeff != 0.0),
         "distillation_use_topk": False,
         "distillation_only": False,
-        "score_centering": bool(spec.get("score_centering", False)),
-        "global_batch_size": spec.get("global_batch_size"),
-        "temperature": float(spec["temperature"]),
+        "score_centering": bool(rollout_correction.get("score_centering", False)),
+        "global_batch_size": int(actor_cfg.ppo_mini_batch_size) * int(rollout_cfg.n),
+        "temperature": float(rollout_cfg.temperature),
     }
     with engine.train_mode(disable_auto_offload=False):
         return precompile_engine_train_step(engine, actor.loss_fn, non_tensor=non_tensor)
 
 
-def apply_worker_method() -> None:
+def register_worker_method() -> None:
     """Adds ``precompile_train_step`` (ONE_TO_ALL, non-blocking) to verl's ``ActorRolloutRefWorker``.
 
-    Always installed (it does nothing unless called), so driver and workers agree on the worker's methods.
+    Registered in every process, so the driver's worker group and the workers agree on the worker's methods; it does
+    nothing until called, and the worker skips it unless ``engine_kwargs.tpu.precompile_train_step`` is set.
     """
     from verl.single_controller.base.decorator import Dispatch, register
     from verl.workers import engine_workers
@@ -275,107 +360,69 @@ def apply_worker_method() -> None:
         return
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    def precompile_train_step(self, spec: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        return _worker_precompile_train_step(self, spec)
+    def precompile_train_step(self) -> dict[str, Any]:
+        return worker_precompile_train_step(self)
 
     cls.precompile_train_step = precompile_train_step
 
 
-def _precompile_spec(trainer: Any) -> dict[str, Any]:
-    cfg = trainer.config
-    actor = cfg.actor_rollout_ref.actor
-    rollout_correction = actor.policy_loss.get("rollout_correction", {}) or {}
-    return {
-        "temperature": float(cfg.actor_rollout_ref.rollout.temperature),
-        "calculate_entropy": bool(actor.calculate_entropy or actor.entropy_coeff != 0.0),
-        "score_centering": bool(rollout_correction.get("score_centering", False)),
-        "global_batch_size": int(actor.ppo_mini_batch_size) * int(cfg.actor_rollout_ref.rollout.n),
-    }
+def _cache_actor_dispatch_info(worker_group: Any) -> None:
+    """Queries the actor mesh's dispatch info now, while the workers are idle.
+
+    ``PPOTrainer._balance_batch`` queries it lazily on step 1; queued behind a running precompile, that query would
+    block the driver (untimed) instead of the first ``update_actor``.
+    """
+    dispatch_info = getattr(worker_group, "_dispatch_info", None)
+    query = getattr(worker_group, "_query_dispatch_info", None)
+    if isinstance(dispatch_info, dict) and callable(query) and "actor" not in dispatch_info:
+        dispatch_info["actor"] = query("actor")
 
 
-def fire_precompile(trainer: Any) -> bool:
-    """Starts ``precompile_train_step`` on the trainer workers without waiting; True if it was started."""
-    if getattr(trainer, "_tpu_precompile_refs", None) is not None or getattr(trainer, "_tpu_precompile_fired", False):
+def start_precompile(manager: Any) -> bool:
+    """Starts ``precompile_train_step`` on the trainer workers once per ``manager`` without waiting; True if started.
+
+    Called by the TPU weight-sync backends after a sync (``weight_sync_backends``), i.e. right after the initial sync
+    to the standalone rollout, when the trainer is idle until its first batch.
+    """
+    if getattr(manager, _STARTED_ATTR, False):
         return False
-    trainer._tpu_precompile_fired = True
-    if getattr(trainer, "_enable_hybrid_replicas", False):
-        logger.warning("%s=1 ignored: hybrid rollout replicas share the trainer devices", ENV_VAR)
-        return False
-    wg = getattr(trainer, "actor_rollout_wg", None)
-    if wg is None or not hasattr(wg, "precompile_train_step"):
-        logger.warning("%s=1 ignored: the actor worker group has no precompile_train_step", ENV_VAR)
+    setattr(manager, _STARTED_ATTR, True)
+    worker_group = getattr(manager, "actor_wg", None)
+    if worker_group is None or not hasattr(worker_group, "precompile_train_step"):
         return False
     try:
-        spec = _precompile_spec(trainer)
-        trainer._tpu_precompile_t0 = time.perf_counter()
-        trainer._tpu_precompile_refs = wg.precompile_train_step(spec)
+        _cache_actor_dispatch_info(worker_group)
+        setattr(manager, _T0_ATTR, time.perf_counter())
+        setattr(manager, _REFS_ATTR, worker_group.precompile_train_step())
     except Exception as exc:  # noqa: BLE001 - never block training on the optional precompile.
         logger.warning("trainer precompile could not be started: %r", exc)
-        trainer._tpu_precompile_refs = None
+        setattr(manager, _REFS_ATTR, None)
         return False
-    logger.warning("trainer precompile started on the trainer workers (spec=%s)", spec)
     return True
 
 
-def wait_for_precompile(trainer: Any) -> None:
-    """Waits for a started precompile (once) and logs its outcome; errors only log."""
-    refs = getattr(trainer, "_tpu_precompile_refs", None)
+async def collect_precompile(manager: Any) -> Optional[list[Any]]:
+    """Waits for a started precompile (once) and logs its outcome; worker errors only log. Returns the results."""
+    refs = getattr(manager, _REFS_ATTR, None)
     if refs is None:
-        return
-    trainer._tpu_precompile_refs = None
+        return None
+    setattr(manager, _REFS_ATTR, None)
     t_wait = time.perf_counter()
     try:
         import ray
 
-        results = ray.get(refs) if isinstance(refs, list) else ray.get(refs)
+        results = await asyncio.to_thread(ray.get, refs)
     except Exception as exc:  # noqa: BLE001
         logger.warning("trainer precompile failed on a worker: %r", exc)
-        return
-    now = time.perf_counter()
-    first = results[0] if isinstance(results, list) and results else results
-    logger.warning(
-        "trainer precompile done: waited %.1fs before the first update_actor (%.1fs since start); rank0=%s",
-        now - t_wait,
-        now - getattr(trainer, "_tpu_precompile_t0", now),
-        first,
-    )
-
-
-def apply_driver_hooks() -> None:
-    """Wraps ``PPOTrainerSeparateAsync.on_train_begin`` and ``PPOTrainer._update_actor`` (no-ops unless enabled)."""
-    from verl.trainer.ppo.v1 import trainer_base, trainer_separate_async
-
-    sep_cls = trainer_separate_async.PPOTrainerSeparateAsync
-    if not getattr(sep_cls, "_verl_tpu_precompile_patched", False):
-        orig_begin = sep_cls.on_train_begin
-
-        def on_train_begin(self, *args: Any, **kwargs: Any) -> Any:
-            out = orig_begin(self, *args, **kwargs)
-            if is_enabled():
-                fire_precompile(self)
-            return out
-
-        sep_cls.on_train_begin = on_train_begin
-        sep_cls._verl_tpu_precompile_patched = True
-
-    base_cls = trainer_base.PPOTrainer
-    if not getattr(base_cls, "_verl_tpu_precompile_patched", False):
-        orig_update = base_cls._update_actor
-
-        def _update_actor(self, *args: Any, **kwargs: Any) -> Any:
-            wait_for_precompile(self)
-            return orig_update(self, *args, **kwargs)
-
-        base_cls._update_actor = _update_actor
-        base_cls._verl_tpu_precompile_patched = True
-
-
-def apply_precompile_hooks() -> None:
-    """The worker method always (driver and workers must agree on it); the driver hooks only when enabled."""
-    hooks = [apply_worker_method] + ([apply_driver_hooks] if is_enabled() else [])
-    for fn in hooks:
-        try:
-            fn()
-        except Exception as exc:  # noqa: BLE001 - optional feature; keep plugin import working.
-            log = logger.warning if is_enabled() else logger.debug
-            log("trainer precompile hook %s not applied: %r", fn.__name__, exc)
+        return None
+    results = results if isinstance(results, list) else [results]
+    first = results[0] if results else None
+    if isinstance(first, dict) and first.get("status") != "skipped":
+        now = time.perf_counter()
+        logger.warning(
+            "trainer precompile done (collected after %.1fs, %.1fs after it started); rank0=%s",
+            now - t_wait,
+            now - getattr(manager, _T0_ATTR, now),
+            first,
+        )
+    return results
