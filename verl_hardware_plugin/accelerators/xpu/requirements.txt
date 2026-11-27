@@ -1,0 +1,13 @@
+# Intel XPU runtime pins for `pip install "verl-hardware-plugin[xpu]"`.
+# Pins only. The index flags cannot live in this file (pip rejects option lines in extras), so install with:
+#   --extra-index-url https://download.pytorch.org/whl/xpu
+# See docs/accelerators/xpu/install_guidance.md for the full command and the system packages pip cannot install.
+
+# Local-version pin: PyPI's torch is the CUDA build, only the XPU index has +xpu. Without the index flags pip stops with
+# "no matching distribution" instead of installing a CUDA torch.
+torch==2.15.0+xpu
+# Lets Ray count Intel GPUs.
+dpctl
+# fsdp_xpu.py loads the XPU flash-attention kernels through the HF kernels hub. transformers declares `kernels` only under
+# an extra, and rejects any version outside this window at import time.
+kernels>=0.16.0,<0.17.0

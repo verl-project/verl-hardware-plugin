@@ -1,0 +1,6 @@
+# vLLM XPU wheel for `pip install "verl-hardware-plugin[xpu,vllm-xpu]"`. Must track the torch pin in requirements.txt
+# (vLLM 0.34.0 requires torch==2.15.0+xpu). Extra index flags:
+#   --extra-index-url https://wheels.vllm.ai/0.34.0/xpu --extra-index-url https://wheels.vllm.ai/xpu
+#   --extra-index-url https://vllm-project.github.io/vllm-xpu-kernels/whl
+# (the last one serves vllm-xpu-kernels, which the vLLM wheel pins exactly and no other index carries)
+vllm==0.34.0+xpu

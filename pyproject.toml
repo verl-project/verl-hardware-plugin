@@ -12,16 +12,26 @@ license = {text = "Apache-2.0"}
 dependencies = [
     "verl>=0.9.0",
 ]
+# Extras are read from one requirements file per backend, so each backend owns its own dependencies.
+dynamic = ["optional-dependencies"]
 
-[project.optional-dependencies]
-dev = [
-    "orjson>=3.9",
-    "pytest>=8.2",  # importorskip(exc_type=...)
-    "pyzmq",  # ROCm MoRI checkpoint engine tests
-]
 
 [project.entry-points."verl.plugins"]
 hardware = "verl_hardware_plugin"
+
+[tool.setuptools.dynamic.optional-dependencies]
+xpu = {file = ["verl_hardware_plugin/accelerators/xpu/requirements.txt"]}
+enflame = {file = ["verl_hardware_plugin/accelerators/enflame/requirements.txt"]}
+iluvatar = {file = ["verl_hardware_plugin/accelerators/iluvatar/requirements.txt"]}
+metax = {file = ["verl_hardware_plugin/accelerators/metax/requirements.txt"]}
+mlu = {file = ["verl_hardware_plugin/accelerators/mlu/requirements.txt"]}
+musa = {file = ["verl_hardware_plugin/accelerators/musa/requirements.txt"]}
+supa = {file = ["verl_hardware_plugin/accelerators/supa/requirements.txt"]}
+tpu = {file = ["verl_hardware_plugin/accelerators/tpu/requirements.txt"]}
+rocm = {file = ["verl_hardware_plugin/accelerators/rocm/requirements.txt"]}
+neuron = {file = ["verl_hardware_plugin/accelerators/neuron/requirements.txt"]}
+vllm-xpu = {file = ["verl_hardware_plugin/accelerators/xpu/requirements-vllm.txt"]}
+dev = {file = ["requirements-dev.txt"]}
 
 [tool.setuptools.packages.find]
 include = ["verl_hardware_plugin*"]

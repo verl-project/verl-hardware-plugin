@@ -1,0 +1,77 @@
+name: Extras
+
+# Guards `pip install "verl-hardware-plugin[<backend>]"`: the built wheel carries one extra per backend, and the XPU pins
+# still resolve against the real indexes. Runs only when something that feeds the extras changes.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - pyproject.toml
+      - requirements-dev.txt
+      - "verl_hardware_plugin/accelerators/*/requirements*.txt"
+      - .github/workflows/extras.yml
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1" # weekly: catches an index that dropped a pinned wheel
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install build twine
+          python -m build
+          twine check dist/*
+
+      - name: Every backend has an extra in the wheel metadata
+        run: |
+          python - <<'PY'
+          import glob, pathlib, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          meta = next(n for n in zipfile.ZipFile(wheel).namelist() if n.endswith(".dist-info/METADATA"))
+          text = zipfile.ZipFile(wheel).read(meta).decode()
+          extras = {l.split(": ", 1)[1].strip() for l in text.splitlines() if l.startswith("Provides-Extra:")}
+          backends = {p.parent.name for p in pathlib.Path("verl_hardware_plugin/accelerators").glob("*/__init__.py")}
+          missing = sorted(backends - extras)
+          print("extras:", sorted(extras))
+          assert not missing, f"backends without an extra in the wheel: {missing}"
+          assert "Requires-Dist: torch==2.15.0+xpu; extra == \"xpu\"" in text
+          PY
+
+  resolve-xpu:
+    # Resolves the XPU pins (torch, vllm, kernels, dpctl) against download.pytorch.org and wheels.vllm.ai without
+    # installing them, so a pin that no index serves any more fails here and not on a user's machine.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # verl on PyPI (0.9.1) pins transformers<5.11 but vLLM 0.34.0 needs >=5.16.1, so resolve against a verl core commit.
+      # Move it to a commit whose requirements.txt allows transformers >= 5.16.1 (verl main since PR #8390).
+      VERL_CORE_SHA: 8612d0292c38dbe7b104a8c783594f5c57119fa7
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve .[xpu,vllm-xpu]
+        run: |
+          python -m pip install --upgrade pip
+          pip install --dry-run --ignore-installed \
+            "verl[verl-core] @ git+https://github.com/verl-project/verl.git@${VERL_CORE_SHA}" ".[xpu,vllm-xpu]" \
+            --extra-index-url https://download.pytorch.org/whl/xpu \
+            --extra-index-url https://wheels.vllm.ai/0.34.0/xpu \
+            --extra-index-url https://wheels.vllm.ai/xpu \
+            --extra-index-url https://vllm-project.github.io/vllm-xpu-kernels/whl
