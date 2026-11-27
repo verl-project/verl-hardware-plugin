@@ -18,6 +18,9 @@ patch to span several hosts. Each remaining patch fills a gap in vLLM (v0.29.0 -
   with other engines (``tpu_vllm.subhost_engine_env``): per-worker MegaScale ports and libtpu log dir, and the
   GKE webhook's container-level TPU variables and ``TORCH_TPU_DEVICES_PER_HOST`` dropped. Upstream fix: a
   per-engine port base in vllm-torchtpu.
+* ``vllm.v1.worker.gpu_model_runner.GPUModelRunner._update_states``: guard against missing
+  ``req_data.all_token_ids[req_id]`` keys under ``VLLM_ASYNC_SCHEDULING=True`` during in-flight ``tpu-sync``
+  abort/pause/resume weight updates (``KeyError`` -> ``EngineDeadError``).
 """
 
 import functools
@@ -437,6 +440,48 @@ def patch_tpu_fp8_moe_rollout() -> None:
     _patch_fp8_moe_dummy_load()
 
 
+# TODO: Remove this workaround once upstream vLLM fixes the async-scheduling
+# abort/pause/resume desync where GPUModelRunner._update_states unconditionally
+# indexes req_data.all_token_ids[req_id] even when resumed_from_preemption is
+# False (raising KeyError -> EngineDeadError during in-flight tpu-sync weight
+# updates in multi-epoch runs).
+def patch_tpu_async_scheduling_update_states() -> None:
+    """Guard GPUModelRunner._update_states against missing req_data.all_token_ids keys under async scheduling."""
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    except ImportError:
+        return
+
+    orig_update_states = GPUModelRunner.__dict__.get("_update_states") or getattr(
+        GPUModelRunner, "_update_states", None
+    )
+    if orig_update_states is None or getattr(orig_update_states, "_verl_async_all_token_ids_patched", False):
+        return
+
+    @functools.wraps(orig_update_states)
+    def _update_states_with_all_token_ids_guard(self, scheduler_output):
+        if getattr(self, "use_async_scheduling", False):
+            req_data = getattr(scheduler_output, "scheduled_cached_reqs", None)
+            all_token_ids = getattr(req_data, "all_token_ids", None)
+            if isinstance(all_token_ids, dict):
+                req_id_to_index = self.input_batch.req_id_to_index
+                for req_id in req_data.req_ids:
+                    if req_id not in all_token_ids and req_id not in req_id_to_index:
+                        req_state = self.requests.get(req_id)
+                        if req_state is not None:
+                            all_token_ids[req_id] = list(req_state.output_token_ids)
+                            logger.warning(
+                                "Backfilled missing req_data.all_token_ids[%s] in GPUModelRunner._update_states "
+                                "(async scheduling + weight-sync desync guard).",
+                                req_id,
+                            )
+        return orig_update_states(self, scheduler_output)
+
+    _update_states_with_all_token_ids_guard._verl_async_all_token_ids_patched = True  # type: ignore[attr-defined]
+    GPUModelRunner._update_states = _update_states_with_all_token_ids_guard
+    logger.info("Installed async-scheduling all_token_ids KeyError guard on GPUModelRunner._update_states.")
+
+
 def patch_vllm_for_tpu() -> None:
     """Install the patches in this process. Later calls return at once."""
     global _PATCHES_APPLIED
@@ -454,6 +499,7 @@ def patch_vllm_for_tpu() -> None:
 
     _apply_tpu_precision_patches()
     patch_tpu_fp8_moe_rollout()
+    patch_tpu_async_scheduling_update_states()
     if os.environ.get(SUBHOST_MEGASCALE_PORT_ENV):
         patch_tpu_worker_subhost_env()
     _PATCHES_APPLIED = True

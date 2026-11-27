@@ -306,3 +306,70 @@ def test_patch_tpu_fp8_moe_rollout_installs_pr2967_routed_experts_shim():
             unquantized_mod.VllmUnquantizedConfig(has_bias=True).get_quant_method(
                 RoutedExperts(), "model.layers.0.mlp.experts"
             )
+
+
+def _fake_gpu_model_runner_modules():
+    runner_mod = types.ModuleType("vllm.v1.worker.gpu_model_runner")
+
+    class GPUModelRunner:
+        def __init__(self, *, use_async_scheduling: bool = True):
+            self.use_async_scheduling = use_async_scheduling
+            self.input_batch = types.SimpleNamespace(req_id_to_index={})
+            self.requests = {}
+
+        def _update_states(self, scheduler_output):
+            req_data = scheduler_output.scheduled_cached_reqs
+            for req_id in req_data.req_ids:
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                req_state = self.requests[req_id]
+                if req_index is None and self.use_async_scheduling and req_state.output_token_ids:
+                    resumed = req_data.all_token_ids[req_id]
+                    req_state.output_token_ids = resumed[-len(req_state.output_token_ids) :]
+            return "updated"
+
+    runner_mod.GPUModelRunner = GPUModelRunner
+    modules = {
+        "vllm": types.ModuleType("vllm"),
+        "vllm.v1": types.ModuleType("vllm.v1"),
+        "vllm.v1.worker": types.ModuleType("vllm.v1.worker"),
+        "vllm.v1.worker.gpu_model_runner": runner_mod,
+    }
+    return modules, runner_mod
+
+
+def test_patch_tpu_async_scheduling_update_states_backfills_missing_all_token_ids():
+    modules, runner_mod = _fake_gpu_model_runner_modules()
+    with mock.patch.dict("sys.modules", modules):
+        tpu_vllm_patches.patch_tpu_async_scheduling_update_states()
+        tpu_vllm_patches.patch_tpu_async_scheduling_update_states()  # idempotent
+
+        runner = runner_mod.GPUModelRunner(use_async_scheduling=True)
+        runner.requests["req-missing"] = types.SimpleNamespace(output_token_ids=[11, 22, 33])
+        runner.requests["req-present"] = types.SimpleNamespace(output_token_ids=[44, 55])
+        runner.requests["req-in-batch"] = types.SimpleNamespace(output_token_ids=[66])
+        runner.input_batch.req_id_to_index["req-in-batch"] = 0
+
+        sched_out = types.SimpleNamespace(
+            scheduled_cached_reqs=types.SimpleNamespace(
+                req_ids=["req-missing", "req-present", "req-in-batch"],
+                all_token_ids={"req-present": [1, 2, 44, 55]},
+            )
+        )
+        assert runner._update_states(sched_out) == "updated"
+        assert runner.requests["req-missing"].output_token_ids == [11, 22, 33]
+        assert runner.requests["req-present"].output_token_ids == [44, 55]
+        assert "req-in-batch" not in sched_out.scheduled_cached_reqs.all_token_ids
+
+
+def test_patch_tpu_async_scheduling_update_states_noop_when_sync_scheduling():
+    modules, runner_mod = _fake_gpu_model_runner_modules()
+    with mock.patch.dict("sys.modules", modules):
+        tpu_vllm_patches.patch_tpu_async_scheduling_update_states()
+
+        runner = runner_mod.GPUModelRunner(use_async_scheduling=False)
+        runner.requests["req-sync"] = types.SimpleNamespace(output_token_ids=[11, 22])
+        sched_out = types.SimpleNamespace(
+            scheduled_cached_reqs=types.SimpleNamespace(req_ids=["req-sync"], all_token_ids={})
+        )
+        assert runner._update_states(sched_out) == "updated"
+        assert sched_out.scheduled_cached_reqs.all_token_ids == {}
