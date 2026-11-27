@@ -95,6 +95,16 @@ def _select_tile():
     return None
 
 
+def _wait_for_import(name: str) -> None:
+    """Block until a concurrent import of `name` has finished (a no-op for a reentrant import)."""
+    try:
+        from importlib._bootstrap import _lock_unlock_module
+
+        _lock_unlock_module(name)
+    except Exception:  # private API: if it is missing the caller's completeness check still protects us
+        pass
+
+
 def _patch_kernels_module(mod, tile) -> None:
     import torch
     import triton
@@ -174,9 +184,20 @@ def apply() -> None:
     tile = _select_tile()
     if tile is None:
         return
-    _applied = True
     mod = sys.modules.get(_KERNELS_MODULE)
-    if mod is not None:
-        _patch_kernels_module(mod, tile)
-    else:
+    if mod is None:
         sys.meta_path.insert(0, _PatchAfterImport(tile))
+        _applied = True
+        return
+    _wait_for_import(_KERNELS_MODULE)
+    if not all(hasattr(mod, name) for name in _TILED_KERNELS):
+        # Another thread is still importing it (or it is an unexpected module): do not claim success, so a
+        # later apply() can retry instead of leaving the stock kernels in use for good.
+        logger.warning("fused_logprob_patch: %s is not fully imported yet; patch not applied", _KERNELS_MODULE)
+        return
+    try:
+        _patch_kernels_module(mod, tile)
+    except Exception:
+        logger.warning("fused_logprob_patch failed; verl's original kernels stay in use", exc_info=True)
+        return
+    _applied = True

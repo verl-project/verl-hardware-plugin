@@ -198,3 +198,29 @@ def test_spec_lookup_does_not_consume_the_hook(monkeypatch, tmp_path):
         found.loader.exec_module(module)  # the real import
     patched.assert_called_once()
     assert hook not in sys.meta_path
+
+
+def test_half_imported_module_is_not_claimed_and_can_be_retried(monkeypatch):
+    pytest.importorskip("triton")
+    _patch_env(monkeypatch)
+    partial = types.ModuleType(patch_mod._KERNELS_MODULE)  # kernels not defined yet: another thread is importing
+    monkeypatch.setitem(sys.modules, patch_mod._KERNELS_MODULE, partial)
+    with mock.patch("triton.set_allocator"):
+        patch_mod.apply()  # must not raise
+    assert patch_mod._applied is False
+    for name in patch_mod._TILED_KERNELS:
+        setattr(partial, name, _FakeKernel())
+    partial.SUPPORT_CUDA_TMA = False
+    with mock.patch("triton.set_allocator"):
+        patch_mod.apply()
+    assert patch_mod._applied is True and partial.SUPPORT_CUDA_TMA is True
+
+
+def test_failed_patch_leaves_a_retry_possible(monkeypatch):
+    pytest.importorskip("triton")
+    _patch_env(monkeypatch)
+    mod = _fake_kernels_module()
+    monkeypatch.setitem(sys.modules, patch_mod._KERNELS_MODULE, mod)
+    with mock.patch("triton.set_allocator", side_effect=RuntimeError("boom")):
+        patch_mod.apply()  # must not raise
+    assert patch_mod._applied is False
