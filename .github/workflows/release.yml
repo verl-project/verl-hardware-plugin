@@ -55,7 +55,9 @@ jobs:
 
   publish:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Only a pushed tag publishes. A manual run (workflow_dispatch) started on a v* tag has the same ref, so the ref
+    # check alone would let it upload; the event name keeps manual runs build-only.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: pypi
