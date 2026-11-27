@@ -98,9 +98,9 @@ def _select_tile():
 def _wait_for_import(name: str) -> None:
     """Block until a concurrent import of `name` has finished (a no-op for a reentrant import)."""
     try:
-        from importlib._bootstrap import _lock_unlock_module
+        import importlib._bootstrap as bootstrap
 
-        _lock_unlock_module(name)
+        bootstrap._lock_unlock_module(name)  # type: ignore[attr-defined]
     except Exception:  # private API: if it is missing the caller's completeness check still protects us
         pass
 
