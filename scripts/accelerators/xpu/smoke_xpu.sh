@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run this ON an Intel GPU machine, inside the Python environment you installed the plugin into. Plain PASS/FAIL, no expertise needed.
-#   scripts/smoke_xpu.sh
+#   scripts/accelerators/xpu/smoke_xpu.sh
 FAILS=0
 check() { # name, python-code, what to do if it fails
   out=$(python - 2>&1 <<PY
