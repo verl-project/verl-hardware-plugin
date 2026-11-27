@@ -21,5 +21,9 @@ else printf 'WARN  pip check reports conflicts (expected for Docker or --no-deps
 check "the plugin is registered with verl (entry point)" 'from importlib.metadata import entry_points as e; x=[p.value for p in e(group="verl.plugins")]; assert "verl_hardware_plugin" in x, x; print(x)' "install the plugin: pip install -e . (or the wheel) into THIS environment"
 check "verl picks the Intel platform by itself" 'from verl.plugin.platform import get_platform as g; n=g().device_name; assert n=="xpu", n; print(n)' "check VERL_USE_EXTERNAL_PLUGINS is not set to none, and that torch.xpu is available"
 check "the kernels package is in the range the plugin needs" 'import importlib.metadata as m; v=m.version("kernels"); a=tuple(map(int,v.split(".")[:2])); assert (0,16)<=a<(0,17), v; print(v)' "pip install \"kernels>=0.16.0,<0.17.0\""
-python -c "import vllm" 2>/dev/null && check "vLLM is the Intel (+xpu) build" 'import importlib.metadata as m; v=m.version("vllm"); assert "+xpu" in v, v; print(v)' "install vllm from the wheels.vllm.ai xpu index"
+# Skip vLLM only when it is not installed. A vLLM that is installed but cannot be imported (missing shared library,
+# incompatible dependency) must FAIL, so the import runs inside the check.
+if python -c "import importlib.metadata as m; m.version('vllm')" 2>/dev/null; then
+  check "vLLM imports and is the Intel (+xpu) build" 'import vllm, importlib.metadata as m; v=m.version("vllm"); assert "+xpu" in v, v; print(v)' "reinstall vllm from the wheels.vllm.ai xpu index and check its shared libraries"
+fi
 echo; [ $FAILS = 0 ] && echo "RESULT: ALL PASS - the install is sound. Next: a 2-step GRPO run (see the install guide)." || echo "RESULT: $FAILS FAILED - fix the first FAIL above, then re-run."; exit $((FAILS>0))
