@@ -10,6 +10,7 @@ verl_hardware_plugin/accelerators/rocm/
 ├── __init__.py                       # no platform: the ROCm platform is built into verl
 ├── registration.py                   # registers the components below on import
 ├── engines/mori_checkpoint_engine.py # `mori` checkpoint engine (MoRI-IO RDMA + XGMI weight sync)
+├── engines/mori_publish_checkpoint_engine.py # `mori_publish` checkpoint engine (trainer snapshot, rollout RDMA READ)
 ├── launch.py                         # Primus experiment YAML -> verl.trainer.main_ppo
 ├── config/                           # Hydra groups for the Primus engines
 └── primus/                           # Primus Megatron and Primus MaxText (JAX) training engines
@@ -20,6 +21,7 @@ verl_hardware_plugin/accelerators/rocm/
 | Component | Registered as | Doc |
 |-----------|---------------|-----|
 | MoRI-IO checkpoint engine: trainer → rollout weight sync with one-sided RDMA WRITE striped over all NICs and XGMI fan-out inside each rollout node | checkpoint engine `mori` | [mori_checkpoint_engine.md](./mori_checkpoint_engine.md) |
+| MoRI-IO publish checkpoint engine: each trainer rank snapshots its weights into registered device memory, each rollout worker reads them with RDMA READ at its own pace; the trainer does not wait for the rollouts | checkpoint engine `mori_publish` | module docstring of [mori_publish_checkpoint_engine.py](../../../verl_hardware_plugin/accelerators/rocm/engines/mori_publish_checkpoint_engine.py) |
 | Primus Megatron trainer: verl's Megatron engine with Primus patches, configured by a Primus YAML | training engine `megatron`, vendor `amd`; `model_engine=primus` | [primus.md](./primus.md) |
 | Primus MaxText trainer: MaxText (JAX) train step, one process per GPU, configured by a Primus YAML | training engine `maxtext`; `model_engine=maxtext` | [primus.md](./primus.md) |
 

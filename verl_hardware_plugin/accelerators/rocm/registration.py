@@ -30,6 +30,17 @@ except Exception as exc:
         pass
 
 try:
+    from verl_hardware_plugin.accelerators.rocm.engines import mori_publish_checkpoint_engine  # noqa: F401
+except Exception as exc:
+    logger.debug("ROCm MoRI publish checkpoint engine registration failed: %s", exc)
+    try:  # say why when backend "mori_publish" is requested
+        from verl.checkpoint_engine.base import CheckpointEngineRegistry
+
+        CheckpointEngineRegistry.record_import_error("mori_publish_checkpoint_engine", exc)
+    except Exception:
+        pass
+
+try:
     from verl_hardware_plugin.accelerators.rocm.primus.resolver import register_resolver
 
     register_resolver()
