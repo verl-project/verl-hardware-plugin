@@ -463,18 +463,24 @@ def patch_tpu_async_scheduling_update_states() -> None:
         if getattr(self, "use_async_scheduling", False):
             req_data = getattr(scheduler_output, "scheduled_cached_reqs", None)
             all_token_ids = getattr(req_data, "all_token_ids", None)
-            if isinstance(all_token_ids, dict):
+            num_output_tokens = getattr(req_data, "num_output_tokens", None)
+            if isinstance(all_token_ids, dict) and num_output_tokens is not None:
                 req_id_to_index = self.input_batch.req_id_to_index
-                for req_id in req_data.req_ids:
-                    if req_id not in all_token_ids and req_id not in req_id_to_index:
-                        req_state = self.requests.get(req_id)
-                        if req_state is not None:
-                            all_token_ids[req_id] = list(req_state.output_token_ids)
-                            logger.warning(
-                                "Backfilled missing req_data.all_token_ids[%s] in GPUModelRunner._update_states "
-                                "(async scheduling + weight-sync desync guard).",
-                                req_id,
-                            )
+                for i, req_id in enumerate(req_data.req_ids):
+                    # Only the case upstream indexes: not in the persistent batch, async, with output tokens.
+                    if num_output_tokens[i] <= 0 or req_id in all_token_ids or req_id in req_id_to_index:
+                        continue
+                    req_state = self.requests.get(req_id)
+                    if req_state is not None:
+                        # Same layout as the scheduler's Request.all_token_ids: prompt + output tokens.
+                        all_token_ids[req_id] = list(req_state.prompt_token_ids or ()) + list(
+                            req_state.output_token_ids
+                        )
+                        logger.warning(
+                            "Backfilled missing req_data.all_token_ids[%s] in GPUModelRunner._update_states "
+                            "(async scheduling + weight-sync desync guard).",
+                            req_id,
+                        )
         return orig_update_states(self, scheduler_output)
 
     _update_states_with_all_token_ids_guard._verl_async_all_token_ids_patched = True  # type: ignore[attr-defined]

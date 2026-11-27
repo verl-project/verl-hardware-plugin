@@ -318,13 +318,14 @@ def _fake_gpu_model_runner_modules():
             self.requests = {}
 
         def _update_states(self, scheduler_output):
+            # Mirrors vLLM's gpu_model_runner._update_states resume path.
             req_data = scheduler_output.scheduled_cached_reqs
-            for req_id in req_data.req_ids:
+            for i, req_id in enumerate(req_data.req_ids):
                 req_index = self.input_batch.req_id_to_index.get(req_id)
-                req_state = self.requests[req_id]
-                if req_index is None and self.use_async_scheduling and req_state.output_token_ids:
+                num_output_tokens = req_data.num_output_tokens[i]
+                if req_index is None and self.use_async_scheduling and num_output_tokens > 0:
                     resumed = req_data.all_token_ids[req_id]
-                    req_state.output_token_ids = resumed[-len(req_state.output_token_ids) :]
+                    self.requests[req_id].output_token_ids = resumed[-num_output_tokens:]
             return "updated"
 
     runner_mod.GPUModelRunner = GPUModelRunner
@@ -337,6 +338,10 @@ def _fake_gpu_model_runner_modules():
     return modules, runner_mod
 
 
+def _req_state(prompt, output):
+    return types.SimpleNamespace(prompt_token_ids=prompt, output_token_ids=output)
+
+
 def test_patch_tpu_async_scheduling_update_states_backfills_missing_all_token_ids():
     modules, runner_mod = _fake_gpu_model_runner_modules()
     with mock.patch.dict("sys.modules", modules):
@@ -344,21 +349,26 @@ def test_patch_tpu_async_scheduling_update_states_backfills_missing_all_token_id
         tpu_vllm_patches.patch_tpu_async_scheduling_update_states()  # idempotent
 
         runner = runner_mod.GPUModelRunner(use_async_scheduling=True)
-        runner.requests["req-missing"] = types.SimpleNamespace(output_token_ids=[11, 22, 33])
-        runner.requests["req-present"] = types.SimpleNamespace(output_token_ids=[44, 55])
-        runner.requests["req-in-batch"] = types.SimpleNamespace(output_token_ids=[66])
+        runner.requests["req-missing"] = _req_state([1, 2], [11, 22, 33])
+        runner.requests["req-present"] = _req_state([3], [44, 55])
+        runner.requests["req-in-batch"] = _req_state([4], [66])
+        runner.requests["req-no-output"] = _req_state([5, 6], [])
         runner.input_batch.req_id_to_index["req-in-batch"] = 0
 
-        sched_out = types.SimpleNamespace(
-            scheduled_cached_reqs=types.SimpleNamespace(
-                req_ids=["req-missing", "req-present", "req-in-batch"],
-                all_token_ids={"req-present": [1, 2, 44, 55]},
-            )
+        req_data = types.SimpleNamespace(
+            req_ids=["req-missing", "req-present", "req-in-batch", "req-no-output"],
+            all_token_ids={"req-present": [3, 44, 55]},
+            num_output_tokens=[3, 2, 1, 0],
         )
+        sched_out = types.SimpleNamespace(scheduled_cached_reqs=req_data)
+        # Without the guard the fake (like vLLM) raises KeyError on req-missing.
         assert runner._update_states(sched_out) == "updated"
+        assert req_data.all_token_ids["req-missing"] == [1, 2, 11, 22, 33]
         assert runner.requests["req-missing"].output_token_ids == [11, 22, 33]
         assert runner.requests["req-present"].output_token_ids == [44, 55]
-        assert "req-in-batch" not in sched_out.scheduled_cached_reqs.all_token_ids
+        # Requests upstream does not index are left alone.
+        assert "req-in-batch" not in req_data.all_token_ids
+        assert "req-no-output" not in req_data.all_token_ids
 
 
 def test_patch_tpu_async_scheduling_update_states_noop_when_sync_scheduling():
@@ -367,9 +377,7 @@ def test_patch_tpu_async_scheduling_update_states_noop_when_sync_scheduling():
         tpu_vllm_patches.patch_tpu_async_scheduling_update_states()
 
         runner = runner_mod.GPUModelRunner(use_async_scheduling=False)
-        runner.requests["req-sync"] = types.SimpleNamespace(output_token_ids=[11, 22])
-        sched_out = types.SimpleNamespace(
-            scheduled_cached_reqs=types.SimpleNamespace(req_ids=["req-sync"], all_token_ids={})
-        )
-        assert runner._update_states(sched_out) == "updated"
-        assert sched_out.scheduled_cached_reqs.all_token_ids == {}
+        runner.requests["req-sync"] = _req_state([1], [11, 22])
+        req_data = types.SimpleNamespace(req_ids=["req-sync"], all_token_ids={}, num_output_tokens=[2])
+        assert runner._update_states(types.SimpleNamespace(scheduled_cached_reqs=req_data)) == "updated"
+        assert req_data.all_token_ids == {}
