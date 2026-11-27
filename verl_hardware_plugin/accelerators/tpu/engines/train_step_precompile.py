@@ -322,7 +322,7 @@ def worker_precompile_train_step(worker: Any) -> dict[str, Any]:
         return {"status": "skipped", "reason": "the worker hosts a rollout engine on the trainer devices"}
     actor = getattr(worker, "actor", None)
     engine = getattr(actor, "engine", None)
-    if engine is None:
+    if actor is None or engine is None:
         return {"status": "skipped", "reason": "worker has no actor engine"}
     actor_cfg, rollout_cfg = worker.config.actor, worker.config.rollout
     model_config, engine_config = actor.model_config, actor.engine_config
