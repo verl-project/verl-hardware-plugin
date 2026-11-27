@@ -34,6 +34,7 @@ import torch
 from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
 from verl_hardware_plugin.accelerators.xpu.patches import (
+    fused_logprob_patch,
     numa_affinity_patch,
     ray_device_pin_patch,
     reduce_avg_allreduce_patch,
@@ -45,7 +46,13 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # Every monkeypatch this platform installs, applied from __init__ below. See
 # each module's own docstring for what it patches and why.
-_PATCHES = (reduce_avg_allreduce_patch, ray_device_pin_patch, register_vtune, numa_affinity_patch)
+_PATCHES = (
+    reduce_avg_allreduce_patch,
+    ray_device_pin_patch,
+    register_vtune,
+    numa_affinity_patch,
+    fused_logprob_patch,
+)
 
 
 def _ensure_torch_xpu() -> bool:

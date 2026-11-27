@@ -18,6 +18,7 @@ verl_hardware_plugin/accelerators/xpu/
 ├── engines/megatron_xpu.py          # Megatron engine registration (Work in Progress — not yet validated end-to-end)
 ├── patches/reduce_avg_allreduce_patch.py  # xccl ReduceOp.AVG workaround
 ├── patches/ray_device_pin_patch.py        # pins each Ray worker to its assigned device (otherwise every rank lands on xpu:0)
+├── patches/fused_logprob_patch.py         # switches verl's fused Triton log-prob kernels to the tensor-descriptor path (Triton >= 3.9)
 ├── profilers/itt_profile_xpu.py     # ITT range markers + VtuneProfiler
 └── profilers/register_vtune.py      # claims `profiler.tool: vtune`
 ```
@@ -64,3 +65,17 @@ not needed at runtime. Build and run commands are in the [installation guide](./
 ## Related Documentation
 
 - [verl plugin system](../../development.md)
+
+## Fused log-prob kernels (`actor_rollout_ref.model.use_fused_kernels`, `impl_backend: triton`)
+
+verl's fused Triton lm_head + log-prob/entropy kernel loads tiles with pointer arithmetic, which Intel's Triton does not
+lower to 2D block loads. On a B60 the stock kernel needs about 1.3-1.5 s for 4096 tokens (forward + backward); the plugin
+patch `fused_logprob_patch` brings it to about 0.12 s by enabling verl's own tensor-descriptor path and a tile measured
+on B60. It applies only when all of these hold; otherwise verl's kernels run unchanged:
+
+- Triton >= 3.9 with `tl.make_tensor_descriptor` (ships with torch 2.15 XPU wheels; torch 2.14 has Triton 3.8, where the
+  tensor-descriptor path is 13x slower, so the patch stays off);
+- every visible device has the same measured tile (today: B60 and B70; other devices keep verl's defaults until someone measures them);
+- `VERL_XPU_FUSED_LOGPROB_PATCH` is not `0`.
+
+`VERL_XPU_FUSED_LOGPROB_TILE="BM,BN,BK,num_warps,num_stages"` overrides the tile, for example to try an unlisted device.
