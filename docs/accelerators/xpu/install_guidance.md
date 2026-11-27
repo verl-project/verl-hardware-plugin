@@ -32,10 +32,11 @@ plugin-side monkeypatch over `torch.distributed.all_reduce`
 
 ## 1. Install verl and verl-hardware-plugin
 
-Pick one. All three install the same set of packages (torch 2.15.0+xpu, vLLM 0.34.0+xpu, transformers 5.18.x): the Docker
-image runs the commands of Option C.
+Pick one. Options B and C install torch 2.15.0+xpu, vLLM 0.34.0+xpu and transformers 5.18.x. Option A builds verl's
+Docker image, which on verl `main` still pins torch 2.14.0+xpu and vLLM 0.32.0 until verl PR #8863 (vLLM 0.34.0, torch
+2.15.0) is merged; for the stack in this guide use Option B or C until then.
 
-### Option A: Docker (recommended)
+### Option A: Docker (versions follow verl #8863)
 
 The image is [`docker/xpu/Dockerfile.stable.vllm`](https://github.com/verl-project/verl/blob/main/docker/xpu/Dockerfile.stable.vllm)
 in verl-core. It installs verl and this plugin together, so nothing else is needed. Pin the two checkouts with
@@ -44,15 +45,16 @@ certificates, `pip`, `certifi` and `uv` are fetched fresh.
 
 ```bash
 git clone https://github.com/verl-project/verl.git && cd verl
-docker build -f docker/xpu/Dockerfile.stable.vllm -t verl:xpu-vllm034 .
-docker run --rm -it --device /dev/dri --ipc=host --privileged verl:xpu-vllm034
+docker build -f docker/xpu/Dockerfile.stable.vllm -t verl:xpu-vllm .
+docker run --rm -it --device /dev/dri --ipc=host --privileged verl:xpu-vllm
 ```
 
 The image is built in stages (`drivers` -> `runtime-base` -> `builder` -> `runtime`); only the finished `/opt/venv` and
 the verl / plugin checkouts (`/opt/verl`, `/opt/verl-hardware-plugin`) are shipped. It contains:
 
-- the Intel GPU user-mode driver (compute-runtime, IGC, Level Zero), installed from the OMIX apt repo
-  (`--build-arg OMIX_VERSION`, default 0.4.1, as in vLLM 0.34.0's XPU image);
+- the Intel GPU user-mode driver (compute-runtime, IGC, Level Zero). Once verl #8863 is merged it comes from the OMIX
+  apt repo (`--build-arg OMIX_VERSION`, default 0.4.1, as in vLLM 0.34.0's XPU image); verl `main` today installs
+  compute-runtime 26.27 from release packages;
 - gcc/g++ and the Python headers, `ffmpeg`, `libnuma-dev` and `libze-dev` (see the system packages under Option C);
 - `CCL_SYCL_ALLGATHERV_TMP_BUF`, `CCL_SYCL_ALLREDUCE_TMP_BUF`, `CCL_SYCL_REDUCE_SCATTER_TMP_BUF` and
   `CCL_SYCL_BROADCAST_TMP_BUF`, all set to `1`: they stop oneCCL from caching IPC handles of freed buffers, which
@@ -106,7 +108,8 @@ System packages on the host: `g++`/`gcc` and the Python 3.12 headers (Triton com
 use), `libnuma-dev`, `libze-dev` (it provides the unversioned `libze_loader.so` that oneCCL opens; without it `xccl`
 fails with "ze_data was not initialized"), and `ffmpeg` (the FFmpeg shared libraries that `torchcodec` needs to decode
 video). The Docker image also installs `libhwloc15`, `libpciaccess0`, `libigsc1` and `intel-metrics-library` (from
-the OMIX apt repo, see the Dockerfile) for the Sysman PCI/NUMA query that pyzes makes; install them as well.
+the OMIX apt repo after verl #8863, `ppa:kobuk-team/intel-graphics` before it; see the Dockerfile) for the Sysman
+PCI/NUMA query that pyzes makes; install them as well.
 
 ```bash
 # Use pip >= 26.2.2 and uv >= 0.13.4 (both carry the corrected CA bundle).
