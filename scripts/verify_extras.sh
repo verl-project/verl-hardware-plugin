@@ -21,8 +21,8 @@ missing=""; for d in "$ROOT"/verl_hardware_plugin/accelerators/*/; do b=$(basena
 [ -z "$missing" ] && pass "every hardware backend folder has its own pip extra" || fail "every backend has an extra" "missing:$missing"
 echo "$M" | grep '^Provides-Extra' | raw
 
-echo "$M" | grep -q 'torch==2.14.0+xpu; extra == "xpu"' && pass "extra [xpu] pins the Intel build of torch (2.14.0+xpu)" || fail "extra [xpu] pins torch +xpu" "check accelerators/xpu/requirements.txt"
-echo "$M" | grep -q 'vllm==0.32.0+xpu; extra == "vllm-xpu"' && pass "extra [vllm-xpu] pins the Intel build of vLLM" || fail "extra [vllm-xpu] pins vllm" "check accelerators/xpu/requirements-vllm.txt"
+echo "$M" | grep -q 'torch==2.15.0+xpu; extra == "xpu"' && pass "extra [xpu] pins the Intel build of torch (2.15.0+xpu)" || fail "extra [xpu] pins torch +xpu" "check accelerators/xpu/requirements.txt"
+echo "$M" | grep -q 'vllm==0.34.0+xpu; extra == "vllm-xpu"' && pass "extra [vllm-xpu] pins the Intel build of vLLM" || fail "extra [vllm-xpu] pins vllm" "check accelerators/xpu/requirements-vllm.txt"
 echo "$M" | grep 'extra == "xpu"' | raw
 
 cp -r "$ROOT" "$T/copy"; rm -rf "$T/copy/.git"
@@ -32,8 +32,8 @@ else pass "the safety test rejects a bad requirements file (we planted one on pu
 (cd "$ROOT" && python -m pytest -q tests/test_vendor_extras.py >"$T/pos.log" 2>&1) && pass "the safety test accepts the real files" || fail "the safety test accepts the real files" "see -v"; tail -2 "$T/pos.log" | raw
 
 if [ "$R" = 1 ]; then
-  SHA=${VERL_CORE_SHA:-3d7a8a0a3372895e3380a2e3a0d0f94d6530eac6}
-  F="--extra-index-url https://download.pytorch.org/whl/xpu --extra-index-url https://wheels.vllm.ai/0.32.0/xpu --extra-index-url https://wheels.vllm.ai/xpu"
+  SHA=${VERL_CORE_SHA:-8612d0292c38dbe7b104a8c783594f5c57119fa7}
+  F="--extra-index-url https://download.pytorch.org/whl/xpu --extra-index-url https://wheels.vllm.ai/0.34.0/xpu --extra-index-url https://wheels.vllm.ai/xpu --extra-index-url https://vllm-project.github.io/vllm-xpu-kernels/whl"
   if pip install --dry-run --ignore-installed "verl[verl-core] @ git+https://github.com/verl-project/verl.git@${SHA}" "$ROOT[xpu,vllm-xpu]" $F >"$T/res.log" 2>&1; then
     pass "the pinned Intel torch, vLLM and kernels all exist on the real package servers today"; grep '^Would install' "$T/res.log" | tr ' ' '\n' | grep -E '^(torch|vllm|kernels)-' | raw
   else fail "the pins resolve on the real servers" "a pinned version is gone or two pins conflict (see -v)"; tail -5 "$T/res.log" | raw; fi

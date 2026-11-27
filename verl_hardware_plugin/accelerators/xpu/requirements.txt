@@ -5,7 +5,7 @@
 
 # Local-version pin: PyPI's torch is the CUDA build, only the XPU index has +xpu. Without the index flags pip stops with
 # "no matching distribution" instead of installing a CUDA torch.
-torch==2.14.0+xpu
+torch==2.15.0+xpu
 # Lets Ray count Intel GPUs.
 dpctl
 # fsdp_xpu.py loads the XPU flash-attention kernels through the HF kernels hub. transformers declares `kernels` only under
