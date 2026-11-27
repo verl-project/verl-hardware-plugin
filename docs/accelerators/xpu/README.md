@@ -75,7 +75,7 @@ on B60. It applies only when all of these hold; otherwise verl's kernels run unc
 
 - Triton >= 3.9 with `tl.make_tensor_descriptor` (ships with torch 2.15 XPU wheels; torch 2.14 has Triton 3.8, where the
   tensor-descriptor path is 13x slower, so the patch stays off);
-- the device has a measured tile (today: B60 and B70; other devices keep verl's defaults until someone measures them);
+- every visible device has the same measured tile (today: B60 and B70; other devices keep verl's defaults until someone measures them);
 - `VERL_XPU_FUSED_LOGPROB_PATCH` is not `0`.
 
 `VERL_XPU_FUSED_LOGPROB_TILE="BM,BN,BK,num_warps,num_stages"` overrides the tile, for example to try an unlisted device.

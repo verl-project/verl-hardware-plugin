@@ -24,7 +24,7 @@ XPU keeps verl's original behaviour. Add a row after measuring a device, do not 
 
 Gates (all must hold, otherwise this is a no-op and logs why at INFO):
 - `VERL_XPU_FUSED_LOGPROB_PATCH` is not "0";
-- torch.xpu is available and the device name contains a key of `_TILES`;
+- torch.xpu is available and every visible device name contains a key of `_TILES` with one common tile;
 - Triton >= 3.9 and `tl.make_tensor_descriptor` exists.
 
 `VERL_XPU_FUSED_LOGPROB_TILE="BM,BN,BK,warps,stages"` overrides the table (also lets an unlisted
@@ -84,11 +84,14 @@ def _select_tile():
         return tile
     import torch
 
-    name = torch.xpu.get_device_name(0)
-    for key, tile in _TILES.items():
-        if key in name:
-            return tile
-    logger.info("fused_logprob_patch: no measured tile for device %r, keeping verl defaults", name)
+    # Look at every visible device, not just xpu:0: Ray may pin a worker to any physical index (see
+    # ray_device_pin_patch) and this runs before that happens. Only a host whose devices all map to the same
+    # tile is patched; a mixed host keeps verl's defaults rather than risk a tile that does not fit.
+    names = [torch.xpu.get_device_name(i) for i in range(torch.xpu.device_count())]
+    tiles = {next((t for k, t in _TILES.items() if k in n), None) for n in names}
+    if len(tiles) == 1 and None not in tiles:
+        return tiles.pop()
+    logger.info("fused_logprob_patch: no single measured tile for devices %r, keeping verl defaults", names)
     return None
 
 
@@ -131,14 +134,17 @@ class _PatchAfterImport(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
         if fullname != _KERNELS_MODULE:
             return None
-        sys.meta_path.remove(self)
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)
         if spec is None or spec.loader is None:
             return spec
-        loader, tile = spec.loader, self._tile
+        loader, tile, finder = spec.loader, self._tile, self
         original_exec = loader.exec_module
 
         def exec_module(module):
+            # Leave the hook installed until the module really runs, so a spec-only lookup
+            # (importlib.util.find_spec) does not disable the patch.
+            if finder in sys.meta_path:
+                sys.meta_path.remove(finder)
             original_exec(module)
             try:
                 _patch_kernels_module(module, tile)
