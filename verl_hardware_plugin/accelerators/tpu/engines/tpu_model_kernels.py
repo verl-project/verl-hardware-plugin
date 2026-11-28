@@ -31,6 +31,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import importlib.util
+import inspect
 import logging
 import os
 import re
@@ -309,6 +310,18 @@ def configure_qwen3_5_expert_parallel(
     """
     from torchtitan.experiments.tpu.components.expert_parallel import use_expert_parallel
 
+    extra: dict[str, Any] = {}
+    # Experimental torchtitan EP knobs, set via env vars. Each is passed only when the installed torchtitan's
+    # ``use_expert_parallel`` accepts it, so older torchtitan versions ignore them.
+    _ep_params = inspect.signature(use_expert_parallel).parameters
+    for _env, _kw, _cast in (
+        ("VERL_TPU_EP_CHUNK_DW_FP32", "accumulate_chunk_weight_grads_fp32", lambda v: v == "1"),
+        ("VERL_TPU_EP_MAX_INFLIGHT_CHUNKS", "max_inflight_chunks", int),
+        ("VERL_TPU_EP_OVERFLOW_MODE", "ep_overflow_mode", str),
+    ):
+        _v = os.environ.get(_env, "")
+        if _v and _kw in _ep_params:
+            extra[_kw] = _cast(_v)
     use_expert_parallel(
         model_spec.model,
         ep_degree=expert_parallel_degree,
@@ -316,7 +329,10 @@ def configure_qwen3_5_expert_parallel(
         ep_capacity_factor=ep_capacity_factor,
         num_token_chunks=num_token_chunks,
         paired_grouped_mm=paired_grouped_mm,
+        **extra,
     )
+    if extra:
+        logger.warning("torchtitan EP: experimental EP knobs %s", extra)
     logger.info(
         "torchtitan EP: ep=%d, transport=%s, capacity_factor=%s, num_token_chunks=%s, paired grouped mm=%s",
         expert_parallel_degree,

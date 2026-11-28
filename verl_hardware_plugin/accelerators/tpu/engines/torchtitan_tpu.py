@@ -1205,6 +1205,14 @@ class TorchTitanTPUEngine(BaseEngine):
             graph_trainer_mode.validate_graph_trainer_engine(
                 engine_config, tpu_options, use_simple_fsdp=self._use_simple_fsdp, tpu_kernels=self._tpu_kernels
             )
+            if os.environ.get("VERL_TPU_COMPILED_OPT_STEP", "0") == "1" and (
+                tpu_options.fp32_master or tpu_options.optimizer_host_offload
+            ):
+                # The compiled optimizer step returns before _chunked_clip_and_step: no FP32 masters, no host offload.
+                logger.warning(
+                    "VERL_TPU_COMPILED_OPT_STEP=1 ignores engine_kwargs.tpu.fp32_master / optimizer_host_offload: the "
+                    "optimizer steps the device bf16 parameters (bf16 AdamW moments)"
+                )
         self._graph_policy_loss_spec: Optional[graph_trainer_mode.GraphPolicyLossSpec] = None
         self._graph_trainer_traced_len: Optional[int] = None
         # trainer_mode=graph_trainer with kda: the Tokamax KDA document budget pinned on the first step.
@@ -1918,26 +1926,51 @@ class TorchTitanTPUEngine(BaseEngine):
         if forward_only and tpu_options.static_log_prob_micro_batch_len:
             static_len = int(tpu_options.static_log_prob_micro_batch_len)
         bin_slot_len = int(getattr(self, "_bin_slot_len", 0) or 0)
-        if (
+        use_bins = bool(
             bin_slot_len > 0
             and static_len >= bin_slot_len
             and static_len % bin_slot_len == 0
             and getattr(self.engine_config, "use_dynamic_bsz", False)
             and getattr(data["input_ids"], "is_nested", False)
-        ):
+        )
+        global_pack = False
+        if use_bins:
             from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import pack_micro_batches_into_bins
 
+            pack_align, pack_max_segments = 1, 0
+            try:
+                from verl.utils.global_pack import global_pack_enabled, global_pack_settings
+
+                global_pack = global_pack_enabled()
+                if global_pack:
+                    # The controller planned each rank's sequences with these same settings (verl.utils.global_pack).
+                    _, pack_align, pack_max_segments = global_pack_settings()
+            except ImportError:
+                pass
             micro_batches, indices = pack_micro_batches_into_bins(
                 data=data,
                 dp_group=dp_group,
                 bin_len=bin_slot_len,
                 num_bins=static_len // bin_slot_len,
+                align=pack_align,
+                max_segments=pack_max_segments,
             )
         else:
             micro_batches, indices = prepare_micro_batches(
                 data=data,
                 dp_group=dp_group,
                 same_micro_num_in_dp=True,
+            )
+        if use_bins:
+            from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import log_micro_batch_fill
+
+            log_micro_batch_fill(
+                data,
+                len(micro_batches),
+                static_len,
+                dp_group,
+                tag="fwd" if forward_only else "fwd_bwd",
+                global_pack=global_pack,
             )
         static_response_len = int(tpu_options.static_max_response_len or 0)
         slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)
