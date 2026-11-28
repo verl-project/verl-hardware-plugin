@@ -86,6 +86,15 @@ multi-host replicas launch as before.
   and ports. The first engine of a host claims it for its job (a shared `flock` on
   `/tmp/verl_tpu_subhost_rollout.lock`, held while the engine runs), and an engine of another job fails at startup.
   Give each job its own rollout hosts.
+- **Serialized `StartSession` init:** co-located sub-host engines serialize `TPUWorker.init_device` (the `tpu_dist`
+  / `tpunetd` `StartSession` handshake over `vbar.sock`) on `/tmp/verl_tpu_subhost_start_session.lock` so concurrent
+  `StartSession` calls on one host do not collide (`GRPC_ERROR error message: START_SESSION failed`). Model loading
+  and XLA compilation still run in parallel across engines. Only sub-host engines (those with
+  `VERL_TPU_SUBHOST_MEGASCALE_PORT` set) install this wrapper; whole-host, multi-host, and non-sub-host replicas are
+  untouched. Serialization is fail-closed: if all workers of an engine do not reach the gate within
+  120 s, if rank 0 dies or fails before signaling `GO`, or if the 30-minute safety timeout expires while waiting for
+  the host lock or `GO`, the engine aborts and startup fails with an error instead of calling `StartSession`
+  unserialized. Set `VERL_TPU_SUBHOST_SERIALIZE_START_SESSION=0` to disable the serializer.
 
 ## Verify
 

@@ -3,7 +3,13 @@
 
 """vLLM / vllm-torchtpu runtime patches for TPU rollout."""
 
+import fcntl
+import json
 import os
+import subprocess
+import sys
+import threading
+import time
 import types
 from unittest import mock
 
@@ -381,3 +387,567 @@ def test_patch_tpu_async_scheduling_update_states_noop_when_sync_scheduling():
         req_data = types.SimpleNamespace(req_ids=["req-sync"], all_token_ids={}, num_output_tokens=[2])
         assert runner._update_states(types.SimpleNamespace(scheduled_cached_reqs=req_data)) == "updated"
         assert req_data.all_token_ids == {}
+
+
+# ---------------------------------------------------------------------------
+# Sub-host StartSession serialization (TPUWorker.init_device)
+# ---------------------------------------------------------------------------
+
+
+def _fake_tpu_worker_module_with_init_device(init_device_fn):
+    worker_mod = types.ModuleType("vllm_torchtpu.worker.tpu_worker")
+
+    class TPUWorker:
+        def __init__(self, rank: int, world_size: int):
+            self.rank = rank
+            self.parallel_config = types.SimpleNamespace(world_size=world_size)
+
+        init_device = init_device_fn
+
+    worker_mod.TPUWorker = TPUWorker
+    worker_mod._configure_tpu_process_env = lambda rank, local_rank, world_size, local_world_size: None
+    modules = {
+        "vllm_torchtpu": types.ModuleType("vllm_torchtpu"),
+        "vllm_torchtpu.worker": types.ModuleType("vllm_torchtpu.worker"),
+        "vllm_torchtpu.worker.tpu_worker": worker_mod,
+    }
+    return worker_mod, modules
+
+
+def test_subhost_start_session_hook_is_no_op_for_single_engine_hosts():
+    """Engines without SUBHOST_MEGASCALE_PORT_ENV (non-sub-host engines) do not wrap init_device."""
+
+    def orig_init(self):
+        return "ok"
+
+    worker_mod, modules = _fake_tpu_worker_module_with_init_device(orig_init)
+    with mock.patch.dict(os.environ):
+        os.environ.pop(tpu_vllm_patches.SUBHOST_MEGASCALE_PORT_ENV, None)
+        _patch_in_fake_worker_process(modules)
+        assert not tpu_vllm_patches.subhost_serialize_start_session_enabled()
+    assert worker_mod.TPUWorker.init_device is orig_init
+
+
+@pytest.mark.parametrize("disabled_value", ["0", "false", "OFF", "no"])
+def test_subhost_start_session_hook_can_be_disabled_via_env(disabled_value):
+    def orig_init(self):
+        return "ok"
+
+    worker_mod, modules = _fake_tpu_worker_module_with_init_device(orig_init)
+    env = {
+        tpu_vllm_patches.SUBHOST_MEGASCALE_PORT_ENV: "21000",
+        tpu_vllm_patches.SUBHOST_SERIALIZE_START_SESSION_ENV: disabled_value,
+    }
+    with mock.patch.dict(os.environ, env):
+        _patch_in_fake_worker_process(modules)
+        assert not tpu_vllm_patches.subhost_serialize_start_session_enabled()
+    assert worker_mod.TPUWorker.init_device is orig_init
+
+
+def test_subhost_start_session_hook_is_idempotent_and_patches_init_device(tmp_path, monkeypatch):
+    calls = []
+
+    def orig_init(self):
+        calls.append((self.rank, self.parallel_config.world_size))
+        return "initialized"
+
+    lock_path = str(tmp_path / "start_session.lock")
+    monkeypatch.setattr(tpu_vllm_patches, "SUBHOST_START_SESSION_LOCK_FILE", lock_path)
+    worker_mod, modules = _fake_tpu_worker_module_with_init_device(orig_init)
+    env = {
+        tpu_vllm_patches.SUBHOST_MEGASCALE_PORT_ENV: "21000",
+        tpu_vllm_patches.SUBHOST_ENGINE_ID_ENV: "engine-single",
+    }
+    with mock.patch.dict(os.environ, env):
+        os.environ.pop(tpu_vllm_patches.SUBHOST_SERIALIZE_START_SESSION_ENV, None)
+        _patch_in_fake_worker_process(modules)
+        wrapped = worker_mod.TPUWorker.init_device
+        assert wrapped is not orig_init
+        with mock.patch.dict("sys.modules", modules):
+            tpu_vllm_patches.patch_tpu_worker_subhost_start_session()
+        assert worker_mod.TPUWorker.init_device is wrapped  # idempotent
+        assert worker_mod.TPUWorker(rank=0, world_size=1).init_device() == "initialized"
+    assert calls == [(0, 1)]
+    assert os.path.exists(lock_path)
+
+
+@pytest.mark.parametrize(
+    "num_engines, world_size",
+    [
+        (2, 4),  # 2 x TP=4 on a TPU 7x host
+        (4, 2),  # 4 x TP=2 on a TPU 7x host
+        (2, 1),  # single-worker path
+    ],
+)
+def test_subhost_start_session_serializes_engines_while_running_siblings_concurrently(
+    tmp_path, num_engines, world_size
+):
+    lock_path = str(tmp_path / "start_session.lock")
+    start_barrier = threading.Barrier(num_engines * world_size)
+    intra_barriers = {f"eng-{e}": threading.Barrier(world_size) for e in range(num_engines)}
+    state_lock = threading.Lock()
+    active_engines: dict[str, int] = {}
+    max_concurrent_engines = 0
+    intervals: dict[str, list[tuple[float, float]]] = {f"eng-{e}": [] for e in range(num_engines)}
+    errors: list[BaseException] = []
+
+    def worker_fn(engine_id: str, rank: int):
+        try:
+            start_barrier.wait(timeout=10.0)
+            with tpu_vllm_patches.serialize_subhost_start_session(
+                rank=rank,
+                world_size=world_size,
+                engine_id=engine_id,
+                lock_path=lock_path,
+                peer_appear_timeout_s=15.0,
+                safety_timeout_s=15.0,
+                poll_interval_s=0.005,
+            ):
+                t_enter = time.monotonic()
+                nonlocal max_concurrent_engines
+                with state_lock:
+                    active_engines[engine_id] = active_engines.get(engine_id, 0) + 1
+                    max_concurrent_engines = max(max_concurrent_engines, len(active_engines))
+                # Every rank of this engine must reach init_device concurrently (simulating tpu_dist rendezvous).
+                intra_barriers[engine_id].wait(timeout=10.0)
+                time.sleep(0.03)
+                t_exit = time.monotonic()
+                with state_lock:
+                    intervals[engine_id].append((t_enter, t_exit))
+                    active_engines[engine_id] -= 1
+                    if active_engines[engine_id] == 0:
+                        del active_engines[engine_id]
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker_fn, args=(f"eng-{e}", r)) for e in range(num_engines) for r in range(world_size)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20.0)
+        assert not t.is_alive()
+
+    assert errors == []
+    assert max_concurrent_engines == 1
+    # Engine intervals [min_enter, max_exit] must be strictly non-overlapping across co-located engines.
+    spans = sorted((min(s for s, _ in ivs), max(e for _, e in ivs), eid) for eid, ivs in intervals.items())
+    for eid, ivs in intervals.items():
+        assert len(ivs) == world_size, f"engine {eid} ran {len(ivs)} workers, expected {world_size}"
+    for (_, prev_end, prev_id), (next_start, _, next_id) in zip(spans[:-1], spans[1:], strict=True):
+        assert prev_end <= next_start, f"{prev_id} ({prev_end}) overlapped {next_id} ({next_start})"
+    # Ephemeral per-engine coordination files are cleaned up; the persistent host lockfile stays.
+    remaining = sorted(os.listdir(tmp_path))
+    assert remaining == ["start_session.lock"]
+
+
+def test_subhost_start_session_releases_lock_before_model_load(tmp_path):
+    """After init_device finishes, co-located engines run subsequent stages (load_model / compile) in parallel."""
+    lock_path = str(tmp_path / "start_session.lock")
+    load_barrier = threading.Barrier(4)  # 2 engines x TP=2 must enter load_model concurrently
+    errors: list[BaseException] = []
+
+    def worker_fn(engine_id: str, rank: int):
+        try:
+            with tpu_vllm_patches.serialize_subhost_start_session(
+                rank=rank,
+                world_size=2,
+                engine_id=engine_id,
+                lock_path=lock_path,
+                peer_appear_timeout_s=10.0,
+                safety_timeout_s=10.0,
+                poll_interval_s=0.005,
+            ):
+                time.sleep(0.02)
+            # Only succeeds if both engines have released the StartSession lock before load_model.
+            load_barrier.wait(timeout=5.0)
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker_fn, args=(f"eng-{e}", r)) for e in range(2) for r in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15.0)
+        assert not t.is_alive()
+    assert errors == []
+
+
+def test_subhost_start_session_serializes_across_subprocesses(tmp_path):
+    """Two real multi-worker sub-host engines (4 OS processes) serialize strictly via POSIX flock."""
+    lock_path = str(tmp_path / "start_session.lock")
+    log_path = str(tmp_path / "events.jsonl")
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    script = (
+        "import json, sys, time\n"
+        "from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import (\n"
+        "    serialize_subhost_start_session,\n"
+        ")\n"
+        "lock_path, log_path, engine_id = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+        "rank, world_size = int(sys.argv[4]), int(sys.argv[5])\n"
+        "with serialize_subhost_start_session(\n"
+        "    rank=rank, world_size=world_size, engine_id=engine_id,\n"
+        "    lock_path=lock_path, peer_appear_timeout_s=15.0,\n"
+        "    safety_timeout_s=15.0, poll_interval_s=0.005,\n"
+        "):\n"
+        "    t0 = time.time()\n"
+        "    time.sleep(0.08)\n"
+        "    t1 = time.time()\n"
+        "    with open(log_path, 'a', encoding='utf-8') as fh:\n"
+        "        fh.write(json.dumps({'engine': engine_id, 'rank': rank, 't0': t0, 't1': t1}) + '\\n')\n"
+    )
+    env = {**os.environ, "PYTHONPATH": repo_root}
+    procs = [
+        subprocess.Popen([sys.executable, "-c", script, lock_path, log_path, f"proc-eng-{e}", str(r), "2"], env=env)
+        for e in range(2)
+        for r in range(2)
+    ]
+    for p in procs:
+        assert p.wait(timeout=20.0) == 0
+
+    with open(log_path, encoding="utf-8") as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
+    assert len(records) == 4
+    by_engine: dict[str, list[dict]] = {}
+    for rec in records:
+        by_engine.setdefault(rec["engine"], []).append(rec)
+    spans = sorted((min(r["t0"] for r in rs), max(r["t1"] for r in rs), eid) for eid, rs in by_engine.items())
+    assert spans[0][1] <= spans[1][0], f"Subprocess engines overlapped: {spans}"
+
+
+@pytest.mark.parametrize("safety_timeout_s", [10.0, None])
+def test_subhost_start_session_siblings_wait_while_other_engine_holds_lock_past_appear_timeout(
+    tmp_path, safety_timeout_s
+):
+    """If another engine holds the host lock longer than peer_appear_timeout_s (e.g. >120s in prod), siblings
+    keep waiting while rank 0 holds its leader lock and never enter the guarded section before rank 0."""
+    lock_path = str(tmp_path / "start_session.lock")
+    peer_hold_s = 0.25
+    short_appear_timeout_s = 0.05  # 5x shorter than peer_hold_s (models the old 120s window)
+
+    peer_locked = threading.Event()
+    peer_released_at: list[float] = []
+    entered_before_peer_release: list[int] = []
+    entered_at: dict[int, float] = {}
+    intra = threading.Barrier(4)
+    errors: list[BaseException] = []
+
+    def peer_engine():
+        with tpu_vllm_patches.serialize_subhost_start_session(
+            rank=0,
+            world_size=1,
+            engine_id="eng-peer-slow",
+            lock_path=lock_path,
+            safety_timeout_s=10.0,
+            poll_interval_s=0.005,
+        ):
+            peer_locked.set()
+            time.sleep(peer_hold_s)
+            peer_released_at.append(time.monotonic())
+
+    def waiting_worker(rank: int):
+        try:
+            assert peer_locked.wait(timeout=5.0)
+            with tpu_vllm_patches.serialize_subhost_start_session(
+                rank=rank,
+                world_size=4,
+                engine_id="eng-waiter",
+                lock_path=lock_path,
+                peer_appear_timeout_s=short_appear_timeout_s,
+                safety_timeout_s=safety_timeout_s,
+                poll_interval_s=0.005,
+            ):
+                t_enter = time.monotonic()
+                if not peer_released_at:
+                    entered_before_peer_release.append(rank)
+                entered_at[rank] = t_enter
+                intra.wait(timeout=5.0)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    peer = threading.Thread(target=peer_engine)
+    workers = [threading.Thread(target=waiting_worker, args=(r,)) for r in range(4)]
+    peer.start()
+    for w in workers:
+        w.start()
+    peer.join(timeout=10.0)
+    for w in workers:
+        w.join(timeout=10.0)
+        assert not w.is_alive()
+
+    assert errors == []
+    assert entered_before_peer_release == [], (
+        f"Workers entered before peer released lock: {entered_before_peer_release}"
+    )
+    assert set(entered_at) == {0, 1, 2, 3}
+    assert min(entered_at.values()) >= peer_released_at[0]
+
+
+@pytest.mark.parametrize("failing_rank", [0, 2])
+def test_subhost_start_session_releases_lock_on_exception(tmp_path, failing_rank):
+    """If an engine raises during init_device (either rank 0 or a sibling), the lock is released and peers proceed."""
+    lock_path = str(tmp_path / "start_session.lock")
+    intra = threading.Barrier(4)
+    seen_errors: list[str] = []
+
+    def failing_worker(rank: int):
+        try:
+            with tpu_vllm_patches.serialize_subhost_start_session(
+                rank=rank,
+                world_size=4,
+                engine_id="eng-fail",
+                lock_path=lock_path,
+                peer_appear_timeout_s=5.0,
+                safety_timeout_s=5.0,
+                poll_interval_s=0.005,
+            ):
+                intra.wait(timeout=5.0)
+                if rank == failing_rank:
+                    raise RuntimeError(f"rank-{rank} init boom")
+        except RuntimeError as exc:
+            seen_errors.append(str(exc))
+
+    threads = [threading.Thread(target=failing_worker, args=(r,)) for r in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+        assert not t.is_alive()
+    assert seen_errors == [f"rank-{failing_rank} init boom"]
+
+    # Peer engine acquires the lock immediately without hanging.
+    peer_ran = []
+    with tpu_vllm_patches.serialize_subhost_start_session(
+        rank=0,
+        world_size=1,
+        engine_id="eng-peer",
+        lock_path=lock_path,
+        safety_timeout_s=5.0,
+        poll_interval_s=0.005,
+    ):
+        peer_ran.append(True)
+    assert peer_ran == [True]
+
+
+def test_subhost_start_session_aborts_siblings_when_rank0_aborts_before_go(tmp_path):
+    """If rank 0 raises before GO, siblings see ABORT and raise instead of entering init_device unserialized."""
+    lock_path = str(tmp_path / "start_session.lock")
+    sibling_entered = threading.Event()
+    sibling_errors: list[BaseException] = []
+    real_open = os.open
+
+    def fail_on_host_lock(path, flags, *args, **kwargs):
+        if path == lock_path:
+            raise OSError("simulated lock open failure")
+        return real_open(path, flags, *args, **kwargs)
+
+    def sibling_fn():
+        try:
+            with tpu_vllm_patches.serialize_subhost_start_session(
+                rank=1,
+                world_size=2,
+                engine_id="eng-abort",
+                lock_path=lock_path,
+                peer_appear_timeout_s=30.0,
+                safety_timeout_s=30.0,
+                poll_interval_s=0.005,
+            ):
+                sibling_entered.set()
+        except BaseException as exc:
+            sibling_errors.append(exc)
+
+    sibling = threading.Thread(target=sibling_fn)
+    sibling.start()
+    try:
+        with mock.patch.object(tpu_vllm_patches.os, "open", side_effect=fail_on_host_lock):
+            with pytest.raises(OSError, match="simulated lock open failure"):
+                with tpu_vllm_patches.serialize_subhost_start_session(
+                    rank=0,
+                    world_size=2,
+                    engine_id="eng-abort",
+                    lock_path=lock_path,
+                    peer_appear_timeout_s=30.0,
+                    safety_timeout_s=30.0,
+                    poll_interval_s=0.005,
+                ):
+                    pass
+        sibling.join(timeout=3.0)
+        assert not sibling.is_alive(), "Sibling did not abort promptly on rank-0 ABORT"
+        assert not sibling_entered.is_set(), "Sibling must not enter guarded section after rank-0 ABORT"
+        assert len(sibling_errors) == 1 and isinstance(sibling_errors[0], RuntimeError)
+    finally:
+        sibling.join(timeout=5.0)
+        assert not sibling.is_alive()
+
+
+def test_subhost_start_session_aborts_all_ranks_when_safety_timeout_expires(tmp_path):
+    """If another engine holds the lock past safety_timeout_s, every rank aborts instead of running unserialized."""
+    lock_path = str(tmp_path / "start_session.lock")
+    blocker_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+    fcntl.flock(blocker_fd, fcntl.LOCK_EX)
+    entered: list[int] = []
+    errors: dict[int, BaseException] = {}
+    err_lock = threading.Lock()
+    try:
+
+        def worker_fn(rank: int):
+            try:
+                with tpu_vllm_patches.serialize_subhost_start_session(
+                    rank=rank,
+                    world_size=4,
+                    engine_id="eng-safety-timeout",
+                    lock_path=lock_path,
+                    peer_appear_timeout_s=5.0,
+                    safety_timeout_s=0.15,
+                    poll_interval_s=0.005,
+                ):
+                    entered.append(rank)
+            except BaseException as exc:
+                with err_lock:
+                    errors[rank] = exc
+
+        threads = [threading.Thread(target=worker_fn, args=(r,)) for r in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+            assert not t.is_alive()
+
+        assert entered == [], f"No rank may enter guarded section on safety timeout; entered={entered}"
+        assert set(errors) == {0, 1, 2, 3}
+        assert isinstance(errors[0], TimeoutError)
+        for r in (1, 2, 3):
+            assert isinstance(errors[r], TimeoutError | RuntimeError)
+    finally:
+        fcntl.flock(blocker_fd, fcntl.LOCK_UN)
+        os.close(blocker_fd)
+
+
+def test_subhost_start_session_aborts_when_peer_never_arrives(tmp_path):
+    """Missing sibling or missing leader aborts with TimeoutError instead of proceeding unserialized."""
+    lock_path = str(tmp_path / "start_session.lock")
+    entered = False
+    with pytest.raises(TimeoutError, match="sibling TPU worker"):
+        with tpu_vllm_patches.serialize_subhost_start_session(
+            rank=0,
+            world_size=2,
+            engine_id="eng-missing-sibling",
+            lock_path=lock_path,
+            peer_appear_timeout_s=0.08,
+            safety_timeout_s=5.0,
+            poll_interval_s=0.005,
+        ):
+            entered = True
+    assert not entered
+
+    with pytest.raises(TimeoutError, match="waiting for rank 0"):
+        with tpu_vllm_patches.serialize_subhost_start_session(
+            rank=1,
+            world_size=2,
+            engine_id="eng-missing-leader",
+            lock_path=lock_path,
+            peer_appear_timeout_s=0.08,
+            safety_timeout_s=5.0,
+            poll_interval_s=0.005,
+        ):
+            entered = True
+    assert not entered
+
+
+def test_subhost_start_session_recovers_after_hard_process_crash(tmp_path):
+    """If a process holding the host lock dies abruptly (os._exit), the OS drops flock and peer engines proceed."""
+    lock_path = str(tmp_path / "start_session.lock")
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    crash_script = (
+        "import os, sys\n"
+        "from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import serialize_subhost_start_session\n"
+        "with serialize_subhost_start_session(rank=0, world_size=1, engine_id='eng-crash', lock_path=sys.argv[1]):\n"
+        "    os._exit(42)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", crash_script, lock_path],
+        env={**os.environ, "PYTHONPATH": repo_root},
+        timeout=15.0,
+    )
+    assert proc.returncode == 42
+
+    ran = False
+    with tpu_vllm_patches.serialize_subhost_start_session(
+        rank=0,
+        world_size=1,
+        engine_id="eng-after-crash",
+        lock_path=lock_path,
+        safety_timeout_s=5.0,
+        poll_interval_s=0.005,
+    ):
+        ran = True
+    assert ran is True
+
+
+def test_subhost_start_session_sibling_aborts_on_rank0_hard_crash(tmp_path):
+    """If rank 0 dies abruptly (os._exit) before GO, sibling ranks abort promptly instead of proceeding unserialized."""
+    lock_path = str(tmp_path / "start_session.lock")
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    # Hold the host lock from the test process so rank 0 enters the leader section and blocks on host_fd.
+    blocker_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+    fcntl.flock(blocker_fd, fcntl.LOCK_EX)
+    sibling_entered = threading.Event()
+    sibling_errors: list[BaseException] = []
+    try:
+        rank0_script = (
+            "import os, sys, threading\n"
+            "from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import (\n"
+            "    serialize_subhost_start_session,\n"
+            ")\n"
+            "threading.Timer(0.25, lambda: os._exit(99)).start()\n"
+            "with serialize_subhost_start_session(\n"
+            "    rank=0, world_size=2, engine_id='eng-r0-crash',\n"
+            "    lock_path=sys.argv[1], peer_appear_timeout_s=30.0,\n"
+            "    safety_timeout_s=30.0, poll_interval_s=0.005,\n"
+            "):\n"
+            "    pass\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", rank0_script, lock_path],
+            env={**os.environ, "PYTHONPATH": repo_root},
+        )
+
+        def sibling_fn():
+            try:
+                with tpu_vllm_patches.serialize_subhost_start_session(
+                    rank=1,
+                    world_size=2,
+                    engine_id="eng-r0-crash",
+                    lock_path=lock_path,
+                    peer_appear_timeout_s=30.0,
+                    safety_timeout_s=30.0,
+                    poll_interval_s=0.005,
+                ):
+                    sibling_entered.set()
+            except BaseException as exc:
+                sibling_errors.append(exc)
+
+        sibling = threading.Thread(target=sibling_fn)
+        sibling.start()
+        assert proc.wait(timeout=10.0) == 99
+        # Sibling detects leader_path flock drop well before safety_timeout_s=30.0 and aborts with RuntimeError.
+        sibling.join(timeout=3.0)
+        assert not sibling.is_alive(), "Sibling did not detect rank-0 crash promptly"
+        assert not sibling_entered.is_set(), "Sibling must not enter guarded section after rank-0 death"
+        assert len(sibling_errors) == 1 and isinstance(sibling_errors[0], RuntimeError)
+    finally:
+        fcntl.flock(blocker_fd, fcntl.LOCK_UN)
+        os.close(blocker_fd)
+
+
+@pytest.mark.parametrize("rank, world_size", [(-1, 2), (2, 2), (0, 0)])
+def test_subhost_start_session_rejects_invalid_rank_or_world_size(tmp_path, rank, world_size):
+    with pytest.raises(ValueError, match="Expected 0 <= rank < world_size"):
+        with tpu_vllm_patches.serialize_subhost_start_session(
+            rank=rank,
+            world_size=world_size,
+            engine_id="bad",
+            lock_path=str(tmp_path / "start_session.lock"),
+        ):
+            pass
