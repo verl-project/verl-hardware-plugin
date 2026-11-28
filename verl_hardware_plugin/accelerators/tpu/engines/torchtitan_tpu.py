@@ -1917,26 +1917,51 @@ class TorchTitanTPUEngine(BaseEngine):
         if forward_only and tpu_options.static_log_prob_micro_batch_len:
             static_len = int(tpu_options.static_log_prob_micro_batch_len)
         bin_slot_len = int(getattr(self, "_bin_slot_len", 0) or 0)
-        if (
+        use_bins = bool(
             bin_slot_len > 0
             and static_len >= bin_slot_len
             and static_len % bin_slot_len == 0
             and getattr(self.engine_config, "use_dynamic_bsz", False)
             and getattr(data["input_ids"], "is_nested", False)
-        ):
+        )
+        global_pack = False
+        if use_bins:
             from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import pack_micro_batches_into_bins
 
+            pack_align, pack_max_segments = 1, 0
+            try:
+                from verl.utils.global_pack import global_pack_enabled, global_pack_settings
+
+                global_pack = global_pack_enabled()
+                if global_pack:
+                    # The controller planned each rank's sequences with these same settings (verl.utils.global_pack).
+                    _, pack_align, pack_max_segments = global_pack_settings()
+            except ImportError:
+                pass
             micro_batches, indices = pack_micro_batches_into_bins(
                 data=data,
                 dp_group=dp_group,
                 bin_len=bin_slot_len,
                 num_bins=static_len // bin_slot_len,
+                align=pack_align,
+                max_segments=pack_max_segments,
             )
         else:
             micro_batches, indices = prepare_micro_batches(
                 data=data,
                 dp_group=dp_group,
                 same_micro_num_in_dp=True,
+            )
+        if use_bins:
+            from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import log_micro_batch_fill
+
+            log_micro_batch_fill(
+                data,
+                len(micro_batches),
+                static_len,
+                dp_group,
+                tag="fwd" if forward_only else "fwd_bwd",
+                global_pack=global_pack,
             )
         static_response_len = int(tpu_options.static_max_response_len or 0)
         slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)

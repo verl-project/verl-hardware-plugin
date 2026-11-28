@@ -1616,26 +1616,28 @@ def bin_slot_permutation(
     return slot_src, contig_src, tail_ranges
 
 
+def _ffd_bins(lengths: list[int], bin_len: int, align: int, max_segments: int) -> list[list[int]]:
+    """FFD bins of ``lengths``: verl's ``ffd_pack_bins`` (the global packing planner's cost), else the same loop."""
+    try:
+        from verl.utils.global_pack import ffd_pack_bins
+    except ImportError:  # verl without global packing: plain FFD (align/max_segments only matter with it)
+        return _ffd_pack_indices(list(enumerate(lengths)), bin_len)
+    return ffd_pack_bins(lengths, bin_len, align=align, max_segments=max_segments)
+
+
 def pack_micro_batches_into_bins(
-    data: TensorDict, dp_group: Any, bin_len: int, num_bins: int
+    data: TensorDict, dp_group: Any, bin_len: int, num_bins: int, align: int = 1, max_segments: int = 0
 ) -> tuple[list[TensorDict], list[list[int]]]:
-    """Packs ``data`` into micro-batches that each provably fit ``num_bins`` bins of ``bin_len`` tokens."""
+    """Packs ``data`` into micro-batches that each provably fit ``num_bins`` bins of ``bin_len`` tokens.
+
+    First-fit decreasing over this rank's sequences, budgeting each at its ``align``-rounded length with at most
+    ``max_segments`` sequences per bin (``0``: no cap). With ``VERL_TPU_GLOBAL_PACK=1`` the controller already chose
+    each rank's sequences (``verl.utils.global_pack``) with this same FFD as the cost, so the bin count here is the
+    planned one and every rank needs (about) the same number of micro-batches.
+    """
     input_ids = data["input_ids"]
-    lengths = input_ids.offsets().diff().tolist()
-    bins: list[list[int]] = []
-    bin_used: list[int] = []
-    for idx in sorted(range(len(lengths)), key=lambda k: -int(lengths[k])):
-        ln = int(lengths[idx])
-        placed = False
-        for b in range(len(bins)):
-            if bin_used[b] + ln <= bin_len:
-                bins[b].append(idx)
-                bin_used[b] += ln
-                placed = True
-                break
-        if not placed:
-            bins.append([idx])
-            bin_used.append(ln)
+    lengths = [int(x) for x in input_ids.offsets().diff().tolist()]
+    bins = _ffd_bins(lengths, bin_len, align, max_segments)
     mb_indices: list[list[int]] = []
     for start_b in range(0, len(bins), num_bins):
         merged = [idx for b_list in bins[start_b : start_b + num_bins] for idx in b_list]
@@ -1654,6 +1656,41 @@ def pack_micro_batches_into_bins(
             mb_indices.append([popped])
     mbs = [tu.index_select_tensor_dict(data, idxs) for idxs in mb_indices]
     return mbs, mb_indices
+
+
+def log_micro_batch_fill(
+    data: TensorDict, num_micro_batches: int, static_len: int, dp_group: Any, tag: str = "", global_pack: bool = False
+) -> Optional[float]:
+    """Logs one line on global rank 0: micro-batches per rank and the real-token fill of the static rows.
+
+    ``fill = real tokens of the whole DP mini-batch / (dp * micro-batches * static_len)``. The global token count comes
+    from the ``global_token_num`` the actor worker all-gathers for every mini-batch; without it (forward-only passes)
+    one CPU all-reduce over ``dp_group`` sums the ranks' tokens. Returns the fill ratio (``None`` without a row length).
+    """
+    if static_len <= 0 or not getattr(data["input_ids"], "is_nested", False):
+        return None
+    dist_on = dp_group is not None and torch.distributed.is_initialized()
+    dp_size = torch.distributed.get_world_size(dp_group) if dist_on else 1
+    local_tokens = int(data["input_ids"].offsets()[-1])
+    global_lengths = tu.get_non_tensor_data(data=data, key="global_token_num", default=None)
+    global_lengths = getattr(global_lengths, "data", global_lengths)
+    if isinstance(global_lengths, list | tuple) and global_lengths:
+        global_tokens = int(sum(int(x) for x in global_lengths))
+    elif dist_on and dp_size > 1:
+        t_tok = torch.tensor([local_tokens], dtype=torch.int64)
+        torch.distributed.all_reduce(t_tok, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+        global_tokens = int(t_tok.item())
+    else:
+        global_tokens = local_tokens
+    rows = dp_size * max(1, int(num_micro_batches))
+    fill = global_tokens / (rows * static_len)
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        print(
+            f"[tpu_pack] {tag} global_pack={int(global_pack)} micro_batches/rank={num_micro_batches} "
+            f"dp={dp_size} seqs/rank0={len(data)} real_tokens={global_tokens} row_len={static_len} fill={fill:.3f}",
+            flush=True,
+        )
+    return fill
 
 
 def install_tpu_attention(modules: Any, use_splash: bool) -> int:
