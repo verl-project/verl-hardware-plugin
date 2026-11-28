@@ -3,6 +3,7 @@
 
 """vLLM / vllm-torchtpu runtime patches for TPU rollout."""
 
+import logging
 import os
 import types
 from unittest import mock
@@ -116,7 +117,11 @@ def test_subhost_worker_hook_drops_torch_tpu_devices_per_host():
 
 
 def _fake_fp8_quant_modules(
-    *, with_native_dummy: bool = False, native_unquantized: bool = False, quantize_prefix: bool = True
+    *,
+    with_native_dummy: bool = False,
+    native_unquantized: bool = False,
+    native_via_helper: bool = False,
+    quantize_prefix: bool = True,
 ):
     calls = []
     fused_moe_mod = types.ModuleType("vllm.model_executor.layers.fused_moe")
@@ -175,6 +180,17 @@ def _fake_fp8_quant_modules(
 
     unquantized_mod = types.ModuleType("vllm_torchtpu.layers.adapter.quantization.unquantized")
 
+    class VllmUnquantizedFusedMoEMethod:
+        def __init__(self, moe_config):
+            self.moe_config = moe_config
+
+    def _native_moe_method(cfg, layer, prefix):
+        # vllm-torchtpu#2967 (717a50d1); vllm_config="native" marks objects built by upstream, not the shim.
+        if configs_mod.should_quantize_on_load(prefix):
+            fp8_config = VllmFp8Config(is_checkpoint_fp8_serialized=False, vllm_config="native")
+            return VllmFp8MoEMethodTPU(fp8_config, cfg.get_moe_config(layer))
+        return VllmUnquantizedFusedMoEMethod(cfg.get_moe_config(layer))
+
     class VllmUnquantizedConfig:
         def __init__(self, has_bias=False):
             self._has_bias = has_bias
@@ -186,14 +202,28 @@ def _fake_fp8_quant_modules(
 
             def get_quant_method(self, layer, prefix):
                 if isinstance(layer, RoutedExperts):
-                    return "native_pr2967"
+                    if configs_mod.should_quantize_on_load(prefix):
+                        fp8_config = VllmFp8Config(is_checkpoint_fp8_serialized=False, vllm_config="native")
+                        return VllmFp8MoEMethodTPU(fp8_config, self.get_moe_config(layer))
+                    return VllmUnquantizedFusedMoEMethod(self.get_moe_config(layer))
+                return "orig_quant"
+        elif native_via_helper:
+            # Native #2967 routing after a refactor that moves it into a helper: the name
+            # VllmFp8MoEMethodTPU no longer appears in get_quant_method's own source.
+            def get_quant_method(self, layer, prefix):
+                if isinstance(layer, RoutedExperts):
+                    return _native_moe_method(self, layer, prefix)
                 return "orig_quant"
         else:
-
+            # Mirrors pre-#2967 vllm-torchtpu (e.g. 281b52666): handles RoutedExperts with the
+            # unquantized MoE method, without routing QUANTIZE_ON_LOAD_PREFIXES to VllmFp8MoEMethodTPU.
             def get_quant_method(self, layer, prefix):
+                if isinstance(layer, RoutedExperts):
+                    return VllmUnquantizedFusedMoEMethod(self.get_moe_config(layer))
                 return "orig_quant"
 
     unquantized_mod.VllmUnquantizedConfig = VllmUnquantizedConfig
+    unquantized_mod.VllmUnquantizedFusedMoEMethod = VllmUnquantizedFusedMoEMethod
 
     modules = {
         "vllm": types.ModuleType("vllm"),
@@ -283,13 +313,26 @@ def test_patch_tpu_fp8_moe_rollout_skips_when_native_fixes_present():
         with_native_dummy=True, native_unquantized=True
     )
     orig_create = fp8_mod.VllmFp8MoEMethodTPU.create_weights
-    orig_get_quant = unquantized_mod.VllmUnquantizedConfig.get_quant_method
     with mock.patch.dict("sys.modules", modules):
         tpu_vllm_patches.patch_tpu_fp8_moe_rollout()
     assert fp8_mod.VllmFp8MoEMethodTPU.create_weights is orig_create
-    assert unquantized_mod.VllmUnquantizedConfig.get_quant_method is orig_get_quant
-    assert unquantized_mod.VllmUnquantizedConfig().get_quant_method(RoutedExperts(), "experts") == "native_pr2967"
+    cfg = unquantized_mod.VllmUnquantizedConfig()
+    native_method = cfg.get_quant_method(RoutedExperts(), "experts")
+    assert isinstance(native_method, fp8_mod.VllmFp8MoEMethodTPU)
+    assert native_method.quant_config.vllm_config == "native"  # upstream's object, not the shim's
+    assert isinstance(cfg.get_quant_method(RoutedExperts(), "mlp.gate"), unquantized_mod.VllmUnquantizedFusedMoEMethod)
     assert calls == []
+
+
+def test_pr2967_shim_defers_to_native_routing_behind_a_helper():
+    """A refactor that hides VllmFp8MoEMethodTPU from get_quant_method's own source must not let the shim
+    replace upstream's FP8 MoE method with its own."""
+    modules, _, fp8_mod, _, unquantized_mod, RoutedExperts = _fake_fp8_quant_modules(native_via_helper=True)
+    with mock.patch.dict("sys.modules", modules):
+        tpu_vllm_patches.patch_tpu_fp8_moe_rollout()
+        method = unquantized_mod.VllmUnquantizedConfig().get_quant_method(RoutedExperts(), "model.layers.0.mlp.experts")
+        assert isinstance(method, fp8_mod.VllmFp8MoEMethodTPU)
+        assert method.quant_config.vllm_config == "native"
 
 
 def test_patch_tpu_fp8_moe_rollout_installs_pr2967_routed_experts_shim():
@@ -301,11 +344,36 @@ def test_patch_tpu_fp8_moe_rollout_installs_pr2967_routed_experts_shim():
         assert isinstance(method, fp8_mod.VllmFp8MoEMethodTPU)
         assert method.quant_config.is_checkpoint_fp8_serialized is False
         assert method.quant_config.activation_scheme == "dynamic"
-        assert cfg.get_quant_method(RoutedExperts(), "model.layers.0.self_attn") == "orig_quant"
+        unmatched = cfg.get_quant_method(RoutedExperts(), "model.layers.0.mlp.gate")
+        assert isinstance(unmatched, unquantized_mod.VllmUnquantizedFusedMoEMethod)
+        assert cfg.get_quant_method(object(), "model.layers.0.mlp.experts") == "orig_quant"  # not RoutedExperts
         with pytest.raises(NotImplementedError, match="expert bias"):
             unquantized_mod.VllmUnquantizedConfig(has_bias=True).get_quant_method(
                 RoutedExperts(), "model.layers.0.mlp.experts"
             )
+
+
+def test_pr2967_shim_warns_once_on_unexpected_upstream_method(caplog):
+    """Warn once if upstream returns neither VllmFp8MoEMethodTPU nor VllmUnquantizedFusedMoEMethod."""
+    modules, _, _, _, unquantized_mod, RoutedExperts = _fake_fp8_quant_modules()
+
+    class UnexpectedMoEMethod:
+        pass
+
+    unexpected = UnexpectedMoEMethod()
+    unquantized_mod.VllmUnquantizedConfig.get_quant_method = lambda self, layer, prefix: unexpected
+    with (
+        mock.patch.dict("sys.modules", modules),
+        caplog.at_level(logging.WARNING, logger=tpu_vllm_patches.__name__),
+    ):
+        tpu_vllm_patches.patch_tpu_fp8_moe_rollout()
+        cfg = unquantized_mod.VllmUnquantizedConfig()
+        assert cfg.get_quant_method(RoutedExperts(), "model.layers.0.mlp.experts") is unexpected
+        assert cfg.get_quant_method(RoutedExperts(), "model.layers.1.mlp.experts") is unexpected
+    warnings = [rec for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "UnexpectedMoEMethod" in warnings[0].message
+    assert "QUANTIZE_ON_LOAD_PREFIXES" in warnings[0].message
 
 
 def _fake_gpu_model_runner_modules():
