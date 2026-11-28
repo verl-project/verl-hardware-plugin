@@ -123,7 +123,8 @@ TPU_SINGLE_HOST_MAX_CHIPS = 4
 # when neither is available (no webhook variables and no Ray labels), keyed by device count: a host holds 4
 # chips (``2x2x1``) = 8 devices, and the multi-host entries follow the GKE slice shapes (``2x2x2`` = 2 hosts,
 # ``2x2x4`` = 4, ``2x4x4`` = 8, ``4x4x4`` = 16, ``4x4x8`` = 32). Only whole hosts (and a single device) are
-# listed: a standalone process can open only a chip's first core. Rollout engines that use part of a host take
+# listed: a standalone process can open only a chip's first core unless explicit 4-D single-core bounds are set
+# (as sub-host TP=1 rollout engines do). Rollout engines that use part of a host take
 # ``TPU_V7X_SUBHOST_TOPOLOGY_MAP`` instead (see ``single_host_tpu_topology``).
 TPU_V7X_CORES_PER_CHIP = 2
 TPU_V7X_DEVICES_PER_HOST = 8
@@ -138,15 +139,20 @@ TPU_V7X_TOPOLOGY_MAP = {
     128: "4,4,4,2",
     256: "4,4,8,2",
 }
-# The mesh of a rollout engine on part of one TPU 7x host, one process per TensorCore: TP=2 is one chip
-# (``1,1,1,2``), TP=4 two chips (``1,2,1,2``). Validated on ``2x2x1`` hosts running four TP=2 or two TP=4
-# vLLM engines side by side (tpu_dist init and all-reduce, then GRPO training). Only the single-host rollout
-# uses it; a trainer pool of 2 or 4 devices is not validated and still needs ``TORCH_TPU_TOPOLOGY``.
+# The mesh of a rollout engine on part of one TPU 7x host, one process per TensorCore: TP=1 is one TensorCore
+# (``1,1,1,1``), TP=2 is one chip (``1,1,1,2``), TP=4 two chips (``1,2,1,2``). Validated on ``2x2x1`` hosts running
+# eight TP=1 (both TensorCores of every chip via explicit 4-D ``1,1,1,1`` bounds), four TP=2, or two TP=4 vLLM
+# engines side by side. Note that ``single_host_tpu_topology`` checks ``TPU_V7X_TOPOLOGY_MAP`` first (which also maps
+# ``1 -> "1,1,1,1"``); keeping ``1`` here is what opts TPU 7x TP=1 rollout replicas into sub-host slotting, host
+# claim, and disjoint ports. Only the single-host rollout uses it; a trainer pool of 2 or 4 devices is not validated
+# and still needs ``TORCH_TPU_TOPOLOGY``.
 TPU_V7X_SUBHOST_TOPOLOGY_MAP = {
+    1: "1,1,1,1",
     2: "1,1,1,2",
     4: "1,2,1,2",
 }
 # One process per TensorCore: every process is a ``1,1,1,1`` cell of the mesh.
+# Mirrored as ``_V7X_SINGLE_CORE_BOUNDS`` in ``rollout/tpu_vllm_patches.py`` (leaf module; tested equal).
 TPU_V7X_PROCESS_BOUNDS = "1,1,1,1"
 
 
@@ -473,8 +479,9 @@ def single_host_tpu_topology(num_chips: int, pod_type: str = "") -> str:
 
     Such a replica must not inherit the slice's ``TORCH_TPU_TOPOLOGY`` (set by the GKE TPU webhook or the job):
     vllm-torchtpu builds the slice-builder addresses of its local workers only, and libtpu then fails with
-    "Expected <slice chips> worker addresses, got <host chips>". On TPU 7x a TP=2 / TP=4 replica, which uses part
-    of a host, takes ``TPU_V7X_SUBHOST_TOPOLOGY_MAP``. Sizes without a known mesh return ``""`` so that the
+    "Expected <slice chips> worker addresses, got <host chips>". On TPU 7x a TP=1 / TP=2 / TP=4 replica, which uses
+    part of a host, takes the sub-host path (``TPU_V7X_SUBHOST_TOPOLOGY_MAP``; ``1`` is also in
+    ``TPU_V7X_TOPOLOGY_MAP`` with the same ``"1,1,1,1"`` mesh). Sizes without a known mesh return ``""`` so that the
     caller keeps the inherited environment rather than failing.
     """
     if is_tpu_v7x(pod_type):

@@ -37,6 +37,7 @@ import inspect
 import logging
 import multiprocessing.process
 import os
+import re
 import sys
 import time
 import uuid
@@ -518,7 +519,7 @@ def patch_vllm_for_tpu() -> None:
     patch_tpu_async_scheduling_update_states()
     if os.environ.get(SUBHOST_MEGASCALE_PORT_ENV):
         patch_tpu_worker_subhost_env()
-        if subhost_serialize_start_session_enabled():
+        if subhost_serialize_start_session_enabled() or _subhost_tp1_chip_order_active():
             patch_tpu_worker_subhost_start_session()
     _PATCHES_APPLIED = True
     logger.info("Successfully applied all TPU patches to vLLM and vllm-torchtpu.")
@@ -526,6 +527,12 @@ def patch_vllm_for_tpu() -> None:
 
 # Set by tpu_vllm.subhost_engine_env on an engine that shares its host: the first port of the engine's MegaScale block.
 SUBHOST_MEGASCALE_PORT_ENV = "VERL_TPU_SUBHOST_MEGASCALE_PORT"
+# Mirrors tpu_vllm.SUBHOST_OWNER_ENV (kept here to avoid importing tpu_vllm from a leaf module; tested equal).
+_SUBHOST_OWNER_ENV = "VERL_TPU_SUBHOST_OWNER"
+# Mirrors platform_tpu.TPU_V7X_PROCESS_BOUNDS (leaf module; tested equal).
+_V7X_SINGLE_CORE_BOUNDS = "1,1,1,1"
+# Keep per-chip liveness flock fds open until process exit so paired odd cores can test even-core liveness via flock.
+_TP1_CHIP_ALIVE_FDS: list[int] = []
 # Unique per-launch identifier for one sub-host engine, shared across all of its TP worker processes.
 SUBHOST_ENGINE_ID_ENV = "VERL_TPU_SUBHOST_ENGINE_ID"
 # Enabled by default for co-located sub-host engines; set to "0" to opt out of host-wide StartSession serialization.
@@ -556,15 +563,35 @@ _POD_TPU_ENV_VARS = (
 )
 
 
-def subhost_worker_env(rank: int, local_rank: int, megascale_port: int) -> dict[str, str]:
-    """The per-worker variables of an engine that shares its host; ``local_rank`` includes the engine's offset."""
-    return {
+def subhost_worker_env(rank: int, local_rank: int, megascale_port: int, world_size: int = 0) -> dict[str, str]:
+    """The per-worker variables of an engine that shares its host; ``local_rank`` includes the engine's offset.
+
+    For ``world_size == 1`` (TP=1 on TPU 7x), also restores explicit 4-D ``1,1,1,1`` bounds and per-slot localhost
+    process addresses after ``_POD_TPU_ENV_VARS`` are stripped so both TensorCores of a chip can run independently.
+    """
+    env = {
         "TPU_VISIBLE_DEVICES": str(local_rank),
         "TPU_VISIBLE_CHIPS": str(local_rank),
         "MEGASCALE_PORT": str(megascale_port + 2 * rank),
         "MEGASCALE_DEBUG_PORT": str(megascale_port + 2 * rank + 1),
         "TPU_LOG_DIR": f"/tmp/tpu_logs/rank_{local_rank}",
     }
+    if world_size == 1:
+        process_port = megascale_port + 2
+        env.update(
+            {
+                "TPU_HOST_BOUNDS": _V7X_SINGLE_CORE_BOUNDS,
+                "TPU_PROCESS_BOUNDS": _V7X_SINGLE_CORE_BOUNDS,
+                "TPU_CHIPS_PER_HOST_BOUNDS": _V7X_SINGLE_CORE_BOUNDS,
+                "TPU_CHIPS_PER_PROCESS_BOUNDS": _V7X_SINGLE_CORE_BOUNDS,
+                "CLOUD_TPU_TASK_ID": "0",
+                "TPU_WORKER_ID": "0",
+                "TPU_WORKER_HOSTNAMES": "localhost",
+                "TPU_PROCESS_ADDRESSES": f"localhost:{process_port}",
+                "TPU_PROCESS_PORT": str(process_port),
+            }
+        )
+    return env
 
 
 def patch_tpu_worker_subhost_env() -> None:
@@ -589,13 +616,22 @@ def patch_tpu_worker_subhost_env() -> None:
         original(rank, local_rank, world_size, local_world_size)
         for name in _POD_TPU_ENV_VARS:
             os.environ.pop(name, None)
-        env = subhost_worker_env(int(rank), int(local_rank), megascale_port)
+        env = subhost_worker_env(int(rank), int(local_rank), megascale_port, world_size=int(world_size))
         os.makedirs(env["TPU_LOG_DIR"], exist_ok=True)
         os.environ.update(env)
 
     _configure_tpu_process_env._verl_subhost_env = True  # type: ignore[attr-defined]
     tpu_worker._configure_tpu_process_env = _configure_tpu_process_env
     logger.info("Applied the TPU patch for engines that share a host (MegaScale ports from %d).", megascale_port)
+
+
+def _subhost_tp1_chip_order_active() -> bool:
+    """Whether this worker needs TPU 7x TP=1 even-before-odd per-chip StartSession ordering."""
+    return (
+        bool(os.environ.get(SUBHOST_MEGASCALE_PORT_ENV))
+        and bool(os.environ.get(_SUBHOST_OWNER_ENV))
+        and os.environ.get("TORCH_TPU_TOPOLOGY") == _V7X_SINGLE_CORE_BOUNDS
+    )
 
 
 def subhost_serialize_start_session_enabled() -> bool:
@@ -923,14 +959,99 @@ def serialize_subhost_start_session(
             )
 
 
-def patch_tpu_worker_subhost_start_session() -> None:
-    """Serialize ``TPUWorker.init_device`` across co-located sub-host engines on the same TPU host.
+def _tp1_chip_handshake_paths(owner: str, chip: int, base_dir: str = "/tmp") -> tuple[str, str]:
+    """Per-controller per-chip liveness lock and ready marker for TPU 7x TP=1 dual-core bootstrap."""
+    safe_owner = re.sub(r"[^A-Za-z0-9_.-]", "_", owner)
+    alive_path = os.path.join(base_dir, f"verl_tpu_subhost_chip{chip}_{safe_owner}.alive")
+    ready_path = os.path.join(base_dir, f"verl_tpu_subhost_chip{chip}_{safe_owner}.ready")
+    return alive_path, ready_path
 
-    Installed only when ``SUBHOST_MEGASCALE_PORT_ENV`` is set (sub-host engines where ``engines_per_host > 1``)
-    and ``SUBHOST_SERIALIZE_START_SESSION_ENV`` is not disabled. Engines without ``SUBHOST_MEGASCALE_PORT_ENV``
-    (whole-host, multi-host, and non-sub-host engines) never install this wrapper.
+
+def _acquire_tp1_chip_alive_lock(
+    alive_path: str,
+    ready_path: str,
+    core: int,
+    *,
+    safety_timeout_s: float | None = _SUBHOST_INIT_SAFETY_TIMEOUT_S,
+    poll_interval_s: float = _SUBHOST_INIT_POLL_INTERVAL_S,
+) -> int:
+    """Acquire the persistent per-chip liveness ``flock`` held by a TP=1 even core until process exit."""
+    lock_dir = os.path.dirname(alive_path)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
+    fd = os.open(alive_path, os.O_RDWR | os.O_CREAT, 0o666)
+    deadline = None if safety_timeout_s is None else time.monotonic() + safety_timeout_s
+    if not _acquire_flock(fd, deadline, poll_interval_s):
+        os.close(fd)
+        raise TimeoutError(
+            f"TPU 7x TP=1 even core {core} timed out after {safety_timeout_s}s acquiring chip liveness lock "
+            f"{alive_path}."
+        )
+    # Remove any stale ready marker left by a previously exited even core on this chip before init_device runs.
+    try:
+        os.unlink(ready_path)
+    except FileNotFoundError:
+        pass
+    os.pwrite(fd, f"{os.getpid()}\n".encode(), 0)
+    return fd
+
+
+def _wait_for_tp1_even_core_ready(
+    alive_path: str,
+    ready_path: str,
+    core: int,
+    *,
+    peer_appear_timeout_s: float = _SUBHOST_INIT_PEER_APPEAR_TIMEOUT_S,
+    safety_timeout_s: float | None = _SUBHOST_INIT_SAFETY_TIMEOUT_S,
+    poll_interval_s: float = _SUBHOST_INIT_POLL_INTERVAL_S,
+) -> None:
+    """Block a TPU 7x TP=1 odd core until its chip's even core holds ``alive_path`` and publishes ``ready_path``.
+
+    - ``alive_path`` locked and ``ready_path`` present: even core completed ``StartSession`` and is alive -> proceed.
+    - ``alive_path`` locked without ``ready_path``: even core is queued or initializing -> keep waiting up to
+      ``safety_timeout_s`` (reusing the host-serializer safety bound).
+    - ``alive_path`` unlocked: even core has not started yet or exited -> wait up to ``peer_appear_timeout_s`` and
+      raise ``TimeoutError`` (ignoring any stale ``ready_path`` left by an exited process).
     """
-    if not subhost_serialize_start_session_enabled():
+    now = time.monotonic()
+    appear_deadline = now + peer_appear_timeout_s
+    safety_deadline = None if safety_timeout_s is None else now + safety_timeout_s
+    while True:
+        alive = _is_lock_held(alive_path)
+        if alive and os.path.exists(ready_path):
+            return
+        t = time.monotonic()
+        if safety_deadline is not None and t >= safety_deadline:
+            raise TimeoutError(
+                f"TPU 7x TP=1 core {core} timed out after {safety_timeout_s}s waiting for chip "
+                f"{core // 2}'s even core (core {core - 1}) to finish StartSession ({ready_path})."
+            )
+        if not alive and t >= appear_deadline:
+            raise TimeoutError(
+                f"TPU 7x TP=1 core {core} timed out after {peer_appear_timeout_s}s waiting for chip "
+                f"{core // 2}'s even core (core {core - 1}) to appear and hold {alive_path}."
+            )
+        time.sleep(poll_interval_s)
+
+
+def patch_tpu_worker_subhost_start_session() -> None:
+    """Serialize ``TPUWorker.init_device`` across co-located sub-host engines and order TPU 7x TP=1 chip cores.
+
+    Installed only when ``SUBHOST_MEGASCALE_PORT_ENV`` is set (sub-host engines where ``engines_per_host > 1``) and
+    either host-wide serialization is enabled or TPU 7x TP=1 per-chip ordering is active. Engines without
+    ``SUBHOST_MEGASCALE_PORT_ENV`` (whole-host, multi-host, and non-sub-host engines) never install this wrapper.
+
+    On TPU 7x dual-core chips running two independent TP=1 engines, only the even core runs ``tpunetd``
+    ``StartSession`` (the odd core logs ``process_owns_chips is false, using NoOpControl``). If an odd core enters
+    TPU runtime initialization before its paired even core completes ``StartSession``, the odd core can observe a
+    stale multi-chip id and abort with ``tpu_topology.cc: Check failed: index < ReduceProductDimensions(bounds)``.
+    Keeping the odd-core wait inside this single wrapper *before* acquiring ``SUBHOST_START_SESSION_LOCK_FILE``
+    guarantees an odd core arriving first cannot hold the host lock while waiting for its paired even core.
+    ``VERL_TPU_SUBHOST_SERIALIZE_START_SESSION=0`` disables host-wide mutual exclusion only; TP=1 per-chip ordering
+    remains enforced because odd-first initialization is a correctness failure (tracked upstream in
+    ``google-pytorch/torch_tpu#7213``; remove this ordering workaround once fixed there).
+    """
+    if not subhost_serialize_start_session_enabled() and not _subhost_tp1_chip_order_active():
         return
     try:
         import vllm_torchtpu.worker.tpu_worker as tpu_worker
@@ -951,13 +1072,62 @@ def patch_tpu_worker_subhost_start_session() -> None:
             os.environ.get(SUBHOST_ENGINE_ID_ENV)
             or f"ppid{os.getppid()}_p{os.environ.get(SUBHOST_MEGASCALE_PORT_ENV, '0')}"
         )
-        with serialize_subhost_start_session(
-            rank=rank,
-            world_size=world_size,
-            engine_id=engine_id,
-            lock_path=SUBHOST_START_SESSION_LOCK_FILE,
-        ):
-            return original(self, *args, **kwargs)
+        serialize = subhost_serialize_start_session_enabled()
+        owner = os.environ.get(_SUBHOST_OWNER_ENV, "")
+        tp1_order = world_size == 1 and bool(owner) and os.environ.get("TORCH_TPU_TOPOLOGY") == _V7X_SINGLE_CORE_BOUNDS
+
+        def _run_serialized():
+            if not serialize:
+                return original(self, *args, **kwargs)
+            with serialize_subhost_start_session(
+                rank=rank,
+                world_size=world_size,
+                engine_id=engine_id,
+                lock_path=SUBHOST_START_SESSION_LOCK_FILE,
+            ):
+                return original(self, *args, **kwargs)
+
+        if not tp1_order:
+            return _run_serialized()
+
+        core = int(os.environ.get("TPU_LOCAL_RANK_OFFSET", "0"))
+        alive_path, ready_path = _tp1_chip_handshake_paths(owner, core // 2)
+        if core % 2 == 1:
+            # Wait BEFORE acquiring the host StartSession lock so an odd core arriving first cannot deadlock.
+            _wait_for_tp1_even_core_ready(alive_path, ready_path, core)
+            return _run_serialized()
+
+        alive_fd = _acquire_tp1_chip_alive_lock(alive_path, ready_path, core)
+        try:
+            ctx = (
+                serialize_subhost_start_session(
+                    rank=rank,
+                    world_size=world_size,
+                    engine_id=engine_id,
+                    lock_path=SUBHOST_START_SESSION_LOCK_FILE,
+                )
+                if serialize
+                else contextlib.nullcontext()
+            )
+            with ctx:
+                result = original(self, *args, **kwargs)
+                if hasattr(torch, "tpu"):
+                    # Force TPU runtime initialization if deferred so this chip's StartSession finishes before
+                    # the paired odd core enters init_device.
+                    torch.empty(1, device="tpu")
+                _write_atomic(ready_path, f"{os.getpid()}\n".encode())
+        except BaseException:
+            try:
+                try:
+                    os.unlink(ready_path)
+                except OSError:
+                    pass
+                fcntl.flock(alive_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(alive_fd)
+            raise
+        _TP1_CHIP_ALIVE_FDS.append(alive_fd)
+        return result
 
     init_device._verl_subhost_start_session = True  # type: ignore[attr-defined]
     worker_cls.init_device = init_device

@@ -172,8 +172,15 @@ part of a slice) does a pool take the fallback shape for its device count from `
 The generation comes from the `ray.io/tpu-pod-type` node label of the pool's hosts or
 from `TPU_ACCELERATOR_TYPE`; set `TORCH_TPU_TOPOLOGY='x,y,z,cores'` to override. Rollout engines on TPU 7x
 use one worker per TensorCore, e.g. a TP=8 engine per host; on every generation an engine's mesh is its
-own worker count. A TP=2 or TP=4 rollout engine on one TPU 7x host takes `1,1,1,2` (one chip) or `1,2,1,2`
-(two chips) from `TPU_V7X_SUBHOST_TOPOLOGY_MAP`.
+own worker count. A TP=1, TP=2, or TP=4 rollout engine on one TPU 7x host takes `1,1,1,1` (one TensorCore, allowing up
+to eight independent TP=1 engines across both cores of every chip), `1,1,1,2` (one chip), or `1,2,1,2` (two chips) from
+`TPU_V7X_SUBHOST_TOPOLOGY_MAP`. Because a TP=1 engine holds a full copy of the model on a single `94.74 GiB` (96 GB)
+TensorCore, small models (e.g., `Qwen3.5-0.8B`) fit in BF16 including `tpu-sync` staging, whereas larger models such as
+`Qwen3.5-35B-A3B` (~64.6 GiB in BF16, leaving only ~2 GiB for KV cache at `gpu_memory_utilization=0.70`) practically
+require FP8 weights for serving (~1.65M KV tokens/core at `0.70`) and additionally require chunked staging or `EP=1`
+FP8 direct receive for full RL weight sync with `tpu-sync`. See
+[vLLM & SGLang Rollout](./rollout.md#several-engines-per-host-tpu-7x) for sub-host port, startup-ordering, and
+weight-sync considerations.
 
 ### Device memory
 

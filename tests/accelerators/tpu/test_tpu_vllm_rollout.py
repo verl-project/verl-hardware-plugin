@@ -322,7 +322,8 @@ def test_replica_launch_servers_rejects_a_single_host_replica_split_across_hosts
         ("v7x-8", 8, "2,2,1,2"),
         ("v6e-8", 8, "2,4,1"),
         ("v5p-16", 4, "2,2,1"),
-        # TP=2 / TP=4 on TPU 7x: the mesh of the replica's one or two chips.
+        # TP=1 / TP=2 / TP=4 on TPU 7x: the mesh of the replica's single core, one chip, or two chips.
+        ("v7x-8", 1, "1,1,1,1"),
         ("v7x-8", 2, "1,1,1,2"),
         ("v7x-8", 4, "1,2,1,2"),
         # No known mesh: the replica keeps the inherited value instead of failing.
@@ -346,7 +347,7 @@ def test_replica_single_host_topology_from_ray(tpu_vllm, monkeypatch, pod_type, 
 
 
 # ---------------------------------------------------------------------------
-# Several engines on one TPU 7x host (8 x TP=4, 16 x TP=2)
+# Several engines on one TPU 7x host (8 x TP=1, 4 x TP=2, 2 x TP=4 per host)
 # ---------------------------------------------------------------------------
 
 
@@ -381,13 +382,17 @@ def _engine_ports(env, chips):
     megascale = int(env[SUBHOST_MEGASCALE_PORT_ENV])
     ports = {int(env["MASTER_PORT"]), int(env["MEGASCALE_COORDINATOR_ADDRESS"].rsplit(":", 1)[1])}
     ports |= {int(address.rsplit(":", 1)[1]) for address in env["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")}
+    if "TPU_PROCESS_PORT" in env:
+        ports.add(int(env["TPU_PROCESS_PORT"]))
     for rank in range(chips):
-        worker = subhost_worker_env(rank, int(env["TPU_LOCAL_RANK_OFFSET"]) + rank, megascale)
+        worker = subhost_worker_env(rank, int(env["TPU_LOCAL_RANK_OFFSET"]) + rank, megascale, world_size=chips)
         ports |= {int(worker["MEGASCALE_PORT"]), int(worker["MEGASCALE_DEBUG_PORT"])}
+        if "TPU_PROCESS_PORT" in worker:
+            ports.add(int(worker["TPU_PROCESS_PORT"]))
     return ports
 
 
-@pytest.mark.parametrize("chips, topology", [(4, "1,2,1,2"), (2, "1,1,1,2")])
+@pytest.mark.parametrize("chips, topology", [(4, "1,2,1,2"), (2, "1,1,1,2"), (1, "1,1,1,1")])
 def test_replica_gives_engines_on_one_host_disjoint_devices_and_ports(tpu_vllm, chips, topology):
     # Replicas arrive in any order (asyncio.gather): here the highest rank first.
     per_host = 8 // chips
@@ -403,6 +408,36 @@ def test_replica_gives_engines_on_one_host_disjoint_devices_and_ports(tpu_vllm, 
         assert env["TPU_MULTIHOST_BACKEND"] == "mp"
         assert env["MASTER_ADDR"] == "127.0.0.1"
         assert len(env["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == chips
+        if chips == 1:
+            from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import (
+                _SUBHOST_OWNER_ENV,
+                _V7X_SINGLE_CORE_BOUNDS,
+                SUBHOST_MEGASCALE_PORT_ENV,
+                subhost_worker_env,
+            )
+
+            assert _V7X_SINGLE_CORE_BOUNDS == tpu_vllm.TPU_V7X_PROCESS_BOUNDS
+            assert _SUBHOST_OWNER_ENV == tpu_vllm.SUBHOST_OWNER_ENV
+            assert env["TPU_HOST_BOUNDS"] == "1,1,1,1"
+            assert env["TPU_PROCESS_BOUNDS"] == "1,1,1,1"
+            assert env["TPU_CHIPS_PER_HOST_BOUNDS"] == "1,1,1,1"
+            assert env["TPU_CHIPS_PER_PROCESS_BOUNDS"] == "1,1,1,1"
+            assert env["TPU_VISIBLE_DEVICES"] == env["TPU_VISIBLE_CHIPS"] == env["TPU_LOCAL_RANK_OFFSET"]
+            assert env["CLOUD_TPU_TASK_ID"] == env["TPU_WORKER_ID"] == "0"
+            assert env["TPU_WORKER_HOSTNAMES"] == "localhost"
+            assert env["TPU_PROCESS_ADDRESSES"] == f"localhost:{env['TPU_PROCESS_PORT']}"
+            worker_env = subhost_worker_env(
+                0, int(env["TPU_LOCAL_RANK_OFFSET"]), int(env[SUBHOST_MEGASCALE_PORT_ENV]), world_size=1
+            )
+            assert worker_env["TPU_PROCESS_PORT"] == env["TPU_PROCESS_PORT"]
+            assert worker_env["TPU_PROCESS_ADDRESSES"] == env["TPU_PROCESS_ADDRESSES"]
+            for bound_key in (
+                "TPU_HOST_BOUNDS",
+                "TPU_PROCESS_BOUNDS",
+                "TPU_CHIPS_PER_HOST_BOUNDS",
+                "TPU_CHIPS_PER_PROCESS_BOUNDS",
+            ):
+                assert worker_env[bound_key] == env[bound_key]
         for name, prefix in (
             ("VLLM_CACHE_ROOT", "/tmp/vllm_cache"),
             ("TORCHINDUCTOR_CACHE_DIR", "/tmp/inductor_cache"),
@@ -433,10 +468,10 @@ def test_replica_slots_are_per_host(tpu_vllm):
     assert [env["TPU_LOCAL_RANK_OFFSET"] for env in envs] == ["0", "0", "4", "4"]
 
 
-@pytest.mark.parametrize("pod_type, chips", [("v7x-8", 8), ("v7x-8", 1), ("v6e-8", 4)])
+@pytest.mark.parametrize("pod_type, chips", [("v7x-8", 8), ("v6e-8", 4), ("v6e-8", 1)])
 def test_replica_whole_host_and_other_replicas_are_unchanged(tpu_vllm, monkeypatch, pod_type, chips):
-    # A TP=8 replica owns its TPU 7x host; TP=1 (a standalone process opens only a chip's first core) and other
-    # generations are not sub-host engines either. Their server env is what it was before.
+    # A TP=8 replica owns its TPU 7x host, and other TPU generations do not use v7x sub-host slotting.
+    # Their server env is what it was before.
     monkeypatch.delenv("TPU_ACCELERATOR_TYPE", raising=False)
     replica = _single_host_replica(tpu_vllm, 0, chips)
     nodes = [{"Alive": True, "Resources": {"TPU": 8.0}, "NodeID": NODE_A, "Labels": {"ray.io/tpu-pod-type": pod_type}}]
@@ -494,8 +529,8 @@ def test_default_subhost_ports_are_clear_of_ray_workers_and_ephemeral_ports(tpu_
     assert (ray_low, ray_high) == (10002, 19999)  # ray start's --min-worker-port / --max-worker-port defaults
     assert block.start > ray_high and block.stop - 1 < tpu_vllm.EPHEMERAL_PORTS[0]
     tpu_vllm.check_subhost_port_block(block)
-    # Every port of 4 x TP=2 or 2 x TP=4 engines, and of their workers, is inside the block.
-    for chips in (2, 4):
+    # Every port of 8 x TP=1, 4 x TP=2, or 2 x TP=4 engines, and of their workers, is inside the block.
+    for chips in (1, 2, 4):
         for slot in range(8 // chips):
             assert _engine_ports(tpu_vllm.subhost_engine_env(slot, chips, replica_rank=slot), chips) <= set(block)
 

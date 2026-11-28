@@ -70,12 +70,25 @@ The rollout settings that matter on TPU (the recipes already set them):
 
 ### Several engines per host (TPU 7x)
 
-With `tensor_model_parallel_size` 2 or 4 on TPU 7x (one or two chips), several replicas share a host, e.g.
-16 x TP=2 or 8 x TP=4 on four `2x2x1` rollout hosts. `auto_assign_accelerator_type` spreads the replicas evenly
-over the slices the rollout replicas hold, and each engine on a host gets its own slot of the host's devices
-(`TPU_LOCAL_RANK_OFFSET`), fixed ports, its own libtpu MegaScale coordinator, and compile caches under
-`/tmp/*_tp<N>_r<replica>`. The replicas on a host must all use the same TP size. TP=8 (a whole host) and
-multi-host replicas launch as before.
+With `tensor_model_parallel_size` 1, 2, or 4 on TPU 7x (one TensorCore, one chip, or two chips), several replicas
+share a host, e.g. 32 x TP=1, 16 x TP=2, or 8 x TP=4 on four `2x2x1` rollout hosts. `auto_assign_accelerator_type`
+spreads the replicas evenly over the slices the rollout replicas hold, and each engine on a host gets its own slot of
+the host's devices (`TPU_LOCAL_RANK_OFFSET`), fixed ports, its own libtpu MegaScale coordinator (and explicit 4-D
+`1,1,1,1` single-core bounds for TP=1 so both cores of every chip can run independently), and compile caches under
+`/tmp/*_tp<N>_r<replica>`. The replicas on a host must all use the same TP size. TP=8 (a whole host) and multi-host
+replicas launch as before.
+
+- **Applicability (TP=1 HBM & weight sync):** each TP=1 engine stores a full model copy on one `94.74 GiB` (96 GB)
+  TensorCore. Small models (e.g., `Qwen3.5-0.8B`) fit comfortably in BF16 including `tpu-sync` staging (~1.9 GiB/core).
+  In contrast, ~35B models (~64.6 GiB in BF16) leave only ~2 GiB for KV cache and activations under a `0.70`
+  `gpu_memory_utilization` budget (~66.3 GiB), so serving practically requires FP8 weights (~35 GiB, leaving ~1.65M KV
+  tokens/core on `Qwen3.5-35B-A3B` at `0.70`; with vllm-torchtpu's unified GDN block pool enabled, all 32 GDN value
+  heads sit on one core at TP=1, raising the minimum block size—and thus `max_model_len`—to 1088 tokens). Moreover,
+  under `tpu-sync`'s current whole-model BF16 staging (`EP=1` cannot yet enable `rollout_fp8_moe` zero-copy receive),
+  binding 35B's 853 BF16 staging tensors (~64.6 GiB) alongside ~35 GiB FP8 rollout weights exceeds a single v7x core's
+  `94.74 GiB` HBM, so 35B TP=1 full RL weight sync requires chunked staging or `EP=1` FP8 direct receive. Each host
+  running 8 x TP=1 also receives 8 full weight copies per `update_weights` sync (4x the per-host volume of 2 x TP=4 and
+  2x that of 4 x TP=2) and compiles each replica independently on cold start due to per-replica cache directories.
 
 - **Ports:** the engines of a host use `[base, base + 460)`, with base `VERL_TPU_ROLLOUT_SUBHOST_PORT_BASE`
   (default `21000`, i.e. 21000-21459). The block must stay clear of Ray's worker ports (`ray start
@@ -86,15 +99,20 @@ multi-host replicas launch as before.
   and ports. The first engine of a host claims it for its job (a shared `flock` on
   `/tmp/verl_tpu_subhost_rollout.lock`, held while the engine runs), and an engine of another job fails at startup.
   Give each job its own rollout hosts.
-- **Serialized `StartSession` init:** co-located sub-host engines serialize `TPUWorker.init_device` (the `tpu_dist`
-  / `tpunetd` `StartSession` handshake over `vbar.sock`) on `/tmp/verl_tpu_subhost_start_session.lock` so concurrent
-  `StartSession` calls on one host do not collide (`GRPC_ERROR error message: START_SESSION failed`). Model loading
-  and XLA compilation still run in parallel across engines. Only sub-host engines (those with
+- **Serialized `StartSession` init & TP=1 dual-core ordering:** co-located sub-host engines serialize
+  `TPUWorker.init_device` (the `tpu_dist` / `tpunetd` `StartSession` handshake over `vbar.sock`) on
+  `/tmp/verl_tpu_subhost_start_session.lock` so concurrent `StartSession` calls on one host do not collide
+  (`GRPC_ERROR error message: START_SESSION failed`). Model loading and XLA compilation still run in parallel across
+  engines. For TPU 7x TP=1, the same wrapper also orders each chip's even core ahead of its paired odd core: the even
+  core holds a per-chip liveness `flock` until process exit, completes `init_device` and forces TPU runtime init inside
+  the host lock, then publishes a ready marker; the odd core waits for that live marker **before** acquiring the host
+  lock so an odd core arriving first cannot deadlock. Only sub-host engines (those with
   `VERL_TPU_SUBHOST_MEGASCALE_PORT` set) install this wrapper; whole-host, multi-host, and non-sub-host replicas are
-  untouched. Serialization is fail-closed: if all workers of an engine do not reach the gate within
-  120 s, if rank 0 dies or fails before signaling `GO`, or if the 30-minute safety timeout expires while waiting for
-  the host lock or `GO`, the engine aborts and startup fails with an error instead of calling `StartSession`
-  unserialized. Set `VERL_TPU_SUBHOST_SERIALIZE_START_SESSION=0` to disable the serializer.
+  untouched. Serialization is fail-closed: if all workers of an engine (or a TP=1 chip's even core) do not appear
+  within 120 s, if rank 0 dies or fails before signaling `GO`, or if the 30-minute safety timeout expires while waiting
+  for the host lock, `GO`, or the even core's ready marker, startup fails with an error instead of proceeding
+  unserialized. Set `VERL_TPU_SUBHOST_SERIALIZE_START_SESSION=0` to disable host-wide mutual exclusion (TP=1 per-chip
+  even-before-odd ordering remains active because odd-first initialization aborts in `libtpu`).
 
 ## Verify
 

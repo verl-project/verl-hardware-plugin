@@ -951,3 +951,179 @@ def test_subhost_start_session_rejects_invalid_rank_or_world_size(tmp_path, rank
             lock_path=str(tmp_path / "start_session.lock"),
         ):
             pass
+
+
+def test_subhost_worker_hook_sets_4d_single_core_bounds_for_tp1():
+    """For TP=1 on TPU 7x, after dropping pod-wide env vars, the worker hook restores explicit 4-D 1,1,1,1 bounds
+    and per-slot localhost process addresses so both cores of every chip can run independently."""
+    worker_mod, modules = _fake_tpu_worker_module(lambda rank, local_rank, world_size, local_world_size: None)
+    env = {
+        tpu_vllm_patches.SUBHOST_MEGASCALE_PORT_ENV: "21100",
+        "TPU_WORKER_HOSTNAMES": "pod-worker-0",
+        "TPU_PROCESS_ADDRESSES": "pod-worker-0:8476",
+        "TPU_PROCESS_PORT": "8476",
+        "TORCH_TPU_DEVICES_PER_HOST": "8",
+    }
+    with mock.patch.dict(os.environ, env), mock.patch.object(os, "makedirs") as makedirs:
+        _patch_in_fake_worker_process(modules)
+        worker_mod._configure_tpu_process_env(0, 5, 1, 1)  # slot 5 (odd core of chip 2)
+        assert os.environ["TPU_VISIBLE_DEVICES"] == "5"
+        assert os.environ["TPU_VISIBLE_CHIPS"] == "5"
+        assert os.environ["TPU_HOST_BOUNDS"] == "1,1,1,1"
+        assert os.environ["TPU_PROCESS_BOUNDS"] == "1,1,1,1"
+        assert os.environ["TPU_CHIPS_PER_HOST_BOUNDS"] == "1,1,1,1"
+        assert os.environ["TPU_CHIPS_PER_PROCESS_BOUNDS"] == "1,1,1,1"
+        assert os.environ["CLOUD_TPU_TASK_ID"] == "0"
+        assert os.environ["TPU_WORKER_ID"] == "0"
+        assert os.environ["TPU_WORKER_HOSTNAMES"] == "localhost"
+        assert os.environ["TPU_PROCESS_PORT"] == "21102"
+        assert os.environ["TPU_PROCESS_ADDRESSES"] == "localhost:21102"
+        assert os.environ["MEGASCALE_PORT"] == "21100"
+        assert os.environ["MEGASCALE_DEBUG_PORT"] == "21101"
+        assert os.environ["TPU_LOG_DIR"] == "/tmp/tpu_logs/rank_5"
+        assert "TORCH_TPU_DEVICES_PER_HOST" not in os.environ
+    makedirs.assert_called_once_with("/tmp/tpu_logs/rank_5", exist_ok=True)
+
+
+def _tp1_worker_subprocess_script() -> str:
+    """Child-process harness exercising the unified init_device wrapper across real OS processes."""
+    return (
+        "import json, os, sys, time, types\n"
+        "from verl_hardware_plugin.accelerators.tpu.rollout import tpu_vllm_patches as p\n"
+        "lock_path, base_dir, log_path, hold_after_s, sleep_init_s = (\n"
+        "    sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4]), float(sys.argv[5])\n"
+        ")\n"
+        "core = int(os.environ['TPU_LOCAL_RANK_OFFSET'])\n"
+        "p.SUBHOST_START_SESSION_LOCK_FILE = lock_path\n"
+        "orig_paths = p._tp1_chip_handshake_paths\n"
+        "p._tp1_chip_handshake_paths = lambda owner, chip: orig_paths(owner, chip, base_dir=base_dir)\n"
+        "p._SUBHOST_INIT_POLL_INTERVAL_S = 0.01\n"
+        "worker_mod = types.ModuleType('vllm_torchtpu.worker.tpu_worker')\n"
+        "class TPUWorker:\n"
+        "    def __init__(self):\n"
+        "        self.rank = 0\n"
+        "        self.parallel_config = types.SimpleNamespace(world_size=1)\n"
+        "    def init_device(self):\n"
+        "        t_enter = time.time()\n"
+        "        time.sleep(sleep_init_s)\n"
+        "        t_exit = time.time()\n"
+        "        with open(log_path, 'a', encoding='utf-8') as f:\n"
+        "            f.write(json.dumps({'core': core, 'enter': t_enter, 'exit': t_exit}) + '\\n')\n"
+        "        return 'ok'\n"
+        "worker_mod.TPUWorker = TPUWorker\n"
+        "worker_mod._configure_tpu_process_env = lambda *a, **kw: None\n"
+        "sys.modules['vllm_torchtpu'] = types.ModuleType('vllm_torchtpu')\n"
+        "sys.modules['vllm_torchtpu.worker'] = types.ModuleType('vllm_torchtpu.worker')\n"
+        "sys.modules['vllm_torchtpu.worker.tpu_worker'] = worker_mod\n"
+        "p._PATCHES_APPLIED = False\n"
+        "p.patch_vllm_for_tpu()\n"
+        "assert TPUWorker().init_device() == 'ok'\n"
+        "if hold_after_s > 0:\n"
+        "    time.sleep(hold_after_s)\n"
+    )
+
+
+@pytest.mark.parametrize("serialize_flag", ["1", "0"])
+def test_tp1_unified_wrapper_orders_odd_after_even_when_odd_arrives_first(tmp_path, serialize_flag):
+    """Odd core arriving BEFORE even core must neither deadlock on the host StartSession lock nor enter init_device
+    ahead of its paired even core, whether host-wide serialization is enabled ("1") or opted out ("0")."""
+    lock_path = str(tmp_path / "start_session.lock")
+    log_path = str(tmp_path / "events.jsonl")
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    script = _tp1_worker_subprocess_script()
+    base_env = {
+        **os.environ,
+        "PYTHONPATH": repo_root,
+        tpu_vllm_patches.SUBHOST_MEGASCALE_PORT_ENV: "21040",
+        tpu_vllm_patches._SUBHOST_OWNER_ENV: "host-a:123:abcd",
+        tpu_vllm_patches.SUBHOST_SERIALIZE_START_SESSION_ENV: serialize_flag,
+        "TORCH_TPU_TOPOLOGY": "1,1,1,1",
+    }
+    # Launch odd core (core 3, chip 1) 0.2s BEFORE even core (core 2, chip 1).
+    p_odd = subprocess.Popen(
+        [sys.executable, "-c", script, lock_path, str(tmp_path), log_path, "0.0", "0.1"],
+        env={
+            **base_env,
+            "TPU_LOCAL_RANK_OFFSET": "3",
+            tpu_vllm_patches.SUBHOST_ENGINE_ID_ENV: "eng-odd-3",
+        },
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    time.sleep(0.2)
+    # Even core holds its alive lock for 0.6s after init_device so odd core observes a live even core.
+    p_even = subprocess.Popen(
+        [sys.executable, "-c", script, lock_path, str(tmp_path), log_path, "0.6", "0.2"],
+        env={
+            **base_env,
+            "TPU_LOCAL_RANK_OFFSET": "2",
+            tpu_vllm_patches.SUBHOST_ENGINE_ID_ENV: "eng-even-2",
+        },
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    _, err_odd = p_odd.communicate(timeout=15.0)
+    _, err_even = p_even.communicate(timeout=15.0)
+    assert p_odd.returncode == 0, f"odd failed: {err_odd}"
+    assert p_even.returncode == 0, f"even failed: {err_even}"
+
+    with open(log_path, encoding="utf-8") as fh:
+        events = [json.loads(line) for line in fh]
+    assert [e["core"] for e in events] == [2, 3]
+    assert events[0]["exit"] <= events[1]["enter"]
+
+
+def test_tp1_chip_order_rejects_stale_ready_marker_when_even_core_exited(tmp_path):
+    """A leftover ready marker without an active even-core alive flock must NOT unblock the odd core."""
+    alive_path, ready_path = tpu_vllm_patches._tp1_chip_handshake_paths("owner:1", 2, base_dir=str(tmp_path))
+    with open(alive_path, "w", encoding="utf-8") as fh:
+        fh.write("999999\n")
+    with open(ready_path, "w", encoding="utf-8") as fh:
+        fh.write("999999\n")
+    with pytest.raises(TimeoutError, match="core 5 .* to appear and hold"):
+        tpu_vllm_patches._wait_for_tp1_even_core_ready(
+            alive_path,
+            ready_path,
+            core=5,
+            peer_appear_timeout_s=0.05,
+            safety_timeout_s=5.0,
+            poll_interval_s=0.005,
+        )
+
+
+def test_tp1_chip_order_waits_past_peer_appear_while_even_core_holds_alive_lock(tmp_path):
+    """While even core holds alive_path (e.g. queued behind other engines on the host lock), odd core waits beyond
+    peer_appear_timeout_s up to safety_timeout_s, and fails at safety_timeout_s if ready never arrives."""
+    alive_path, ready_path = tpu_vllm_patches._tp1_chip_handshake_paths("owner:2", 1, base_dir=str(tmp_path))
+    alive_fd = os.open(alive_path, os.O_RDWR | os.O_CREAT, 0o666)
+    fcntl.flock(alive_fd, fcntl.LOCK_EX)
+    try:
+        # Publish ready_path AFTER peer_appear_timeout_s (0.04s) has already elapsed: odd core must still succeed.
+        timer = threading.Timer(0.10, lambda: tpu_vllm_patches._write_atomic(ready_path, b"123\n"))
+        timer.start()
+        try:
+            tpu_vllm_patches._wait_for_tp1_even_core_ready(
+                alive_path,
+                ready_path,
+                core=3,
+                peer_appear_timeout_s=0.04,
+                safety_timeout_s=2.0,
+                poll_interval_s=0.005,
+            )
+        finally:
+            timer.join(timeout=2.0)
+
+        # If ready_path is removed and never published, safety_timeout_s bounds the wait.
+        os.unlink(ready_path)
+        with pytest.raises(TimeoutError, match="core 3 .* finish StartSession"):
+            tpu_vllm_patches._wait_for_tp1_even_core_ready(
+                alive_path,
+                ready_path,
+                core=3,
+                peer_appear_timeout_s=0.02,
+                safety_timeout_s=0.08,
+                poll_interval_s=0.005,
+            )
+    finally:
+        fcntl.flock(alive_fd, fcntl.LOCK_UN)
+        os.close(alive_fd)
