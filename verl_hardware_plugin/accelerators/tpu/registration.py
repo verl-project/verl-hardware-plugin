@@ -24,6 +24,14 @@ try:
 except Exception as exc:
     logger.debug("TPU tpu-sync checkpoint engine registration failed: %s", exc)
 
+try:
+    # engine_kwargs.tpu.precompile_train_step: the trainer worker method (see engines/train_step_precompile.py).
+    from verl_hardware_plugin.accelerators.tpu.engines import train_step_precompile
+
+    train_step_precompile.register_worker_method()
+except Exception as exc:
+    logger.debug("TPU trainer precompile worker method registration failed: %s", exc)
+
 
 def register_rollout() -> None:
     """Keep upstream vLLM and SGLang loaders on non-TPU devices without importing them eagerly."""
