@@ -118,18 +118,28 @@ def apply_checkpoint_engine_manager_hooks() -> None:
             @ckpt_base.auto_await
             async def _patched_mgr_update(self, global_steps: int | None = None):
                 backend = canonical_backend(self.backend)
+                if backend in (RAY_PLASMA_STORE_BACKEND, TPU_SYNC_BACKEND):
+                    from verl_hardware_plugin.accelerators.tpu.engines import train_step_precompile
+
+                    # engine_kwargs.tpu.precompile_train_step: log the precompile started after the previous sync.
+                    await train_step_precompile.collect_precompile(self)
                 if backend == RAY_PLASMA_STORE_BACKEND:
                     from verl_hardware_plugin.accelerators.tpu.weight_sync import ray_checkpoint_engine
 
-                    return await ray_checkpoint_engine.update_ray_weights(self, global_steps=global_steps)
-                if backend == TPU_SYNC_BACKEND:
+                    result = await ray_checkpoint_engine.update_ray_weights(self, global_steps=global_steps)
+                elif backend == TPU_SYNC_BACKEND:
                     from verl_hardware_plugin.accelerators.tpu.weight_sync import tpu_sync_checkpoint_engine
 
-                    return await tpu_sync_checkpoint_engine.update_tpu_sync_weights(self, global_steps=global_steps)
-                res = _orig_mgr_update(self, global_steps=global_steps)
-                if inspect.isawaitable(res):
-                    return await res
-                return res
+                    result = await tpu_sync_checkpoint_engine.update_tpu_sync_weights(self, global_steps=global_steps)
+                else:
+                    res = _orig_mgr_update(self, global_steps=global_steps)
+                    if inspect.isawaitable(res):
+                        return await res
+                    return res
+                # These backends sync standalone rollout replicas: after the first sync the trainer is idle until its
+                # first batch, so start the (opt-in) train-step precompile there. The workers skip it unless enabled.
+                train_step_precompile.start_precompile(self)
+                return result
 
             ckpt_base.CheckpointEngineWorker.__init__ = _patched_worker_init
             ckpt_base.CheckpointEngineManager.update_weights = _patched_mgr_update

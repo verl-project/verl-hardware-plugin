@@ -2953,3 +2953,137 @@ def test_fp8_moe_ineligible_rollout_direct_install_opt_out_and_worker_guards(fak
     )
     with pytest.raises(RuntimeError, match="get_vllm_params boom"):
         asyncio.run(eng2.send_weights(make_forced_fp8_weights(0), global_steps=0))
+
+
+class _SyncReplica:
+    """A rollout replica stand-in for the dead-replica tests: answers, hangs, or raises (an EngineDeadError)."""
+
+    def __init__(self, rank, mode):
+        self.replica_rank = rank
+        self.server_address = f"10.0.0.{rank}:8000"
+        self.mode = mode
+        self.calls = 0
+
+    async def resume_generation(self):
+        self.calls += 1
+        if self.mode == "hang":
+            await asyncio.sleep(60)
+        if self.mode == "raise":
+            raise RuntimeError("EngineDeadError")
+        return self.replica_rank
+
+
+class _FakeLoadBalancer:
+    def __init__(self):
+        self.removed = []
+        self.remove_servers = SimpleNamespace(remote=self._remove)
+
+    async def _remove_async(self):
+        return None
+
+    def _remove(self, server_ids):
+        self.removed.extend(server_ids)
+        return self._remove_async()
+
+
+def _dead_replica_manager(monkeypatch, modes):
+    replicas = [_SyncReplica(rank, mode) for rank, mode in enumerate(modes)]
+    balancer = _FakeLoadBalancer()
+    monkeypatch.setattr(tpu_sync_engine, "TPU_SYNC_REPLICA_RPC_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(
+        tpu_sync_engine, "_rollout_load_balancers", lambda: [([r.server_address for r in replicas], balancer)]
+    )
+    return SimpleNamespace(replicas=replicas), replicas, balancer
+
+
+def test_weight_sync_drops_hung_and_dead_replicas_and_skips_them_afterwards(monkeypatch):
+    manager, replicas, balancer = _dead_replica_manager(monkeypatch, ["ok", "hang", "raise", "ok"])
+
+    answered = asyncio.run(
+        tpu_sync_engine._call_live_replicas(manager, "resume_generation", lambda r, _: r.resume_generation(), 3)
+    )
+
+    assert answered == [(0, 0), (3, 3)]
+    # Dropped from request routing too, so the least-in-flight balancer stops sending sessions to a dead engine.
+    assert sorted(balancer.removed) == ["10.0.0.1:8000", "10.0.0.2:8000"]
+    assert manager._tpu_sync_dead_replicas == {"10.0.0.1:8000", "10.0.0.2:8000"}
+
+    answered = asyncio.run(
+        tpu_sync_engine._call_live_replicas(manager, "resume_generation", lambda r, _: r.resume_generation(), 4)
+    )
+    assert [index for index, _ in answered] == [0, 3]
+    assert [r.calls for r in replicas] == [2, 1, 1, 2]
+
+
+def test_weight_sync_raises_with_the_first_error_when_every_replica_fails(monkeypatch):
+    manager, _, _ = _dead_replica_manager(monkeypatch, ["raise", "raise"])
+
+    with pytest.raises(RuntimeError, match="every rollout replica failed install.*EngineDeadError"):
+        asyncio.run(tpu_sync_engine._call_live_replicas(manager, "install", lambda r, _: r.resume_generation(), 1))
+
+
+def test_weight_sync_manager_calls_fall_back_to_replica_by_replica(monkeypatch):
+    manager, replicas, balancer = _dead_replica_manager(monkeypatch, ["ok", "hang"])
+    manager_calls = []
+
+    async def resume_generation_replicas():
+        manager_calls.append("resume")
+        await asyncio.gather(*[r.resume_generation() for r in replicas])
+
+    # Healthy rollout: the manager-wide call runs as before, and nothing is dropped.
+    replicas[1].mode = "ok"
+    asyncio.run(
+        tpu_sync_engine._run_on_live_replicas(
+            manager, "resume_generation", resume_generation_replicas, lambda r, _: r.resume_generation(), 1
+        )
+    )
+    assert manager_calls == ["resume"] and not balancer.removed
+
+    # A replica that stops answering times the manager-wide call out; the per-replica retry finds and drops it.
+    replicas[1].mode = "hang"
+    asyncio.run(
+        tpu_sync_engine._run_on_live_replicas(
+            manager, "resume_generation", resume_generation_replicas, lambda r, _: r.resume_generation(), 2
+        )
+    )
+    assert manager_calls == ["resume", "resume"]
+    assert balancer.removed == ["10.0.0.1:8000"]
+
+    # Once a replica is dropped, the manager-wide call (which would wait on it) is skipped.
+    asyncio.run(
+        tpu_sync_engine._run_on_live_replicas(
+            manager, "resume_generation", resume_generation_replicas, lambda r, _: r.resume_generation(), 3
+        )
+    )
+    assert manager_calls == ["resume", "resume"]
+
+
+def test_weight_sync_fails_the_step_when_a_cached_transfer_hangs(fake_tpu_sync, worker_ext, monkeypatch):
+    """A transfer that never finishes (a rollout host gone entirely) fails the step instead of hanging the run, once
+    the transfer plan is cached; the first transfer of a run, which also plans the reshard, is not bounded."""
+    tp = 2
+    weights = _trainer_weights()
+    samplers = [_make_sampler(worker_ext, rank, tp, _FakeVllmModel(tp)) for rank in range(tp)]
+    manager, _ = _make_manager(
+        [_trainer_engine(rank) for rank in range(2)],
+        lambda rank: iter(weights.items()),
+        samplers,
+        [],
+        return_after_d2h=False,
+    )
+    monkeypatch.setattr(tpu_sync_engine, "TPU_SYNC_TRANSFER_TIMEOUT_S", 0.2)
+    try:
+        # First transfer: slower than the timeout, but not bounded.
+        fake_tpu_sync.transfer_gate = threading.Event()
+        threading.Timer(0.5, fake_tpu_sync.transfer_gate.set).start()
+        asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+
+        # Cached plan: a transfer that does not finish in time fails the step.
+        fake_tpu_sync.transfer_gate = threading.Event()
+        threading.Timer(1.0, fake_tpu_sync.transfer_gate.set).start()  # lets the blocked transfer thread exit
+        with pytest.raises(RuntimeError, match="weight transfer to the rollout did not finish within"):
+            asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=1))
+    finally:
+        if fake_tpu_sync.transfer_gate is not None:
+            fake_tpu_sync.transfer_gate.set()
+        fake_tpu_sync.transfer_gate = None

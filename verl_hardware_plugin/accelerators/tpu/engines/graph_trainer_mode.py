@@ -110,6 +110,12 @@ def validate_graph_trainer_engine(
     budget = options.kda_document_budget
     if "kda" in tpu_kernels and budget is not None and budget < 2:
         errors.append(f"kda_document_budget={budget} must be at least 2 (one sequence plus the padding tail)")
+    if options.precompile_train_step:
+        # The precompiled step runs on synthetic data: nothing it pins may depend on the real first step's data.
+        if "kda" in tpu_kernels and budget is None:
+            errors.append("precompile_train_step with the Tokamax KDA kernels needs kda_document_budget")
+        if (options.graph_trainer or {}).get("optimizer_compile") == "in_graph":
+            errors.append("precompile_train_step does not support graph_trainer.optimizer_compile='in_graph'")
     if options.gdn_row_slot_len and options.static_micro_batch_len:
         if int(options.static_micro_batch_len) % int(options.gdn_row_slot_len) != 0:
             errors.append(

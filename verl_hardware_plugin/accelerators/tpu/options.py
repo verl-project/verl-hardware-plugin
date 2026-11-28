@@ -296,6 +296,10 @@ class TPUEngineOptions:
             Ignored when ``trainer_mode`` is not ``graph_trainer``.
         kda_document_budget: ``trainer_mode=graph_trainer`` with ``kda``: the Tokamax KDA ``max_num_segments`` (packed
             documents per micro-batch + 1) pinned for the run (default: the first step's count + 1).
+        precompile_train_step: ``trainer_mode=graph_trainer`` with standalone rollout replicas (``separate_async``):
+            trace and compile the training step on a synthetic micro-batch right after the initial weight sync, while
+            the first rollout batch is generated, instead of in the first ``update_actor`` (default: ``False``; see
+            ``engines/train_step_precompile.py``). Workers that host a rollout engine skip it.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -342,6 +346,7 @@ class TPUEngineOptions:
     trainer_mode: Optional[str] = None
     graph_trainer: Optional[dict[str, Any]] = None
     kda_document_budget: Optional[int] = None
+    precompile_train_step: Optional[bool] = None
 
     def __post_init__(self) -> None:
         if self.static_micro_batch_num_seqs is not None and (
@@ -398,6 +403,7 @@ _ENGINE_KINDS: dict[str, Any] = {
     "trainer_mode": str,
     "graph_trainer": dict,
     "kda_document_budget": int,
+    "precompile_train_step": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
@@ -525,6 +531,11 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
             f"got {values['static_micro_batch_num_seqs']!r}"
         )
     _normalize_trainer_mode(values)
+    if values.get("precompile_train_step") and values.get("trainer_mode") != TRAINER_MODE_GRAPH_TRAINER:
+        raise ValueError(
+            f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.precompile_train_step needs "
+            f"trainer_mode={TRAINER_MODE_GRAPH_TRAINER}"
+        )
     return TPUEngineOptions(**values)
 
 
