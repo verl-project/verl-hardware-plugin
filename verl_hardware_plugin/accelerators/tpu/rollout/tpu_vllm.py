@@ -15,9 +15,9 @@ and its multi-node layout, and changes only what TPU needs:
 * ``enable_sleep_mode=False``: vllm-torchtpu has no sleep mode.
 * With ``checkpoint_engine.backend=tpu-sync``, vLLM's workers load the tpu-sync worker extension
   (``tpu_sync_worker_extension.py``), which receives the trainer's weights over the network.
-* On TPU 7x, TP=2 and TP=4 replicas share their host with other replicas (e.g. 16 x TP=2 on four hosts):
-  each engine takes a slot of the host's devices and its own fixed ports (see ``subhost_engine_env``), and all
-  the engines of a host must come from one controller (``claim_host_for_subhost_engines``).
+* On TPU 7x, TP=1, TP=2 and TP=4 replicas share their host with other replicas (e.g. 8 x TP=1, 4 x TP=2 or 2 x TP=4
+  per host): each engine takes a slot of the host's devices and its own fixed ports (see ``subhost_engine_env``), and
+  all the engines of a host must come from one controller (``claim_host_for_subhost_engines``).
 
 The same logic previously lived behind ``get_resource_name() == "TPU"`` branches in verl's
 ``vllm_async_server.py`` and ``replica.py``.
@@ -38,6 +38,7 @@ from verl.utils.device import get_device_name
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
     TPU_V7X_DEVICES_PER_HOST,
+    TPU_V7X_PROCESS_BOUNDS,
     TPU_V7X_SUBHOST_TOPOLOGY_MAP,
     is_tpu_v7x,
     ray_tpu_accelerator_name,
@@ -45,6 +46,7 @@ from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
 )
 from verl_hardware_plugin.accelerators.tpu.profilers.tpu_vllm_timeline import vLLMServerTimelineMixin
 from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import (
+    SUBHOST_ENGINE_ID_ENV,
     SUBHOST_MEGASCALE_PORT_ENV,
     patch_vllm_for_tpu,
 )
@@ -201,7 +203,7 @@ def claim_host_for_subhost_engines(owner: str, path: str = SUBHOST_CLAIM_FILE) -
                 return fd
             fcntl.flock(fd, fcntl.LOCK_UN)  # another controller's engines hold the claim, or did until just now
         raise RuntimeError(
-            f"This host already runs TP=2 / TP=4 rollout engines of another controller ({holder}); this engine "
+            f"This host already runs TP=1 / TP=2 / TP=4 rollout engines of another controller ({holder}); this engine "
             f"belongs to {owner}. Engines that share a host must all come from one verl job's rollout, which "
             "assigns their devices and ports: give each job its own rollout hosts."
         )
@@ -213,12 +215,19 @@ def claim_host_for_subhost_engines(owner: str, path: str = SUBHOST_CLAIM_FILE) -
 def subhost_engine_env(slot: int, devices_per_engine: int, replica_rank: int) -> dict[str, str]:
     """The environment of a vLLM engine in slot ``slot`` of a host it shares with other engines.
 
-    Everything here is per engine; the per-worker part (MegaScale ports, libtpu log dir) is set in each worker by
-    ``tpu_vllm_patches.patch_tpu_worker_subhost_env``, which ``SUBHOST_MEGASCALE_PORT_ENV`` switches on.
+    Everything here is per engine; the per-worker part (MegaScale ports, libtpu log dir, and for TP=1 the explicit
+    4-D ``1,1,1,1`` single-core bounds) is set in each worker by ``tpu_vllm_patches.patch_tpu_worker_subhost_env``,
+    which ``SUBHOST_MEGASCALE_PORT_ENV`` switches on.
     """
     offset = slot * devices_per_engine
     block = _subhost_port_base() + _PORTS_PER_DEVICE * offset
-    return {
+    # For TP=1 (8 slots, offsets 0..7), placing slicebuilder at block + 300 would collide with MASTER_PORT (block + 200)
+    # of slots 5..7 (21100 + 200 == 21000 + 300). Keep single-device process & slicebuilder ports in [block, block+20).
+    if devices_per_engine == 1:
+        slicebuilder_addresses = f"localhost:{block + 3}"
+    else:
+        slicebuilder_addresses = ",".join(f"localhost:{block + 300 + r}" for r in range(devices_per_engine))
+    env = {
         # vllm-torchtpu binds worker r to device offset + r: TPU_LOCAL_RANK_OFFSET in its spawn-time worker binding,
         # DEBUG_TPU_LOCAL_RANK_OFFSET where TPUWorker.init_device sets LOCAL_RANK. Neither is part of its compile
         # cache key.
@@ -228,19 +237,42 @@ def subhost_engine_env(slot: int, devices_per_engine: int, replica_rank: int) ->
         # torch_tpu's rendezvous and slice builder on this engine's ports.
         "MASTER_ADDR": "127.0.0.1",
         "MASTER_PORT": str(block + 200),
-        "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(f"localhost:{block + 300 + r}" for r in range(devices_per_engine)),
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES": slicebuilder_addresses,
         # libtpu's MegaScale coordinator of this engine alone: the GKE TPU webhook's container-level value names the
         # pod, so every engine in the container would share it.
         "MEGASCALE_COORDINATOR_ADDRESS": f"127.0.0.1:{block}",
         SUBHOST_MEGASCALE_PORT_ENV: str(block),
-        # The server actor claims the host for this controller (see claim_host_for_subhost_engines).
+        # The server actor claims the host for this controller (see claim_host_for_subhost_engines), and this
+        # per-launch engine ID groups the engine's TP workers for StartSession serialization.
         SUBHOST_OWNER_ENV: _CONTROLLER_ID,
+        SUBHOST_ENGINE_ID_ENV: f"{_CONTROLLER_ID}:slot{slot}:r{replica_rank}:{uuid.uuid4().hex[:8]}",
         # Compile caches of their own: a cache keyed by the replica alone hands one TP size's executables to another
         # ("local device count is 0" when a TP=8 engine loaded TP=4 executables).
         "VLLM_CACHE_ROOT": f"/tmp/vllm_cache_tp{devices_per_engine}_r{replica_rank}",
         "TORCHINDUCTOR_CACHE_DIR": f"/tmp/inductor_cache_tp{devices_per_engine}_r{replica_rank}",
         "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": f"/tmp/tpu_tier3_tp{devices_per_engine}_r{replica_rank}",
     }
+    if devices_per_engine == 1:
+        # Standalone WORLD_SIZE=1 falls back to torch_tpu's 3-D "1,1,1" default bounds, which opens an entire
+        # 2-core TPU 7x chip (rejecting TPU_VISIBLE_CHIPS=4..7 and colliding on the second core's VFIO device).
+        # Setting all four 4-D "1,1,1,1" bounds pins this engine to exactly one TensorCore.
+        process_port = block + 2
+        env.update(
+            {
+                "TPU_HOST_BOUNDS": TPU_V7X_PROCESS_BOUNDS,
+                "TPU_PROCESS_BOUNDS": TPU_V7X_PROCESS_BOUNDS,
+                "TPU_CHIPS_PER_HOST_BOUNDS": TPU_V7X_PROCESS_BOUNDS,
+                "TPU_CHIPS_PER_PROCESS_BOUNDS": TPU_V7X_PROCESS_BOUNDS,
+                "TPU_VISIBLE_DEVICES": str(offset),
+                "TPU_VISIBLE_CHIPS": str(offset),
+                "CLOUD_TPU_TASK_ID": "0",
+                "TPU_WORKER_ID": "0",
+                "TPU_WORKER_HOSTNAMES": "localhost",
+                "TPU_PROCESS_ADDRESSES": f"localhost:{process_port}",
+                "TPU_PROCESS_PORT": str(process_port),
+            }
+        )
+    return env
 
 
 class TPUvLLMHttpServer(vLLMServerTimelineMixin, vLLMHttpServer):
@@ -325,8 +357,9 @@ class TPUvLLMReplica(vLLMReplica):
             # A replica on one host (e.g. one of several replicas on a multi-host rollout slice) is its own mesh; it
             # must not inherit the slice's TORCH_TPU_TOPOLOGY. Multi-host replicas get theirs from vllm-torchtpu's
             # rendezvous. The TPU type comes from the replica's host, not from this process's environment, which
-            # may be a CPU Ray head without TPU_ACCELERATOR_TYPE. On TPU 7x a TP=2 / TP=4 replica gets the mesh of
-            # its one or two chips; sizes without a known mesh keep the inherited environment, as before.
+            # may be a CPU Ray head without TPU_ACCELERATOR_TYPE. On TPU 7x a TP=1 / TP=2 / TP=4 replica gets the mesh
+            # of its one TensorCore, one chip, or two chips; sizes without a known mesh keep the inherited environment,
+            # as before.
             chips_per_host = self.gpus_per_replica_node
             pod_type = ray_tpu_accelerator_name(node_ids=list(node_ids))
             topology = single_host_tpu_topology(chips_per_host, pod_type=pod_type)
