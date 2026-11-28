@@ -3,6 +3,7 @@
 
 """vLLM / vllm-torchtpu runtime patches for TPU rollout."""
 
+import logging
 import os
 import types
 from unittest import mock
@@ -350,3 +351,26 @@ def test_patch_tpu_fp8_moe_rollout_installs_pr2967_routed_experts_shim():
             unquantized_mod.VllmUnquantizedConfig(has_bias=True).get_quant_method(
                 RoutedExperts(), "model.layers.0.mlp.experts"
             )
+
+
+def test_pr2967_shim_warns_once_on_unexpected_upstream_method(caplog):
+    """Warn once if upstream returns neither VllmFp8MoEMethodTPU nor VllmUnquantizedFusedMoEMethod."""
+    modules, _, _, _, unquantized_mod, RoutedExperts = _fake_fp8_quant_modules()
+
+    class UnexpectedMoEMethod:
+        pass
+
+    unexpected = UnexpectedMoEMethod()
+    unquantized_mod.VllmUnquantizedConfig.get_quant_method = lambda self, layer, prefix: unexpected
+    with (
+        mock.patch.dict("sys.modules", modules),
+        caplog.at_level(logging.WARNING, logger=tpu_vllm_patches.__name__),
+    ):
+        tpu_vllm_patches.patch_tpu_fp8_moe_rollout()
+        cfg = unquantized_mod.VllmUnquantizedConfig()
+        assert cfg.get_quant_method(RoutedExperts(), "model.layers.0.mlp.experts") is unexpected
+        assert cfg.get_quant_method(RoutedExperts(), "model.layers.1.mlp.experts") is unexpected
+    warnings = [rec for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "UnexpectedMoEMethod" in warnings[0].message
+    assert "QUANTIZE_ON_LOAD_PREFIXES" in warnings[0].message

@@ -272,11 +272,20 @@ def _patch_unquantized_routed_experts() -> None:
     @functools.wraps(orig_get_quant)
     def _get_quant_method_pr2967(self, layer, prefix):
         method = orig_get_quant(self, layer, prefix)
-        if not (
-            isinstance(method, unquantized_moe_cls)
-            and isinstance(layer, routed_experts_cls)
-            and should_quantize_on_load(prefix)
-        ):
+        if not (isinstance(layer, routed_experts_cls) and should_quantize_on_load(prefix)):
+            return method
+        if isinstance(method, fp8_moe_cls):
+            return method
+        if not isinstance(method, unquantized_moe_cls):
+            if not getattr(_get_quant_method_pr2967, "_verl_pr2967_unexpected_warned", False):
+                _get_quant_method_pr2967._verl_pr2967_unexpected_warned = True  # type: ignore[attr-defined]
+                logger.warning(
+                    "vllm-torchtpu#2967 backport: QUANTIZE_ON_LOAD_PREFIXES matched %s, but upstream "
+                    "returned %s instead of VllmUnquantizedFusedMoEMethod or VllmFp8MoEMethodTPU; "
+                    "passing it through unchanged.",
+                    prefix,
+                    type(method).__name__,
+                )
             return method
         moe_config = self.get_moe_config(layer)
         if moe_config.has_bias:
