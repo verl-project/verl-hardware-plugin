@@ -1204,6 +1204,14 @@ class TorchTitanTPUEngine(BaseEngine):
             graph_trainer_mode.validate_graph_trainer_engine(
                 engine_config, tpu_options, use_simple_fsdp=self._use_simple_fsdp, tpu_kernels=self._tpu_kernels
             )
+            if os.environ.get("VERL_TPU_COMPILED_OPT_STEP", "0") == "1" and (
+                tpu_options.fp32_master or tpu_options.optimizer_host_offload
+            ):
+                # The compiled optimizer step returns before _chunked_clip_and_step: no FP32 masters, no host offload.
+                logger.warning(
+                    "VERL_TPU_COMPILED_OPT_STEP=1 ignores engine_kwargs.tpu.fp32_master / optimizer_host_offload: the "
+                    "optimizer steps the device bf16 parameters (bf16 AdamW moments)"
+                )
         self._graph_policy_loss_spec: Optional[graph_trainer_mode.GraphPolicyLossSpec] = None
         self._graph_trainer_traced_len: Optional[int] = None
         # trainer_mode=graph_trainer with kda: the Tokamax KDA document budget pinned on the first step.
