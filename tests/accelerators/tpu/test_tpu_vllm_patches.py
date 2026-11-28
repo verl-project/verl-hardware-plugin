@@ -415,7 +415,7 @@ def _fake_tpu_worker_module_with_init_device(init_device_fn):
 
 
 def test_subhost_start_session_hook_is_no_op_for_single_engine_hosts():
-    """Single-engine hosts (TP=8, TP=1, multi-host, non-v7x: no SUBHOST_MEGASCALE_PORT_ENV) do not wrap init_device."""
+    """Engines without SUBHOST_MEGASCALE_PORT_ENV (non-sub-host engines) do not wrap init_device."""
 
     def orig_init(self):
         return "ok"

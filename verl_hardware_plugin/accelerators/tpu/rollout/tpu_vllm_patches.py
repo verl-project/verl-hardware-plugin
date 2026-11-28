@@ -927,8 +927,8 @@ def patch_tpu_worker_subhost_start_session() -> None:
     """Serialize ``TPUWorker.init_device`` across co-located sub-host engines on the same TPU host.
 
     Installed only when ``SUBHOST_MEGASCALE_PORT_ENV`` is set (sub-host engines where ``engines_per_host > 1``)
-    and ``SUBHOST_SERIALIZE_START_SESSION_ENV`` is not disabled. Whole-host (TP=8), TP=1, multi-host, and non-v7x
-    engines never install this wrapper.
+    and ``SUBHOST_SERIALIZE_START_SESSION_ENV`` is not disabled. Engines without ``SUBHOST_MEGASCALE_PORT_ENV``
+    (whole-host, multi-host, and non-sub-host engines) never install this wrapper.
     """
     if not subhost_serialize_start_session_enabled():
         return
